@@ -265,7 +265,7 @@ impl MarkdownPreview {
         })
     }
 
-    fn set_markdown_html(
+    pub(in crate::ui::pages::code) fn set_markdown_html(
         &self,
         html: &str,
         signature: super::ContentSignature,
@@ -634,7 +634,7 @@ fn source_anchor(offset: usize) -> String {
     format!(r#"<span class="source-anchor" data-source-start="{offset}"></span>"#)
 }
 
-fn markdown_to_html(markdown: &str) -> String {
+pub(in crate::ui::pages::code) fn markdown_to_html(markdown: &str) -> String {
     let body = markdown_fragment_to_html(markdown);
 
     format!(
