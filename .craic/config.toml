@@ -1,0 +1,1 @@
+commit_convention = "Use Conventional Commits style for the summary line. Use a type prefix such as feat:, chore:, cleanup:, fix:, BREAKING etc., followed by a concise imperative description (< 10 words)."

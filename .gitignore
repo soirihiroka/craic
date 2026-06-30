@@ -1,0 +1,11 @@
+/target/
+/crates/*/target/
+/crates/craic-diff-ui/Cargo.lock
+/craic
+.vscode/
+*.pdf
+*.mp4
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.m4a

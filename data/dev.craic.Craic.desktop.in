@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=@APP_NAME@
+Comment=Vibe IDE & Agentic Development Environment
+Exec=@BIN_PATH@
+Icon=@APP_ID@
+Terminal=false
+Categories=Development;RevisionControl;GTK;
+Keywords=Git;Repository;Version Control;IDE;Agent;AI;Vibe;
+StartupNotify=true
+StartupWMClass=@APP_ID@
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=New Window
+Exec=@BIN_PATH@
+Icon=@APP_ID@
