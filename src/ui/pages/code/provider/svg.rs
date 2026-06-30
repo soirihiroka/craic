@@ -188,7 +188,11 @@ impl SvgPreview {
         preview
     }
 
-    fn set_svg(&self, bytes: &[u8], signature: super::ContentSignature) {
+    pub(in crate::ui::pages::code) fn set_svg(
+        &self,
+        bytes: &[u8],
+        signature: super::ContentSignature,
+    ) {
         if self.signature.borrow().as_ref() == Some(&signature) {
             return;
         }

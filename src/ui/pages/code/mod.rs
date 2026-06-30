@@ -13,6 +13,7 @@ use crate::system::capabilities::files::{
 use crate::system::path::ProviderKind;
 use crate::system::{SystemPath, WorkspacePath, WorkspaceRef};
 use crate::ui::content::code_editor;
+use crate::ui::file_type;
 use crate::ui::sidebar::file_browser::ContainerFileAction;
 use adw::prelude::*;
 use gtk::glib;
@@ -25,6 +26,7 @@ use std::time::Duration;
 const MAX_EDITOR_FILE_BYTES: u64 = 1024 * 1024;
 const CODE_FILE_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(75);
 const CODE_FILE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(120);
+const LIVE_PREVIEW_REFRESH_DEBOUNCE: Duration = Duration::from_millis(60);
 
 pub(super) struct CodePage {
     ctx: PageContext,
@@ -50,7 +52,13 @@ struct PendingSave {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DisplayedPreview {
     system_path: SystemPath,
-    signature: provider::DiskSignature,
+    signature: PreviewSignature,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewSignature {
+    Disk(provider::DiskSignature),
+    Content(provider::ContentSignature),
 }
 
 #[derive(Clone)]
@@ -418,6 +426,7 @@ impl CodePage {
             let file_monitor = file_monitor.clone();
             let displayed_preview = displayed_preview.clone();
             let save_generation = Rc::new(Cell::new(0_u64));
+            let preview_generation = Rc::new(Cell::new(0_u64));
 
             move || {
                 let Some(file_path) = file_editor_path.borrow().clone() else {
@@ -430,6 +439,36 @@ impl CodePage {
                     generation,
                     base_signature: *file_editor_disk_signature.borrow(),
                 }));
+
+                let preview_generation_value = preview_generation.get().wrapping_add(1).max(1);
+                preview_generation.set(preview_generation_value);
+                {
+                    let ctx = ctx.clone();
+                    let right = right.clone();
+                    let file_editor = file_editor.clone();
+                    let file_editor_path = file_editor_path.clone();
+                    let preview_file_path = file_path.clone();
+                    let displayed_preview = displayed_preview.clone();
+                    let preview_generation = preview_generation.clone();
+                    gtk::glib::timeout_add_local_once(LIVE_PREVIEW_REFRESH_DEBOUNCE, move || {
+                        if preview_generation.get() != preview_generation_value {
+                            return;
+                        }
+                        if file_editor_path.borrow().as_deref() != Some(preview_file_path.as_str())
+                        {
+                            return;
+                        }
+
+                        let text = file_editor.document_text();
+                        refresh_live_file_preview(
+                            &ctx,
+                            &right,
+                            &displayed_preview,
+                            &preview_file_path,
+                            &text,
+                        );
+                    });
+                }
 
                 let ctx = ctx.clone();
                 let file_editor = file_editor.clone();
@@ -822,6 +861,66 @@ fn repository_item_line_column_selection(
     Some((offset, offset))
 }
 
+fn refresh_live_file_preview(
+    ctx: &PageContext,
+    right: &right::RightPane,
+    displayed_preview: &DisplayedPreviewState,
+    file_path: &str,
+    text: &str,
+) {
+    let preview_kind = file_type::preview_kind_for_path(file_path, false);
+    let signature = provider::content_signature(text.as_bytes());
+    match preview_kind {
+        file_type::PreviewKind::Markdown => {
+            let html = provider::markdown::markdown_to_html(text);
+            let local_path = local_workspace_path(ctx, file_path);
+            right
+                .file_markdown_preview
+                .set_markdown_html(&html, signature, local_path.as_deref());
+            right
+                .file_markdown_preview
+                .set_source_offset(right.file_editor.source_offset_at_scroll_top());
+            right
+                .file_view_split
+                .set_end_child(Some(&right.file_markdown_preview.root));
+            set_live_displayed_preview(ctx, displayed_preview, file_path, signature);
+            log::debug!("refreshed live markdown preview file_path={file_path}");
+        }
+        file_type::PreviewKind::Svg => {
+            right.file_svg_preview.set_svg(text.as_bytes(), signature);
+            right
+                .file_view_split
+                .set_end_child(Some(&right.file_svg_preview.root));
+            set_live_displayed_preview(ctx, displayed_preview, file_path, signature);
+            log::debug!("refreshed live svg preview file_path={file_path}");
+        }
+        _ => {}
+    }
+}
+
+fn set_live_displayed_preview(
+    ctx: &PageContext,
+    displayed_preview: &DisplayedPreviewState,
+    file_path: &str,
+    signature: provider::ContentSignature,
+) {
+    let path = ctx.workspace_ref().path(file_path);
+    let system_path = SystemPath {
+        system: ctx.system_ref(),
+        workspace: ctx.workspace_ref(),
+        path,
+    };
+    displayed_preview.replace(Some(DisplayedPreview {
+        system_path,
+        signature: PreviewSignature::Content(signature),
+    }));
+}
+
+fn local_workspace_path(ctx: &PageContext, file_path: &str) -> Option<PathBuf> {
+    (ctx.system_ref().provider_kind == ProviderKind::Local)
+        .then(|| PathBuf::from(ctx.workspace_ref().path(file_path).absolute))
+}
+
 struct RepositoryItem {
     files: Arc<dyn FileAccess>,
     workspace: WorkspaceRef,
@@ -862,7 +961,7 @@ fn show_repository_item(
     let file_path = item.workspace_path.relative_or_empty();
     let displayed = DisplayedPreview {
         system_path: item.metadata.path.clone(),
-        signature: provider::disk_signature(&item.metadata),
+        signature: PreviewSignature::Disk(provider::disk_signature(&item.metadata)),
     };
     if displayed_preview.borrow().as_ref() == Some(&displayed) {
         log::debug!("skip unchanged file preview file_path={file_path}");
