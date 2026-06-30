@@ -1,0 +1,219 @@
+use super::{FileBrowser, tree::BrowserRow};
+use crate::system::capabilities::files::{FileWatchCallback, FileWatchRequest};
+use gtk::glib;
+use std::collections::HashSet;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
+
+const FILE_BROWSER_WATCH_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FileBrowserWatchSignature {
+    workspace_id: String,
+    directories: Vec<String>,
+}
+
+impl FileBrowser {
+    pub(super) fn update_file_watch_scope(self: &Rc<Self>, rows: &[BrowserRow]) {
+        if !self.search_query.borrow().is_empty() {
+            self.stop_file_watch_scope();
+            return;
+        }
+
+        let workspace = self.workspace.borrow().clone();
+        let directories = open_folder_watch_directories(rows, &self.expanded_dirs.borrow());
+        let signature = FileBrowserWatchSignature {
+            workspace_id: workspace.id.to_string(),
+            directories,
+        };
+        if self.file_watch_signature.borrow().as_ref() == Some(&signature) {
+            return;
+        }
+
+        self.stop_file_watch_scope();
+        self.file_watch_signature.replace(Some(signature.clone()));
+        let generation = self.file_watch_generation.get();
+        let file_access = self.file_access.borrow().clone();
+        let (sender, receiver) = mpsc::channel();
+        let sender = Arc::new(Mutex::new(sender));
+        let mut subscriptions = Vec::new();
+
+        let request = FileWatchRequest {
+            paths: signature
+                .directories
+                .iter()
+                .map(|relative| workspace.path(relative))
+                .collect(),
+            recursive: false,
+        };
+        let callback: FileWatchCallback = Arc::new(move |changes| {
+            if let Ok(sender) = sender.lock() {
+                let _ = sender.send(changes);
+            }
+        });
+        match file_access.watch(request, callback) {
+            Ok(subscription) => subscriptions.push(subscription),
+            Err(err) => {
+                log::warn!(
+                    "file browser watch registration failed workspace={} watched_dirs={} err={err}",
+                    workspace.display_name,
+                    signature.directories.len()
+                );
+            }
+        }
+
+        log::info!(
+            "file browser watch scope updated workspace={} watched_dirs={} subscriptions={}",
+            workspace.display_name,
+            signature.directories.len(),
+            subscriptions.len()
+        );
+
+        if subscriptions.is_empty() {
+            return;
+        }
+
+        let browser = Rc::clone(self);
+        let source_id =
+            glib::timeout_add_local(FILE_BROWSER_WATCH_EVENT_POLL_INTERVAL, move || {
+                if browser.file_watch_generation.get() != generation {
+                    return glib::ControlFlow::Break;
+                }
+
+                let mut changed_paths = HashSet::new();
+                while let Ok(changes) = receiver.try_recv() {
+                    changed_paths.extend(
+                        changes
+                            .into_iter()
+                            .map(|path| path.relative_or_empty().to_string()),
+                    );
+                }
+
+                if !changed_paths.is_empty() {
+                    browser.refresh_watched_folder_view(generation, changed_paths);
+                }
+
+                glib::ControlFlow::Continue
+            });
+        self.file_watch_subscriptions.replace(subscriptions);
+        self.file_watch_event_source.replace(Some(source_id));
+    }
+
+    pub(super) fn stop_file_watch_scope(&self) {
+        self.file_watch_generation
+            .set(self.file_watch_generation.get().wrapping_add(1).max(1));
+        if let Some(source_id) = self.file_watch_event_source.borrow_mut().take() {
+            source_id.remove();
+        }
+        self.file_watch_subscriptions.borrow_mut().clear();
+        self.file_watch_signature.borrow_mut().take();
+    }
+
+    fn refresh_watched_folder_view(
+        self: &Rc<Self>,
+        generation: u64,
+        changed_paths: HashSet<String>,
+    ) {
+        if self.file_watch_generation.get() != generation {
+            return;
+        }
+
+        let Some(signature) = self.file_watch_signature.borrow().clone() else {
+            return;
+        };
+
+        let invalidated_dirs =
+            watched_directories_for_changes(&signature.directories, &changed_paths);
+        if invalidated_dirs.is_empty() {
+            log::trace!(
+                "file browser watch ignored changes workspace={} changed_paths={} watched_dirs={}",
+                signature.workspace_id,
+                changed_paths.len(),
+                signature.directories.len()
+            );
+            return;
+        }
+
+        log::debug!(
+            "file browser watch refresh workspace={} changed_paths={} invalidated_dirs={}",
+            signature.workspace_id,
+            changed_paths.len(),
+            invalidated_dirs.len()
+        );
+        {
+            let mut cache = self.tree_directory_cache.borrow_mut();
+            for directory in &invalidated_dirs {
+                cache.remove(directory.as_str());
+            }
+        }
+        self.tree_rows_cache.borrow_mut().take();
+        self.rows_signature.borrow_mut().clear();
+
+        if self.search_query.borrow().is_empty() {
+            self.rebuild_if_changed();
+        }
+    }
+}
+
+fn open_folder_watch_directories(
+    rows: &[BrowserRow],
+    expanded_dirs: &HashSet<String>,
+) -> Vec<String> {
+    let mut directories = HashSet::new();
+    directories.insert(String::new());
+    for row in rows {
+        if row.is_dir && expanded_dirs.contains(&row.path) {
+            directories.insert(row.path.clone());
+        }
+    }
+
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
+    directories.sort();
+    directories
+}
+
+fn watched_directories_for_changes(
+    watched_directories: &[String],
+    changed_paths: &HashSet<String>,
+) -> HashSet<String> {
+    let watched = watched_directories
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut invalidated = HashSet::new();
+
+    for changed_path in changed_paths {
+        if watched.contains(changed_path.as_str()) {
+            invalidated.insert(changed_path.clone());
+        }
+        if let Some(parent) = nearest_watched_parent(&watched, changed_path) {
+            invalidated.insert(parent);
+        }
+    }
+
+    invalidated
+}
+
+fn nearest_watched_parent(watched: &HashSet<&str>, path: &str) -> Option<String> {
+    if path.is_empty() {
+        return watched.contains("").then(String::new);
+    }
+
+    let mut current = parent_folder(path);
+    loop {
+        if watched.contains(current.as_str()) {
+            return Some(current);
+        }
+        if current.is_empty() {
+            return None;
+        }
+        current = parent_folder(&current);
+    }
+}
+
+fn parent_folder(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
+}

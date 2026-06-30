@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Craic App Icon</title>
+  
+  <!-- 1. Outer Shadow / Extrusion of the Diamond Background -->
+  <rect x="22" y="22" width="84" height="84" rx="20" transform="translate(0, 4) rotate(45 64 64)" fill="#1a1e27"/>
+
+  <!-- 2. Main Front Face of the Diamond Background -->
+  <rect x="22" y="22" width="84" height="84" rx="20" transform="rotate(45 64 64)" fill="#2b303c" stroke="#3d4454" stroke-width="1.5"/>
+
+  <!-- 3. Soft Drop Shadow of the Foreground C Shape & Nodes onto the Diamond -->
+  <g opacity="0.25" fill="none" stroke="#000000" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" transform="translate(0, 4)">
+    <!-- Main C Arc -->
+    <path d="M 84 33 A 36 36 0 1 0 84 95"/>
+    <!-- Branch 1 (Top-Left to Center) -->
+    <path d="M 33 50 C 45 50, 60 64, 74 64"/>
+    <!-- Branch 2 (Bottom-Left to Center) -->
+    <path d="M 33 78 C 45 78, 60 64, 74 64"/>
+    <!-- Node Shadows -->
+    <circle cx="84" cy="33" r="8" fill="#000000" stroke="#000000" stroke-width="4"/>
+    <circle cx="84" cy="95" r="8" fill="#000000" stroke="#000000" stroke-width="4"/>
+    <circle cx="74" cy="64" r="8" fill="#000000" stroke="#000000" stroke-width="4"/>
+  </g>
+
+  <!-- 4. Foreground C Shape & Nodes -->
+  <g fill="none" stroke="#ff7800" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Main C Arc -->
+    <path d="M 84 33 A 36 36 0 1 0 84 95"/>
+    <!-- Branch 1 (Top-Left to Center) -->
+    <path d="M 33 50 C 45 50, 60 64, 74 64"/>
+    <!-- Branch 2 (Bottom-Left to Center) -->
+    <path d="M 33 78 C 45 78, 60 64, 74 64"/>
+    <!-- Nodes -->
+    <circle cx="84" cy="33" r="8" fill="#ffffff" stroke="#e66100" stroke-width="4"/>
+    <circle cx="84" cy="95" r="8" fill="#ffffff" stroke="#e66100" stroke-width="4"/>
+    <circle cx="74" cy="64" r="8" fill="#ffffff" stroke="#e66100" stroke-width="4"/>
+  </g>
+</svg>
