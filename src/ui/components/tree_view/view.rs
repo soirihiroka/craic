@@ -475,15 +475,16 @@ where
         button.grab_focus()
     }
 
-    pub(in crate::ui) fn focus_edit_row(&self, key: &K, select_all: bool) -> bool {
+    pub(in crate::ui) fn focus_edit_row(&self, key: &K, placement: EditFocusPlacement) -> bool {
         let Some(entry) = self.row_widget(key).and_then(icon_row_entry) else {
             return false;
         };
         let focused = entry.grab_focus();
-        if select_all {
-            entry.select_region(0, -1);
-        } else {
-            entry.set_position(0);
+        match placement {
+            EditFocusPlacement::Start => entry.set_position(0),
+            EditFocusPlacement::SelectBeforeFirstDot => {
+                entry.select_region(0, position_before_first_dot(&entry.text()));
+            }
         }
         focused
     }
@@ -963,6 +964,18 @@ where
             self.sticky_layer.set_visible(false);
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ui) enum EditFocusPlacement {
+    Start,
+    SelectBeforeFirstDot,
+}
+
+fn position_before_first_dot(text: &str) -> i32 {
+    text.chars()
+        .position(|ch| ch == '.')
+        .unwrap_or_else(|| text.chars().count()) as i32
 }
 
 fn set_scroll_value(adjustment: &gtk::Adjustment, value: f64) {

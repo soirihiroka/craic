@@ -14,4 +14,4 @@ pub(in crate::ui) use icon_row::{
     sync_icon_row_text,
 };
 pub(in crate::ui) use tree_row::{TreeRenderState, TreeRow, sticky_items};
-pub(in crate::ui) use view::{TreeRenderer, TreeView};
+pub(in crate::ui) use view::{EditFocusPlacement, TreeRenderer, TreeView};

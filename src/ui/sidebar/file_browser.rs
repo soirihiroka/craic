@@ -619,7 +619,8 @@ impl FileBrowser {
         };
 
         self.tree.scroll_row_into_view(&key);
-        self.tree.focus_edit_row(&key, false);
+        self.tree
+            .focus_edit_row(&key, tree_view::EditFocusPlacement::Start);
     }
 
     pub(super) fn focus_pending_rename_entry(&self) {
@@ -628,7 +629,9 @@ impl FileBrowser {
         };
 
         self.tree.scroll_row_into_view(&key);
-        self.tree.focus_edit_row(&key, true);
+        log::debug!("file browser rename focus key={key:?}");
+        self.tree
+            .focus_edit_row(&key, tree_view::EditFocusPlacement::SelectBeforeFirstDot);
     }
 
     fn selected_row_key(&self) -> Option<rows::BrowserListRowKey> {
