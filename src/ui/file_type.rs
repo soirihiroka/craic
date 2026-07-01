@@ -298,7 +298,7 @@ fn icon_name_from_name_extension(file_name: &str, extension: &str) -> &'static s
             return "devicon-git-symbolic";
         }
         "license" | "license.md" | "license.txt" | "licence" | "licence.md" | "licence.txt" => {
-            return "text-x-copying-symbolic";
+            return "license-symbolic";
         }
         "changelog" => return "text-x-changelog-symbolic",
         "copying" => return "text-x-copying-symbolic",
@@ -311,8 +311,10 @@ fn icon_name_from_name_extension(file_name: &str, extension: &str) -> &'static s
         ".node-version" | ".nvmrc" => return "devicon-nodejs-symbolic",
         ".python-version" => return "text-x-python-symbolic",
         "build.gradle" | "build.gradle.kts" => return "text-makefile-symbolic",
-        "bun.lock" | "bun.lockb" | "bunfig.toml" => return "devicon-bun-symbolic",
-        "cargo.lock" | "cargo.toml" => return "text-rust-symbolic",
+        "bun.lock" | "bun.lockb" => return "devicon-bun-symbolic",
+        "bunfig.toml" => return "text-x-toml-symbolic",
+        "cargo.lock" => return "text-rust-symbolic",
+        "cargo.toml" => return "text-x-toml-symbolic",
         "cmakelists.txt" => return "text-makefile-symbolic",
         "composer.json" | "composer.lock" => return "devicon-php-symbolic",
         "go.mod" | "go.sum" | "go.work" => return "text-makefile-symbolic",
@@ -325,7 +327,8 @@ fn icon_name_from_name_extension(file_name: &str, extension: &str) -> &'static s
         "package.swift" => return "text-swift-symbolic",
         "pom.xml" => return "text-makefile-symbolic",
         "pubspec.yaml" | "pubspec.yml" => return "devicon-dart-symbolic",
-        "pyproject.toml" | "requirements.txt" => return "text-makefile-symbolic",
+        "pyproject.toml" => return "text-x-toml-symbolic",
+        "requirements.txt" => return "text-makefile-symbolic",
         "containerfile" | "wscript" => return "text-makefile-symbolic",
         "sketch.yaml" | "sketch.yml" => return "text-makefile-symbolic",
         "tsconfig.json" => return "text-x-script-symbolic",
@@ -334,6 +337,7 @@ fn icon_name_from_name_extension(file_name: &str, extension: &str) -> &'static s
 
     match extension {
         "env" => "text-x-script-symbolic",
+        "toml" => "text-x-toml-symbolic",
         "astro" => "devicon-astro-symbolic",
         "bash" | "sh" | "zsh" => "text-x-script-symbolic",
         "bazel" | "bzl" => "devicon-bazel-symbolic",
