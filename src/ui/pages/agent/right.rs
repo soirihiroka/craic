@@ -23,7 +23,11 @@ use crate::ui::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsageTr
 use crate::ui::{AGENT_SESSION_NOTIFICATION_DETAILED_ACTION, agent_session_notification_id};
 use crate::ui::{
     canvas_scroll,
-    components::{context_menu, terminal as terminal_component},
+    components::{
+        context_menu,
+        search::{SearchOption, SearchPanel},
+        terminal as terminal_component,
+    },
 };
 
 #[cfg(test)]
@@ -67,6 +71,30 @@ enum TerminalSessionState {
     Closing,
 }
 
+#[derive(Clone)]
+struct TerminalSearchOptions {
+    case_sensitive: Rc<Cell<bool>>,
+    whole_word: Rc<Cell<bool>>,
+    regex: Rc<Cell<bool>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TerminalSearchMove {
+    Keep,
+    Previous,
+    Next,
+}
+
+impl TerminalSearchOptions {
+    fn new() -> Self {
+        Self {
+            case_sensitive: Rc::new(Cell::new(false)),
+            whole_word: Rc::new(Cell::new(false)),
+            regex: Rc::new(Cell::new(false)),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::ui) struct LoadedHistorySessionStatus {
     pub(in crate::ui) session_id: u64,
@@ -89,6 +117,8 @@ pub(in crate::ui) struct AgentChat {
     pub(in crate::ui) root: gtk::Box,
     ctx: PageContext,
     prompt_bar: PromptBar,
+    search_panel: SearchPanel,
+    search_options: TerminalSearchOptions,
     notebook: gtk::Notebook,
     sessions: Rc<RefCell<Vec<AgentSession>>>,
     next_session_id: Rc<Cell<u64>>,
@@ -126,6 +156,10 @@ impl AgentChat {
             .hexpand(true)
             .vexpand(true)
             .build();
+        let search_panel = SearchPanel::new("Search Agent Terminal");
+        search_panel.set_clear_on_close(false);
+        search_panel.set_options_visible(true);
+        search_panel.set_navigation_visible(true);
 
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -133,12 +167,17 @@ impl AgentChat {
             .vexpand(true)
             .build();
         root.append(&prompt_bar.root);
+        search_panel.set_key_capture_widget(&root);
+        search_panel.install_shortcuts(&root);
+        root.append(&search_panel.widget());
         root.append(&notebook);
 
         let chat = Self {
             root,
             ctx,
             prompt_bar,
+            search_panel,
+            search_options: TerminalSearchOptions::new(),
             notebook,
             sessions: Rc::new(RefCell::new(Vec::new())),
             next_session_id: Rc::new(Cell::new(1)),
@@ -154,6 +193,7 @@ impl AgentChat {
         };
 
         chat.connect_controls();
+        chat.connect_search_controls();
         chat.start_status_polling();
 
         chat
@@ -569,10 +609,126 @@ impl AgentChat {
     fn connect_controls(&self) {
         self.notebook.connect_switch_page({
             let sessions = self.sessions.clone();
+            let search_panel = self.search_panel.clone();
+            let search_options = self.search_options.clone();
 
             move |_, page, _| {
                 if let Some(session) = session_by_page(&sessions, page) {
+                    apply_terminal_search(
+                        &session.terminal,
+                        &search_panel,
+                        &search_options,
+                        TerminalSearchMove::Keep,
+                    );
                     session.terminal.grab_focus();
+                }
+            }
+        });
+    }
+
+    fn connect_search_controls(&self) {
+        self.search_panel.connect_query_changed({
+            let sessions = self.sessions.clone();
+            let notebook = self.notebook.clone();
+            let search_panel = self.search_panel.clone();
+            let search_options = self.search_options.clone();
+
+            move |_| {
+                if let Some(terminal) = active_terminal(&sessions, &notebook) {
+                    apply_terminal_search(
+                        &terminal,
+                        &search_panel,
+                        &search_options,
+                        TerminalSearchMove::Next,
+                    );
+                }
+            }
+        });
+        self.search_panel.connect_opened({
+            let sessions = self.sessions.clone();
+            let notebook = self.notebook.clone();
+            let search_panel = self.search_panel.clone();
+            let search_options = self.search_options.clone();
+
+            move || {
+                if let Some(terminal) = active_terminal(&sessions, &notebook) {
+                    apply_terminal_search(
+                        &terminal,
+                        &search_panel,
+                        &search_options,
+                        TerminalSearchMove::Next,
+                    );
+                }
+            }
+        });
+        self.search_panel.connect_closed({
+            let sessions = self.sessions.clone();
+            let notebook = self.notebook.clone();
+            let search_panel = self.search_panel.clone();
+
+            move || {
+                if let Some(terminal) = active_terminal(&sessions, &notebook) {
+                    terminal.search_set_regex(None, 0);
+                    search_panel.set_status("");
+                    log::debug!("agent terminal search cleared on close");
+                }
+            }
+        });
+        connect_terminal_search_option(
+            &self.search_panel,
+            SearchOption::CaseSensitive,
+            self.search_options.case_sensitive.clone(),
+            self.sessions.clone(),
+            self.notebook.clone(),
+            self.search_options.clone(),
+        );
+        connect_terminal_search_option(
+            &self.search_panel,
+            SearchOption::WholeWord,
+            self.search_options.whole_word.clone(),
+            self.sessions.clone(),
+            self.notebook.clone(),
+            self.search_options.clone(),
+        );
+        connect_terminal_search_option(
+            &self.search_panel,
+            SearchOption::Regex,
+            self.search_options.regex.clone(),
+            self.sessions.clone(),
+            self.notebook.clone(),
+            self.search_options.clone(),
+        );
+        self.search_panel.connect_previous({
+            let sessions = self.sessions.clone();
+            let notebook = self.notebook.clone();
+            let search_panel = self.search_panel.clone();
+            let search_options = self.search_options.clone();
+
+            move || {
+                if let Some(terminal) = active_terminal(&sessions, &notebook) {
+                    apply_terminal_search(
+                        &terminal,
+                        &search_panel,
+                        &search_options,
+                        TerminalSearchMove::Previous,
+                    );
+                }
+            }
+        });
+        self.search_panel.connect_next({
+            let sessions = self.sessions.clone();
+            let notebook = self.notebook.clone();
+            let search_panel = self.search_panel.clone();
+            let search_options = self.search_options.clone();
+
+            move || {
+                if let Some(terminal) = active_terminal(&sessions, &notebook) {
+                    apply_terminal_search(
+                        &terminal,
+                        &search_panel,
+                        &search_options,
+                        TerminalSearchMove::Next,
+                    );
                 }
             }
         });
@@ -588,7 +744,11 @@ impl AgentChat {
         local_history_id: Option<i64>,
         initial_active_state: AgentActiveState,
     ) -> Result<AgentSession, String> {
-        let terminal = configured_terminal(config::load().font_sizes.shell, &self.sessions);
+        let terminal = configured_terminal(
+            config::load().font_sizes.shell,
+            &self.sessions,
+            &self.search_panel,
+        );
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -1602,6 +1762,100 @@ fn selected_session_id(notebook: &gtk::Notebook) -> Option<u64> {
         .and_then(|page| page.widget_name().parse::<u64>().ok())
 }
 
+fn connect_terminal_search_option(
+    search_panel: &SearchPanel,
+    option: SearchOption,
+    option_value: Rc<Cell<bool>>,
+    sessions: Rc<RefCell<Vec<AgentSession>>>,
+    notebook: gtk::Notebook,
+    search_options: TerminalSearchOptions,
+) {
+    search_panel.connect_option_toggled(option, {
+        let search_panel = search_panel.clone();
+
+        move |active| {
+            option_value.set(active);
+            if let Some(terminal) = active_terminal(&sessions, &notebook) {
+                apply_terminal_search(
+                    &terminal,
+                    &search_panel,
+                    &search_options,
+                    TerminalSearchMove::Next,
+                );
+            }
+        }
+    });
+}
+
+fn active_terminal(
+    sessions: &Rc<RefCell<Vec<AgentSession>>>,
+    notebook: &gtk::Notebook,
+) -> Option<vte4::Terminal> {
+    notebook
+        .current_page()
+        .and_then(|page_num| notebook.nth_page(Some(page_num)))
+        .and_then(|page| session_by_page(sessions, &page))
+        .map(|session| session.terminal)
+}
+
+fn apply_terminal_search(
+    terminal: &vte4::Terminal,
+    search_panel: &SearchPanel,
+    options: &TerminalSearchOptions,
+    search_move: TerminalSearchMove,
+) {
+    let query = search_panel.query();
+    if query.is_empty() {
+        terminal.search_set_regex(None, 0);
+        search_panel.set_status("");
+        return;
+    }
+
+    let pattern = terminal_search_pattern(&query, options);
+    let regex = match vte4::Regex::for_search(&pattern, 0) {
+        Ok(regex) => regex,
+        Err(err) => {
+            terminal.search_set_regex(None, 0);
+            search_panel.set_status("Invalid");
+            log::warn!(
+                "agent terminal search regex invalid query_len={} regex_mode={}: {err}",
+                query.len(),
+                options.regex.get()
+            );
+            return;
+        }
+    };
+
+    terminal.search_set_regex(Some(&regex), 0);
+    terminal.search_set_wrap_around(true);
+    let found = match search_move {
+        TerminalSearchMove::Previous => terminal.search_find_previous(),
+        TerminalSearchMove::Keep | TerminalSearchMove::Next => terminal.search_find_next(),
+    };
+    search_panel.set_status(if found { "Found" } else { "No Results" });
+    log::debug!(
+        "agent terminal search applied query_len={} move={search_move:?} found={found}",
+        query.len()
+    );
+}
+
+fn terminal_search_pattern(query: &str, options: &TerminalSearchOptions) -> String {
+    let mut pattern = if options.regex.get() {
+        query.to_string()
+    } else {
+        regex::escape(query)
+    };
+
+    if options.whole_word.get() {
+        pattern = format!(r"\b(?:{pattern})\b");
+    }
+    if !options.case_sensitive.get() {
+        pattern = format!("(?i:{pattern})");
+    }
+
+    pattern
+}
+
 fn active_state_counts_as_running(state: AgentActiveState) -> bool {
     matches!(state, AgentActiveState::Loading | AgentActiveState::Asking)
 }
@@ -1633,10 +1887,11 @@ fn session_state_for_poll(
 fn configured_terminal(
     font_size: f64,
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
+    search_panel: &SearchPanel,
 ) -> vte4::Terminal {
     let terminal =
         terminal_component::configured_terminal(font_size, DEFAULT_COLUMNS, DEFAULT_ROWS);
-    install_terminal_shortcuts(&terminal, sessions);
+    install_terminal_shortcuts(&terminal, sessions, search_panel);
     terminal
 }
 
@@ -1647,12 +1902,14 @@ fn set_terminal_font(terminal: &vte4::Terminal, font_size: f64) {
 fn install_terminal_shortcuts(
     terminal: &vte4::Terminal,
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
+    search_panel: &SearchPanel,
 ) {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     keys.connect_key_pressed({
         let terminal = terminal.clone();
         let sessions = sessions.clone();
+        let search_panel = search_panel.clone();
 
         move |_, key, _, modifiers| {
             if let Some(delta) = font_size_delta_for_key(key, modifiers) {
@@ -1670,6 +1927,15 @@ fn install_terminal_shortcuts(
 
             let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+
+            if ctrl
+                && !shift
+                && !modifiers.contains(gdk::ModifierType::ALT_MASK)
+                && matches!(key, gdk::Key::f | gdk::Key::F)
+            {
+                search_panel.open();
+                return glib::Propagation::Stop;
+            }
 
             if ctrl
                 && !shift
