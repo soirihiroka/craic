@@ -170,6 +170,7 @@ pub(super) fn draw_editor(
         return;
     };
     let highlights = state.highlight_cache.borrow();
+    let syntax_source = state.syntax_source.borrow();
     let syntax_issues = state.syntax_issues.borrow();
     let spellcheck_issues = state.spellcheck_issues.borrow();
     let visual_lines = &layout.visual_lines;
@@ -335,19 +336,47 @@ pub(super) fn draw_editor(
         if selection.is_none() {
             draw_empty_selection_marker(context, state, line, text_x, y, theme.selection);
         }
-        draw_highlighted_slice(
-            area,
-            context,
-            state,
-            &text,
-            &highlights,
-            line.start,
-            line.end,
-            text_x,
-            baseline,
-            text_right.min(clip_right),
-            text_left.max(clip_left),
-        );
+        if let Some((source, start, end)) =
+            highlight_source_span_for_line(state, syntax_source.as_deref(), &text, line)
+        {
+            draw_highlighted_slice(
+                area,
+                context,
+                state,
+                source,
+                &highlights,
+                start,
+                end,
+                text_x,
+                baseline,
+                text_right.min(clip_right),
+                text_left.max(clip_left),
+            );
+        } else if syntax_source.is_none() {
+            draw_highlighted_slice(
+                area,
+                context,
+                state,
+                &text,
+                &highlights,
+                line.start,
+                line.end,
+                text_x,
+                baseline,
+                text_right.min(clip_right),
+                text_left.max(clip_left),
+            );
+        } else {
+            draw_plain_text(
+                area,
+                context,
+                state,
+                &text[line.start..line.end],
+                text_x,
+                baseline,
+                (0.86, 0.86, 0.86),
+            );
+        }
         draw_spellcheck_issues(
             area,
             context,
@@ -1850,6 +1879,8 @@ fn gutter_width_for_line_count(
 struct LineMeta {
     number: Option<usize>,
     kind: EditorDiffKind,
+    source_start: Option<usize>,
+    source_end: Option<usize>,
     fold_index: Option<usize>,
     fold_expanded: bool,
     show_fold_control: bool,
@@ -1863,6 +1894,8 @@ fn line_metadata(state: &Rc<EditorState>, source_line: usize) -> Option<LineMeta
             .map(|row| LineMeta {
                 number: row.number,
                 kind: row.kind,
+                source_start: row.source_start,
+                source_end: row.source_end,
                 fold_index: row.fold_index,
                 fold_expanded: row.fold_expanded,
                 show_fold_control: row.show_fold_control,
@@ -1870,11 +1903,59 @@ fn line_metadata(state: &Rc<EditorState>, source_line: usize) -> Option<LineMeta
             .unwrap_or(LineMeta {
                 number: None,
                 kind: EditorDiffKind::Missing,
+                source_start: None,
+                source_end: None,
                 fold_index: None,
                 fold_expanded: false,
                 show_fold_control: false,
             }),
     )
+}
+
+fn highlight_source_span_for_line<'a>(
+    state: &Rc<EditorState>,
+    syntax_source: Option<&'a str>,
+    display_text: &str,
+    line: &VisualLine,
+) -> Option<(&'a str, usize, usize)> {
+    let source = syntax_source?;
+    let meta = line_metadata(state, line.source_line)?;
+    let source_start = meta.source_start?;
+    let source_end = meta.source_end?;
+    if source_start > source_end
+        || source_end > source.len()
+        || !source.is_char_boundary(source_start)
+        || !source.is_char_boundary(source_end)
+    {
+        return None;
+    }
+
+    let display_line_start = display_line_start_for_offset(display_text, line.start)?;
+    let relative_start = line.start.checked_sub(display_line_start)?;
+    let relative_end = line.end.checked_sub(display_line_start)?;
+    let start = source_start.checked_add(relative_start)?;
+    let end = source_start.checked_add(relative_end)?;
+    if start > end
+        || end > source_end
+        || !source.is_char_boundary(start)
+        || !source.is_char_boundary(end)
+    {
+        return None;
+    }
+
+    let display_segment = display_text.get(line.start..line.end)?;
+    let source_segment = source.get(start..end)?;
+    (display_segment == source_segment).then_some((source, start, end))
+}
+
+fn display_line_start_for_offset(display_text: &str, offset: usize) -> Option<usize> {
+    if offset > display_text.len() || !display_text.is_char_boundary(offset) {
+        return None;
+    }
+    display_text[..offset]
+        .rfind('\n')
+        .map(|newline| newline + 1)
+        .or(Some(0))
 }
 
 fn draw_line_background(

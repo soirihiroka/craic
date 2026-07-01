@@ -45,6 +45,7 @@ type FontSizeAdjustCallback = Rc<dyn Fn(f64)>;
 
 struct EditorState {
     text: RefCell<TextBuffer>,
+    syntax_source: RefCell<Option<String>>,
     language: RefCell<String>,
     font_size: Cell<f64>,
     char_width: Cell<f64>,
@@ -263,6 +264,7 @@ pub(in crate::ui) enum EditorDiffKind {
 pub(in crate::ui) struct DiffEditorDocument {
     pub(in crate::ui) rows: Vec<DiffEditorRow>,
     pub(in crate::ui) language: String,
+    pub(in crate::ui) source: String,
 }
 
 #[derive(Clone)]
@@ -270,6 +272,8 @@ pub(in crate::ui) struct DiffEditorRow {
     pub(in crate::ui) number: Option<usize>,
     pub(in crate::ui) text: String,
     pub(in crate::ui) paired_text: String,
+    pub(in crate::ui) source_start: Option<usize>,
+    pub(in crate::ui) source_end: Option<usize>,
     pub(in crate::ui) kind: EditorDiffKind,
     pub(in crate::ui) fold_index: Option<usize>,
     pub(in crate::ui) fold_expanded: bool,
@@ -435,6 +439,7 @@ impl CodeEditor {
 
         let state = Rc::new(EditorState {
             text: RefCell::new(TextBuffer::new(text)),
+            syntax_source: RefCell::new(None),
             language: RefCell::new(language.to_string()),
             font_size: Cell::new(font_size),
             char_width: Cell::new(font_metrics.char_width),
@@ -597,6 +602,7 @@ impl CodeEditor {
             .collect::<Vec<_>>()
             .join("\n");
         self.state.text.borrow_mut().set_text(&text);
+        self.state.syntax_source.replace(Some(document.source));
         self.state.cursor.set(0);
         self.state.selection.borrow_mut().take();
         self.state.undo_stack.borrow_mut().clear();
@@ -783,6 +789,7 @@ impl CodeEditor {
         if text_changed {
             input::dismiss_completion(&self.state);
             self.state.text.borrow_mut().set_text(text);
+            self.state.syntax_source.borrow_mut().take();
             self.state.cursor.set(text.len());
             self.state.selection.borrow_mut().take();
             self.state.undo_stack.borrow_mut().clear();
@@ -1311,12 +1318,14 @@ fn log_draw_panic(state: &Rc<EditorState>, width: i32, height: i32, payload: &(d
                     .take(8)
                     .map(|(index, row)| {
                         format!(
-                            "#{index}: number={:?} kind={:?} fold_index={:?} fold_expanded={} show_fold_control={} text_len={} paired_len={}",
+                            "#{index}: number={:?} kind={:?} fold_index={:?} fold_expanded={} show_fold_control={} source={:?}..{:?} text_len={} paired_len={}",
                             row.number,
                             row.kind,
                             row.fold_index,
                             row.fold_expanded,
                             row.show_fold_control,
+                            row.source_start,
+                            row.source_end,
                             row.text.len(),
                             row.paired_text.len()
                         )
@@ -1704,7 +1713,12 @@ fn reset_syntax_worker(state: &Rc<EditorState>) {
         SyntaxWorkerCommand::Reset {
             generation,
             language: state.language.borrow().clone(),
-            source: state.text.borrow().as_str().to_string(),
+            source: state
+                .syntax_source
+                .borrow()
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| state.text.borrow().as_str().to_string()),
             auto_folds: state.auto_folding_enabled.get() && state.diff_rows.borrow().is_none(),
         },
     );
