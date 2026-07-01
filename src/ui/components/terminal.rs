@@ -1,3 +1,4 @@
+use gtk::prelude::*;
 use gtk::{gdk, pango};
 use vte4::prelude::*;
 
@@ -14,6 +15,18 @@ const TERMINAL_PATH_MATCH_PATTERN: &str = r#"(?x)
     )
     (?::[0-9]+(?::[0-9]+)?)?
 "#;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalActivation {
+    Url(String),
+    File(TerminalFileActivation),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalFileActivation {
+    pub(crate) target: String,
+    pub(crate) launch_dir: String,
+}
 
 pub(crate) fn configured_terminal(font_size: f64, columns: i64, rows: i64) -> vte4::Terminal {
     let terminal = vte4::Terminal::new();
@@ -51,6 +64,88 @@ pub(crate) fn set_font(terminal: &vte4::Terminal, font_size: f64) {
         "monospace {}",
         font_size.round() as i32
     ))));
+}
+
+pub(crate) fn install_activation<F>(terminal: &vte4::Terminal, launch_dir: String, activate: F)
+where
+    F: Fn(TerminalActivation) + 'static,
+{
+    let click = gtk::GestureClick::builder().button(1).build();
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    click.connect_pressed({
+        let terminal = terminal.clone();
+
+        move |gesture, press_count, x, y| {
+            let modifiers = gesture.current_event_state();
+            if press_count != 1
+                || !modifiers.contains(gdk::ModifierType::CONTROL_MASK)
+                || modifiers.contains(gdk::ModifierType::ALT_MASK)
+            {
+                return;
+            }
+
+            let Some(activation) = activation_at(&terminal, x, y, &launch_dir) else {
+                return;
+            };
+
+            match &activation {
+                TerminalActivation::Url(url) => {
+                    log::info!("terminal url activation requested url={url}");
+                }
+                TerminalActivation::File(file) => {
+                    log::info!(
+                        "terminal file activation requested target={} launch_dir={}",
+                        file.target,
+                        file.launch_dir
+                    );
+                }
+            }
+            activate(activation);
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        }
+    });
+    terminal.add_controller(click);
+}
+
+fn activation_at(
+    terminal: &vte4::Terminal,
+    x: f64,
+    y: f64,
+    launch_dir: &str,
+) -> Option<TerminalActivation> {
+    if let Some(hyperlink) = terminal
+        .check_hyperlink_at(x, y)
+        .and_then(|value| clean_activation_text(value.as_str()))
+    {
+        return Some(classify_activation(hyperlink, launch_dir));
+    }
+
+    let (matched, _) = terminal.check_match_at(x, y);
+    matched
+        .and_then(|value| clean_activation_text(value.as_str()))
+        .map(|target| classify_activation(target, launch_dir))
+}
+
+fn classify_activation(target: String, launch_dir: &str) -> TerminalActivation {
+    if is_http_url(&target) {
+        TerminalActivation::Url(target)
+    } else {
+        TerminalActivation::File(TerminalFileActivation {
+            target,
+            launch_dir: launch_dir.to_string(),
+        })
+    }
+}
+
+fn is_http_url(target: &str) -> bool {
+    let lower = target.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn clean_activation_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value.trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ')' | ']' | '}'));
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn install_matches(terminal: &vte4::Terminal) {

@@ -2,6 +2,7 @@ use crate::git::RepositorySnapshot;
 use crate::system::capabilities::shell::ShellCommandSpec;
 use crate::system::capabilities::{
     docker::DockerAccess, files::FileAccess, git::GitAccess, open::OpenAccess, shell::ShellAccess,
+    terminal_link::TerminalLinkAccess,
 };
 use crate::system::{SystemPath, SystemProviderRegistry, SystemRef, WorkspacePath, WorkspaceRef};
 use crate::terminal::CommandSpec;
@@ -207,6 +208,11 @@ impl PageContext {
     pub(super) fn opener(&self) -> Option<Arc<dyn OpenAccess>> {
         self.providers
             .opener(&self.system_ref.borrow().id, &self.workspace_ref())
+    }
+
+    pub(super) fn terminal_links(&self) -> Option<Arc<dyn TerminalLinkAccess>> {
+        self.providers
+            .terminal_links(&self.system_ref.borrow().id, &self.workspace_ref())
     }
 
     pub(super) fn opener_unavailable_message(&self) -> String {

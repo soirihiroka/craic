@@ -17,9 +17,12 @@ use super::{
     provider::{self, AgentProvider, CommandSpec},
 };
 use crate::config;
+use crate::system::WorkspacePath;
+use crate::system::capabilities::{open::OpenTargetKind, terminal_link::TerminalLinkTarget};
 use crate::ui::agent_history::{self, AgentSessionRow, RestoreState};
 use crate::ui::agent_status::{AgentActiveState, AgentInactiveState, AgentSessionState};
 use crate::ui::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsageTracker};
+use crate::ui::pages::PageCommand;
 use crate::ui::{AGENT_SESSION_NOTIFICATION_DETAILED_ACTION, agent_session_notification_id};
 use crate::ui::{
     canvas_scroll,
@@ -44,6 +47,17 @@ const NOTIFICATION_TIMEOUT_MS: &str = "5000";
 const WAITING_AGENT_SESSION_ICON: &str = "hand-touch-symbolic";
 const SMART_SUMMARY_TRIGGER_ROWS: i64 = 500;
 const CODEX_MAPPING_RETRY_DELAYS_MS: &[u64] = &[1_800, 8_000, 30_000, 90_000];
+const TERMINAL_CONFLICTING_ACCELS: &[(&str, &[&str])] = &[
+    ("app.pull", &["<Control>p"]),
+    ("app.push", &["<Control>u"]),
+    ("app.refresh", &["<Control>r"]),
+    ("app.refresh_page", &["F5"]),
+    ("app.preferences", &["<Control>comma"]),
+    ("app.shortcuts", &["<Control>question"]),
+    ("app.about", &["F1"]),
+];
+type FocusHandlers = Rc<RefCell<Vec<Box<dyn Fn(bool)>>>>;
+
 #[derive(Clone)]
 struct AgentSession {
     id: u64,
@@ -137,6 +151,7 @@ pub(in crate::ui) struct AgentChat {
     resource_usage_callback: Rc<RefCell<Option<Rc<dyn Fn(u64, Option<AgentResourceUsage>)>>>>,
     close_callback: Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
     history_callback: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    focus_handlers: FocusHandlers,
     usage_tracker: Rc<RefCell<ProcessUsageTracker>>,
 }
 
@@ -160,6 +175,7 @@ impl AgentChat {
         search_panel.set_clear_on_close(false);
         search_panel.set_options_visible(true);
         search_panel.set_navigation_visible(true);
+        let search_widget = search_panel.widget();
 
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -167,10 +183,16 @@ impl AgentChat {
             .vexpand(true)
             .build();
         root.append(&prompt_bar.root);
-        search_panel.set_key_capture_widget(&root);
-        search_panel.install_shortcuts(&root);
-        root.append(&search_panel.widget());
+        search_panel.set_key_capture_widget(&search_widget);
+        search_panel.install_shortcuts(&search_widget);
+        root.append(&search_widget);
         root.append(&notebook);
+        let focus_handlers = Rc::new(RefCell::new(Vec::<Box<dyn Fn(bool)>>::new()));
+        if let Some(application) = ctx.window().and_then(|window| window.application()) {
+            focus_handlers.borrow_mut().push(Box::new(move |focused| {
+                set_terminal_conflicting_accels_enabled(&application, !focused);
+            }));
+        }
 
         let chat = Self {
             root,
@@ -189,6 +211,7 @@ impl AgentChat {
             resource_usage_callback: Rc::new(RefCell::new(None)),
             close_callback: Rc::new(RefCell::new(None)),
             history_callback: Rc::new(RefCell::new(None)),
+            focus_handlers,
             usage_tracker: Rc::new(RefCell::new(ProcessUsageTracker::new())),
         };
 
@@ -748,6 +771,16 @@ impl AgentChat {
             config::load().font_sizes.shell,
             &self.sessions,
             &self.search_panel,
+        );
+        install_focus_tracking(&terminal, &self.focus_handlers);
+        terminal_component::install_activation(
+            &terminal,
+            command.target_working_dir().to_string(),
+            {
+                let ctx = self.ctx.clone();
+
+                move |activation| handle_agent_terminal_activation(&ctx, activation)
+            },
         );
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1856,6 +1889,193 @@ fn terminal_search_pattern(query: &str, options: &TerminalSearchOptions) -> Stri
     pattern
 }
 
+fn handle_agent_terminal_activation(
+    ctx: &PageContext,
+    activation: terminal_component::TerminalActivation,
+) {
+    match activation {
+        terminal_component::TerminalActivation::Url(url) => {
+            confirm_open_agent_terminal_url(ctx.clone(), url)
+        }
+        terminal_component::TerminalActivation::File(file) => {
+            open_agent_terminal_file_location(ctx, &file)
+        }
+    }
+}
+
+fn confirm_open_agent_terminal_url(ctx: PageContext, url: String) {
+    let Some(opener) = ctx.opener() else {
+        ctx.show_error(
+            "Open Link Failed",
+            "Opening links is unavailable for this workspace.",
+        );
+        log::warn!("agent terminal url activation failed reason=no-opener url={url}");
+        return;
+    };
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Open Link?")
+        .body(&url)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("open", "Open");
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let parent = ctx.window();
+    dialog.choose(
+        parent.as_ref(),
+        None::<&gio::Cancellable>,
+        move |response| {
+            if response.as_str() != "open" {
+                log::debug!("agent terminal url activation cancelled url={url}");
+                return;
+            }
+
+            match opener.open_url(&url) {
+                Ok(message) => {
+                    log::info!("agent terminal url opened url={url} message={message}");
+                    ctx.show_toast(&message);
+                }
+                Err(err) => {
+                    log::warn!("agent terminal url activation failed url={url}: {err}");
+                    ctx.show_error("Open Link Failed", &err);
+                }
+            }
+        },
+    );
+}
+
+#[derive(Clone, Debug)]
+struct TerminalFileLocation {
+    path: String,
+    line: Option<usize>,
+    column: Option<usize>,
+}
+
+fn open_agent_terminal_file_location(
+    ctx: &PageContext,
+    file: &terminal_component::TerminalFileActivation,
+) {
+    let location = parse_terminal_file_location(&file.target);
+    let Some(terminal_links) = ctx.terminal_links() else {
+        let message = "Terminal link navigation is unavailable for this workspace.".to_string();
+        log::warn!(
+            "agent terminal file activation failed target={} launch_dir={} reason=no-terminal-link-capability",
+            file.target,
+            file.launch_dir
+        );
+        ctx.show_toast(&message);
+        return;
+    };
+    let target = match terminal_links.resolve_file(&file.launch_dir, &location.path) {
+        Ok(path) => path,
+        Err(err) => {
+            log::warn!(
+                "agent terminal file activation failed target={} launch_dir={}: {}",
+                file.target,
+                file.launch_dir,
+                err
+            );
+            ctx.show_toast(&err);
+            return;
+        }
+    };
+
+    let path = match target {
+        TerminalLinkTarget::Workspace(path) => path,
+        TerminalLinkTarget::External(path) => {
+            open_external_agent_terminal_file(ctx, file, &path);
+            return;
+        }
+    };
+
+    log::info!(
+        "agent terminal file activation dispatched target={} resolved_path={} line={:?} column={:?}",
+        file.target,
+        path.display(),
+        location.line,
+        location.column
+    );
+    ctx.dispatch_command(PageCommand::OpenFileLocation {
+        path: path.relative_or_empty().to_string(),
+        line: location.line,
+        column: location.column,
+    });
+}
+
+fn open_external_agent_terminal_file(
+    ctx: &PageContext,
+    file: &terminal_component::TerminalFileActivation,
+    path: &WorkspacePath,
+) {
+    let Some(opener) = ctx.opener() else {
+        let message = "Opening files outside the workspace is unavailable.".to_string();
+        log::warn!(
+            "agent terminal external file activation failed target={} path={} reason=no-opener",
+            file.target,
+            path.absolute
+        );
+        ctx.show_toast(&message);
+        return;
+    };
+
+    match opener.open_path(path, OpenTargetKind::File) {
+        Ok(message) => {
+            log::info!(
+                "agent terminal external file opened target={} path={} message={}",
+                file.target,
+                path.absolute,
+                message
+            );
+            ctx.show_toast(&message);
+        }
+        Err(err) => {
+            log::warn!(
+                "agent terminal external file activation failed target={} path={}: {}",
+                file.target,
+                path.absolute,
+                err
+            );
+            ctx.show_error("Open File Failed", &err);
+        }
+    }
+}
+
+fn parse_terminal_file_location(target: &str) -> TerminalFileLocation {
+    let target = target
+        .strip_prefix("file://")
+        .unwrap_or(target)
+        .trim()
+        .to_string();
+    let mut path = target.as_str();
+    let mut line = None;
+    let mut column = None;
+
+    if let Some((before, last)) = path.rsplit_once(':')
+        && let Ok(value) = last.parse::<usize>()
+        && value > 0
+    {
+        if let Some((before_line, maybe_line)) = before.rsplit_once(':')
+            && let Ok(line_value) = maybe_line.parse::<usize>()
+            && line_value > 0
+        {
+            path = before_line;
+            line = Some(line_value);
+            column = Some(value);
+        } else {
+            path = before;
+            line = Some(value);
+        }
+    }
+
+    TerminalFileLocation {
+        path: path.to_string(),
+        line,
+        column,
+    }
+}
+
 fn active_state_counts_as_running(state: AgentActiveState) -> bool {
     matches!(state, AgentActiveState::Loading | AgentActiveState::Asking)
 }
@@ -2100,6 +2320,37 @@ fn modified_key_codepoint(key: gdk::Key) -> Option<u32> {
         gdk::Key::Insert => Some(57_425),
         gdk::Key::Delete => Some(57_426),
         _ => None,
+    }
+}
+
+fn install_focus_tracking(terminal: &vte4::Terminal, focus_handlers: &FocusHandlers) {
+    let focus = gtk::EventControllerFocus::new();
+    focus.connect_enter({
+        let focus_handlers = focus_handlers.clone();
+
+        move |_| notify_focus_handlers(&focus_handlers, true)
+    });
+    focus.connect_leave({
+        let focus_handlers = focus_handlers.clone();
+
+        move |_| notify_focus_handlers(&focus_handlers, false)
+    });
+    terminal.add_controller(focus);
+}
+
+fn notify_focus_handlers(focus_handlers: &FocusHandlers, focused: bool) {
+    for handler in focus_handlers.borrow().iter() {
+        handler(focused);
+    }
+}
+
+fn set_terminal_conflicting_accels_enabled(app: &gtk::Application, enabled: bool) {
+    for (action, accels) in TERMINAL_CONFLICTING_ACCELS {
+        if enabled {
+            app.set_accels_for_action(action, accels);
+        } else {
+            app.set_accels_for_action(action, &[]);
+        }
     }
 }
 

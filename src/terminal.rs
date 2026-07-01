@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use vte4::prelude::*;
 
+pub(crate) use crate::ui::components::terminal::{TerminalActivation, TerminalFileActivation};
+
 const DEFAULT_COLUMNS: i64 = 100;
 const DEFAULT_ROWS: i64 = 34;
 const SESSION_RAIL_WIDTH: i32 = 120;
@@ -30,18 +32,6 @@ const CTRL_BACKSPACE_SEQUENCE: &[u8] = b"\x17";
 type EmptyHandlers = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 type FocusHandlers = Rc<RefCell<Vec<Box<dyn Fn(bool)>>>>;
 type ActivationHandlers = Rc<RefCell<Vec<Box<dyn Fn(TerminalActivation)>>>>;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum TerminalActivation {
-    Url(String),
-    File(TerminalFileActivation),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TerminalFileActivation {
-    pub(crate) target: String,
-    pub(crate) launch_dir: String,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -217,11 +207,12 @@ impl TerminalPanel {
         search_panel.set_clear_on_close(false);
         search_panel.set_options_visible(true);
         search_panel.set_navigation_visible(true);
-        search_panel.set_key_capture_widget(&root);
-        search_panel.install_shortcuts(&root);
+        let search_widget = search_panel.widget();
+        search_panel.set_key_capture_widget(&search_widget);
+        search_panel.install_shortcuts(&search_widget);
 
         root.append(&separator);
-        root.append(&search_panel.widget());
+        root.append(&search_widget);
         root.append(&terminal_area);
 
         let panel = Self {
@@ -854,85 +845,15 @@ fn install_terminal_activation(
     activation_handlers: &ActivationHandlers,
     launch_dir: String,
 ) {
-    let click = gtk::GestureClick::builder().button(1).build();
-    click.set_propagation_phase(gtk::PropagationPhase::Capture);
-    click.connect_pressed({
-        let terminal = terminal.clone();
+    terminal_component::install_activation(terminal, launch_dir, {
         let activation_handlers = activation_handlers.clone();
 
-        move |gesture, press_count, x, y| {
-            let modifiers = gesture.current_event_state();
-            if press_count != 1
-                || !modifiers.contains(gdk::ModifierType::CONTROL_MASK)
-                || modifiers.contains(gdk::ModifierType::ALT_MASK)
-            {
-                return;
-            }
-
-            let Some(activation) = terminal_activation_at(&terminal, x, y, &launch_dir) else {
-                return;
-            };
-
-            match &activation {
-                TerminalActivation::Url(url) => {
-                    log::info!("terminal url activation requested url={url}");
-                }
-                TerminalActivation::File(file) => {
-                    log::info!(
-                        "terminal file activation requested target={} launch_dir={}",
-                        file.target,
-                        file.launch_dir
-                    );
-                }
-            }
+        move |activation| {
             for handler in activation_handlers.borrow().iter() {
                 handler(activation.clone());
             }
-            gesture.set_state(gtk::EventSequenceState::Claimed);
         }
     });
-    terminal.add_controller(click);
-}
-
-fn terminal_activation_at(
-    terminal: &vte4::Terminal,
-    x: f64,
-    y: f64,
-    launch_dir: &str,
-) -> Option<TerminalActivation> {
-    if let Some(hyperlink) = terminal
-        .check_hyperlink_at(x, y)
-        .and_then(|value| clean_activation_text(value.as_str()))
-    {
-        return Some(classify_terminal_activation(hyperlink, launch_dir));
-    }
-
-    let (matched, _) = terminal.check_match_at(x, y);
-    matched
-        .and_then(|value| clean_activation_text(value.as_str()))
-        .map(|target| classify_terminal_activation(target, launch_dir))
-}
-
-fn classify_terminal_activation(target: String, launch_dir: &str) -> TerminalActivation {
-    if is_http_url(&target) {
-        TerminalActivation::Url(target)
-    } else {
-        TerminalActivation::File(TerminalFileActivation {
-            target,
-            launch_dir: launch_dir.to_string(),
-        })
-    }
-}
-
-fn is_http_url(target: &str) -> bool {
-    let lower = target.to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://")
-}
-
-fn clean_activation_text(value: &str) -> Option<String> {
-    let value = value.trim();
-    let value = value.trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ')' | ']' | '}'));
-    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn connect_terminal_search_option(
