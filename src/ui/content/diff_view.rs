@@ -266,9 +266,44 @@ fn connect_diff_folds(
 fn toggle_fold(folds: &Rc<RefCell<Vec<DiffFoldRange>>>, fold_index: usize) {
     let mut folds = folds.borrow_mut();
     let Some(fold) = folds.get_mut(fold_index) else {
+        log::debug!("diff_view ignored stale fold toggle index={fold_index}");
         return;
     };
     fold.expanded = !fold.expanded;
+}
+
+fn normalize_diff_folds(folds: &mut Vec<DiffFoldRange>, row_count: usize) {
+    let before = folds.clone();
+    let mut normalized: Vec<DiffFoldRange> = Vec::with_capacity(folds.len());
+
+    folds.sort_by_key(|fold| (fold.start, fold.end));
+    for mut fold in folds.iter().copied() {
+        fold.start = fold.start.min(row_count);
+        fold.end = fold.end.min(row_count);
+        if fold.start >= fold.end {
+            continue;
+        }
+        if let Some(previous) = normalized.last() {
+            if fold.start < previous.end {
+                fold.start = previous.end;
+            }
+            if fold.start >= fold.end {
+                continue;
+            }
+        }
+        normalized.push(fold);
+    }
+
+    if *folds == normalized {
+        return;
+    }
+
+    log::debug!(
+        "diff_view normalized folds before={} after={} row_count={row_count}",
+        before.len(),
+        normalized.len()
+    );
+    *folds = normalized;
 }
 
 fn refresh_editors(
@@ -279,9 +314,12 @@ fn refresh_editors(
     language: &Rc<RefCell<String>>,
     scroll_y: f64,
 ) {
-    let display_rows = display_rows(&full_rows.borrow(), &folds.borrow());
+    let full_rows = full_rows.borrow();
+    let mut folds = folds.borrow_mut();
+    normalize_diff_folds(&mut folds, full_rows.len());
+    let display_rows = display_rows(&full_rows, &folds);
     let language = language.borrow().clone();
-    let (left_document, right_document) = editor_documents(&display_rows, &language);
+    let (left_document, right_document) = editor_documents(&full_rows, &display_rows, &language);
     let markers = scrollbar_markers(&display_rows);
 
     left_editor.set_diff_document(left_document);
@@ -292,8 +330,15 @@ fn refresh_editors(
     right_editor.set_scroll_y(scroll_y);
 }
 
+#[derive(Clone)]
+struct DisplayDiffRow {
+    row: FileDiffRow,
+    source_index: Option<usize>,
+}
+
 fn editor_documents(
-    rows: &[FileDiffRow],
+    full_rows: &[FileDiffRow],
+    rows: &[DisplayDiffRow],
     language: &str,
 ) -> (
     code_editor::DiffEditorDocument,
@@ -301,14 +346,27 @@ fn editor_documents(
 ) {
     let mut left_rows = Vec::with_capacity(rows.len());
     let mut right_rows = Vec::with_capacity(rows.len());
+    let (left_source, left_ranges) = side_source(full_rows, DiffSide::Left);
+    let (right_source, right_ranges) = side_source(full_rows, DiffSide::Right);
 
-    for row in rows {
+    for display_row in rows {
+        let row = &display_row.row;
         let left_text = row.left_text.clone().unwrap_or_default();
         let right_text = row.right_text.clone().unwrap_or_default();
+        let left_range = display_row
+            .source_index
+            .and_then(|index| left_ranges.get(index).copied().flatten())
+            .filter(|&(start, end)| source_range_matches(&left_source, start, end, &left_text));
+        let right_range = display_row
+            .source_index
+            .and_then(|index| right_ranges.get(index).copied().flatten())
+            .filter(|&(start, end)| source_range_matches(&right_source, start, end, &right_text));
         left_rows.push(code_editor::DiffEditorRow {
             number: row.left_number.filter(|_| !is_fold_row(row)),
             text: left_text.clone(),
             paired_text: right_text.clone(),
+            source_start: left_range.map(|range| range.0),
+            source_end: left_range.map(|range| range.1),
             kind: editor_kind(row.left_number, row.left_text.as_ref(), row.left_kind),
             fold_index: fold_index(row),
             fold_expanded: fold_expanded(row),
@@ -318,6 +376,8 @@ fn editor_documents(
             number: row.right_number.filter(|_| !is_fold_row(row)),
             text: right_text,
             paired_text: left_text,
+            source_start: right_range.map(|range| range.0),
+            source_end: right_range.map(|range| range.1),
             kind: editor_kind(row.right_number, row.right_text.as_ref(), row.right_kind),
             fold_index: fold_index(row),
             fold_expanded: fold_expanded(row),
@@ -329,12 +389,61 @@ fn editor_documents(
         code_editor::DiffEditorDocument {
             rows: left_rows,
             language: language.to_string(),
+            source: left_source,
         },
         code_editor::DiffEditorDocument {
             rows: right_rows,
             language: language.to_string(),
+            source: right_source,
         },
     )
+}
+
+#[derive(Clone, Copy)]
+enum DiffSide {
+    Left,
+    Right,
+}
+
+fn side_source(rows: &[FileDiffRow], side: DiffSide) -> (String, Vec<Option<(usize, usize)>>) {
+    let mut source = String::new();
+    let mut ranges = vec![None; rows.len()];
+    let mut first_line = true;
+
+    for (index, row) in rows.iter().enumerate() {
+        if is_fold_row(row) {
+            continue;
+        }
+        let Some(text) = side_text(row, side) else {
+            continue;
+        };
+        if first_line {
+            first_line = false;
+        } else {
+            source.push('\n');
+        }
+        let start = source.len();
+        source.push_str(text);
+        let end = source.len();
+        ranges[index] = Some((start, end));
+    }
+
+    (source, ranges)
+}
+
+fn side_text(row: &FileDiffRow, side: DiffSide) -> Option<&str> {
+    match side {
+        DiffSide::Left => row.left_number.and(row.left_text.as_deref()),
+        DiffSide::Right => row.right_number.and(row.right_text.as_deref()),
+    }
+}
+
+fn source_range_matches(source: &str, start: usize, end: usize, text: &str) -> bool {
+    start <= end
+        && end <= source.len()
+        && source.is_char_boundary(start)
+        && source.is_char_boundary(end)
+        && source.get(start..end) == Some(text)
 }
 
 fn editor_kind(
@@ -397,9 +506,17 @@ fn build_initial_folds(
     folds
 }
 
-fn display_rows(full_rows: &[FileDiffRow], folds: &[DiffFoldRange]) -> Vec<FileDiffRow> {
+fn display_rows(full_rows: &[FileDiffRow], folds: &[DiffFoldRange]) -> Vec<DisplayDiffRow> {
     if folds.is_empty() {
-        return full_rows.to_vec();
+        return full_rows
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, row)| DisplayDiffRow {
+                row,
+                source_index: Some(index),
+            })
+            .collect();
     }
 
     let mut rows = Vec::new();
@@ -408,17 +525,26 @@ fn display_rows(full_rows: &[FileDiffRow], folds: &[DiffFoldRange]) -> Vec<FileD
     for (fold_index, fold) in folds.iter().copied().enumerate() {
         while source_index < fold.start {
             if let Some(row) = full_rows.get(source_index) {
-                rows.push(row.clone());
+                rows.push(DisplayDiffRow {
+                    row: row.clone(),
+                    source_index: Some(source_index),
+                });
             }
             source_index += 1;
         }
 
-        rows.push(fold_row(fold_index, fold));
+        rows.push(DisplayDiffRow {
+            row: fold_row(fold_index, fold),
+            source_index: None,
+        });
 
         if fold.expanded {
             while source_index < fold.end {
                 if let Some(row) = full_rows.get(source_index) {
-                    rows.push(row.clone());
+                    rows.push(DisplayDiffRow {
+                        row: row.clone(),
+                        source_index: Some(source_index),
+                    });
                 }
                 source_index += 1;
             }
@@ -429,7 +555,10 @@ fn display_rows(full_rows: &[FileDiffRow], folds: &[DiffFoldRange]) -> Vec<FileD
 
     while source_index < full_rows.len() {
         if let Some(row) = full_rows.get(source_index) {
-            rows.push(row.clone());
+            rows.push(DisplayDiffRow {
+                row: row.clone(),
+                source_index: Some(source_index),
+            });
         }
         source_index += 1;
     }
@@ -468,10 +597,11 @@ fn fold_expanded(row: &FileDiffRow) -> bool {
             .is_some_and(|text| text.starts_with("- "))
 }
 
-fn scrollbar_markers(rows: &[FileDiffRow]) -> Vec<code_editor::ScrollbarMarker> {
+fn scrollbar_markers(rows: &[DisplayDiffRow]) -> Vec<code_editor::ScrollbarMarker> {
     rows.iter()
         .enumerate()
-        .filter_map(|(row_index, row)| {
+        .filter_map(|(row_index, display_row)| {
+            let row = &display_row.row;
             let added = row.left_kind == DiffKind::Added || row.right_kind == DiffKind::Added;
             let deleted = row.left_kind == DiffKind::Deleted || row.right_kind == DiffKind::Deleted;
             let kind = match (added, deleted) {
