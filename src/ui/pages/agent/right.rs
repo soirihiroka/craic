@@ -21,7 +21,10 @@ use crate::ui::agent_history::{self, AgentSessionRow, RestoreState};
 use crate::ui::agent_status::{AgentActiveState, AgentInactiveState, AgentSessionState};
 use crate::ui::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsageTracker};
 use crate::ui::{AGENT_SESSION_NOTIFICATION_DETAILED_ACTION, agent_session_notification_id};
-use crate::ui::{canvas_scroll, components::context_menu};
+use crate::ui::{
+    canvas_scroll,
+    components::{context_menu, terminal as terminal_component},
+};
 
 #[cfg(test)]
 use super::provider::agy::terminal_text_active_state as agy_terminal_text_active_state;
@@ -37,7 +40,6 @@ const NOTIFICATION_TIMEOUT_MS: &str = "5000";
 const WAITING_AGENT_SESSION_ICON: &str = "hand-touch-symbolic";
 const SMART_SUMMARY_TRIGGER_ROWS: i64 = 500;
 const CODEX_MAPPING_RETRY_DELAYS_MS: &[u64] = &[1_800, 8_000, 30_000, 90_000];
-
 #[derive(Clone)]
 struct AgentSession {
     id: u64,
@@ -1632,40 +1634,14 @@ fn configured_terminal(
     font_size: f64,
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
 ) -> vte4::Terminal {
-    let terminal = vte4::Terminal::new();
-    terminal.set_hexpand(true);
-    terminal.set_vexpand(true);
-    terminal.set_focusable(true);
-    terminal.set_size(DEFAULT_COLUMNS, DEFAULT_ROWS);
-    set_terminal_font(&terminal, font_size);
-    terminal.set_scrollback_lines(10_000);
-    terminal.set_scroll_on_keystroke(true);
-    terminal.set_scroll_on_output(false);
-    terminal.set_scroll_unit_is_pixels(true);
-    terminal.set_enable_fallback_scrolling(false);
-    terminal.set_mouse_autohide(true);
-    terminal.set_bold_is_bright(true);
-    terminal.set_enable_sixel(true);
-    terminal.set_enable_shaping(false);
-    terminal.set_enable_bidi(false);
-    terminal.set_colors(
-        Some(&rgba(212, 212, 212)),
-        Some(&rgba(30, 30, 30)),
-        &ansi_palette().iter().collect::<Vec<_>>(),
-    );
-    terminal.set_color_cursor(Some(&rgba(174, 175, 173)));
-    terminal.set_color_highlight(Some(&rgba(38, 79, 120)));
-    terminal.set_color_highlight_foreground(Some(&rgba(255, 255, 255)));
+    let terminal =
+        terminal_component::configured_terminal(font_size, DEFAULT_COLUMNS, DEFAULT_ROWS);
     install_terminal_shortcuts(&terminal, sessions);
-    install_terminal_context_menu(&terminal);
     terminal
 }
 
 fn set_terminal_font(terminal: &vte4::Terminal, font_size: f64) {
-    terminal.set_font(Some(&pango::FontDescription::from_string(&format!(
-        "monospace {}",
-        font_size.round() as i32
-    ))));
+    terminal_component::set_font(terminal, font_size);
 }
 
 fn install_terminal_shortcuts(
@@ -1814,10 +1790,6 @@ fn is_modifier_key(key: gdk::Key) -> bool {
             | gdk::Key::Caps_Lock
             | gdk::Key::Num_Lock
     )
-}
-
-fn install_terminal_context_menu(terminal: &vte4::Terminal) {
-    context_menu::install_terminal_context_menu(terminal);
 }
 
 fn modified_key_sequence(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<String> {
@@ -2642,34 +2614,4 @@ fn terminate_child(pid: Option<glib::Pid>) {
     unsafe {
         libc::kill(pid.0 as libc::pid_t, libc::SIGHUP);
     }
-}
-
-fn ansi_palette() -> [gdk::RGBA; 16] {
-    [
-        rgba(0, 0, 0),
-        rgba(205, 49, 49),
-        rgba(13, 188, 121),
-        rgba(229, 229, 16),
-        rgba(36, 114, 200),
-        rgba(188, 63, 188),
-        rgba(17, 168, 205),
-        rgba(229, 229, 229),
-        rgba(102, 102, 102),
-        rgba(241, 76, 76),
-        rgba(35, 209, 139),
-        rgba(245, 245, 67),
-        rgba(59, 142, 234),
-        rgba(214, 112, 214),
-        rgba(41, 184, 219),
-        rgba(255, 255, 255),
-    ]
-}
-
-fn rgba(red: u8, green: u8, blue: u8) -> gdk::RGBA {
-    gdk::RGBA::new(
-        red as f32 / 255.0,
-        green as f32 / 255.0,
-        blue as f32 / 255.0,
-        1.0,
-    )
 }
