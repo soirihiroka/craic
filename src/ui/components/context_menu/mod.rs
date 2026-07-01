@@ -317,7 +317,12 @@ pub(crate) fn copy_terminal_selection(terminal: &vte4::Terminal) {
 }
 
 pub(crate) fn copy_terminal_all(terminal: &vte4::Terminal) {
-    let Some(text) = terminal.text_format(vte4::Format::Text) else {
+    let (_cursor_column, cursor_row) = terminal.cursor_position();
+    let visible_end_row = terminal.row_count().saturating_sub(1);
+    let end_row = cursor_row.max(visible_end_row);
+    let end_col = terminal.column_count().max(1);
+    let (text, _) = terminal.text_range_format(vte4::Format::Text, 0, 0, end_row, end_col);
+    let Some(text) = text else {
         log::debug!("terminal copy-all skipped reason=no-text");
         return;
     };
@@ -327,7 +332,11 @@ pub(crate) fn copy_terminal_all(terminal: &vte4::Terminal) {
     }
 
     terminal.clipboard().set_text(&text);
-    log::info!("terminal copy-all copied chars={}", text.chars().count());
+    log::info!(
+        "terminal copy-all copied rows=0..{} chars={}",
+        end_row,
+        text.chars().count()
+    );
 }
 
 pub(crate) fn copy_terminal_screen(terminal: &vte4::Terminal) {
