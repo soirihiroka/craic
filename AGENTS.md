@@ -12,3 +12,5 @@ Avoid async Rust.
 Remember to log thing.
 
 When writing docs avoid leaking personal information (ip, specific repo names etc).
+
+Remember to ask for permission.
