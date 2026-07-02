@@ -7,7 +7,6 @@ use gtk::gio;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
-use std::thread;
 use std::time::Duration;
 
 const DELETE_WATCH_SUPPRESSION_MS: u64 = 1_200;
@@ -412,12 +411,12 @@ impl FileBrowser {
 
         let file_access = self.file_access.borrow().clone();
         let (sender, receiver) = mpsc::channel();
-
-        thread::spawn(move || {
-            log::info!("file browser delete start path={}", path.display());
-            let result = file_access.delete(&path);
-            let _ = sender.send(result);
-        });
+        file_access.delete(
+            path.clone(),
+            Box::new(move |result| {
+                let _ = sender.send(result);
+            }),
+        );
 
         gtk::glib::timeout_add_local(Duration::from_millis(SEARCH_POLL_MS), {
             let browser = self.clone();
@@ -479,7 +478,12 @@ impl FileBrowser {
         self.delete_watch_suppression_paths
             .borrow_mut()
             .remove(path);
-        self.refresh_browser_row_state();
+        self.rows_signature.borrow_mut().clear();
+        if self.search_query.borrow().is_empty() {
+            self.rebuild();
+        } else {
+            self.rebuild_search_result_rows_from_cache();
+        }
     }
 
     fn suppress_delete_watch_events(self: &Rc<Self>, path: FileNodePath) {

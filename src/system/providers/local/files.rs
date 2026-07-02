@@ -1,8 +1,8 @@
 use crate::gitignore;
 use crate::system::capabilities::files::{
-    DirectoryListing, FileAccess, FileKind, FileNodeCapabilities, FileNodeInfo, FileRead,
-    FileSearchMatch, FileSearchOutput, FileSearchQuery, FileSignature, FileWatchCallback,
-    FileWatchChanges, FileWatchRequest, FileWatchSubscription,
+    DirectoryListing, FileAccess, FileKind, FileNodeCapabilities, FileNodeInfo,
+    FileOperationCallback, FileRead, FileSearchMatch, FileSearchOutput, FileSearchQuery,
+    FileSignature, FileWatchCallback, FileWatchChanges, FileWatchRequest, FileWatchSubscription,
 };
 use crate::system::path::{
     ArchiveFormat, FileNodePath, FileNodeRef, SystemRef, WorkspacePath, WorkspaceRef,
@@ -19,6 +19,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -615,6 +616,20 @@ impl LocalFileAccess {
         );
         Err("Archive contents are read-only.".to_string())
     }
+
+    fn delete_sync(&self, path: &FileNodePath) -> Result<(), String> {
+        if path.contains_archive() {
+            return self.deny_virtual_write("delete", path);
+        }
+        let local_path = self.local_path_for_node(path)?;
+        let metadata = fs::symlink_metadata(&local_path)
+            .map_err(|err| format!("Unable to inspect path: {err}"))?;
+        if metadata.is_dir() {
+            fs::remove_dir_all(&local_path).map_err(|err| format!("Unable to delete folder: {err}"))
+        } else {
+            fs::remove_file(&local_path).map_err(|err| format!("Unable to delete file: {err}"))
+        }
+    }
 }
 
 impl FileAccess for LocalFileAccess {
@@ -865,18 +880,12 @@ impl FileAccess for LocalFileAccess {
             .map_err(|err| format!("Unable to rename: {err}"))
     }
 
-    fn delete(&self, path: &FileNodePath) -> Result<(), String> {
-        if path.contains_archive() {
-            return self.deny_virtual_write("delete", path);
-        }
-        let local_path = self.local_path_for_node(path)?;
-        let metadata = fs::symlink_metadata(&local_path)
-            .map_err(|err| format!("Unable to inspect path: {err}"))?;
-        if metadata.is_dir() {
-            fs::remove_dir_all(&local_path).map_err(|err| format!("Unable to delete folder: {err}"))
-        } else {
-            fs::remove_file(&local_path).map_err(|err| format!("Unable to delete file: {err}"))
-        }
+    fn delete(&self, path: FileNodePath, callback: FileOperationCallback) {
+        let access = self.clone();
+        thread::spawn(move || {
+            log::info!("local file delete worker start path={}", path.display());
+            callback(access.delete_sync(&path));
+        });
     }
 
     fn search_text(&self, query: FileSearchQuery) -> Result<FileSearchOutput, String> {

@@ -214,6 +214,7 @@ pub(crate) struct FileWatchRequest {
 
 pub(crate) type FileWatchChanges = HashSet<FileNodePath>;
 pub(crate) type FileWatchCallback = Arc<dyn Fn(FileWatchChanges) + Send + Sync + 'static>;
+pub(crate) type FileOperationCallback = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
 
 pub(crate) struct FileWatchSubscription {
     stop_sender: Option<mpsc::Sender<()>>,
@@ -391,7 +392,7 @@ pub(crate) trait FileAccess: Send + Sync {
         destination_parent: &FileNodePath,
         new_name: &str,
     ) -> Result<FileNodePath, String>;
-    fn delete(&self, path: &FileNodePath) -> Result<(), String>;
+    fn delete(&self, path: FileNodePath, callback: FileOperationCallback);
 
     fn watch(
         &self,

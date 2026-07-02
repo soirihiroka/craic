@@ -1,15 +1,16 @@
 use super::{SshCommandRunner, remote_workspace_path, shell_quote, workspace_path_for_remote};
 use crate::gitignore;
 use crate::system::capabilities::files::{
-    DirectoryListing, FileAccess, FileKind, FileNodeCapabilities, FileNodeInfo, FileRead,
-    FileSearchMatch, FileSearchOutput, FileSearchQuery, FileSignature, FileWatchCallback,
-    FileWatchRequest, FileWatchSubscription,
+    DirectoryListing, FileAccess, FileKind, FileNodeCapabilities, FileNodeInfo,
+    FileOperationCallback, FileRead, FileSearchMatch, FileSearchOutput, FileSearchQuery,
+    FileSignature, FileWatchCallback, FileWatchRequest, FileWatchSubscription,
 };
 use crate::system::path::{ArchiveFormat, FileNodePath, SystemRef, WorkspacePath, WorkspaceRef};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const SSH_FILE_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -182,6 +183,12 @@ impl SshFileAccess {
             git_ignored,
             capabilities,
         }
+    }
+
+    fn delete_sync(&self, path: &FileNodePath) -> Result<(), String> {
+        let resolved = self.resolve_native_node(path, "delete")?;
+        let script = format!("rm -rf -- {}", shell_quote(&resolved.remote_path));
+        self.runner.run_script("delete path", &script).map(|_| ())
     }
 }
 
@@ -375,10 +382,12 @@ impl FileAccess for SshFileAccess {
             .map(|_| destination)
     }
 
-    fn delete(&self, path: &FileNodePath) -> Result<(), String> {
-        let resolved = self.resolve_native_node(path, "delete")?;
-        let script = format!("rm -rf -- {}", shell_quote(&resolved.remote_path));
-        self.runner.run_script("delete path", &script).map(|_| ())
+    fn delete(&self, path: FileNodePath, callback: FileOperationCallback) {
+        let access = self.clone();
+        thread::spawn(move || {
+            log::info!("ssh file delete worker start path={}", path.display());
+            callback(access.delete_sync(&path));
+        });
     }
 
     fn watch(
