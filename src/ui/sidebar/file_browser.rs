@@ -350,11 +350,8 @@ impl FileBrowser {
         self.selected_node_path.replace(Some(node_path));
         self.selected_search_match.borrow_mut().take();
         let rows = self.visible_rows();
-        let signature = {
-            let status_signatures = self.changed_file_statuses.borrow();
-            let loading_dirs = self.tree_directory_loading.borrow();
-            rows_signature(&rows, &status_signatures, &loading_dirs)
-        };
+        let status_signatures = self.changed_file_statuses.borrow();
+        let signature = rows_signature(&rows, &status_signatures);
         self.replace_rows(rows, signature, TreeScrollTarget::RevealSelection);
         log::debug!("file browser revealed workspace path={path}");
     }
@@ -720,11 +717,8 @@ impl FileBrowser {
 
     pub(super) fn rebuild_if_changed(self: &Rc<Self>) {
         let rows = self.visible_rows();
-        let signature = {
-            let status_signatures = self.changed_file_statuses.borrow();
-            let loading_dirs = self.tree_directory_loading.borrow();
-            rows_signature(&rows, &status_signatures, &loading_dirs)
-        };
+        let status_signatures = self.changed_file_statuses.borrow();
+        let signature = rows_signature(&rows, &status_signatures);
         if *self.rows_signature.borrow() == signature {
             return;
         }
@@ -737,11 +731,8 @@ impl FileBrowser {
 
     pub(super) fn rebuild(self: &Rc<Self>) {
         let rows = self.visible_rows();
-        let signature = {
-            let status_signatures = self.changed_file_statuses.borrow();
-            let loading_dirs = self.tree_directory_loading.borrow();
-            rows_signature(&rows, &status_signatures, &loading_dirs)
-        };
+        let status_signatures = self.changed_file_statuses.borrow();
+        let signature = rows_signature(&rows, &status_signatures);
         self.replace_rows(
             rows,
             signature,
