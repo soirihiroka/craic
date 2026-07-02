@@ -47,12 +47,15 @@ cargo run
 ```
 
 ### Install
+
 Installs build artifacts, desktop launcher, and icons under `~/.local`:
+
 ```sh
 make install
 ```
 
 ### Uninstall
+
 ```sh
 make uninstall
 ```
