@@ -50,6 +50,20 @@ const DEFAULT_CSS: &str = r#"
     border-left: 3px solid alpha(@view_fg_color, 0.25);
     padding-left: 12px;
 }
+.craic-markdown-alert-title-label {
+    font-weight: bold;
+}
+.craic-markdown-alert-title-note,
+.craic-markdown-alert-title-tip,
+.craic-markdown-alert-title-important {
+    color: @accent_color;
+}
+.craic-markdown-alert-title-warning {
+    color: @warning_color;
+}
+.craic-markdown-alert-title-caution {
+    color: @error_color;
+}
 .craic-markdown-table {
     border: 1px solid alpha(@view_fg_color, 0.12);
 }
