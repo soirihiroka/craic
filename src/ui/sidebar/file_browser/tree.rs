@@ -78,12 +78,11 @@ impl BrowserRow {
         }
         let capabilities = RowCapabilities::from(&info.capabilities);
         let is_dir = kind == FileNodeKind::Directory;
-        let tree_role =
-            if is_dir || capabilities.listable || matches!(kind, FileNodeKind::Archive { .. }) {
-                TreeRowRole::Branch
-            } else {
-                TreeRowRole::Leaf
-            };
+        let tree_role = if is_dir || capabilities.listable {
+            TreeRowRole::Branch
+        } else {
+            TreeRowRole::Leaf
+        };
         let executable = info.mode.is_some_and(|mode| mode & 0o111 != 0);
         let mut row = Self {
             path: info.path.display(),

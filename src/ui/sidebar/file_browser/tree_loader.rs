@@ -177,9 +177,10 @@ impl FileBrowser {
                     }
                     Err(err) => {
                         log::debug!(
-                            "file browser directory load failed path={} err={err}",
+                            "file browser directory load failed path={} cached_empty=true err={err}",
                             path.display()
                         );
+                        cache.insert(path, Vec::new());
                     }
                 }
                 changed = true;
