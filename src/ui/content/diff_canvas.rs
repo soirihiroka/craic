@@ -109,7 +109,7 @@ struct DiffSelectionPoint {
     byte: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum DiffContextAction {
     Copy,
     SelectAll,
@@ -218,13 +218,16 @@ impl DiffCanvas {
         area.connect_resize({
             let state = state.clone();
             let spinner = spinner.clone();
-            move |area, _, _| {
-                state.layout_cache.borrow_mut().take();
-                state.layout_pending_signature.borrow_mut().take();
-                state.last_layout_log.borrow_mut().take();
-                request_layout(area, &state, &spinner);
+            move |area, width, height| {
+                log::debug!(
+                    "diff_canvas resize width={} height={} cache_present={} pending_layout={}",
+                    width,
+                    height,
+                    state.layout_cache.borrow().is_some(),
+                    state.layout_pending_signature.borrow().is_some()
+                );
+                request_layout(area, &state, &spinner, "resize");
                 clamp_scroll(area, &state);
-                area.queue_draw();
             }
         });
 
@@ -278,7 +281,7 @@ impl DiffCanvas {
         self.state.layout_cache.borrow_mut().take();
         self.state.layout_pending_signature.borrow_mut().take();
         self.state.last_layout_log.borrow_mut().take();
-        request_layout(&self.area, &self.state, &self.spinner);
+        request_layout(&self.area, &self.state, &self.spinner, "set_rows");
         clamp_scroll(&self.area, &self.state);
         self.area.queue_draw();
     }
@@ -349,7 +352,7 @@ impl DiffCanvas {
         self.state.layout_cache.borrow_mut().take();
         self.state.layout_pending_signature.borrow_mut().take();
         self.state.last_layout_log.borrow_mut().take();
-        request_layout(&self.area, &self.state, &self.spinner);
+        request_layout(&self.area, &self.state, &self.spinner, "set_font_size");
         clamp_scroll(&self.area, &self.state);
         self.area.queue_draw();
     }
@@ -520,8 +523,10 @@ fn request_layout(
     area: &gtk::DrawingArea,
     state: &Rc<DiffCanvasState>,
     spinner: &adw::Spinner,
+    reason: &'static str,
 ) -> bool {
     let Some(request) = layout_request_for_area(area, state) else {
+        log::debug!("diff_canvas layout request skipped caller={reason} reason=no-rows");
         state.layout_cache.borrow_mut().take();
         state.layout_pending_signature.borrow_mut().take();
         state.content_height.set(1.0);
@@ -535,12 +540,26 @@ fn request_layout(
         .as_ref()
         .is_some_and(|cache| cache.signature == request.signature)
     {
+        log::debug!(
+            "diff_canvas layout request cache_hit caller={} rows={} content_width={} generation={}",
+            reason,
+            request.signature.rows,
+            request.signature.content_width,
+            request.signature.generation
+        );
         state.layout_pending_signature.borrow_mut().take();
         spinner.set_visible(false);
         return true;
     }
 
     if state.layout_pending_signature.borrow().as_ref() == Some(&request.signature) {
+        log::debug!(
+            "diff_canvas layout request already_pending caller={} rows={} content_width={} generation={}",
+            reason,
+            request.signature.rows,
+            request.signature.content_width,
+            request.signature.generation
+        );
         spinner.set_visible(true);
         return false;
     }
@@ -552,7 +571,8 @@ fn request_layout(
         .replace(Some(request.signature.clone()));
     spinner.set_visible(true);
     log::debug!(
-        "diff_canvas layout worker start request={} rows={} content_width={} generation={}",
+        "diff_canvas layout worker start caller={} request={} rows={} content_width={} generation={}",
+        reason,
         request_id,
         request.signature.rows,
         request.signature.content_width,
@@ -1312,7 +1332,7 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
                 return;
             }
             area.grab_focus();
-            request_layout(&area, &state, &spinner);
+            request_layout(&area, &state, &spinner, "drag_begin");
             let width = area.allocated_width();
             let height = area.allocated_height();
             let total_height = state.content_height.get();
@@ -1448,6 +1468,9 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
         let area = area.clone();
         let state = state.clone();
         move |gesture, _, x, y| {
+            log::debug!(
+                "diff_canvas secondary_click x={x:.1} y={y:.1} state_mutation=false focus_grab=false"
+            );
             if state.middle_autoscroll.is_active() {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 return;
@@ -1551,7 +1574,7 @@ fn install_key_shortcuts(
                 state.layout_cache.borrow_mut().take();
                 state.layout_pending_signature.borrow_mut().take();
                 state.last_layout_log.borrow_mut().take();
-                request_layout(&area, &state, &spinner);
+                request_layout(&area, &state, &spinner, "font_zoom_key");
                 clamp_scroll(&area, &state);
                 area.queue_draw();
             }
@@ -1782,9 +1805,12 @@ fn show_context_menu(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, x: f6
             let area = area.clone();
             let state = state.clone();
 
-            move |action| match action {
-                DiffContextAction::Copy => copy_selection(&area, &state),
-                DiffContextAction::SelectAll => select_all_side(&area, &state, side),
+            move |action| {
+                log::debug!("diff_canvas context_menu action={action:?}");
+                match action {
+                    DiffContextAction::Copy => copy_selection(&area, &state),
+                    DiffContextAction::SelectAll => select_all_side(&area, &state, side),
+                }
             }
         },
     );
