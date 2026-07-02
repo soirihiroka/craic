@@ -2,7 +2,11 @@ use gtk::cairo;
 use gtk::pango::{FontDescription, SCALE};
 use gtk::prelude::*;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+const TEXT_WIDTH_CACHE_ENTRY_LIMIT: usize = 8192;
+const TEXT_WIDTH_CACHE_BYTE_LIMIT: usize = 1024 * 1024;
+const TEXT_WIDTH_CACHE_MAX_TEXT_BYTES: usize = 1024;
 
 pub(in crate::ui) const FONT_FAMILIES: &str = "JetBrainsMono Nerd Font Mono, JetBrainsMono NFM, JetBrains Mono, monospace, Noto Sans Mono CJK SC, Noto Sans Mono CJK TC, Noto Sans Mono CJK JP, Noto Sans Mono CJK KR, Noto Color Emoji, Noto Emoji, emoji";
 
@@ -29,6 +33,38 @@ pub(in crate::ui) struct TextColor {
 impl TextColor {
     pub(in crate::ui) const fn rgb(red: f64, green: f64, blue: f64) -> Self {
         Self { red, green, blue }
+    }
+}
+
+pub(in crate::ui) struct TextWidthCache {
+    font_size: i32,
+    total_bytes: usize,
+    widths: HashMap<String, f64>,
+    insertion_order: VecDeque<String>,
+}
+
+impl TextWidthCache {
+    pub(in crate::ui) fn new(font_size: f64) -> Self {
+        Self {
+            font_size: font_size_key(font_size),
+            total_bytes: 0,
+            widths: HashMap::new(),
+            insertion_order: VecDeque::new(),
+        }
+    }
+
+    pub(in crate::ui) fn clear_for_font_size(&mut self, font_size: i32) {
+        if self.font_size == font_size {
+            return;
+        }
+        self.font_size = font_size;
+        self.clear();
+    }
+
+    pub(in crate::ui) fn clear(&mut self) {
+        self.total_bytes = 0;
+        self.widths.clear();
+        self.insertion_order.clear();
     }
 }
 
@@ -73,12 +109,30 @@ pub(in crate::ui) fn font_size_key(font_size: f64) -> i32 {
     font_size.round() as i32
 }
 
-pub(in crate::ui) fn text_width_for_size(
+pub(in crate::ui) fn cached_text_width(
     area: &gtk::DrawingArea,
     font_size: f64,
+    cache: &mut TextWidthCache,
     text: &str,
 ) -> f64 {
-    measure_text_width(area, &font_description(font_size), text)
+    if text.is_empty() {
+        return 0.0;
+    }
+
+    let font_size = font_size_key(font_size);
+    let cacheable = text.len() <= TEXT_WIDTH_CACHE_MAX_TEXT_BYTES;
+    if cacheable {
+        cache.clear_for_font_size(font_size);
+        if let Some(width) = cache.widths.get(text).copied() {
+            return width;
+        }
+    }
+
+    let width = measure_text_width(area, &font_description_for_size(font_size), text);
+    if cacheable {
+        cache_text_width(cache, text, width);
+    }
+    width
 }
 
 pub(in crate::ui) fn draw_plain_text(
@@ -110,6 +164,30 @@ fn font_description_for_size(font_size: i32) -> FontDescription {
         cache.borrow_mut().insert(font_size, font.clone());
         font
     })
+}
+
+fn cache_text_width(cache: &mut TextWidthCache, text: &str, width: f64) {
+    let text_len = text.len();
+    if text_len > TEXT_WIDTH_CACHE_BYTE_LIMIT || cache.widths.contains_key(text) {
+        return;
+    }
+
+    while cache.widths.len() >= TEXT_WIDTH_CACHE_ENTRY_LIMIT
+        || cache.total_bytes.saturating_add(text_len) > TEXT_WIDTH_CACHE_BYTE_LIMIT
+    {
+        let Some(oldest) = cache.insertion_order.pop_front() else {
+            cache.clear();
+            break;
+        };
+        if cache.widths.remove(&oldest).is_some() {
+            cache.total_bytes = cache.total_bytes.saturating_sub(oldest.len());
+        }
+    }
+
+    let key = text.to_string();
+    cache.total_bytes = cache.total_bytes.saturating_add(key.len());
+    cache.insertion_order.push_back(key.clone());
+    cache.widths.insert(key, width);
 }
 
 fn measure_text_width(area: &gtk::DrawingArea, font: &FontDescription, text: &str) -> f64 {

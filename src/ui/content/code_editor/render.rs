@@ -29,9 +29,6 @@ const FOLD_ICON: &[u8] = include_bytes!("../../../assets/pan-down-symbolic.svg")
 const FOLD_ICON_COLLAPSED_ANGLE: f64 = -std::f64::consts::FRAC_PI_2;
 const FOLD_ICON_EXPANDED_ANGLE: f64 = 0.0;
 const FOLD_ICON_STATE_LIMIT: usize = 512;
-const TEXT_WIDTH_CACHE_ENTRY_LIMIT: usize = 8192;
-const TEXT_WIDTH_CACHE_BYTE_LIMIT: usize = 1024 * 1024;
-const TEXT_WIDTH_CACHE_MAX_TEXT_BYTES: usize = 1024;
 
 thread_local! {
     static FOLD_ICON_BASE_PIXBUF: RefCell<Option<Pixbuf>> = RefCell::new(None);
@@ -1782,56 +1779,8 @@ pub(super) fn text_width(area: &gtk::DrawingArea, state: &Rc<EditorState>, text:
     if text.is_empty() {
         return 0.0;
     }
-
-    let font_size = font_size_key(state.font_size.get());
-    let cacheable = cacheable_text_width_key(text);
-    if cacheable {
-        let mut cache = state.text_width_cache.borrow_mut();
-        cache.clear_for_font_size(font_size);
-        if let Some(width) = cache.widths.get(text).copied() {
-            return width;
-        }
-    }
-
-    let width = canvas::text_width_for_size(area, state.font_size.get(), text);
-    if cacheable {
-        cache_text_width(state, font_size, text, width);
-    }
-    width
-}
-
-fn cacheable_text_width_key(text: &str) -> bool {
-    !text.is_empty() && text.len() <= TEXT_WIDTH_CACHE_MAX_TEXT_BYTES
-}
-
-fn cache_text_width(state: &Rc<EditorState>, font_size: i32, text: &str, width: f64) {
-    let text_len = text.len();
-    if text_len > TEXT_WIDTH_CACHE_BYTE_LIMIT {
-        return;
-    }
-
     let mut cache = state.text_width_cache.borrow_mut();
-    cache.clear_for_font_size(font_size);
-    if cache.widths.contains_key(text) {
-        return;
-    }
-
-    while cache.widths.len() >= TEXT_WIDTH_CACHE_ENTRY_LIMIT
-        || cache.total_bytes.saturating_add(text_len) > TEXT_WIDTH_CACHE_BYTE_LIMIT
-    {
-        let Some(oldest) = cache.insertion_order.pop_front() else {
-            cache.clear();
-            break;
-        };
-        if cache.widths.remove(&oldest).is_some() {
-            cache.total_bytes = cache.total_bytes.saturating_sub(oldest.len());
-        }
-    }
-
-    let key = text.to_string();
-    cache.total_bytes = cache.total_bytes.saturating_add(key.len());
-    cache.insertion_order.push_back(key.clone());
-    cache.widths.insert(key, width);
+    canvas::cached_text_width(area, state.font_size.get(), &mut cache, text)
 }
 
 pub(super) fn offset_for_x(

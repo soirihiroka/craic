@@ -1,4 +1,3 @@
-use std::collections::{HashMap, VecDeque};
 use std::ops::Deref;
 
 pub(super) struct TextBuffer {
@@ -123,36 +122,4 @@ pub(in crate::ui) fn byte_offset_for_line_column(text: &str, line: usize, column
     }
 
     text.len()
-}
-
-pub(super) struct TextWidthCache {
-    pub(super) font_size: i32,
-    pub(super) total_bytes: usize,
-    pub(super) widths: HashMap<String, f64>,
-    pub(super) insertion_order: VecDeque<String>,
-}
-
-impl TextWidthCache {
-    pub(super) fn new(font_size: f64) -> Self {
-        Self {
-            font_size: font_size.round() as i32,
-            total_bytes: 0,
-            widths: HashMap::new(),
-            insertion_order: VecDeque::new(),
-        }
-    }
-
-    pub(super) fn clear_for_font_size(&mut self, font_size: i32) {
-        if self.font_size == font_size {
-            return;
-        }
-        self.font_size = font_size;
-        self.clear();
-    }
-
-    pub(super) fn clear(&mut self) {
-        self.total_bytes = 0;
-        self.widths.clear();
-        self.insertion_order.clear();
-    }
 }

@@ -4,6 +4,7 @@ use super::{
         canvas::{self, TextColor},
         selection::{AnchoredSelection, clipped_bounds},
     },
+    diff_layout,
 };
 use crate::config;
 use crate::git::{DiffKind, FileDiffRow};
@@ -14,7 +15,9 @@ use gtk::cairo;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 const MIN_CONTENT_WIDTH: i32 = 360;
@@ -24,7 +27,9 @@ const DIVIDER_WIDTH: f64 = 1.0;
 
 #[derive(Clone)]
 pub(in crate::ui) struct DiffCanvas {
-    pub(in crate::ui) root: gtk::DrawingArea,
+    pub(in crate::ui) root: gtk::Overlay,
+    area: gtk::DrawingArea,
+    spinner: adw::Spinner,
     state: Rc<DiffCanvasState>,
 }
 
@@ -43,6 +48,9 @@ struct DiffCanvasState {
     font_size_adjust_callback: RefCell<Option<Rc<dyn Fn(f64)>>>,
     layout_generation: Cell<u64>,
     layout_cache: RefCell<Option<DiffLayoutCache>>,
+    layout_pending_signature: RefCell<Option<DiffLayoutSignature>>,
+    layout_request_id: Cell<u64>,
+    text_width_cache: RefCell<canvas::TextWidthCache>,
     max_line_number: Cell<usize>,
     fold_row_count: Cell<usize>,
     syntax: RefCell<Option<DiffSyntaxState>>,
@@ -53,46 +61,10 @@ struct DiffCanvasState {
     last_layout_log: RefCell<Option<LayoutLogSnapshot>>,
 }
 
-#[derive(Clone)]
-struct RowLayout {
-    y: f64,
-    height: f64,
-    left_lines: Vec<WrappedLine>,
-    right_lines: Vec<WrappedLine>,
-}
-
-#[derive(Clone)]
-struct WrappedLine {
-    text: String,
-    start: usize,
-    end: usize,
-}
-
-#[derive(Clone, Copy)]
-struct CachedRowLayout {
-    y: f64,
-    height: f64,
-    shared_visual_line_count: usize,
-    measured: bool,
-}
-
-struct DiffLayoutCache {
-    generation: u64,
-    content_width: i32,
-    gutter_width_bits: u64,
-    line_height_bits: u64,
-    rows: Vec<CachedRowLayout>,
-    markers: Vec<CachedScrollbarMarker>,
-    measured_rows: usize,
-    max_shared_visual_line_count: usize,
-    content_height: f64,
-}
-
-#[derive(Clone, Copy)]
-struct CachedScrollbarMarker {
-    row: usize,
-    kind: canvas_scrollbar::MarkerKind,
-}
+type DiffLayoutCache = diff_layout::Cache;
+type DiffLayoutSignature = diff_layout::Signature;
+type RowLayout = diff_layout::RowLayout;
+type WrappedLine = diff_layout::WrappedLine;
 
 struct DiffSyntaxState {
     left: DiffSyntaxSide,
@@ -131,7 +103,6 @@ struct DiffSelectionPoint {
 struct LayoutLogSnapshot {
     rows: usize,
     folds: usize,
-    measured_rows: usize,
     content_width: i32,
     content_height_bits: u64,
     max_shared_visual_line_count: usize,
@@ -185,6 +156,15 @@ impl DiffCanvas {
             .focusable(true)
             .build();
         area.set_size_request(MIN_CONTENT_WIDTH, 160);
+        let spinner = adw::Spinner::builder()
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        spinner.set_size_request(32, 32);
+        let root = gtk::Overlay::builder().hexpand(true).vexpand(true).build();
+        root.set_child(Some(&area));
+        root.add_overlay(&spinner);
 
         let font_size = config::load().font_sizes.diff;
         let state = Rc::new(DiffCanvasState {
@@ -202,6 +182,9 @@ impl DiffCanvas {
             font_size_adjust_callback: RefCell::new(None),
             layout_generation: Cell::new(1),
             layout_cache: RefCell::new(None),
+            layout_pending_signature: RefCell::new(None),
+            layout_request_id: Cell::new(0),
+            text_width_cache: RefCell::new(canvas::TextWidthCache::new(font_size)),
             max_line_number: Cell::new(1),
             fold_row_count: Cell::new(0),
             syntax: RefCell::new(None),
@@ -214,22 +197,33 @@ impl DiffCanvas {
 
         area.set_draw_func({
             let state = state.clone();
-            move |area, context, width, height| draw(area, context, width, height, &state)
+            let spinner = spinner.clone();
+            move |area, context, width, height| draw(area, context, width, height, &state, &spinner)
         });
         area.connect_resize({
             let state = state.clone();
+            let spinner = spinner.clone();
             move |area, _, _| {
+                state.layout_cache.borrow_mut().take();
+                state.layout_pending_signature.borrow_mut().take();
+                state.last_layout_log.borrow_mut().take();
+                request_layout(area, &state, &spinner);
                 clamp_scroll(area, &state);
                 area.queue_draw();
             }
         });
 
         install_scroll(&area, &state);
-        install_clicks(&area, &state);
+        install_clicks(&area, &state, &spinner);
         install_motion(&area, &state);
-        install_key_shortcuts(&area, &state);
+        install_key_shortcuts(&area, &state, &spinner);
 
-        Self { root: area, state }
+        Self {
+            root,
+            area,
+            spinner,
+            state,
+        }
     }
 
     pub(in crate::ui) fn set_rows(&self, rows: Vec<FileDiffRow>) {
@@ -254,10 +248,11 @@ impl DiffCanvas {
             .layout_generation
             .set(self.state.layout_generation.get().wrapping_add(1).max(1));
         self.state.layout_cache.borrow_mut().take();
+        self.state.layout_pending_signature.borrow_mut().take();
         self.state.last_layout_log.borrow_mut().take();
-        refresh_viewport_layout_cache(&self.root, &self.state);
-        clamp_scroll(&self.root, &self.state);
-        self.root.queue_draw();
+        request_layout(&self.area, &self.state, &self.spinner);
+        clamp_scroll(&self.area, &self.state);
+        self.area.queue_draw();
     }
 
     pub(in crate::ui) fn set_syntax_for_file(
@@ -282,9 +277,11 @@ impl DiffCanvas {
             .layout_generation
             .set(self.state.layout_generation.get().wrapping_add(1).max(1));
         self.state.layout_cache.borrow_mut().take();
+        self.state.layout_pending_signature.borrow_mut().take();
         self.state.last_layout_log.borrow_mut().take();
-        refresh_viewport_layout_cache(&self.root, &self.state);
-        self.root.queue_draw();
+        self.state.content_height.set(1.0);
+        self.spinner.set_visible(false);
+        self.area.queue_draw();
     }
 
     pub(in crate::ui) fn scroll_y(&self) -> f64 {
@@ -292,7 +289,7 @@ impl DiffCanvas {
     }
 
     pub(in crate::ui) fn set_scroll_y(&self, scroll_y: f64) {
-        set_scroll_y(&self.root, &self.state, scroll_y);
+        set_scroll_y(&self.area, &self.state, scroll_y);
     }
 
     pub(in crate::ui) fn set_fold_callback<F>(&self, callback: F)
@@ -313,13 +310,18 @@ impl DiffCanvas {
         }
         self.state.font_size.set(font_size);
         self.state
+            .text_width_cache
+            .borrow_mut()
+            .clear_for_font_size(canvas::font_size_key(font_size));
+        self.state
             .layout_generation
             .set(self.state.layout_generation.get().wrapping_add(1).max(1));
         self.state.layout_cache.borrow_mut().take();
+        self.state.layout_pending_signature.borrow_mut().take();
         self.state.last_layout_log.borrow_mut().take();
-        refresh_viewport_layout_cache(&self.root, &self.state);
-        clamp_scroll(&self.root, &self.state);
-        self.root.queue_draw();
+        request_layout(&self.area, &self.state, &self.spinner);
+        clamp_scroll(&self.area, &self.state);
+        self.area.queue_draw();
     }
 
     pub(in crate::ui) fn set_font_size_adjust_callback<F>(&self, callback: F)
@@ -411,6 +413,7 @@ fn draw(
     width: i32,
     height: i32,
     state: &Rc<DiffCanvasState>,
+    spinner: &adw::Spinner,
 ) {
     let theme = theme_for(area);
     fill_rect(
@@ -422,6 +425,7 @@ fn draw(
         theme.background,
     );
 
+    request_layout(area, state, spinner);
     let content_width =
         canvas_scrollbar::content_width(width).max(MIN_CONTENT_WIDTH.min(width.max(1)));
     let metrics = canvas::measure_font_metrics(area, state.font_size.get(), |font_size| {
@@ -429,15 +433,6 @@ fn draw(
     });
     let rows = state.rows.borrow();
     let gutter_width = gutter_width(area, state);
-    let visible_layouts = visible_row_layouts(
-        area,
-        state,
-        rows.as_slice(),
-        content_width,
-        gutter_width,
-        metrics.line_height,
-        height,
-    );
     let content_height = state
         .layout_cache
         .borrow()
@@ -449,7 +444,6 @@ fn draw(
     log_layout_change(state, rows.as_slice(), content_width, content_height);
     clamp_scroll(area, state);
 
-    let scroll_y = state.scroll_y.get();
     let divider_x = (content_width as f64 / 2.0).floor();
     fill_rect(
         context,
@@ -460,8 +454,19 @@ fn draw(
         theme.divider,
     );
 
-    for (index, layout) in visible_layouts {
+    let cache = state.layout_cache.borrow();
+    let Some(cache) = cache.as_ref() else {
+        canvas_overshoot::draw(context, width, height, &state.overshoot);
+        return;
+    };
+    let scroll_y = state.scroll_y.get();
+    let visible_range =
+        diff_layout::visible_row_range(cache, scroll_y, height as f64, metrics.line_height * 8.0);
+    for index in visible_range {
         let Some(row) = rows.get(index) else {
+            continue;
+        };
+        let Some(layout) = cache.rows.get(index) else {
             continue;
         };
         let y = layout.y - scroll_y;
@@ -474,7 +479,7 @@ fn draw(
             state,
             index,
             row,
-            &layout,
+            layout,
             y,
             content_width,
             gutter_width,
@@ -488,205 +493,151 @@ fn draw(
     canvas_overshoot::draw(context, width, height, &state.overshoot);
 }
 
-fn visible_row_layouts(
+fn request_layout(
     area: &gtk::DrawingArea,
     state: &Rc<DiffCanvasState>,
-    rows: &[FileDiffRow],
-    content_width: i32,
-    gutter_width: f64,
-    line_height: f64,
-    viewport_height: i32,
-) -> Vec<(usize, RowLayout)> {
-    let generation = state.layout_generation.get();
-    let gutter_width_bits = gutter_width.to_bits();
-    let line_height_bits = line_height.to_bits();
-    let needs_cache = state.layout_cache.borrow().as_ref().is_none_or(|cache| {
-        cache.generation != generation
-            || cache.content_width != content_width
-            || cache.gutter_width_bits != gutter_width_bits
-            || cache.line_height_bits != line_height_bits
-            || cache.rows.len() != rows.len()
-    });
-    if needs_cache {
-        let estimated_rows = rows
-            .iter()
-            .map(|row| estimated_visual_line_count(row).max(1))
-            .collect::<Vec<_>>();
-        let markers = rows
-            .iter()
-            .enumerate()
-            .filter_map(|(row, diff_row)| {
-                marker_kind(diff_row).map(|kind| CachedScrollbarMarker { row, kind })
-            })
-            .collect::<Vec<_>>();
-        let mut cached_rows = Vec::with_capacity(rows.len());
-        let mut y = 0.0;
-        for shared_visual_line_count in estimated_rows {
-            let height = shared_visual_line_count as f64 * line_height;
-            cached_rows.push(CachedRowLayout {
-                y,
-                height,
-                shared_visual_line_count,
-                measured: false,
-            });
-            y += height;
-        }
-        log::debug!(
-            "diff_canvas layout_cache rebuild rows={} content_width={} line_height={:.1}",
-            rows.len(),
-            content_width,
-            line_height
-        );
-        state.layout_cache.replace(Some(DiffLayoutCache {
-            generation,
-            content_width,
-            gutter_width_bits,
-            line_height_bits,
-            rows: cached_rows,
-            markers,
-            measured_rows: 0,
-            max_shared_visual_line_count: 1,
-            content_height: y.max(line_height),
-        }));
+    spinner: &adw::Spinner,
+) -> bool {
+    let Some(request) = layout_request_for_area(area, state) else {
+        state.layout_cache.borrow_mut().take();
+        state.layout_pending_signature.borrow_mut().take();
+        state.content_height.set(1.0);
+        spinner.set_visible(false);
+        return false;
+    };
+
+    if state
+        .layout_cache
+        .borrow()
+        .as_ref()
+        .is_some_and(|cache| cache.signature == request.signature)
+    {
+        state.layout_pending_signature.borrow_mut().take();
+        spinner.set_visible(false);
+        return true;
     }
 
-    let scroll_y = state.scroll_y.get();
-    let visible_range = {
-        let cache = state.layout_cache.borrow();
-        let Some(cache) = cache.as_ref() else {
-            return Vec::new();
-        };
-        visible_row_range(cache, scroll_y, viewport_height as f64, line_height * 8.0)
-    };
-    let half_width = (content_width as f64 / 2.0).floor();
-    let text_width = (half_width - gutter_width - PREFIX_WIDTH - CELL_PADDING * 2.0).max(
-        canvas::text_width_for_size(area, state.font_size.get(), "0"),
+    if state.layout_pending_signature.borrow().as_ref() == Some(&request.signature) {
+        spinner.set_visible(true);
+        return false;
+    }
+
+    let request_id = state.layout_request_id.get().wrapping_add(1).max(1);
+    state.layout_request_id.set(request_id);
+    state
+        .layout_pending_signature
+        .replace(Some(request.signature.clone()));
+    spinner.set_visible(true);
+    log::debug!(
+        "diff_canvas layout worker start request={} rows={} content_width={} generation={}",
+        request_id,
+        request.signature.rows,
+        request.signature.content_width,
+        request.signature.generation
     );
-    let mut layouts = Vec::with_capacity(visible_range.len());
-    let mut changed = false;
-    let mut cache = state.layout_cache.borrow_mut();
-    let Some(cache) = cache.as_mut() else {
-        return layouts;
-    };
 
-    for index in visible_range {
-        let Some(row) = rows.get(index) else {
-            continue;
-        };
-        let left_lines = wrap_text(
-            area,
-            state,
-            row.left_text.as_deref().unwrap_or_default(),
-            text_width,
-        );
-        let right_lines = wrap_text(
-            area,
-            state,
-            row.right_text.as_deref().unwrap_or_default(),
-            text_width,
-        );
-        let shared_visual_line_count = left_lines.len().max(right_lines.len()).max(1);
-        let height = shared_visual_line_count as f64 * line_height;
-        let was_measured = cache.rows.get(index).is_some_and(|cached| cached.measured);
-        if let Some(cached) = cache.rows.get(index) {
-            changed |= !was_measured
-                || cached.shared_visual_line_count != shared_visual_line_count
-                || (cached.height - height).abs() > f64::EPSILON;
-        }
-        update_cached_row_layout(cache, index, height, shared_visual_line_count);
-        if !was_measured {
-            cache.measured_rows += 1;
-        }
-        cache.max_shared_visual_line_count = cache
-            .max_shared_visual_line_count
-            .max(shared_visual_line_count);
-        if let Some(cached) = cache.rows.get(index) {
-            layouts.push((
-                index,
-                RowLayout {
-                    y: cached.y,
-                    height: cached.height,
-                    left_lines,
-                    right_lines,
-                },
-            ));
-        }
-    }
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = diff_layout::build(request);
+        let _ = sender.send(result);
+    });
 
-    if changed {
-        log::debug!(
-            "diff_canvas layout_cache measured visible_rows={} content_height={:.1}",
-            layouts.len(),
-            cache.content_height
-        );
-        area.queue_draw();
-    }
-    layouts
+    gtk::glib::timeout_add_local(Duration::from_millis(16), {
+        let area = area.clone();
+        let state = state.clone();
+        let spinner = spinner.clone();
+        move || match receiver.try_recv() {
+            Ok(result) => {
+                if state.layout_request_id.get() != request_id {
+                    log::debug!(
+                        "diff_canvas layout worker stale request={} current={}",
+                        request_id,
+                        state.layout_request_id.get()
+                    );
+                    return gtk::glib::ControlFlow::Break;
+                }
+                if state.layout_pending_signature.borrow().as_ref() != Some(&result.cache.signature)
+                {
+                    log::debug!(
+                        "diff_canvas layout worker stale signature request={} rows={}",
+                        request_id,
+                        result.cache.signature.rows
+                    );
+                    return gtk::glib::ControlFlow::Break;
+                }
+
+                let content_height = result.cache.content_height;
+                let row_count = result.cache.rows.len();
+                let marker_count = result.cache.markers.len();
+                let max_shared = result.cache.max_shared_visual_line_count;
+                state.content_height.set(content_height);
+                state.layout_cache.replace(Some(result.cache));
+                state.layout_pending_signature.borrow_mut().take();
+                state.last_layout_log.borrow_mut().take();
+                spinner.set_visible(false);
+                clamp_scroll(&area, &state);
+                log::debug!(
+                    "diff_canvas layout worker applied request={} rows={} markers={} content_height={:.1} max_shared_visual_lines={} duration_ms={}",
+                    request_id,
+                    row_count,
+                    marker_count,
+                    content_height,
+                    max_shared,
+                    result.duration_ms
+                );
+                area.queue_draw();
+                gtk::glib::ControlFlow::Break
+            }
+            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) => {
+                if state.layout_request_id.get() == request_id {
+                    state.layout_pending_signature.borrow_mut().take();
+                    spinner.set_visible(false);
+                    log::warn!("diff_canvas layout worker disconnected request={request_id}");
+                }
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+
+    false
 }
 
-fn estimated_visual_line_count(row: &FileDiffRow) -> usize {
-    let left = row
-        .left_text
-        .as_deref()
-        .map(|text| text.len() / 120 + 1)
-        .unwrap_or(1);
-    let right = row
-        .right_text
-        .as_deref()
-        .map(|text| text.len() / 120 + 1)
-        .unwrap_or(1);
-    left.max(right)
-}
-
-fn visible_row_range(
-    cache: &DiffLayoutCache,
-    scroll_y: f64,
-    viewport_height: f64,
-    overscan: f64,
-) -> std::ops::Range<usize> {
-    if cache.rows.is_empty() {
-        return 0..0;
+fn layout_request_for_area(
+    area: &gtk::DrawingArea,
+    state: &Rc<DiffCanvasState>,
+) -> Option<diff_layout::Request> {
+    let rows = state.rows.borrow();
+    if rows.is_empty() {
+        return None;
     }
 
-    let start_y = (scroll_y - overscan).max(0.0);
-    let end_y = scroll_y + viewport_height.max(1.0) + overscan;
-    let mut start = cache
-        .rows
-        .partition_point(|layout| layout.y + layout.height < start_y);
-    if start > 0 {
-        start -= 1;
-    }
-    let mut end = start;
-    while end < cache.rows.len() && cache.rows[end].y <= end_y {
-        end += 1;
-    }
-    if end < cache.rows.len() {
-        end += 1;
-    }
-    start..end
-}
+    let content_width = canvas_scrollbar::content_width(area.allocated_width())
+        .max(MIN_CONTENT_WIDTH.min(area.allocated_width().max(1)));
+    let metrics = canvas::measure_font_metrics(area, state.font_size.get(), |font_size| {
+        (font_size + 9.0).ceil()
+    });
+    let gutter_width = gutter_width(area, state);
+    let half_width = (content_width as f64 / 2.0).floor();
+    let text_width =
+        (half_width - gutter_width - PREFIX_WIDTH - CELL_PADDING * 2.0).max(metrics.char_width);
+    let signature = diff_layout::Signature::new(
+        state.layout_generation.get(),
+        content_width,
+        gutter_width,
+        metrics.line_height,
+        text_width,
+        metrics.char_width,
+        rows.len(),
+    );
 
-fn update_cached_row_layout(
-    cache: &mut DiffLayoutCache,
-    index: usize,
-    height: f64,
-    shared_visual_line_count: usize,
-) {
-    let Some(cached) = cache.rows.get_mut(index) else {
-        return;
-    };
-    let delta = height - cached.height;
-    cached.height = height;
-    cached.shared_visual_line_count = shared_visual_line_count;
-    cached.measured = true;
-    if delta.abs() <= f64::EPSILON {
-        return;
-    }
-
-    for layout in cache.rows.iter_mut().skip(index + 1) {
-        layout.y += delta;
-    }
-    cache.content_height = (cache.content_height + delta).max(height);
+    Some(diff_layout::Request {
+        signature,
+        rows: rows.clone(),
+        text_width,
+        line_height: metrics.line_height,
+        char_width: metrics.char_width,
+    })
 }
 
 fn draw_row(
@@ -826,7 +777,7 @@ fn draw_side(
     };
     if let Some(number) = number {
         let number = number.to_string();
-        let number_width = canvas::text_width_for_size(area, state.font_size.get(), &number);
+        let number_width = cached_text_width_for_state(area, state, &number);
         canvas::draw_plain_text(
             area,
             context,
@@ -865,10 +816,8 @@ fn draw_side(
                 .text
                 .get(selection_start..selection_end)
                 .unwrap_or_default();
-            let selection_x =
-                text_x + canvas::text_width_for_size(area, state.font_size.get(), prefix);
-            let selection_width =
-                canvas::text_width_for_size(area, state.font_size.get(), selected).max(2.0);
+            let selection_x = text_x + cached_text_width_for_state(area, state, prefix);
+            let selection_width = cached_text_width_for_state(area, state, selected).max(2.0);
             fill_rect(
                 context,
                 selection_x,
@@ -882,7 +831,7 @@ fn draw_side(
             draw_syntax_line(
                 area,
                 context,
-                state.font_size.get(),
+                state,
                 syntax,
                 line,
                 source_start,
@@ -908,7 +857,7 @@ fn draw_side(
 fn draw_syntax_line(
     area: &gtk::DrawingArea,
     context: &cairo::Context,
-    font_size: f64,
+    state: &Rc<DiffCanvasState>,
     syntax: &DiffSyntaxSide,
     line: &WrappedLine,
     source_start: usize,
@@ -917,6 +866,7 @@ fn draw_syntax_line(
     baseline: f64,
     fallback: TextColor,
 ) {
+    let font_size = state.font_size.get();
     let absolute_start = source_start.saturating_add(line.start);
     let absolute_end = source_start.saturating_add(line.end);
     if absolute_start >= absolute_end
@@ -952,7 +902,7 @@ fn draw_syntax_line(
         if cursor < range_start {
             let plain = &syntax.source[cursor..range_start];
             canvas::draw_plain_text(area, context, font_size, plain, x, baseline, fallback);
-            x += canvas::text_width_for_size(area, font_size, plain);
+            x += cached_text_width_for_state(area, state, plain);
         }
         let segment = &syntax.source[range_start..range_end];
         let color = range.style.color();
@@ -965,7 +915,7 @@ fn draw_syntax_line(
             baseline,
             TextColor::rgb(color.0, color.1, color.2),
         );
-        x += canvas::text_width_for_size(area, font_size, segment);
+        x += cached_text_width_for_state(area, state, segment);
         cursor = range_end;
     }
     if cursor < absolute_end {
@@ -1114,7 +1064,7 @@ fn install_scroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
     area.add_controller(scroll);
 }
 
-fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner: &adw::Spinner) {
     let click = gtk::GestureClick::new();
     click.set_button(0);
     click.connect_pressed({
@@ -1196,9 +1146,10 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
     drag.connect_drag_begin({
         let area = area.clone();
         let state = state.clone();
+        let spinner = spinner.clone();
         move |_, x, y| {
             area.grab_focus();
-            refresh_viewport_layout_cache(&area, &state);
+            request_layout(&area, &state, &spinner);
             let width = area.allocated_width();
             let height = area.allocated_height();
             let total_height = state.content_height.get();
@@ -1237,7 +1188,6 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
         let state = state.clone();
         move |gesture, offset_x, offset_y| {
             if let Some(drag) = state.scrollbar_drag.get() {
-                refresh_viewport_layout_cache(&area, &state);
                 let Some((_, _, _, thumb_height)) = canvas_scrollbar::thumb_rect(
                     area.allocated_width(),
                     area.allocated_height(),
@@ -1334,11 +1284,16 @@ fn install_motion(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
     area.add_controller(motion);
 }
 
-fn install_key_shortcuts(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+fn install_key_shortcuts(
+    area: &gtk::DrawingArea,
+    state: &Rc<DiffCanvasState>,
+    spinner: &adw::Spinner,
+) {
     let keys = gtk::EventControllerKey::new();
     keys.connect_key_pressed({
         let area = area.clone();
         let state = state.clone();
+        let spinner = spinner.clone();
         move |_, key, _, modifiers| {
             if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
                 && !modifiers.contains(gtk::gdk::ModifierType::ALT_MASK)
@@ -1366,12 +1321,18 @@ fn install_key_shortcuts(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
                     config::DEFAULT_DIFF_FONT_SIZE,
                 );
                 state.font_size.set(next);
+                state
+                    .text_width_cache
+                    .borrow_mut()
+                    .clear_for_font_size(canvas::font_size_key(next));
                 config::save_diff_font_size(next);
                 state
                     .layout_generation
                     .set(state.layout_generation.get().wrapping_add(1).max(1));
                 state.layout_cache.borrow_mut().take();
+                state.layout_pending_signature.borrow_mut().take();
                 state.last_layout_log.borrow_mut().take();
+                request_layout(&area, &state, &spinner);
                 clamp_scroll(&area, &state);
                 area.queue_draw();
             }
@@ -1382,42 +1343,15 @@ fn install_key_shortcuts(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
 }
 
 fn set_scroll_y(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, scroll_y: f64) {
-    refresh_viewport_layout_cache(area, state);
-    let max_scroll =
-        canvas_scrollbar::max_scroll(state.content_height.get(), area.allocated_height() as f64);
-    state.scroll_y.set(scroll_y.clamp(0.0, max_scroll));
-    area.queue_draw();
-}
-
-fn refresh_viewport_layout_cache(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
-    let rows = state.rows.borrow();
-    if rows.is_empty() {
-        state.content_height.set(1.0);
-        return;
-    }
-    let content_width = canvas_scrollbar::content_width(area.allocated_width())
-        .max(MIN_CONTENT_WIDTH.min(area.allocated_width().max(1)));
-    let metrics = canvas::measure_font_metrics(area, state.font_size.get(), |font_size| {
-        (font_size + 9.0).ceil()
-    });
-    let gutter_width = gutter_width(area, state);
-    let _ = visible_row_layouts(
-        area,
-        state,
-        rows.as_slice(),
-        content_width,
-        gutter_width,
-        metrics.line_height,
-        area.allocated_height(),
-    );
-    let content_height = state
+    let max_scroll = state
         .layout_cache
         .borrow()
         .as_ref()
-        .map(|cache| cache.content_height)
-        .unwrap_or(metrics.line_height)
-        .max(metrics.line_height);
-    state.content_height.set(content_height);
+        .map_or(f64::INFINITY, |cache| {
+            canvas_scrollbar::max_scroll(cache.content_height, area.allocated_height() as f64)
+        });
+    state.scroll_y.set(scroll_y.max(0.0).min(max_scroll));
+    area.queue_draw();
 }
 
 fn copy_selection(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
@@ -1518,49 +1452,19 @@ fn clamp_scroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
         .set(state.scroll_y.get().clamp(0.0, max_scroll));
 }
 
-fn fold_index_at(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, y: f64) -> Option<usize> {
-    let content_width = canvas_scrollbar::content_width(area.allocated_width())
-        .max(MIN_CONTENT_WIDTH.min(area.allocated_width().max(1)));
-    let rows = state.rows.borrow();
-    let metrics = canvas::measure_font_metrics(area, state.font_size.get(), |font_size| {
-        (font_size + 9.0).ceil()
-    });
-    let _ = visible_row_layouts(
-        area,
-        state,
-        rows.as_slice(),
-        content_width,
-        gutter_width(area, state),
-        metrics.line_height,
-        area.allocated_height(),
-    );
+fn fold_index_at(_area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, y: f64) -> Option<usize> {
     let document_y = y + state.scroll_y.get();
-    let row_index = state
-        .layout_cache
-        .borrow()
+    let cache = state.layout_cache.borrow();
+    let row_index = cache
         .as_ref()
-        .and_then(|cache| row_index_at_y(cache, document_y))?;
+        .and_then(|cache| diff_layout::row_index_at_y(cache, document_y))?;
+    let rows = state.rows.borrow();
     let row = rows.get(row_index)?;
     let fold_index = is_fold_row(row).then(|| row.left_number).flatten();
     if let Some(fold_index) = fold_index {
         log::debug!("diff_canvas fold_hit row_index={row_index} fold_index={fold_index}");
     }
     fold_index
-}
-
-fn row_index_at_y(cache: &DiffLayoutCache, document_y: f64) -> Option<usize> {
-    if cache.rows.is_empty() {
-        return None;
-    }
-
-    let mut index = cache
-        .rows
-        .partition_point(|layout| layout.y + layout.height <= document_y);
-    if index >= cache.rows.len() {
-        index = cache.rows.len().saturating_sub(1);
-    }
-    let layout = cache.rows.get(index)?;
-    (document_y >= layout.y && document_y < layout.y + layout.height).then_some(index)
 }
 
 fn selection_point_at(
@@ -1582,29 +1486,15 @@ fn selection_point_at(
         (font_size + 9.0).ceil()
     });
     let gutter_width = gutter_width(area, state);
-    let layouts = visible_row_layouts(
-        area,
-        state,
-        rows.as_slice(),
-        content_width,
-        gutter_width,
-        metrics.line_height,
-        area.allocated_height(),
-    );
     let document_y = y + state.scroll_y.get();
-    let row_index = state
-        .layout_cache
-        .borrow()
-        .as_ref()
-        .and_then(|cache| row_index_at_y(cache, document_y))?;
+    let cache = state.layout_cache.borrow();
+    let cache = cache.as_ref()?;
+    let row_index = diff_layout::row_index_at_y(cache, document_y)?;
     let row = rows.get(row_index)?;
     if is_fold_row(row) {
         return None;
     }
-    let layout = layouts
-        .iter()
-        .find(|(index, _)| *index == row_index)
-        .map(|(_, layout)| layout)?;
+    let layout = cache.rows.get(row_index)?;
     let side_x = match side {
         DiffCanvasSide::Left => 0.0,
         DiffCanvasSide::Right => half_width + DIVIDER_WIDTH,
@@ -1624,7 +1514,7 @@ fn selection_point_at(
         .floor()
         .max(0.0) as usize;
     let line = lines.get(visual_line.min(lines.len().saturating_sub(1)))?;
-    let byte = line.start + byte_for_x(area, state.font_size.get(), &line.text, x - text_x);
+    let byte = line.start + byte_for_x(area, state, &line.text, x - text_x);
     Some(DiffSelectionPoint {
         side,
         row: row_index,
@@ -1632,14 +1522,23 @@ fn selection_point_at(
     })
 }
 
-fn byte_for_x(area: &gtk::DrawingArea, font_size: f64, text: &str, x: f64) -> usize {
+fn cached_text_width_for_state(
+    area: &gtk::DrawingArea,
+    state: &Rc<DiffCanvasState>,
+    text: &str,
+) -> f64 {
+    let mut cache = state.text_width_cache.borrow_mut();
+    canvas::cached_text_width(area, state.font_size.get(), &mut cache, text)
+}
+
+fn byte_for_x(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, text: &str, x: f64) -> usize {
     if x <= 0.0 || text.is_empty() {
         return 0;
     }
 
     let mut width = 0.0;
     for (byte, grapheme) in text.grapheme_indices(true) {
-        let grapheme_width = canvas::text_width_for_size(area, font_size, grapheme);
+        let grapheme_width = cached_text_width_for_state(area, state, grapheme);
         if x < width + grapheme_width / 2.0 {
             return byte;
         }
@@ -1648,48 +1547,9 @@ fn byte_for_x(area: &gtk::DrawingArea, font_size: f64, text: &str, x: f64) -> us
     text.len()
 }
 
-fn wrap_text(
-    area: &gtk::DrawingArea,
-    state: &Rc<DiffCanvasState>,
-    text: &str,
-    wrap_width: f64,
-) -> Vec<WrappedLine> {
-    if text.is_empty() {
-        return vec![WrappedLine {
-            text: String::new(),
-            start: 0,
-            end: 0,
-        }];
-    }
-    let mut lines = Vec::new();
-    let mut segment_start = 0;
-    let mut line_width = 0.0;
-    for (byte, grapheme) in text.grapheme_indices(true) {
-        let grapheme_width = canvas::text_width_for_size(area, state.font_size.get(), grapheme);
-        if segment_start < byte && line_width + grapheme_width > wrap_width {
-            lines.push(WrappedLine {
-                text: text[segment_start..byte].to_string(),
-                start: segment_start,
-                end: byte,
-            });
-            segment_start = byte;
-            line_width = 0.0;
-        }
-        line_width += grapheme_width;
-    }
-    lines.push(WrappedLine {
-        text: text[segment_start..].to_string(),
-        start: segment_start,
-        end: text.len(),
-    });
-    lines
-}
-
 fn gutter_width(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) -> f64 {
     let max_number = state.max_line_number.get().max(1).to_string();
-    canvas::text_width_for_size(area, state.font_size.get(), &max_number)
-        + PREFIX_WIDTH
-        + CELL_PADDING * 2.0
+    cached_text_width_for_state(area, state, &max_number) + PREFIX_WIDTH + CELL_PADDING * 2.0
 }
 
 fn log_layout_change(
@@ -1698,16 +1558,15 @@ fn log_layout_change(
     content_width: i32,
     content_height: f64,
 ) {
-    let (measured_rows, max_shared_visual_line_count) = state
+    let max_shared_visual_line_count = state
         .layout_cache
         .borrow()
         .as_ref()
-        .map(|cache| (cache.measured_rows, cache.max_shared_visual_line_count))
-        .unwrap_or((0, 0));
+        .map(|cache| cache.max_shared_visual_line_count)
+        .unwrap_or(0);
     let snapshot = LayoutLogSnapshot {
         rows: rows.len(),
         folds: state.fold_row_count.get(),
-        measured_rows,
         content_width,
         content_height_bits: content_height.to_bits(),
         max_shared_visual_line_count,
@@ -1717,10 +1576,9 @@ fn log_layout_change(
         return;
     }
     log::debug!(
-        "diff_canvas row_layout rows={} fold_rows={} measured_rows={} content_width={} content_height={:.1} max_shared_visual_lines={}",
+        "diff_canvas row_layout rows={} fold_rows={} content_width={} content_height={:.1} max_shared_visual_lines={}",
         snapshot.rows,
         snapshot.folds,
-        snapshot.measured_rows,
         snapshot.content_width,
         content_height,
         snapshot.max_shared_visual_line_count
@@ -1739,17 +1597,6 @@ fn diff_prefix(kind: DiffKind) -> Option<&'static str> {
         DiffKind::Added => Some("+"),
         DiffKind::Deleted => Some("-"),
         DiffKind::Context | DiffKind::Fold => None,
-    }
-}
-
-fn marker_kind(row: &FileDiffRow) -> Option<canvas_scrollbar::MarkerKind> {
-    let added = row.right_kind == DiffKind::Added;
-    let deleted = row.left_kind == DiffKind::Deleted;
-    match (added, deleted) {
-        (true, true) => Some(canvas_scrollbar::MarkerKind::Mixed),
-        (true, false) => Some(canvas_scrollbar::MarkerKind::Added),
-        (false, true) => Some(canvas_scrollbar::MarkerKind::Deleted),
-        (false, false) => None,
     }
 }
 
