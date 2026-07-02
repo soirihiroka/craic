@@ -70,7 +70,6 @@ impl DiffView {
         root.append(&canvas.root);
         search_panel.set_key_capture_widget(&root);
         search_panel.install_shortcuts(&root);
-        search_panel.install_shortcuts(&canvas.root);
         connect_diff_search(&search_panel, &canvas);
 
         let full_rows = Rc::new(RefCell::new(Vec::new()));
