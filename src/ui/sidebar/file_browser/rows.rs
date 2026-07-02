@@ -156,6 +156,9 @@ impl FileBrowser {
     }
 
     pub(super) fn set_browser_rows(self: &Rc<Self>, mut rows: Vec<BrowserListRow>) {
+        if !self.deleting_paths.borrow().is_empty() {
+            rows.retain(|row| !self.browser_row_is_deleting(row));
+        }
         if !matches!(rows.last(), Some(BrowserListRow::RootGap)) {
             rows.push(BrowserListRow::RootGap);
         }
@@ -185,6 +188,25 @@ impl FileBrowser {
         if restore_focus && stats.changed() {
             self.focus_selected_row();
         }
+    }
+
+    fn browser_row_is_deleting(&self, row: &BrowserListRow) -> bool {
+        match row {
+            BrowserListRow::Tree(row) => self.path_is_deleting(&row.node_path),
+            BrowserListRow::RenameEntry(row) => self.path_is_deleting(&row.row.node_path),
+            BrowserListRow::Loading(row) => self.path_is_deleting(&row.folder),
+            BrowserListRow::Search(search_match) => self.path_is_deleting(&search_match.node_path),
+            BrowserListRow::NewEntry(_) | BrowserListRow::Status(_) | BrowserListRow::RootGap => {
+                false
+            }
+        }
+    }
+
+    fn path_is_deleting(&self, path: &FileNodePath) -> bool {
+        self.deleting_paths
+            .borrow()
+            .iter()
+            .any(|deleting| path == deleting || path.is_child_of(deleting))
     }
 
     pub(super) fn refresh_browser_row_state(self: &Rc<Self>) {
