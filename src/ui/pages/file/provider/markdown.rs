@@ -377,17 +377,23 @@ fn show_markdown(request: PreviewRequest<'_>, selection: Option<(usize, usize)>)
                     load.comparison.as_ref(),
                     load.spellcheck_issues,
                 );
-                right.file_markdown_preview.set_markdown_html(
-                    &load.html,
-                    load.content_signature,
-                    local_path.as_deref(),
-                );
-                right
-                    .file_markdown_preview
-                    .set_source_offset(right.file_editor.source_offset_at_scroll_top());
-                right
-                    .file_view_split
-                    .set_end_child(Some(&right.file_markdown_preview.root));
+                if load.text.trim().is_empty() {
+                    right
+                        .file_view_split
+                        .set_end_child(Some(&right.file_markdown_status));
+                } else {
+                    right.file_markdown_preview.set_markdown_html(
+                        &load.html,
+                        load.content_signature,
+                        local_path.as_deref(),
+                    );
+                    right
+                        .file_markdown_preview
+                        .set_source_offset(right.file_editor.source_offset_at_scroll_top());
+                    right
+                        .file_view_split
+                        .set_end_child(Some(&right.file_markdown_preview.root));
+                }
                 if let Some((start, end)) = selection {
                     right.file_editor.select_range(start, end);
                 }
@@ -751,7 +757,7 @@ a {{
 
 pub(super) fn markdown_fragment_to_html(markdown: &str) -> String {
     if markdown.is_empty() {
-        "<p><em>No markdown preview</em></p>".to_string()
+        String::new()
     } else {
         let parser = Parser::new_ext(markdown, Options::all());
         let events: Vec<_> = parser.into_offset_iter().collect();

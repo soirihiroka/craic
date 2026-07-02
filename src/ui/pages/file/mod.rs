@@ -854,17 +854,25 @@ fn refresh_live_file_preview(
     let signature = provider::content_signature(text.as_bytes());
     match preview_kind {
         file_type::PreviewKind::Markdown => {
-            let html = provider::markdown::markdown_to_html(text);
-            let local_path = local_workspace_path(ctx, node_path);
-            right
-                .file_markdown_preview
-                .set_markdown_html(&html, signature, local_path.as_deref());
-            right
-                .file_markdown_preview
-                .set_source_offset(right.file_editor.source_offset_at_scroll_top());
-            right
-                .file_view_split
-                .set_end_child(Some(&right.file_markdown_preview.root));
+            if text.trim().is_empty() {
+                right
+                    .file_view_split
+                    .set_end_child(Some(&right.file_markdown_status));
+            } else {
+                let html = provider::markdown::markdown_to_html(text);
+                let local_path = local_workspace_path(ctx, node_path);
+                right.file_markdown_preview.set_markdown_html(
+                    &html,
+                    signature,
+                    local_path.as_deref(),
+                );
+                right
+                    .file_markdown_preview
+                    .set_source_offset(right.file_editor.source_offset_at_scroll_top());
+                right
+                    .file_view_split
+                    .set_end_child(Some(&right.file_markdown_preview.root));
+            }
             set_live_displayed_preview(displayed_preview, node_path, signature);
             log::debug!("refreshed live markdown preview file_path={file_path}");
         }
