@@ -97,11 +97,19 @@ pub struct GitSettings {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct QuickActionConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_target_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct LocalWorkspaceConfig {
     #[serde(default)]
     git: LocalGitConfig,
     #[serde(default)]
     github: LocalGitHubConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quick_action: Option<LocalQuickActionConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -120,6 +128,12 @@ struct LocalGitHubConfig {
     auth_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auth_login: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct LocalQuickActionConfig {
+    #[serde(default)]
+    actions: Vec<QuickActionConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -528,6 +542,21 @@ pub fn save_settings(
     let _ = unset_local_config(path, SHOW_REMOTE_OWNER_WARNING_KEY);
 
     Ok(())
+}
+
+pub fn quick_action_config(path: &Path) -> Option<Vec<QuickActionConfig>> {
+    load_local_workspace_config(path)
+        .quick_action
+        .map(|config| config.actions)
+}
+
+pub fn save_quick_action_config(
+    path: &Path,
+    actions: Vec<QuickActionConfig>,
+) -> Result<(), String> {
+    let mut config = load_local_workspace_config(path);
+    config.quick_action = Some(LocalQuickActionConfig { actions });
+    save_local_workspace_config(path, &config)
 }
 
 pub fn save_author_email(path: &Path, email: &str) -> Result<(), String> {
