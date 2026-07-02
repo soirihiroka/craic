@@ -535,7 +535,7 @@ fn append_inline_element(element: &MarkdownElement, markup: &mut String, plain_t
     }
 }
 
-fn block_text(blocks: &[MarkdownPreviewBlock]) -> RenderedText {
+pub(super) fn block_text(blocks: &[MarkdownPreviewBlock]) -> RenderedText {
     let mut markup = Vec::new();
     let mut plain_text = Vec::new();
     for block in blocks {

@@ -61,10 +61,6 @@ impl ElementBuilder {
 }
 
 impl MarkdownElement {
-    pub(super) fn new(tag: &str, attrs: Vec<HtmlAttribute>, children: Vec<MarkdownNode>) -> Self {
-        Self::with_source(tag, attrs, children, None)
-    }
-
     pub(super) fn with_source(
         tag: &str,
         attrs: Vec<HtmlAttribute>,
@@ -79,10 +75,6 @@ impl MarkdownElement {
         }
     }
 
-    pub(super) fn empty(tag: &str) -> Self {
-        Self::new(tag, Vec::new(), Vec::new())
-    }
-
     pub(super) fn empty_with_source(tag: &str, source: Option<SourceRange>) -> Self {
         Self::with_source(tag, Vec::new(), Vec::new(), source)
     }
@@ -95,10 +87,6 @@ impl HtmlAttribute {
             value: value.to_string(),
         }
     }
-}
-
-pub(super) fn append_text(stack: &mut [ElementBuilder], text: &str) {
-    append_text_source(stack, text, None);
 }
 
 pub(super) fn append_text_source(

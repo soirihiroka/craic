@@ -1,13 +1,6 @@
 use gtk::prelude::*;
 use std::ops::Range;
 
-#[derive(Clone, Debug, Default)]
-pub(in crate::ui) struct MarkdownPreviewMeasurement {
-    pub(in crate::ui) content_height: i32,
-    pub(in crate::ui) viewport_height: i32,
-    pub(in crate::ui) source_anchors: Vec<MarkdownPreviewSourceAnchor>,
-}
-
 #[derive(Clone, Debug)]
 pub(in crate::ui) struct MarkdownPreviewSourceAnchor {
     pub(in crate::ui) source: Range<usize>,
@@ -58,6 +51,18 @@ pub(super) fn source_offset_for_y(
     for pair in anchors.windows(2) {
         let current = &pair[0];
         let next = &pair[1];
+        let current_bottom = current.y + current.height.max(1.0);
+        if y <= current_bottom {
+            let visual_span = current.height.max(1.0);
+            let progress = ((y - current.y) / visual_span).clamp(0.0, 1.0);
+            let source_span = current
+                .source
+                .end
+                .saturating_sub(current.source.start)
+                .max(1);
+            return Some(current.source.start + (source_span as f64 * progress).round() as usize);
+        }
+
         if y > next.y {
             continue;
         }
@@ -82,6 +87,18 @@ pub(super) fn y_for_source_offset(
     let first = anchors.first()?;
     if source_offset <= first.source.start {
         return Some(first.y);
+    }
+
+    for anchor in anchors {
+        if source_offset < anchor.source.start || source_offset > anchor.source.end {
+            continue;
+        }
+
+        let source_span = anchor.source.end.saturating_sub(anchor.source.start).max(1);
+        let progress = (source_offset.saturating_sub(anchor.source.start) as f64
+            / source_span as f64)
+            .clamp(0.0, 1.0);
+        return Some(anchor.y + anchor.height.max(1.0) * progress);
     }
 
     for pair in anchors.windows(2) {
