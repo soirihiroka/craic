@@ -2,7 +2,7 @@
 
 A development environment made by me for me :D
 
-Any usage outside of my computer is out of scope X3
+Any usage outside of my computer is out of scope and unsupported X3
 
 <img width="1207" height="764" alt="image" src="https://github.com/user-attachments/assets/511380e1-a28e-42b3-b03c-7896885072ce" />
 
