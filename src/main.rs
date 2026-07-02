@@ -18,6 +18,7 @@ mod system;
 mod terminal;
 mod ui;
 mod workspace;
+mod workspace_config;
 
 const APP_ID: &str = "dev.craic.Craic";
 

@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 const MAX_PDF_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 
-pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
+pub(in crate::ui::pages::file) fn show(request: PreviewRequest<'_>) {
     request
         .right
         .show_provider_loading(request.file_path, "PDF");
@@ -31,7 +31,7 @@ pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
     );
 }
 
-pub(in crate::ui::pages::code) fn show_match(request: PreviewMatchRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_match(request: PreviewMatchRequest<'_>) {
     show(request.into_preview_request());
 }
 

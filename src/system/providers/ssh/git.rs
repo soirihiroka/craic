@@ -4,6 +4,7 @@ use crate::git::{
 };
 use crate::gitignore;
 use crate::system::capabilities::{
+    files::FileAccess,
     git::{GitAccess, GitWatchCallback, GitWatchSubscription},
     github::GitHubAccess,
 };
@@ -12,6 +13,7 @@ use crate::{bitbucket, gitlab};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SSH_GIT_WATCH_INTERVAL: Duration = Duration::from_secs(30);
@@ -35,15 +37,29 @@ struct RemoteCommitRow {
     tags_b64: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct SshGitAccess {
     workspace: WorkspaceRef,
     runner: SshCommandRunner,
+    files: Arc<dyn FileAccess>,
+}
+
+struct SshCommitTargetPlan {
+    force_remove_paths: Vec<String>,
+    update_paths: Vec<String>,
 }
 
 impl SshGitAccess {
-    pub(crate) fn new(workspace: WorkspaceRef, runner: SshCommandRunner) -> Self {
-        Self { workspace, runner }
+    pub(crate) fn new(
+        workspace: WorkspaceRef,
+        runner: SshCommandRunner,
+        files: Arc<dyn FileAccess>,
+    ) -> Self {
+        Self {
+            workspace,
+            runner,
+            files,
+        }
     }
 
     fn git(&self, args: &[String]) -> Result<String, String> {
@@ -304,30 +320,57 @@ impl GitAccess for SshGitAccess {
         description: &str,
         files: &[String],
     ) -> Result<String, String> {
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return Err("Commit summary is required.".to_string());
+        }
+
         if files.is_empty() {
             return Err("Select at least one file to commit.".to_string());
         }
+
+        log::info!(
+            "ssh git commit start workspace={} file_count={}",
+            self.workspace.display_name,
+            files.len()
+        );
+
+        let plan = self.commit_target_plan(files)?;
+        if plan.force_remove_paths.is_empty() && plan.update_paths.is_empty() {
+            return Err("Select at least one file to commit.".to_string());
+        }
+
         let mut script = format!(
-            "cd {} && git add --",
+            "cd {} || exit 2\n\
+             if git rev-parse --verify HEAD >/dev/null 2>&1; then\n\
+               git reset -- .\n\
+             else\n\
+               git rm --cached -r --ignore-unmatch . >/dev/null 2>&1 || true\n\
+             fi",
             shell_quote(&self.workspace.root.absolute)
         );
-        for file in files {
-            script.push(' ');
-            script.push_str(&shell_quote(file));
+        if !plan.force_remove_paths.is_empty() {
+            script.push_str("\ngit update-index --force-remove --");
+            for file in &plan.force_remove_paths {
+                script.push(' ');
+                script.push_str(&shell_quote(file));
+            }
         }
-        script.push_str(" && git commit --only");
-        script.push_str(" -m ");
-        script.push_str(&shell_quote(summary.trim()));
-        if !description.trim().is_empty() {
-            script.push_str(" -m ");
-            script.push_str(&shell_quote(description.trim()));
+        if !plan.update_paths.is_empty() {
+            script.push_str("\ngit update-index --add --remove --replace --");
+            for file in &plan.update_paths {
+                script.push(' ');
+                script.push_str(&shell_quote(file));
+            }
         }
-        script.push_str(" --");
-        for file in files {
-            script.push(' ');
-            script.push_str(&shell_quote(file));
-        }
-        self.runner.run_text("git commit", &script)
+        script.push_str("\ngit commit -F -");
+
+        let stdin = commit_message_stdin(summary, description);
+        let output = self
+            .runner
+            .run_script_with_stdin("git commit", &script, Some(&stdin))?;
+        String::from_utf8(output.stdout)
+            .map_err(|_| "ssh git commit returned non-UTF-8".to_string())
     }
 
     fn discard_path(&self, file_path: &str) -> Result<String, String> {
@@ -370,6 +413,20 @@ impl GitAccess for SshGitAccess {
     }
 
     fn settings(&self) -> GitSettings {
+        let (
+            commit_timezone,
+            warn_if_remote_owner_mismatch,
+            use_system_timezone,
+            github_auth_account,
+        ) = {
+            let config = crate::workspace_config::git_config_from_file_access(self.files.as_ref());
+            (
+                config.commit_timezone,
+                config.warn_if_remote_owner_mismatch.unwrap_or(true),
+                config.use_system_timezone.unwrap_or(false),
+                config.github_auth_account,
+            )
+        };
         GitSettings {
             global_user_name: self
                 .git_ok(&[
@@ -404,10 +461,10 @@ impl GitAccess for SshGitAccess {
                 ])
                 .ok(),
             use_global_user: false,
-            commit_timezone: None,
-            warn_if_remote_owner_mismatch: true,
-            use_system_timezone: false,
-            github_auth_account: None,
+            commit_timezone,
+            warn_if_remote_owner_mismatch,
+            use_system_timezone,
+            github_auth_account,
         }
     }
 
@@ -425,7 +482,6 @@ impl GitAccess for SshGitAccess {
                 "--unset".into(),
                 "user.email".into(),
             ]);
-            Ok(())
         } else {
             self.git(&[
                 "config".into(),
@@ -438,9 +494,16 @@ impl GitAccess for SshGitAccess {
                 "--local".into(),
                 "user.email".into(),
                 settings.local_user_email.clone().unwrap_or_default(),
-            ])
-            .map(|_| ())
+            ])?;
         }
+
+        crate::workspace_config::save_git_config_with_file_access(
+            self.files.as_ref(),
+            settings.commit_timezone.as_deref().unwrap_or_default(),
+            settings.warn_if_remote_owner_mismatch,
+            settings.use_system_timezone,
+            settings.github_auth_account.as_ref(),
+        )
     }
 
     fn save_author_email(&self, email: &str) -> Result<(), String> {
@@ -980,17 +1043,75 @@ impl SshGitAccess {
 
     fn changed_files(&self) -> Result<Vec<ChangedFile>, String> {
         let script = format!(
-            "cd {} && git status --porcelain=v1 -z --untracked-files=all",
+            "cd {} && git --no-optional-locks status --untracked-files=all --branch --porcelain=2 -z",
             shell_quote(&self.workspace.root.absolute)
         );
         let output = self.runner.run_script("git status", &script)?;
-        let mut files = parse_porcelain_status(&output.stdout);
+        let mut files = git::parse_porcelain_status_entries(&output.stdout)
+            .into_iter()
+            .filter(git::status_entry_visible)
+            .map(|entry| git::changed_file_from_porcelain_entry(&entry))
+            .collect::<Vec<_>>();
         files.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
                 .then_with(|| left.status.cmp(&right.status))
         });
         Ok(files)
+    }
+
+    fn commit_target_plan(&self, selected_files: &[String]) -> Result<SshCommitTargetPlan, String> {
+        let script = format!(
+            "cd {} && git --no-optional-locks status --untracked-files=all --branch --porcelain=2 -z",
+            shell_quote(&self.workspace.root.absolute)
+        );
+        let output = self.runner.run_script("git commit status", &script)?;
+        let entries = git::parse_porcelain_status_entries(&output.stdout);
+        let mut force_remove_paths = Vec::new();
+        let mut update_paths = Vec::new();
+        let mut seen_force_remove_paths = HashSet::new();
+        let mut seen_update_paths = HashSet::new();
+
+        for requested in selected_files {
+            let mut resolved = false;
+
+            for entry in &entries {
+                if !git::porcelain_entry_matches_path(entry, requested) {
+                    continue;
+                }
+
+                push_commit_target_paths(
+                    &mut force_remove_paths,
+                    &mut seen_force_remove_paths,
+                    git::porcelain_entry_force_remove_paths(entry),
+                );
+                push_commit_target_paths(
+                    &mut update_paths,
+                    &mut seen_update_paths,
+                    git::porcelain_entry_update_paths(entry),
+                );
+
+                resolved = true;
+                break;
+            }
+
+            if !resolved && seen_update_paths.insert(requested.clone()) {
+                update_paths.push(requested.clone());
+            }
+        }
+
+        log::debug!(
+            "ssh git commit targets resolved workspace={} selected_count={} force_remove_count={} update_count={}",
+            self.workspace.display_name,
+            selected_files.len(),
+            force_remove_paths.len(),
+            update_paths.len()
+        );
+
+        Ok(SshCommitTargetPlan {
+            force_remove_paths,
+            update_paths,
+        })
     }
 
     fn commit_tags(&self, hash: &str) -> Result<Vec<String>, String> {
@@ -1039,6 +1160,29 @@ impl SshGitAccess {
         let output = self.runner.run_script("git tree bytes", &script)?;
         Ok(Some(output.stdout).filter(|bytes| !bytes.is_empty()))
     }
+}
+
+fn push_commit_target_paths(
+    target: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    paths: Vec<String>,
+) {
+    for path in paths {
+        if seen.insert(path.clone()) {
+            target.push(path);
+        }
+    }
+}
+
+fn commit_message_stdin(summary: &str, description: &str) -> Vec<u8> {
+    let mut message = summary.trim().to_string();
+    let description = description.trim();
+    if !description.is_empty() {
+        message.push_str("\n\n");
+        message.push_str(description);
+    }
+    message.push('\n');
+    message.into_bytes()
 }
 
 fn parse_commit_details(

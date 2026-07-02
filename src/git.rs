@@ -1,26 +1,18 @@
 use crate::{bitbucket, github, gitlab};
-use git2::{
-    BranchType, Delta, DiffFindOptions, DiffLineType, DiffOptions, ErrorCode, ObjectType, Oid,
-    Repository, Status, StatusOptions, Tree,
-};
-use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+pub use crate::workspace_config::QuickActionConfig;
 
 const COMMIT_TIMEZONE_KEY: &str = "craic.commitTimezone";
 const USE_SYSTEM_TIMEZONE_KEY: &str = "craic.useSystemTimezone";
 const SHOW_REMOTE_OWNER_WARNING_KEY: &str = "craic.showRemoteOwnerWarning";
 const DEFAULT_COMMIT_TIMEZONE: &str = "+0000";
 const MAX_TEXT_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
-const LOCAL_CONFIG_DIR: &str = ".craic/local";
-const LOCAL_CONFIG_FILE: &str = "config.toml";
-const LOCAL_GITIGNORE_FILE: &str = ".gitignore";
-const LOCAL_GITIGNORE_CONTENTS: &str = "*\n";
 
 struct GitSnapshotTimer {
     repo: String,
@@ -96,46 +88,6 @@ pub struct GitSettings {
     pub github_auth_account: Option<github::GitHubAuthAccount>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct QuickActionConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selected_target_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct LocalWorkspaceConfig {
-    #[serde(default)]
-    git: LocalGitConfig,
-    #[serde(default)]
-    github: LocalGitHubConfig,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    quick_action: Option<LocalQuickActionConfig>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct LocalGitConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    commit_timezone: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    use_system_timezone: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    warn_if_remote_owner_mismatch: Option<bool>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct LocalGitHubConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    auth_host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    auth_login: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct LocalQuickActionConfig {
-    #[serde(default)]
-    actions: Vec<QuickActionConfig>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangedFile {
     pub status: String,
@@ -203,10 +155,13 @@ struct FilePathPair {
     new_path: Option<String>,
 }
 
-#[derive(Debug)]
-struct DiffRowsWithFilePaths {
-    rows: Vec<FileDiffRow>,
-    paths: FilePathPair,
+#[derive(Clone, Debug)]
+pub(crate) struct GitStatusEntry {
+    status_code: String,
+    path: String,
+    old_path: Option<String>,
+    unmerged: bool,
+    untracked: bool,
 }
 
 pub struct BytesComparison {
@@ -234,10 +189,7 @@ pub struct FileDiffRow {
 
 pub fn snapshot(path: &Path) -> Result<RepositorySnapshot, String> {
     let mut timing = GitSnapshotTimer::new(path);
-    let repo = open_repo(path)?;
-    timing.mark("open-repo");
-
-    let root = repo_root(&repo)?;
+    let root = repo_root(path)?;
     timing.mark("repo-root");
 
     let name = root
@@ -245,41 +197,41 @@ pub fn snapshot(path: &Path) -> Result<RepositorySnapshot, String> {
         .and_then(|name| name.to_str())
         .unwrap_or("Repository")
         .to_string();
-    let branch = current_branch(&repo)?;
+    let branch = current_branch(&root)?;
     timing.mark("current-branch");
 
-    let remote_name = upstream_remote(&repo)
-        .or_else(|| Some("origin".to_string()).filter(|remote| repo.find_remote(remote).is_ok()));
+    let remote_name = upstream_remote(&root).or_else(|| {
+        Some("origin".to_string()).filter(|remote| remote_url(&root, remote).is_some())
+    });
     let remote_url = remote_name
         .as_deref()
-        .and_then(|remote| repo.find_remote(remote).ok())
-        .and_then(|remote| remote.url().ok().map(ToString::to_string));
+        .and_then(|remote| remote_url(&root, remote));
     let remote_owner = remote_url.as_deref().and_then(remote_owner_from_remote_url);
     timing.mark("remote-metadata");
 
-    let (ahead, behind, has_upstream) = ahead_behind_count(&repo);
+    let (ahead, behind, has_upstream) = ahead_behind_count(&root);
     timing.mark("ahead-behind");
 
-    let last_fetch_at = last_fetch_at(&repo);
-    let user_name = config_string(&repo, "user.name");
-    let user_email = config_string(&repo, "user.email");
+    let last_fetch_at = last_fetch_at(&root);
+    let user_name = config_string(&root, "user.name");
+    let user_email = config_string(&root, "user.email");
     let github_avatar_url = user_email
         .as_deref()
         .and_then(github::login_from_noreply_email)
         .map(|login| github::avatar_url_for_login(&login));
     timing.mark("user-metadata");
 
-    let branches = branches(&repo, &root, remote_name.as_deref())?;
+    let branches = branches(&root, remote_name.as_deref())?;
     timing.mark("branches");
 
     let warn_if_remote_owner_mismatch =
         local_config_bool_with_default(path, SHOW_REMOTE_OWNER_WARNING_KEY, true);
     timing.mark("local-settings");
 
-    let changed_files = changed_files(&repo)?;
+    let changed_files = changed_files(&root)?;
     timing.mark("changed-files");
 
-    let history_head = history_head(&repo);
+    let history_head = history_head(&root);
     timing.mark("history-head");
 
     timing.finish(&branch, branches.len(), changed_files.len());
@@ -352,117 +304,137 @@ pub fn commit_paths(
         return Err("Select at least one file to commit.".to_string());
     }
 
-    let commit_files = commit_target_paths(path, files)?;
-    if commit_files.is_empty() {
+    let plan = commit_target_plan(path, files)?;
+    if plan.force_remove_paths.is_empty() && plan.update_paths.is_empty() {
         return Err("Select at least one file to commit.".to_string());
     }
-    stage_commit_paths(path, &commit_files)?;
+    reset_index_for_selected_commit(path)?;
+    stage_commit_plan(path, &plan)?;
 
-    let mut args = vec![
-        "commit".to_string(),
-        "--only".to_string(),
-        "-m".to_string(),
-        summary.to_string(),
-    ];
-    let description = description.trim();
-    if !description.is_empty() {
-        args.push("-m".to_string());
-        args.push(description.to_string());
-    }
-    args.push("--".to_string());
-    args.extend(commit_files.iter().cloned());
-
-    run_git_owned_with_commit_timezone(path, &args)
+    run_git_owned_with_commit_timezone_and_stdin(
+        path,
+        &["commit".to_string(), "-F".to_string(), "-".to_string()],
+        &commit_message_stdin(summary, description),
+    )
 }
 
-fn commit_target_paths(path: &Path, selected_files: &[String]) -> Result<Vec<String>, String> {
-    let repo = Repository::open(path).map_err(|err| err.message().to_string())?;
-    let mut options = changed_files_status_options(true);
-    let statuses = match repo.statuses(Some(&mut options)) {
-        Ok(statuses) => statuses,
-        Err(err) => {
-            log::warn!(
-                "failed to refresh git index while resolving commit targets: {}",
-                err.message()
-            );
-            let mut fallback_options = changed_files_status_options(false);
-            repo.statuses(Some(&mut fallback_options))
-                .map_err(|err| err.message().to_string())?
-        }
-    };
+struct CommitTargetPlan {
+    force_remove_paths: Vec<String>,
+    update_paths: Vec<String>,
+}
 
-    let mut snapshot_entries = Vec::new();
-    for entry in statuses
-        .iter()
-        .filter(|entry| entry.status() != Status::CURRENT)
-    {
-        if entry.status().contains(Status::IGNORED) {
-            continue;
-        }
-
-        snapshot_entries.push((
-            status_entry_old_path(&entry),
-            status_entry_new_path(&entry),
-            entry.status(),
-        ));
-    }
-
-    let mut commit_files = Vec::<String>::new();
-    let mut seen = HashSet::new();
+fn commit_target_plan(path: &Path, selected_files: &[String]) -> Result<CommitTargetPlan, String> {
+    let entries = status_entries(path)?;
+    let mut force_remove_paths = Vec::<String>::new();
+    let mut update_paths = Vec::<String>::new();
+    let mut seen_force_remove_paths = HashSet::new();
+    let mut seen_update_paths = HashSet::new();
 
     for requested in selected_files {
         let mut resolved = false;
 
-        for (old_path, new_path, status) in &snapshot_entries {
-            let matches_requested = old_path.as_deref().is_some_and(|path| path == requested)
-                || new_path.as_deref().is_some_and(|path| path == requested);
-
-            if !matches_requested {
+        for entry in &entries {
+            if !porcelain_entry_matches_path(entry, requested) {
                 continue;
             }
 
-            let staged: Vec<String> =
-                if status.intersects(Status::INDEX_RENAMED | Status::WT_RENAMED) {
-                    [old_path.as_deref(), new_path.as_deref()]
-                        .into_iter()
-                        .flatten()
-                        .map(ToString::to_string)
-                        .collect()
-                } else {
-                    new_path
-                        .as_ref()
-                        .or(old_path.as_ref())
-                        .into_iter()
-                        .map(ToString::to_string)
-                        .collect()
-                };
-
-            for staged_path in staged {
-                if seen.insert(staged_path.clone()) {
-                    commit_files.push(staged_path);
-                }
-            }
+            push_commit_target_paths(
+                &mut force_remove_paths,
+                &mut seen_force_remove_paths,
+                porcelain_entry_force_remove_paths(entry),
+            );
+            push_commit_target_paths(
+                &mut update_paths,
+                &mut seen_update_paths,
+                porcelain_entry_update_paths(entry),
+            );
 
             resolved = true;
             break;
         }
 
-        if !resolved && seen.insert(requested.clone()) {
-            commit_files.push(requested.clone());
+        if !resolved {
+            if seen_update_paths.insert(requested.clone()) {
+                update_paths.push(requested.clone());
+            }
         }
     }
 
-    Ok(commit_files)
+    log::debug!(
+        "resolved git commit targets selected_count={} force_remove_count={} update_count={}",
+        selected_files.len(),
+        force_remove_paths.len(),
+        update_paths.len()
+    );
+
+    Ok(CommitTargetPlan {
+        force_remove_paths,
+        update_paths,
+    })
 }
 
-fn stage_commit_paths(path: &Path, files: &[String]) -> Result<(), String> {
-    if files.is_empty() {
+fn push_commit_target_paths(
+    target: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    paths: Vec<String>,
+) {
+    for path in paths {
+        if seen.insert(path.clone()) {
+            target.push(path);
+        }
+    }
+}
+
+fn reset_index_for_selected_commit(path: &Path) -> Result<(), String> {
+    if run_git(path, &["rev-parse", "--verify", "HEAD"]).is_ok() {
+        run_git(path, &["reset", "--", "."]).map(|_| ())
+    } else {
+        run_git(path, &["rm", "--cached", "-r", "--ignore-unmatch", "."]).map(|_| ())
+    }
+}
+
+fn stage_commit_plan(path: &Path, plan: &CommitTargetPlan) -> Result<(), String> {
+    if !plan.force_remove_paths.is_empty() {
+        update_index_paths(path, &["--force-remove"], &plan.force_remove_paths)?;
+    }
+    if !plan.update_paths.is_empty() {
+        update_index_paths(
+            path,
+            &["--add", "--remove", "--replace"],
+            &plan.update_paths,
+        )?;
+    }
+    Ok(())
+}
+
+fn update_index_paths(path: &Path, options: &[&str], paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
         return Ok(());
     }
 
-    let mut add_args = vec!["add".to_string(), "--all".to_string(), "--".to_string()];
-    add_args.extend(files.iter().cloned());
-    run_git_owned(path, &add_args).map(|_| ())
+    let mut args = vec!["update-index".to_string()];
+    args.extend(options.iter().map(|option| option.to_string()));
+    args.push("-z".to_string());
+    args.push("--stdin".to_string());
+
+    let mut stdin = Vec::new();
+    for path in paths {
+        stdin.extend_from_slice(path.as_bytes());
+        stdin.push(0);
+    }
+
+    run_git_owned_with_stdin(path, &args, &stdin).map(|_| ())
+}
+
+fn commit_message_stdin(summary: &str, description: &str) -> Vec<u8> {
+    let mut message = summary.trim().to_string();
+    let description = description.trim();
+    if !description.is_empty() {
+        message.push_str("\n\n");
+        message.push_str(description);
+    }
+    message.push('\n');
+    message.into_bytes()
 }
 
 pub fn discard_path(path: &Path, file_path: &str) -> Result<String, String> {
@@ -487,8 +459,7 @@ pub fn discard_path(path: &Path, file_path: &str) -> Result<String, String> {
 pub fn settings(path: &Path) -> GitSettings {
     let local_user_name = local_config_string(path, "user.name");
     let local_user_email = local_config_string(path, "user.email");
-    let local_workspace_config = load_local_workspace_config(path);
-    let local_git_config = local_workspace_config.git.clone();
+    let local_git_config = crate::workspace_config::git_config(path);
 
     GitSettings {
         global_user_name: global_config_string("user.name"),
@@ -507,7 +478,7 @@ pub fn settings(path: &Path) -> GitSettings {
         use_system_timezone: local_git_config
             .use_system_timezone
             .unwrap_or_else(|| local_config_bool(path, USE_SYSTEM_TIMEZONE_KEY)),
-        github_auth_account: local_github_auth_account(&local_workspace_config.github),
+        github_auth_account: local_git_config.github_auth_account,
     }
 }
 
@@ -529,7 +500,7 @@ pub fn save_settings(
         set_local_config(path, "user.email", user_email.trim())?;
     }
 
-    save_local_git_config(
+    crate::workspace_config::save_git_config(
         path,
         commit_timezone,
         warn_if_remote_owner_mismatch,
@@ -545,18 +516,14 @@ pub fn save_settings(
 }
 
 pub fn quick_action_config(path: &Path) -> Option<Vec<QuickActionConfig>> {
-    load_local_workspace_config(path)
-        .quick_action
-        .map(|config| config.actions)
+    crate::workspace_config::quick_action_config(path)
 }
 
 pub fn save_quick_action_config(
     path: &Path,
     actions: Vec<QuickActionConfig>,
 ) -> Result<(), String> {
-    let mut config = load_local_workspace_config(path);
-    config.quick_action = Some(LocalQuickActionConfig { actions });
-    save_local_workspace_config(path, &config)
+    crate::workspace_config::save_quick_action_config(path, actions)
 }
 
 pub fn save_author_email(path: &Path, email: &str) -> Result<(), String> {
@@ -574,28 +541,14 @@ pub fn push(path: &Path) -> Result<String, String> {
 }
 
 fn conflicted_files(repo_path: &Path) -> Vec<String> {
-    let mut files = Vec::new();
-    if let Ok(repo) = open_repo(repo_path) {
-        if let Ok(index) = repo.index() {
-            if let Ok(conflicts) = index.conflicts() {
-                for conflict_res in conflicts {
-                    if let Ok(conflict) = conflict_res {
-                        let entry = conflict
-                            .our
-                            .as_ref()
-                            .or(conflict.their.as_ref())
-                            .or(conflict.ancestor.as_ref());
-                        if let Some(entry) = entry {
-                            let path_str = String::from_utf8_lossy(&entry.path).into_owned();
-                            if !files.contains(&path_str) {
-                                files.push(path_str);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let mut files = status_entries(repo_path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.unmerged || entry.status_code.contains('U'))
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
     files
 }
 
@@ -631,8 +584,7 @@ pub fn publish(path: &Path, remote: &str, branch: &str) -> Result<String, String
 }
 
 pub fn root_for_path(path: &Path) -> Option<PathBuf> {
-    let repo = Repository::discover(path).ok()?;
-    repo_root(&repo)
+    repo_root(path)
         .ok()
         .map(|root| root.canonicalize().unwrap_or(root))
 }
@@ -772,8 +724,11 @@ pub fn remote_web_url(remote_url: &str) -> String {
 }
 
 pub fn github_slug_for_path(path: &Path) -> Option<String> {
-    let repo = open_repo(path).ok()?;
-    github_slug_for_repo(&repo)
+    let root = repo_root(path).ok()?;
+    let remote_name = upstream_remote(&root).or_else(|| {
+        Some("origin".to_string()).filter(|remote| remote_url(&root, remote).is_some())
+    })?;
+    remote_url(&root, &remote_name).and_then(|url| parse_repo_slug_from_remote_url(&url))
 }
 
 pub fn remote_commit_web_url(remote_url: &str, hash: &str) -> String {
@@ -781,39 +736,40 @@ pub fn remote_commit_web_url(remote_url: &str, hash: &str) -> String {
 }
 
 pub fn comparison(path: &Path, file_path: &str) -> Result<FileComparison, String> {
-    let repo = open_repo(path)?;
-    let DiffRowsWithFilePaths { rows, paths } = file_diff_rows_with_paths(&repo, file_path)?;
+    let paths = worktree_file_path_pair(path, file_path)?;
     let old_path = paths.old_path.as_deref().unwrap_or(file_path);
     let new_path = paths.new_path.as_deref().unwrap_or(file_path);
-    ensure_worktree_text_previewable(&repo, old_path, new_path)?;
+    ensure_worktree_text_previewable(path, old_path, new_path)?;
 
+    let diff = worktree_diff(path, &paths, file_path)?;
     let rows = complete_diff_rows(
-        rows,
-        &head_file_lines(&repo, old_path)?,
-        &workdir_file_lines(&repo, new_path)?,
+        parse_unified_diff(&diff),
+        &head_file_lines(path, old_path)?,
+        &workdir_file_lines(path, new_path)?,
+        paths_changed(&paths),
     );
 
     Ok(FileComparison { rows })
 }
 
 pub fn commit_details(path: &Path, hash: &str) -> Result<Commit, String> {
-    let repo = open_repo(path)?;
-    let oid = Oid::from_str(hash).map_err(|err| err.message().to_string())?;
-    let commit = repo
-        .find_commit(oid)
-        .map_err(|err| err.message().to_string())?;
+    let output = run_git(
+        path,
+        &[
+            "show",
+            "-s",
+            "--format=%H%x1f%h%x1f%an%x1f%ae%x1f%ct%x1f%B",
+            hash,
+        ],
+    )?;
     let tags = tags_for_commit(path, hash).unwrap_or_default();
-
-    Ok(commit_info(&repo, oid, &commit, tags))
+    let (insertions, deletions) = commit_line_stats(path, hash).unwrap_or_default();
+    parse_commit_details(&output, tags, insertions, deletions)
 }
 
 pub fn commit_message(path: &Path, hash: &str) -> Result<CommitMessage, String> {
-    let repo = open_repo(path)?;
-    let oid = Oid::from_str(hash).map_err(|err| err.message().to_string())?;
-    let commit = repo
-        .find_commit(oid)
-        .map_err(|err| err.message().to_string())?;
-    let (summary, description) = commit_message_parts(commit.message().unwrap_or_default());
+    let message = run_git(path, &["show", "-s", "--format=%B", hash])?;
+    let (summary, description) = commit_message_parts(&message);
 
     Ok(CommitMessage {
         summary,
@@ -836,49 +792,24 @@ fn commit_message_parts(message: &str) -> (String, String) {
 }
 
 pub fn commit_parent_hash(path: &Path, hash: &str) -> Result<Option<String>, String> {
-    let repo = open_repo(path)?;
-    let oid = Oid::from_str(hash).map_err(|err| err.message().to_string())?;
-    let commit = repo
-        .find_commit(oid)
-        .map_err(|err| err.message().to_string())?;
-
-    if commit.parent_count() == 0 {
-        return Ok(None);
-    }
-
-    commit
-        .parent_id(0)
-        .map(|oid| Some(oid.to_string()))
-        .map_err(|err| err.message().to_string())
+    let output = run_git(path, &["rev-list", "--parents", "-n", "1", hash])?;
+    Ok(output.split_whitespace().nth(1).map(ToString::to_string))
 }
 
 pub fn tags_for_commit(path: &Path, hash: &str) -> Result<Vec<String>, String> {
-    let repo = open_repo(path)?;
-    let oid = Oid::from_str(hash).map_err(|err| err.message().to_string())?;
-    let tag_names = repo
-        .tag_names(None)
-        .map_err(|err| err.message().to_string())?;
-    let mut tags = Vec::new();
-
-    for name in tag_names.iter().filter_map(|name| name.ok().flatten()) {
-        let Ok(object) = repo.revparse_single(&format!("refs/tags/{name}")) else {
-            continue;
-        };
-        let Ok(commit) = object.peel(ObjectType::Commit) else {
-            continue;
-        };
-        if commit.id() == oid {
-            tags.push(name.to_string());
-        }
-    }
+    let mut tags = run_git(path, &["tag", "--points-at", hash])?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
 
     tags.sort();
     Ok(tags)
 }
 
 pub fn commit_page(path: &Path, after: Option<&str>, limit: usize) -> Result<CommitPage, String> {
-    let repo = open_repo(path)?;
-    paged_commits(&repo, after, limit)
+    paged_commits(path, after, limit)
 }
 
 pub fn commit_search_page(
@@ -887,38 +818,27 @@ pub fn commit_search_page(
     after: Option<&str>,
     limit: usize,
 ) -> Result<CommitPage, String> {
-    let repo = open_repo(path)?;
     if query.trim().is_empty() {
-        return paged_commits(&repo, after, limit);
+        return paged_commits(path, after, limit);
     }
-    paged_commit_search(&repo, query, after, limit)
+    paged_commit_search(path, query, after, limit)
 }
 
 pub fn commit_changed_files(path: &Path, hash: &str) -> Result<Vec<ChangedFile>, String> {
-    let repo = open_repo(path)?;
-    let (old_tree, new_tree) = commit_trees(&repo, hash)?;
-    let diff = repo
-        .diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)
-        .map_err(|err| err.message().to_string())?;
-    let mut files = Vec::new();
-
-    diff.foreach(
-        &mut |delta, _progress| {
-            if let Some(path) = path_from_delta(&delta) {
-                files.push(ChangedFile {
-                    status: delta_status_label(delta.status()).to_string(),
-                    path,
-                    git_status_bits: 0,
-                    worktree_signature: None,
-                });
-            }
-            true
-        },
-        None,
-        None,
-        None,
-    )
-    .map_err(|err| err.message().to_string())?;
+    let output = run_git_bytes(
+        path,
+        &[
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "-M",
+            "-z",
+            hash,
+        ],
+    )?;
+    let mut files = parse_name_status_files_z(&output);
 
     sort_changed_files(&mut files);
     Ok(files)
@@ -929,93 +849,97 @@ pub fn commit_comparison(
     hash: &str,
     file_path: &str,
 ) -> Result<FileComparison, String> {
-    let repo = open_repo(path)?;
-    let (old_tree, new_tree) = commit_trees(&repo, hash)?;
-    let DiffRowsWithFilePaths { rows, paths } =
-        commit_file_diff_rows_with_paths(&repo, old_tree.as_ref(), &new_tree, file_path)?;
+    let paths = commit_file_path_pair(path, hash, file_path)?;
     let old_path = paths.old_path.as_deref().unwrap_or(file_path);
     let new_path = paths.new_path.as_deref().unwrap_or(file_path);
-    ensure_commit_text_previewable(&repo, old_tree.as_ref(), &new_tree, old_path, new_path)?;
+    ensure_commit_text_previewable(path, hash, old_path, new_path)?;
+    let parent = commit_parent_hash(path, hash)?;
+    let diff = commit_diff(path, hash, &paths, file_path)?;
     let rows = complete_diff_rows(
-        rows,
-        &tree_file_lines_opt(&repo, old_tree.as_ref(), old_path)?,
-        &tree_file_lines(&repo, &new_tree, new_path)?,
+        parse_unified_diff(&diff),
+        &tree_file_lines_opt(path, parent.as_deref(), old_path)?,
+        &tree_file_lines(path, hash, new_path)?,
+        paths_changed(&paths),
     );
 
     Ok(FileComparison { rows })
 }
 
-fn open_repo(path: &Path) -> Result<Repository, String> {
-    Repository::discover(path).map_err(|err| err.message().to_string())
-}
-
-fn repo_root(repo: &Repository) -> Result<PathBuf, String> {
-    repo.workdir()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "Bare repositories are not supported.".to_string())
-}
-
-fn current_branch(repo: &Repository) -> Result<String, String> {
-    match repo.head() {
-        Ok(head) => {
-            if let Ok(name) = head.shorthand() {
-                return Ok(name.to_string());
-            }
-            if let Some(oid) = head.target() {
-                return Ok(oid.to_string()[..7].to_string());
-            }
-            Err("Unable to resolve HEAD.".to_string())
-        }
-        Err(err) if err.code() == ErrorCode::UnbornBranch => Ok("main".to_string()),
-        Err(err) => Err(err.message().to_string()),
+fn repo_root(path: &Path) -> Result<PathBuf, String> {
+    let root = run_git(path, &["rev-parse", "--show-toplevel"])?;
+    if root.is_empty() {
+        return Err("Bare repositories are not supported.".to_string());
     }
+    Ok(PathBuf::from(root))
 }
 
-fn branches(
-    repo: &Repository,
-    root: &Path,
-    remote_name: Option<&str>,
-) -> Result<Vec<BranchInfo>, String> {
-    let current = current_branch(repo).unwrap_or_default();
-    let mut branches = Vec::new();
-    let iter = repo
-        .branches(None)
-        .map_err(|err| err.message().to_string())?;
+fn git_dir(path: &Path) -> Option<PathBuf> {
+    let output = run_git(path, &["rev-parse", "--absolute-git-dir"]).ok()?;
+    (!output.is_empty()).then(|| PathBuf::from(output))
+}
 
-    for branch in iter {
-        let (branch, kind) = branch.map_err(|err| err.message().to_string())?;
-        let Some(name) = branch.name().map_err(|err| err.message().to_string())? else {
+fn current_branch(root: &Path) -> Result<String, String> {
+    if let Ok(branch) = run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        if !branch.is_empty() && branch != "HEAD" {
+            return Ok(branch);
+        }
+    }
+
+    if let Ok(hash) = run_git(root, &["rev-parse", "--short", "HEAD"]) {
+        if !hash.is_empty() {
+            return Ok(hash);
+        }
+    }
+
+    Ok(local_config_string(root, "init.defaultBranch").unwrap_or_else(|| "main".to_string()))
+}
+
+fn branches(root: &Path, remote_name: Option<&str>) -> Result<Vec<BranchInfo>, String> {
+    let current = current_branch(root).unwrap_or_default();
+    let mut branches = Vec::new();
+    let output = run_git(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)%00%(refname)%00%(upstream:short)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+
+    for line in output.lines() {
+        let mut fields = line.split('\0');
+        let Some(name) = fields.next().filter(|name| !name.is_empty()) else {
             continue;
         };
+        let refname = fields.next().unwrap_or_default();
+        let upstream = fields
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
         if name.ends_with("/HEAD") {
             continue;
         }
-        let upstream = if kind == BranchType::Local {
-            branch
-                .upstream()
-                .ok()
-                .and_then(|upstream| upstream.name().ok().flatten().map(ToString::to_string))
+        let kind = if refname.starts_with("refs/remotes/") {
+            BranchKind::Remote
         } else {
-            None
+            BranchKind::Local
         };
 
         branches.push(BranchInfo {
             name: name.to_string(),
-            is_current: name == current,
-            kind: if kind == BranchType::Local {
-                BranchKind::Local
-            } else {
-                BranchKind::Remote
-            },
+            is_current: kind == BranchKind::Local && name == current,
+            kind,
             upstream,
             is_default: false,
             is_recent: false,
         });
     }
 
-    let default_name = default_branch_name(repo, remote_name);
+    let default_name = default_branch_name(root, remote_name);
     let remote_ref = remote_name
-        .and_then(|remote| remote_head(repo, remote).map(|head| format!("{remote}/{head}")));
+        .and_then(|remote| remote_head(root, remote).map(|head| format!("{remote}/{head}")));
     if let Some(index) = find_default_branch_index(&branches, &default_name, remote_ref.as_deref())
     {
         branches[index].is_default = true;
@@ -1051,20 +975,26 @@ fn branches(
     Ok(branches)
 }
 
-fn default_branch_name(repo: &Repository, remote_name: Option<&str>) -> String {
+fn default_branch_name(root: &Path, remote_name: Option<&str>) -> String {
     remote_name
-        .and_then(|remote| remote_head(repo, remote))
-        .or_else(|| config_string(repo, "init.defaultBranch"))
+        .and_then(|remote| remote_head(root, remote))
+        .or_else(|| local_config_string(root, "init.defaultBranch"))
         .unwrap_or_else(|| "main".to_string())
 }
 
-fn remote_head(repo: &Repository, remote_name: &str) -> Option<String> {
-    let reference = repo
-        .find_reference(&format!("refs/remotes/{remote_name}/HEAD"))
-        .ok()?;
-    let target = reference.symbolic_target().ok()??;
+fn remote_head(root: &Path, remote_name: &str) -> Option<String> {
+    let target = run_git(
+        root,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            &format!("refs/remotes/{remote_name}/HEAD"),
+        ],
+    )
+    .ok()?;
     target
-        .strip_prefix(&format!("refs/remotes/{remote_name}/"))
+        .strip_prefix(&format!("{remote_name}/"))
         .map(ToString::to_string)
 }
 
@@ -1156,65 +1086,62 @@ fn parse_recent_branch_names(output: &str, limit: usize) -> Vec<String> {
     names
 }
 
-fn upstream_remote(repo: &Repository) -> Option<String> {
-    let head = repo.head().ok()?;
-    let refname = head.name().ok()?;
-    repo.branch_upstream_remote(refname)
+fn upstream_remote(root: &Path) -> Option<String> {
+    run_git(
+        root,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .ok()
+    .and_then(|upstream| upstream.split('/').next().map(ToString::to_string))
+    .filter(|remote| !remote.is_empty())
+}
+
+fn remote_url(root: &Path, remote_name: &str) -> Option<String> {
+    run_git(root, &["remote", "get-url", remote_name])
         .ok()
-        .and_then(|name| name.as_str().ok().map(ToString::to_string))
+        .filter(|url| !url.is_empty())
 }
 
-fn github_slug_for_repo(repo: &Repository) -> Option<String> {
-    let remote_name = upstream_remote(repo)
-        .or_else(|| Some("origin".to_string()).filter(|remote| repo.find_remote(remote).is_ok()))?;
-    let remote = repo.find_remote(&remote_name).ok()?;
-    let url = remote.url().ok()?;
-    parse_repo_slug_from_remote_url(url)
-}
-
-fn ahead_behind_count(repo: &Repository) -> (u32, u32, bool) {
-    let Ok(head) = repo.head() else {
-        return (0, 0, false);
-    };
-    let Some(local_oid) = head.target() else {
-        return (0, 0, false);
-    };
-    let Ok(branch_name) = head.shorthand() else {
-        return (0, 0, false);
-    };
-    let Ok(branch) = repo.find_branch(branch_name, BranchType::Local) else {
-        return (0, 0, false);
-    };
-    let Ok(upstream) = branch.upstream() else {
-        return (0, 0, false);
-    };
-    let Some(upstream_oid) = upstream.get().target() else {
-        return (0, 0, true);
-    };
-
-    repo.graph_ahead_behind(local_oid, upstream_oid)
-        .map(|(ahead, behind)| {
-            (
-                ahead.min(u32::MAX as usize) as u32,
-                behind.min(u32::MAX as usize) as u32,
-                true,
-            )
-        })
-        .unwrap_or((0, 0, true))
-}
-
-fn last_fetch_at(repo: &Repository) -> Option<SystemTime> {
-    std::fs::metadata(repo.path().join("FETCH_HEAD"))
+fn config_string(path: &Path, key: &str) -> Option<String> {
+    run_git(path, &["config", "--get", key])
         .ok()
-        .and_then(|metadata| metadata.modified().ok())
-}
-
-fn config_string(repo: &Repository, key: &str) -> Option<String> {
-    repo.config()
-        .ok()
-        .and_then(|config| config.get_string(key).ok())
-        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn ahead_behind_count(root: &Path) -> (u32, u32, bool) {
+    let Ok(out) = run_git(
+        root,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            "HEAD...@{upstream}",
+            "--",
+        ],
+    ) else {
+        return (0, 0, false);
+    };
+    let mut parts = out.split_whitespace();
+    let ahead = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let behind = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    (ahead, behind, true)
+}
+
+fn last_fetch_at(root: &Path) -> Option<SystemTime> {
+    git_dir(root)
+        .and_then(|dir| std::fs::metadata(dir.join("FETCH_HEAD")).ok())
+        .and_then(|metadata| metadata.modified().ok())
 }
 
 fn local_config_string(path: &Path, key: &str) -> Option<String> {
@@ -1244,91 +1171,8 @@ fn local_config_bool_with_default(path: &Path, key: &str, default: bool) -> bool
         .unwrap_or(default)
 }
 
-fn load_local_workspace_config(path: &Path) -> LocalWorkspaceConfig {
-    let config_path = local_workspace_config_path(path);
-
-    let contents = match std::fs::read_to_string(&config_path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return LocalWorkspaceConfig::default();
-        }
-        Err(err) => {
-            log::warn!(
-                "failed to read local workspace config path={} err={}",
-                config_path.display(),
-                err
-            );
-            return LocalWorkspaceConfig::default();
-        }
-    };
-
-    match toml::from_str::<LocalWorkspaceConfig>(&contents) {
-        Ok(config) => config,
-        Err(err) => {
-            log::warn!(
-                "failed to parse local workspace config path={} err={}",
-                config_path.display(),
-                err
-            );
-            LocalWorkspaceConfig::default()
-        }
-    }
-}
-
-fn save_local_git_config(
-    path: &Path,
-    commit_timezone: &str,
-    warn_if_remote_owner_mismatch: bool,
-    use_system_timezone: bool,
-    github_auth_account: Option<&github::GitHubAuthAccount>,
-) -> Result<(), String> {
-    let timezone = commit_timezone.trim();
-    let commit_timezone = if timezone.is_empty() {
-        None
-    } else {
-        Some(normalize_timezone(timezone)?)
-    };
-
-    let mut config = load_local_workspace_config(path);
-    config.git.commit_timezone = commit_timezone;
-    config.git.use_system_timezone = Some(use_system_timezone);
-    config.git.warn_if_remote_owner_mismatch = Some(warn_if_remote_owner_mismatch);
-    config.github = local_github_config(github_auth_account);
-    save_local_workspace_config(path, &config)
-}
-
-fn local_github_auth_account(config: &LocalGitHubConfig) -> Option<github::GitHubAuthAccount> {
-    let host = config.auth_host.as_deref()?.trim();
-    let login = config.auth_login.as_deref()?.trim();
-    if host.is_empty() || login.is_empty() {
-        return None;
-    }
-
-    Some(github::GitHubAuthAccount {
-        host: host.to_string(),
-        login: login.to_string(),
-    })
-}
-
-fn local_github_config(account: Option<&github::GitHubAuthAccount>) -> LocalGitHubConfig {
-    let Some(account) = account else {
-        return LocalGitHubConfig::default();
-    };
-    let host = account.host.trim();
-    let login = account.login.trim();
-    if host.is_empty() || login.is_empty() {
-        return LocalGitHubConfig::default();
-    }
-
-    LocalGitHubConfig {
-        auth_host: Some(host.to_string()),
-        auth_login: Some(login.to_string()),
-    }
-}
-
 fn switch_github_auth_for_workspace(path: &Path) -> Result<(), String> {
-    let config = load_local_workspace_config(path);
-    let Some(account) = local_github_auth_account(&config.github) else {
+    let Some(account) = crate::workspace_config::github_auth_account(path) else {
         return Ok(());
     };
 
@@ -1361,54 +1205,6 @@ fn switch_github_auth_for_workspace(path: &Path) -> Result<(), String> {
     }
 }
 
-fn save_local_workspace_config(path: &Path, config: &LocalWorkspaceConfig) -> Result<(), String> {
-    let config_path = local_workspace_config_path(path);
-    let local_dir = config_path
-        .parent()
-        .ok_or_else(|| "Failed to resolve local workspace config directory.".to_string())?;
-
-    std::fs::create_dir_all(local_dir).map_err(|err| {
-        format!(
-            "Failed to create local workspace config directory {}: {err}",
-            local_dir.display()
-        )
-    })?;
-    ensure_local_workspace_gitignore(local_dir)?;
-
-    let contents = toml::to_string_pretty(config)
-        .map_err(|err| format!("Failed to serialize local workspace config: {err}"))?;
-    std::fs::write(&config_path, contents).map_err(|err| {
-        format!(
-            "Failed to write local workspace config {}: {err}",
-            config_path.display()
-        )
-    })?;
-    log::info!(
-        "saved local workspace config path={}",
-        config_path.display()
-    );
-    Ok(())
-}
-
-fn ensure_local_workspace_gitignore(local_dir: &Path) -> Result<(), String> {
-    let gitignore_path = local_dir.join(LOCAL_GITIGNORE_FILE);
-    std::fs::write(&gitignore_path, LOCAL_GITIGNORE_CONTENTS).map_err(|err| {
-        format!(
-            "Failed to write local workspace gitignore {}: {err}",
-            gitignore_path.display()
-        )
-    })?;
-    log::debug!(
-        "initialized local workspace gitignore path={}",
-        gitignore_path.display()
-    );
-    Ok(())
-}
-
-fn local_workspace_config_path(path: &Path) -> PathBuf {
-    path.join(LOCAL_CONFIG_DIR).join(LOCAL_CONFIG_FILE)
-}
-
 fn global_config_string(key: &str) -> Option<String> {
     Command::new("git")
         .args(["config", "--global", "--get", key])
@@ -1439,60 +1235,37 @@ fn unset_local_config(path: &Path, key: &str) -> Result<(), String> {
     }
 }
 
-fn changed_files(repo: &Repository) -> Result<Vec<ChangedFile>, String> {
-    let root = repo_root(repo)?;
-    let mut options = changed_files_status_options(true);
-    let statuses = match repo.statuses(Some(&mut options)) {
-        Ok(statuses) => statuses,
-        Err(err) => {
-            log::warn!(
-                "failed to refresh git index while reading changed files: {}",
-                err.message()
-            );
-            let mut options = changed_files_status_options(false);
-            repo.statuses(Some(&mut options))
-                .map_err(|err| err.message().to_string())?
-        }
-    };
-    let mut files = Vec::new();
-
-    for entry in statuses
+fn changed_files(root: &Path) -> Result<Vec<ChangedFile>, String> {
+    let mut files = status_entries(root)?
         .iter()
-        .filter(|entry| entry.status() != Status::CURRENT)
-    {
-        if entry.status().contains(Status::IGNORED) {
-            continue;
-        }
-
-        let raw_status = entry.status();
-        let path = status_path(&entry);
-        let mut status = status_label(raw_status).to_string();
-        if status == "M" && deletion_only_change(&root, &path) {
-            status = "M-".to_string();
-        }
-
-        let worktree_signature = changed_file_worktree_signature(&root, &path);
-        files.push(ChangedFile {
-            status,
-            path,
-            git_status_bits: raw_status.bits(),
-            worktree_signature,
-        });
-    }
+        .filter(|entry| status_entry_visible(entry))
+        .map(|entry| {
+            let mut file = changed_file_from_porcelain_entry(entry);
+            if file.status == "M" && deletion_only_change(root, &file.path) {
+                file.status = "M-".to_string();
+            }
+            file.worktree_signature = changed_file_worktree_signature(root, &file.path);
+            file
+        })
+        .collect::<Vec<_>>();
 
     sort_changed_files(&mut files);
     Ok(files)
 }
 
-fn changed_files_status_options(update_index: bool) -> StatusOptions {
-    let mut options = StatusOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .renames_head_to_index(true)
-        .renames_index_to_workdir(true)
-        .update_index(update_index);
-    options
+fn status_entries(path: &Path) -> Result<Vec<GitStatusEntry>, String> {
+    let output = run_git_bytes(
+        path,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--untracked-files=all",
+            "--branch",
+            "--porcelain=2",
+            "-z",
+        ],
+    )?;
+    Ok(parse_porcelain_status_entries(&output))
 }
 
 fn changed_file_worktree_signature(root: &Path, file_path: &str) -> Option<ChangedFileSignature> {
@@ -1534,269 +1307,414 @@ fn sort_changed_files(files: &mut [ChangedFile]) {
     });
 }
 
-fn status_path(entry: &git2::StatusEntry<'_>) -> String {
-    entry
-        .index_to_workdir()
-        .and_then(|delta| path_from_delta(&delta))
-        .or_else(|| {
-            entry
-                .head_to_index()
-                .and_then(|delta| path_from_delta(&delta))
-        })
-        .unwrap_or_else(|| String::from_utf8_lossy(entry.path_bytes()).to_string())
+pub(crate) fn parse_porcelain_status_entries(bytes: &[u8]) -> Vec<GitStatusEntry> {
+    let tokens = bytes
+        .split(|byte| *byte == 0)
+        .filter(|token| !token.is_empty())
+        .map(|token| String::from_utf8_lossy(token).to_string())
+        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    let mut index = 0;
+
+    while index < tokens.len() {
+        let field = &tokens[index];
+        index += 1;
+
+        match field.as_bytes().first().copied() {
+            Some(b'1') => {
+                if let Some(entry) = parse_porcelain_changed_entry(field) {
+                    entries.push(entry);
+                }
+            }
+            Some(b'2') => {
+                let old_path = tokens.get(index).cloned();
+                index += usize::from(old_path.is_some());
+                if let Some(entry) = parse_porcelain_renamed_entry(field, old_path) {
+                    entries.push(entry);
+                }
+            }
+            Some(b'u') => {
+                if let Some(entry) = parse_porcelain_unmerged_entry(field) {
+                    entries.push(entry);
+                }
+            }
+            Some(b'?') => {
+                if let Some(path) = field.strip_prefix("? ").filter(|path| !path.is_empty()) {
+                    entries.push(GitStatusEntry {
+                        status_code: "??".to_string(),
+                        path: path.to_string(),
+                        old_path: None,
+                        unmerged: false,
+                        untracked: true,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    entries
 }
 
-fn path_from_delta(delta: &git2::DiffDelta<'_>) -> Option<String> {
-    let path = match delta.status() {
-        Delta::Deleted => delta.old_file().path().or_else(|| delta.new_file().path()),
-        _ => delta.new_file().path().or_else(|| delta.old_file().path()),
-    }?;
-
-    Some(path.to_string_lossy().to_string())
+fn parse_porcelain_changed_entry(field: &str) -> Option<GitStatusEntry> {
+    let mut parts = field.splitn(9, ' ');
+    parts.next()?;
+    let status_code = parts.next()?.to_string();
+    for _ in 0..6 {
+        parts.next()?;
+    }
+    let path = parts.next()?.to_string();
+    Some(GitStatusEntry {
+        status_code,
+        path,
+        old_path: None,
+        unmerged: false,
+        untracked: false,
+    })
 }
 
-fn status_entry_old_path(entry: &git2::StatusEntry<'_>) -> Option<String> {
-    entry
-        .head_to_index()
-        .or_else(|| entry.index_to_workdir())
-        .and_then(|delta| delta.old_file().path())
-        .map(|path| path.to_string_lossy().to_string())
+fn parse_porcelain_renamed_entry(field: &str, old_path: Option<String>) -> Option<GitStatusEntry> {
+    let mut parts = field.splitn(10, ' ');
+    parts.next()?;
+    let status_code = parts.next()?.to_string();
+    for _ in 0..6 {
+        parts.next()?;
+    }
+    parts.next()?;
+    let path = parts.next()?.to_string();
+    Some(GitStatusEntry {
+        status_code,
+        path,
+        old_path,
+        unmerged: false,
+        untracked: false,
+    })
 }
 
-fn status_entry_new_path(entry: &git2::StatusEntry<'_>) -> Option<String> {
-    entry
-        .head_to_index()
-        .or_else(|| entry.index_to_workdir())
-        .and_then(|delta| delta.new_file().path())
-        .map(|path| path.to_string_lossy().to_string())
+fn parse_porcelain_unmerged_entry(field: &str) -> Option<GitStatusEntry> {
+    let mut parts = field.splitn(11, ' ');
+    parts.next()?;
+    let status_code = parts.next()?.to_string();
+    for _ in 0..8 {
+        parts.next()?;
+    }
+    let path = parts.next()?.to_string();
+    Some(GitStatusEntry {
+        status_code,
+        path,
+        old_path: None,
+        unmerged: true,
+        untracked: false,
+    })
 }
 
-fn status_label(status: Status) -> &'static str {
-    if status.contains(Status::CONFLICTED) {
+pub(crate) fn status_entry_visible(entry: &GitStatusEntry) -> bool {
+    entry.status_code != "AD"
+}
+
+pub(crate) fn changed_file_from_porcelain_entry(entry: &GitStatusEntry) -> ChangedFile {
+    ChangedFile {
+        status: porcelain_entry_status_label(entry).to_string(),
+        path: entry.path.clone(),
+        git_status_bits: 0,
+        worktree_signature: None,
+    }
+}
+
+fn porcelain_entry_status_label(entry: &GitStatusEntry) -> &'static str {
+    if entry.unmerged || entry.status_code.contains('U') {
         "U"
-    } else if status.intersects(Status::INDEX_RENAMED | Status::WT_RENAMED) {
+    } else if entry.status_code.contains('R') || entry.status_code.contains('C') {
         "R"
-    } else if status.intersects(Status::INDEX_DELETED | Status::WT_DELETED) {
+    } else if entry.status_code.contains('D') {
         "D"
-    } else if status.intersects(Status::INDEX_NEW | Status::WT_NEW) {
+    } else if entry.untracked || entry.status_code.contains('A') || entry.status_code.contains('?')
+    {
         "A"
     } else {
         "M"
     }
 }
 
-fn delta_status_label(delta: Delta) -> &'static str {
-    match delta {
-        Delta::Added => "A",
-        Delta::Deleted => "D",
-        Delta::Renamed => "R",
-        Delta::Conflicted => "U",
-        _ => "M",
-    }
+pub(crate) fn porcelain_entry_matches_path(entry: &GitStatusEntry, path: &str) -> bool {
+    entry.path == path || entry.old_path.as_deref() == Some(path)
 }
 
-fn history_head(repo: &Repository) -> Option<String> {
-    repo.head()
-        .ok()
-        .and_then(|head| head.target())
-        .map(|oid| oid.to_string())
+pub(crate) fn porcelain_entry_force_remove_paths(entry: &GitStatusEntry) -> Vec<String> {
+    if entry.old_path.is_some() || entry.status_code.contains('D') {
+        return vec![entry.old_path.as_ref().unwrap_or(&entry.path).clone()];
+    }
+    Vec::new()
 }
 
-fn commit_tags_map(repo: &Repository) -> std::collections::HashMap<Oid, Vec<String>> {
-    let mut map = std::collections::HashMap::new();
-    let Ok(tag_names) = repo.tag_names(None) else {
-        return map;
-    };
-    for name in tag_names.iter().filter_map(|name| name.ok().flatten()) {
-        let Ok(object) = repo.revparse_single(&format!("refs/tags/{name}")) else {
-            continue;
-        };
-        let Ok(commit) = object.peel(ObjectType::Commit) else {
-            continue;
-        };
-        map.entry(commit.id())
-            .or_insert_with(Vec::new)
-            .push(name.to_string());
+pub(crate) fn porcelain_entry_update_paths(entry: &GitStatusEntry) -> Vec<String> {
+    if entry.status_code.contains('D') && entry.old_path.is_none() {
+        return Vec::new();
     }
-    for tags in map.values_mut() {
-        tags.sort();
-    }
-    map
+    vec![entry.path.clone()]
 }
 
-fn paged_commits(
-    repo: &Repository,
-    after: Option<&str>,
-    limit: usize,
-) -> Result<CommitPage, String> {
-    let mut walk = repo.revwalk().map_err(|err| err.message().to_string())?;
-    if walk.push_head().is_err() {
-        return Ok(CommitPage::default());
-    }
+fn history_head(root: &Path) -> Option<String> {
+    run_git(root, &["rev-parse", "HEAD"]).ok()
+}
 
-    let tags_map = commit_tags_map(repo);
-
-    let after_oid = after
-        .map(Oid::from_str)
-        .transpose()
-        .map_err(|err| err.message().to_string())?;
-    let mut collecting = after_oid.is_none();
-    let mut commits = Vec::new();
-    for oid in walk.flatten() {
-        if !collecting {
-            if Some(oid) == after_oid {
-                collecting = true;
-            }
-            continue;
-        }
-
-        if commits.len() == limit {
-            return Ok(CommitPage {
-                commits,
-                has_more: true,
-            });
-        }
-
-        let Ok(commit) = repo.find_commit(oid) else {
-            continue;
-        };
-        let tags = tags_map.get(&oid).cloned().unwrap_or_default();
-        commits.push(commit_info(repo, oid, &commit, tags));
-    }
-
-    Ok(CommitPage {
-        commits,
-        has_more: false,
-    })
+fn paged_commits(path: &Path, after: Option<&str>, limit: usize) -> Result<CommitPage, String> {
+    let hashes = rev_list_hashes(path, after, limit)?;
+    commits_from_hashes(path, hashes, limit, |_| true)
 }
 
 fn paged_commit_search(
-    repo: &Repository,
+    path: &Path,
     query: &str,
     after: Option<&str>,
     limit: usize,
 ) -> Result<CommitPage, String> {
-    let mut walk = repo.revwalk().map_err(|err| err.message().to_string())?;
-    if walk.push_head().is_err() {
-        return Ok(CommitPage::default());
-    }
-
     let needle = query.to_lowercase();
-    let tags_map = commit_tags_map(repo);
-    let after_oid = after
-        .map(Oid::from_str)
-        .transpose()
-        .map_err(|err| err.message().to_string())?;
-    let mut collecting = after_oid.is_none();
-    let mut commits = Vec::new();
+    let hashes = rev_list_hashes(path, after, usize::MAX)?;
+    commits_from_hashes(path, hashes, limit, |commit| {
+        commit_search_text(commit).to_lowercase().contains(&needle)
+    })
+}
 
-    for oid in walk.flatten() {
+fn rev_list_hashes(path: &Path, after: Option<&str>, limit: usize) -> Result<Vec<String>, String> {
+    let output = run_git(path, &["rev-list", "HEAD"])?;
+    let mut hashes = Vec::new();
+    let mut collecting = after.is_none();
+    let fetch_limit = limit.saturating_add(1);
+
+    for hash in output
+        .lines()
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
+    {
         if !collecting {
-            if Some(oid) == after_oid {
+            if Some(hash) == after {
                 collecting = true;
             }
             continue;
         }
 
-        let Ok(commit) = repo.find_commit(oid) else {
-            continue;
-        };
-        let tags = tags_map.get(&oid).cloned().unwrap_or_default();
-        if !commit_matches_search(oid, &commit, &tags, &needle) {
+        hashes.push(hash.to_string());
+        if hashes.len() >= fetch_limit {
+            break;
+        }
+    }
+
+    Ok(hashes)
+}
+
+fn commits_from_hashes(
+    path: &Path,
+    hashes: Vec<String>,
+    limit: usize,
+    mut include: impl FnMut(&Commit) -> bool,
+) -> Result<CommitPage, String> {
+    let mut commits = Vec::new();
+    let mut has_more = false;
+
+    for hash in hashes {
+        let commit = commit_details(path, &hash)?;
+        if !include(&commit) {
             continue;
         }
-
         if commits.len() == limit {
-            return Ok(CommitPage {
-                commits,
-                has_more: true,
-            });
+            has_more = true;
+            break;
         }
-
-        commits.push(commit_info(repo, oid, &commit, tags));
+        commits.push(commit);
     }
 
-    Ok(CommitPage {
-        commits,
-        has_more: false,
-    })
+    Ok(CommitPage { commits, has_more })
 }
 
-fn commit_matches_search(
-    oid: Oid,
-    commit: &git2::Commit<'_>,
-    tags: &[String],
-    needle: &str,
-) -> bool {
-    let hash = oid.to_string();
-    if hash.to_lowercase().contains(needle) || hash[..7].to_lowercase().contains(needle) {
-        return true;
-    }
-
-    let message = commit.message().unwrap_or_default();
-    let author = commit.author();
-    let haystack = format!(
-        "{}\n{}\n{}\n{}",
-        message,
-        author.name().unwrap_or_default(),
-        author.email().unwrap_or_default(),
-        tags.join("\n")
-    );
-    haystack.to_lowercase().contains(needle)
+fn commit_search_text(commit: &Commit) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        commit.hash,
+        commit.short_hash,
+        commit.subject,
+        commit.comment,
+        commit.author,
+        commit.author_email.as_deref().unwrap_or_default()
+    )
 }
 
-fn commit_info(
-    repo: &Repository,
-    oid: Oid,
-    commit: &git2::Commit<'_>,
+fn parse_commit_details(
+    output: &str,
     tags: Vec<String>,
-) -> Commit {
-    let hash = oid.to_string();
-    let (subject, comment) = commit_message_parts(commit.message().unwrap_or_default());
-    let (insertions, deletions) = commit_line_stats(repo, commit).unwrap_or_default();
-    Commit {
-        hash: hash.clone(),
-        short_hash: hash[..7].to_string(),
+    insertions: usize,
+    deletions: usize,
+) -> Result<Commit, String> {
+    let mut parts = output.splitn(6, '\x1f');
+    let hash = parts
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Commit details did not include a hash.".to_string())?
+        .trim()
+        .to_string();
+    let short_hash = parts
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|| short_hash(&hash).to_string());
+    let author = parts
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|| "Unknown author".to_string());
+    let author_email = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let timestamp = parts
+        .next()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let message = parts.next().unwrap_or_default();
+    let (subject, comment) = commit_message_parts(message);
+
+    Ok(Commit {
+        hash,
+        short_hash,
         subject: if subject.is_empty() {
             "Untitled commit".to_string()
         } else {
             subject
         },
         comment,
-        author: commit
-            .author()
-            .name()
-            .unwrap_or("Unknown author")
-            .to_string(),
-        author_email: commit.author().email().ok().map(ToString::to_string),
-        relative_time: relative_time(commit.time().seconds()),
+        author,
+        author_email,
+        relative_time: relative_time(timestamp),
         insertions,
         deletions,
         tags,
+    })
+}
+
+fn commit_line_stats(path: &Path, hash: &str) -> Result<(usize, usize), String> {
+    let output = run_git(path, &["show", "--numstat", "--format=", hash])?;
+    Ok(numstat_totals(&output))
+}
+
+fn numstat_totals(output: &str) -> (usize, usize) {
+    let mut insertions = 0usize;
+    let mut deletions = 0usize;
+    for line in output.lines() {
+        let mut fields = line.split('\t');
+        let Some(added) = fields.next() else {
+            continue;
+        };
+        let Some(deleted) = fields.next() else {
+            continue;
+        };
+        insertions += added.parse::<usize>().unwrap_or(0);
+        deletions += deleted.parse::<usize>().unwrap_or(0);
+    }
+    (insertions, deletions)
+}
+
+fn parse_name_status_files_z(bytes: &[u8]) -> Vec<ChangedFile> {
+    parse_name_status_entries_z(bytes)
+        .into_iter()
+        .map(|entry| ChangedFile {
+            status: name_status_label(&entry.status).to_string(),
+            path: entry.new_path.or(entry.old_path).unwrap_or_default(),
+            git_status_bits: 0,
+            worktree_signature: None,
+        })
+        .filter(|file| !file.path.is_empty())
+        .collect()
+}
+
+fn parse_name_status_path_pairs_z(bytes: &[u8]) -> Vec<FilePathPair> {
+    parse_name_status_entries_z(bytes)
+        .into_iter()
+        .map(|entry| FilePathPair {
+            old_path: entry.old_path,
+            new_path: entry.new_path,
+        })
+        .collect()
+}
+
+struct NameStatusEntry {
+    status: String,
+    old_path: Option<String>,
+    new_path: Option<String>,
+}
+
+fn parse_name_status_entries_z(bytes: &[u8]) -> Vec<NameStatusEntry> {
+    let tokens = bytes
+        .split(|byte| *byte == 0)
+        .filter(|token| !token.is_empty())
+        .map(|token| String::from_utf8_lossy(token).to_string())
+        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    let mut index = 0;
+
+    while index < tokens.len() {
+        let status = tokens[index].clone();
+        index += 1;
+        let Some(kind) = status.chars().next() else {
+            continue;
+        };
+
+        match kind {
+            'R' | 'C' => {
+                let old_path = tokens.get(index).cloned();
+                let new_path = tokens.get(index + 1).cloned();
+                index += usize::from(old_path.is_some()) + usize::from(new_path.is_some());
+                entries.push(NameStatusEntry {
+                    status,
+                    old_path,
+                    new_path,
+                });
+            }
+            'A' => {
+                let new_path = tokens.get(index).cloned();
+                index += usize::from(new_path.is_some());
+                entries.push(NameStatusEntry {
+                    status,
+                    old_path: None,
+                    new_path,
+                });
+            }
+            'D' => {
+                let old_path = tokens.get(index).cloned();
+                index += usize::from(old_path.is_some());
+                entries.push(NameStatusEntry {
+                    status,
+                    old_path,
+                    new_path: None,
+                });
+            }
+            _ => {
+                let path = tokens.get(index).cloned();
+                index += usize::from(path.is_some());
+                entries.push(NameStatusEntry {
+                    status,
+                    old_path: path.clone(),
+                    new_path: path,
+                });
+            }
+        }
+    }
+
+    entries
+}
+
+fn name_status_label(status: &str) -> &'static str {
+    match status.chars().next() {
+        Some('A') => "A",
+        Some('D') => "D",
+        Some('R') | Some('C') => "R",
+        Some('U') => "U",
+        _ => "M",
     }
 }
 
-fn commit_line_stats(
-    repo: &Repository,
-    commit: &git2::Commit<'_>,
-) -> Result<(usize, usize), String> {
-    let new_tree = commit.tree().map_err(|err| err.message().to_string())?;
-    let old_tree = if commit.parent_count() == 0 {
-        None
-    } else {
-        Some(
-            commit
-                .parent(0)
-                .and_then(|parent| parent.tree())
-                .map_err(|err| err.message().to_string())?,
-        )
-    };
-    let diff = repo
-        .diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)
-        .map_err(|err| err.message().to_string())?;
-    let stats = diff.stats().map_err(|err| err.message().to_string())?;
-
-    Ok((stats.insertions(), stats.deletions()))
+fn short_hash(hash: &str) -> &str {
+    hash.get(..7).unwrap_or(hash)
 }
 
 fn relative_time(seconds: i64) -> String {
@@ -1823,52 +1741,16 @@ fn plural(value: i64, unit: &str) -> String {
     }
 }
 
-fn file_diff_rows_with_paths(
-    repo: &Repository,
-    file_path: &str,
-) -> Result<DiffRowsWithFilePaths, String> {
-    let mut options = DiffOptions::new();
-    configure_diff_options_for_path(file_path, &mut options);
-
-    let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
-    let mut diff = repo
-        .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut options))
-        .map_err(|err| err.message().to_string())?;
-    diff.find_similar(Some(&mut DiffFindOptions::new()))
-        .map_err(|err| err.message().to_string())?;
-
-    diff_rows_and_paths(&diff, file_path)
-}
-
-fn commit_file_diff_rows_with_paths(
-    repo: &Repository,
-    old_tree: Option<&Tree<'_>>,
-    new_tree: &Tree<'_>,
-    file_path: &str,
-) -> Result<DiffRowsWithFilePaths, String> {
-    let mut options = DiffOptions::new();
-    configure_diff_options_for_path(file_path, &mut options);
-    let mut diff = repo
-        .diff_tree_to_tree(old_tree, Some(new_tree), Some(&mut options))
-        .map_err(|err| err.message().to_string())?;
-    diff.find_similar(Some(&mut DiffFindOptions::new()))
-        .map_err(|err| err.message().to_string())?;
-
-    diff_rows_and_paths(&diff, file_path)
-}
-
 const MAX_BINARY_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
 
 pub fn bytes_comparison(path: &Path, file_path: &str) -> Result<BytesComparison, String> {
-    let repo = open_repo(path)?;
-    let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
-    let DiffRowsWithFilePaths { paths, .. } = file_diff_rows_with_paths(&repo, file_path)?;
+    let paths = worktree_file_path_pair(path, file_path)?;
     let old_path = paths.old_path.as_deref().unwrap_or(file_path);
     let new_path = paths.new_path.as_deref().unwrap_or(file_path);
 
     Ok(BytesComparison {
-        before: tree_file_binary_bytes_opt(&repo, head_tree.as_ref(), old_path)?,
-        after: workdir_binary_bytes(&repo, new_path)?,
+        before: tree_file_binary_bytes_opt(path, Some("HEAD"), old_path)?,
+        after: workdir_binary_bytes(path, new_path)?,
     })
 }
 
@@ -1877,46 +1759,57 @@ pub fn commit_bytes_comparison(
     hash: &str,
     file_path: &str,
 ) -> Result<BytesComparison, String> {
-    let repo = open_repo(path)?;
-    let (old_tree, new_tree) = commit_trees(&repo, hash)?;
-    let DiffRowsWithFilePaths { paths, .. } =
-        commit_file_diff_rows_with_paths(&repo, old_tree.as_ref(), &new_tree, file_path)?;
+    let paths = commit_file_path_pair(path, hash, file_path)?;
     let old_path = paths.old_path.as_deref().unwrap_or(file_path);
     let new_path = paths.new_path.as_deref().unwrap_or(file_path);
+    let parent = commit_parent_hash(path, hash)?;
 
     Ok(BytesComparison {
-        before: tree_file_binary_bytes_opt(&repo, old_tree.as_ref(), old_path)?,
-        after: tree_file_binary_bytes_opt(&repo, Some(&new_tree), new_path)?,
+        before: tree_file_binary_bytes_opt(path, parent.as_deref(), old_path)?,
+        after: tree_file_binary_bytes_opt(path, Some(hash), new_path)?,
     })
 }
 
 fn ensure_worktree_text_previewable(
-    repo: &Repository,
+    repo_path: &Path,
     old_path: &str,
     new_path: &str,
 ) -> Result<(), String> {
-    let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
-    ensure_tree_text_previewable(repo, head_tree.as_ref(), old_path)?;
-    ensure_workdir_text_previewable(repo, new_path)
+    ensure_tree_text_previewable(repo_path, Some("HEAD"), old_path)?;
+    ensure_workdir_text_previewable(repo_path, new_path)
 }
 
 fn ensure_commit_text_previewable(
-    repo: &Repository,
-    old_tree: Option<&Tree<'_>>,
-    new_tree: &Tree<'_>,
+    repo_path: &Path,
+    hash: &str,
     old_path: &str,
     new_path: &str,
 ) -> Result<(), String> {
-    ensure_tree_text_previewable(repo, old_tree, old_path)?;
-    ensure_tree_text_previewable(repo, Some(new_tree), new_path)
+    let parent = commit_parent_hash(repo_path, hash)?;
+    ensure_tree_text_previewable(repo_path, parent.as_deref(), old_path)?;
+    ensure_tree_text_previewable(repo_path, Some(hash), new_path)
 }
 
 fn complete_diff_rows(
     rows: Vec<FileDiffRow>,
     left_lines: &[String],
     right_lines: &[String],
+    complete_empty: bool,
 ) -> Vec<FileDiffRow> {
     if rows.is_empty() {
+        if complete_empty {
+            let mut complete = Vec::new();
+            append_context_gap(
+                &mut complete,
+                left_lines,
+                right_lines,
+                1,
+                left_lines.len().saturating_add(1),
+                1,
+                right_lines.len().saturating_add(1),
+            );
+            return complete;
+        }
         return rows;
     }
 
@@ -1993,90 +1886,6 @@ fn append_context_gap(
     }
 }
 
-fn diff_rows_and_paths(
-    diff: &git2::Diff<'_>,
-    file_path: &str,
-) -> Result<DiffRowsWithFilePaths, String> {
-    let builder = RefCell::new(DiffRowsBuilder::default());
-    let first_paths = RefCell::new(None::<FilePathPair>);
-    let matched_paths = RefCell::new(None::<FilePathPair>);
-
-    diff.foreach(
-        &mut |delta, _progress| {
-            let paths = file_path_pair_from_delta(&delta);
-
-            if first_paths.borrow().is_none() {
-                first_paths.replace(Some(paths.clone()));
-            }
-            if is_file_path_match(file_path, &paths) {
-                matched_paths.replace(Some(paths));
-            }
-
-            true
-        },
-        None,
-        Some(&mut |_delta, _hunk| {
-            builder.borrow_mut().flush();
-            true
-        }),
-        Some(&mut |_delta, _hunk, line| {
-            builder.borrow_mut().push(
-                line.origin_value(),
-                line.old_lineno(),
-                line.new_lineno(),
-                line.content(),
-            );
-            true
-        }),
-    )
-    .map_err(|err| err.message().to_string())?;
-
-    let mut builder = builder.into_inner();
-    builder.flush();
-
-    let paths = matched_paths
-        .into_inner()
-        .or(first_paths.into_inner())
-        .unwrap_or_default();
-
-    if paths.old_path.is_some() && paths.new_path.is_some() && paths.old_path != paths.new_path {
-        log::debug!(
-            "resolved renamed diff path for {}: {} -> {}",
-            file_path,
-            paths.old_path.as_deref().unwrap_or("<missing>"),
-            paths.new_path.as_deref().unwrap_or("<missing>")
-        );
-    }
-
-    Ok(DiffRowsWithFilePaths {
-        rows: builder.rows,
-        paths,
-    })
-}
-
-fn configure_diff_options_for_path(file_path: &str, options: &mut DiffOptions) {
-    options
-        .pathspec(file_path)
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .show_untracked_content(true)
-        .context_lines(3)
-        .interhunk_lines(0);
-}
-
-fn file_path_pair_from_delta(delta: &git2::DiffDelta<'_>) -> FilePathPair {
-    FilePathPair {
-        old_path: delta
-            .old_file()
-            .path()
-            .map(|path| path.to_string_lossy().to_string()),
-        new_path: delta
-            .new_file()
-            .path()
-            .map(|path| path.to_string_lossy().to_string()),
-    }
-}
-
 fn is_file_path_match(file_path: &str, paths: &FilePathPair) -> bool {
     paths
         .old_path
@@ -2088,74 +1897,186 @@ fn is_file_path_match(file_path: &str, paths: &FilePathPair) -> bool {
             .is_some_and(|new_path| new_path == file_path)
 }
 
-fn head_file_lines(repo: &Repository, file_path: &str) -> Result<Vec<String>, String> {
-    let Some(tree) = repo.head().ok().and_then(|head| head.peel_to_tree().ok()) else {
-        return Ok(Vec::new());
-    };
-
-    tree_file_lines(repo, &tree, file_path)
+fn paths_changed(paths: &FilePathPair) -> bool {
+    paths.old_path.is_some() && paths.new_path.is_some() && paths.old_path != paths.new_path
 }
 
-fn workdir_file_lines(repo: &Repository, file_path: &str) -> Result<Vec<String>, String> {
-    let bytes = match workdir_text_bytes(repo, file_path)? {
+fn worktree_file_path_pair(path: &Path, file_path: &str) -> Result<FilePathPair, String> {
+    let entries = status_entries(path)?;
+    Ok(entries
+        .iter()
+        .find(|entry| porcelain_entry_matches_path(entry, file_path))
+        .map(|entry| FilePathPair {
+            old_path: if entry.untracked {
+                None
+            } else {
+                entry.old_path.clone().or_else(|| Some(entry.path.clone()))
+            },
+            new_path: Some(entry.path.clone()),
+        })
+        .unwrap_or_else(|| FilePathPair {
+            old_path: Some(file_path.to_string()),
+            new_path: Some(file_path.to_string()),
+        }))
+}
+
+fn commit_file_path_pair(path: &Path, hash: &str, file_path: &str) -> Result<FilePathPair, String> {
+    Ok(commit_name_status_entries(path, hash)?
+        .into_iter()
+        .find(|paths| is_file_path_match(file_path, paths))
+        .unwrap_or_else(|| FilePathPair {
+            old_path: Some(file_path.to_string()),
+            new_path: Some(file_path.to_string()),
+        }))
+}
+
+fn commit_name_status_entries(path: &Path, hash: &str) -> Result<Vec<FilePathPair>, String> {
+    let output = run_git_bytes(
+        path,
+        &[
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "-M",
+            "-z",
+            hash,
+        ],
+    )?;
+    Ok(parse_name_status_path_pairs_z(&output))
+}
+
+fn worktree_diff(path: &Path, paths: &FilePathPair, fallback_path: &str) -> Result<String, String> {
+    if paths.old_path.is_none()
+        && let Some(new_path) = paths.new_path.as_deref()
+    {
+        let root = repo_root(path)?;
+        return run_git_owned_with_success_codes(
+            path,
+            &[
+                "diff".to_string(),
+                "--no-index".to_string(),
+                "--no-ext-diff".to_string(),
+                "--no-color".to_string(),
+                "--unified=3".to_string(),
+                "--".to_string(),
+                "/dev/null".to_string(),
+                root.join(new_path).display().to_string(),
+            ],
+            &[0, 1],
+        );
+    }
+
+    let mut args = vec![
+        "diff".to_string(),
+        "HEAD".to_string(),
+        "--no-ext-diff".to_string(),
+        "--find-renames".to_string(),
+        "--no-color".to_string(),
+        "--unified=3".to_string(),
+    ];
+    args.extend(diff_args_for_paths(&[
+        paths.old_path.as_deref(),
+        paths.new_path.as_deref(),
+        Some(fallback_path),
+    ]));
+    run_git_owned(path, &args)
+}
+
+fn commit_diff(
+    path: &Path,
+    hash: &str,
+    paths: &FilePathPair,
+    fallback_path: &str,
+) -> Result<String, String> {
+    let mut args = vec![
+        "show".to_string(),
+        "--format=".to_string(),
+        "--find-renames".to_string(),
+        "--no-ext-diff".to_string(),
+        "--no-color".to_string(),
+        "--unified=3".to_string(),
+        hash.to_string(),
+    ];
+    args.extend(diff_args_for_paths(&[
+        paths.old_path.as_deref(),
+        paths.new_path.as_deref(),
+        Some(fallback_path),
+    ]));
+    run_git_owned(path, &args)
+}
+
+fn diff_args_for_paths(paths: &[Option<&str>]) -> Vec<String> {
+    let mut args = vec!["--".to_string()];
+    let mut seen = HashSet::new();
+    for path in paths.iter().flatten().filter(|path| !path.is_empty()) {
+        if seen.insert((*path).to_string()) {
+            args.push((*path).to_string());
+        }
+    }
+    args
+}
+
+fn head_file_lines(repo_path: &Path, file_path: &str) -> Result<Vec<String>, String> {
+    tree_file_lines_opt(repo_path, Some("HEAD"), file_path)
+}
+
+fn workdir_file_lines(repo_path: &Path, file_path: &str) -> Result<Vec<String>, String> {
+    let bytes = match workdir_text_bytes(repo_path, file_path)? {
         Some(bytes) => bytes,
         None => return Ok(Vec::new()),
     };
-
-    Ok(String::from_utf8_lossy(&bytes)
-        .lines()
-        .map(ToString::to_string)
-        .collect())
+    Ok(lines_from_bytes(&bytes))
 }
 
 fn tree_file_lines_opt(
-    repo: &Repository,
-    tree: Option<&Tree<'_>>,
+    repo_path: &Path,
+    rev: Option<&str>,
     file_path: &str,
 ) -> Result<Vec<String>, String> {
-    match tree {
-        Some(tree) => tree_file_lines(repo, tree, file_path),
-        None => Ok(Vec::new()),
-    }
+    let Some(rev) = rev else {
+        return Ok(Vec::new());
+    };
+    tree_file_lines(repo_path, rev, file_path)
 }
 
-fn tree_file_lines(
-    repo: &Repository,
-    tree: &Tree<'_>,
-    file_path: &str,
-) -> Result<Vec<String>, String> {
-    let Some(bytes) = tree_file_bytes(repo, tree, file_path, MAX_TEXT_PREVIEW_BYTES)? else {
+fn tree_file_lines(repo_path: &Path, rev: &str, file_path: &str) -> Result<Vec<String>, String> {
+    let Some(bytes) = tree_file_bytes(repo_path, rev, file_path, MAX_TEXT_PREVIEW_BYTES)? else {
         return Ok(Vec::new());
     };
     ensure_blob_text_previewable(&bytes)?;
-
-    Ok(String::from_utf8_lossy(&bytes)
-        .lines()
-        .map(ToString::to_string)
-        .collect())
+    Ok(lines_from_bytes(&bytes))
 }
 
-fn ensure_workdir_text_previewable(repo: &Repository, file_path: &str) -> Result<(), String> {
-    let _ = workdir_text_bytes(repo, file_path)?;
+fn lines_from_bytes(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn ensure_workdir_text_previewable(repo_path: &Path, file_path: &str) -> Result<(), String> {
+    let _ = workdir_text_bytes(repo_path, file_path)?;
     Ok(())
 }
 
 fn ensure_tree_text_previewable(
-    repo: &Repository,
-    tree: Option<&Tree<'_>>,
+    repo_path: &Path,
+    rev: Option<&str>,
     file_path: &str,
 ) -> Result<(), String> {
-    let Some(tree) = tree else {
+    let Some(rev) = rev else {
         return Ok(());
     };
-    let Some(bytes) = tree_file_bytes(repo, tree, file_path, MAX_TEXT_PREVIEW_BYTES)? else {
+    let Some(bytes) = tree_file_bytes(repo_path, rev, file_path, MAX_TEXT_PREVIEW_BYTES)? else {
         return Ok(());
     };
     ensure_blob_text_previewable(&bytes)
 }
 
-fn workdir_text_bytes(repo: &Repository, file_path: &str) -> Result<Option<Vec<u8>>, String> {
-    let path = repo_root(repo)?.join(file_path);
+fn workdir_text_bytes(repo_path: &Path, file_path: &str) -> Result<Option<Vec<u8>>, String> {
+    let path = repo_root(repo_path)?.join(file_path);
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2187,8 +2108,8 @@ fn ensure_blob_text_previewable(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn workdir_binary_bytes(repo: &Repository, file_path: &str) -> Result<Option<Vec<u8>>, String> {
-    let path = repo_root(repo)?.join(file_path);
+fn workdir_binary_bytes(repo_path: &Path, file_path: &str) -> Result<Option<Vec<u8>>, String> {
+    let path = repo_root(repo_path)?.join(file_path);
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2206,38 +2127,35 @@ fn workdir_binary_bytes(repo: &Repository, file_path: &str) -> Result<Option<Vec
 }
 
 fn tree_file_binary_bytes_opt(
-    repo: &Repository,
-    tree: Option<&Tree<'_>>,
+    repo_path: &Path,
+    rev: Option<&str>,
     file_path: &str,
 ) -> Result<Option<Vec<u8>>, String> {
-    let Some(tree) = tree else {
+    let Some(rev) = rev else {
         return Ok(None);
     };
-    tree_file_bytes(repo, tree, file_path, MAX_BINARY_PREVIEW_BYTES)
+    tree_file_bytes(repo_path, rev, file_path, MAX_BINARY_PREVIEW_BYTES)
 }
 
 fn tree_file_bytes(
-    repo: &Repository,
-    tree: &Tree<'_>,
+    repo_path: &Path,
+    rev: &str,
     file_path: &str,
     max_bytes: usize,
 ) -> Result<Option<Vec<u8>>, String> {
-    let entry = match tree.get_path(Path::new(file_path)) {
-        Ok(entry) => entry,
-        Err(err) if err.code() == ErrorCode::NotFound => return Ok(None),
-        Err(err) => return Err(err.message().to_string()),
-    };
-    let object = entry
-        .to_object(repo)
-        .map_err(|err| err.message().to_string())?;
-    let Some(blob) = object.as_blob() else {
+    let spec = format!("{rev}:{file_path}");
+    if run_git(repo_path, &["cat-file", "-e", &spec]).is_err() {
         return Ok(None);
-    };
-    if blob.size() > max_bytes {
+    }
+    let size = run_git(repo_path, &["cat-file", "-s", &spec])?
+        .trim()
+        .parse::<usize>()
+        .map_err(|err| format!("Failed to parse git object size: {err}"))?;
+    if size > max_bytes {
         return Err(format!("{} is too large to preview.", file_name(file_path)));
     }
 
-    Ok(Some(blob.content().to_vec()))
+    run_git_bytes(repo_path, &["show", &spec]).map(Some)
 }
 
 fn is_binary_bytes(bytes: &[u8]) -> bool {
@@ -2250,29 +2168,6 @@ fn file_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-fn commit_trees<'repo>(
-    repo: &'repo Repository,
-    hash: &str,
-) -> Result<(Option<Tree<'repo>>, Tree<'repo>), String> {
-    let oid = Oid::from_str(hash).map_err(|err| err.message().to_string())?;
-    let commit = repo
-        .find_commit(oid)
-        .map_err(|err| err.message().to_string())?;
-    let new_tree = commit.tree().map_err(|err| err.message().to_string())?;
-    let old_tree = if commit.parent_count() == 0 {
-        None
-    } else {
-        Some(
-            commit
-                .parent(0)
-                .and_then(|parent| parent.tree())
-                .map_err(|err| err.message().to_string())?,
-        )
-    };
-
-    Ok((old_tree, new_tree))
-}
-
 #[derive(Default)]
 struct DiffRowsBuilder {
     rows: Vec<FileDiffRow>,
@@ -2281,41 +2176,29 @@ struct DiffRowsBuilder {
 }
 
 impl DiffRowsBuilder {
-    fn push(
+    fn push_context(
         &mut self,
-        line_type: DiffLineType,
-        old_number: Option<u32>,
-        new_number: Option<u32>,
-        content: &[u8],
+        left_number: Option<usize>,
+        right_number: Option<usize>,
+        text: String,
     ) {
-        match line_type {
-            DiffLineType::Context | DiffLineType::ContextEOFNL => {
-                self.flush();
-                self.rows.push(FileDiffRow {
-                    left_number: old_number.map(|number| number as usize),
-                    right_number: new_number.map(|number| number as usize),
-                    left_text: Some(diff_line_text(content)),
-                    right_text: Some(diff_line_text(content)),
-                    left_kind: DiffKind::Context,
-                    right_kind: DiffKind::Context,
-                });
-            }
-            DiffLineType::Deletion | DiffLineType::DeleteEOFNL => {
-                self.deleted.push(PendingDiffLine {
-                    number: old_number.map(|number| number as usize),
-                    text: diff_line_text(content),
-                });
-            }
-            DiffLineType::Addition | DiffLineType::AddEOFNL => {
-                self.added.push(PendingDiffLine {
-                    number: new_number.map(|number| number as usize),
-                    text: diff_line_text(content),
-                });
-            }
-            DiffLineType::FileHeader | DiffLineType::HunkHeader | DiffLineType::Binary => {
-                self.flush();
-            }
-        }
+        self.flush();
+        self.rows.push(FileDiffRow {
+            left_number,
+            right_number,
+            left_text: Some(text.clone()),
+            right_text: Some(text),
+            left_kind: DiffKind::Context,
+            right_kind: DiffKind::Context,
+        });
+    }
+
+    fn push_deleted(&mut self, number: Option<usize>, text: String) {
+        self.deleted.push(PendingDiffLine { number, text });
+    }
+
+    fn push_added(&mut self, number: Option<usize>, text: String) {
+        self.added.push(PendingDiffLine { number, text });
     }
 
     fn flush(&mut self) {
@@ -2351,10 +2234,97 @@ struct PendingDiffLine {
     text: String,
 }
 
-fn diff_line_text(content: &[u8]) -> String {
-    String::from_utf8_lossy(content)
-        .trim_end_matches(['\r', '\n'])
-        .to_string()
+fn parse_unified_diff(diff: &str) -> Vec<FileDiffRow> {
+    let mut builder = DiffRowsBuilder::default();
+    let mut next_left = None::<usize>;
+    let mut next_right = None::<usize>;
+    let mut in_hunk = false;
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            builder.flush();
+            next_left = None;
+            next_right = None;
+            in_hunk = false;
+            continue;
+        }
+        if !in_hunk && is_unified_metadata_line(line) {
+            builder.flush();
+            continue;
+        }
+        if line.starts_with("@@") {
+            builder.flush();
+            if let Some((left, right)) = parse_hunk_line_numbers(line) {
+                next_left = Some(left);
+                next_right = Some(right);
+            }
+            in_hunk = true;
+            continue;
+        }
+        if line.starts_with("\\ ") {
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+
+        if let Some(text) = line.strip_prefix('-') {
+            let left_number = next_left;
+            next_left = next_left.map(|number| number.saturating_add(1));
+            builder.push_deleted(left_number, text.to_string());
+        } else if let Some(text) = line.strip_prefix('+') {
+            let right_number = next_right;
+            next_right = next_right.map(|number| number.saturating_add(1));
+            builder.push_added(right_number, text.to_string());
+        } else {
+            let text = line.strip_prefix(' ').unwrap_or(line).to_string();
+            let left_number = next_left;
+            let right_number = next_right;
+            next_left = next_left.map(|number| number.saturating_add(1));
+            next_right = next_right.map(|number| number.saturating_add(1));
+            builder.push_context(left_number, right_number, text);
+        }
+    }
+
+    builder.flush();
+    builder.rows
+}
+
+fn is_unified_metadata_line(line: &str) -> bool {
+    line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("old mode ")
+        || line.starts_with("new mode ")
+        || line.starts_with("deleted file mode ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("copy from ")
+        || line.starts_with("copy to ")
+        || line.starts_with("rename from ")
+        || line.starts_with("rename to ")
+        || line.starts_with("similarity index ")
+        || line.starts_with("dissimilarity index ")
+        || line.starts_with("Binary files ")
+        || line.starts_with("GIT binary patch")
+        || line.starts_with("literal ")
+        || line.starts_with("delta ")
+}
+
+fn parse_hunk_line_numbers(line: &str) -> Option<(usize, usize)> {
+    let mut parts = line.split_whitespace();
+    parts.next()?;
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    Some((parse_hunk_start(old)?, parse_hunk_start(new)?))
+}
+
+fn parse_hunk_start(value: &str) -> Option<usize> {
+    value
+        .split_once(',')
+        .map(|(start, _)| start)
+        .unwrap_or(value)
+        .parse::<usize>()
+        .ok()
 }
 
 fn run_git(path: &Path, args: &[&str]) -> Result<String, String> {
@@ -2366,6 +2336,22 @@ fn run_git(path: &Path, args: &[&str]) -> Result<String, String> {
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+fn run_git_bytes(path: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .map_err(|err| format!("Failed to run git: {err}"))?;
+
+    if output.status.success() {
+        Ok(output.stdout)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -2500,12 +2486,51 @@ fn progress_percent(line: &str) -> Option<String> {
 }
 
 fn run_git_owned(path: &Path, args: &[String]) -> Result<String, String> {
+    run_git_owned_with_success_codes(path, args, &[0])
+}
+
+fn run_git_owned_with_success_codes(
+    path: &Path,
+    args: &[String],
+    success_codes: &[i32],
+) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(path)
         .output()
         .map_err(|err| format!("Failed to run git: {err}"))?;
 
+    if output
+        .status
+        .code()
+        .is_some_and(|code| success_codes.contains(&code))
+    {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+fn run_git_owned_with_stdin(path: &Path, args: &[String], stdin: &[u8]) -> Result<String, String> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("Failed to run git: {err}"))?;
+    if let Some(mut child_stdin) = child.stdin.take() {
+        child_stdin
+            .write_all(stdin)
+            .map_err(|err| format!("Failed to write git stdin: {err}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("Failed to wait for git: {err}"))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
@@ -2518,8 +2543,58 @@ fn run_git_owned(path: &Path, args: &[String]) -> Result<String, String> {
 fn run_git_owned_with_commit_timezone(path: &Path, args: &[String]) -> Result<String, String> {
     let mut command = Command::new("git");
     command.args(args).current_dir(path);
+    configure_commit_timezone_env(path, &mut command)?;
 
-    let local_git_config = load_local_workspace_config(path).git;
+    let output = command
+        .output()
+        .map_err(|err| format!("Failed to run git: {err}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+fn run_git_owned_with_commit_timezone_and_stdin(
+    path: &Path,
+    args: &[String],
+    stdin: &[u8],
+) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_commit_timezone_env(path, &mut command)?;
+
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("Failed to run git: {err}"))?;
+    if let Some(mut child_stdin) = child.stdin.take() {
+        child_stdin
+            .write_all(stdin)
+            .map_err(|err| format!("Failed to write git stdin: {err}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("Failed to wait for git: {err}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+fn configure_commit_timezone_env(path: &Path, command: &mut Command) -> Result<(), String> {
+    let local_git_config = crate::workspace_config::git_config(path);
     let commit_timezone = local_git_config
         .commit_timezone
         .or_else(|| local_config_string(path, COMMIT_TIMEZONE_KEY));
@@ -2527,7 +2602,7 @@ fn run_git_owned_with_commit_timezone(path: &Path, args: &[String]) -> Result<St
         .use_system_timezone
         .unwrap_or_else(|| local_config_bool(path, USE_SYSTEM_TIMEZONE_KEY));
     let timezone = match commit_timezone {
-        Some(timezone) => Some(normalize_timezone(&timezone)?),
+        Some(timezone) => Some(crate::workspace_config::normalize_timezone(&timezone)?),
         None if use_system_timezone => None,
         None => Some(DEFAULT_COMMIT_TIMEZONE.to_string()),
     };
@@ -2545,47 +2620,7 @@ fn run_git_owned_with_commit_timezone(path: &Path, args: &[String]) -> Result<St
         log::debug!("using system timezone for commit");
     }
 
-    let output = command
-        .output()
-        .map_err(|err| format!("Failed to run git: {err}"))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Err(if stderr.is_empty() { stdout } else { stderr })
-    }
-}
-
-fn normalize_timezone(value: &str) -> Result<String, String> {
-    let value = value.trim();
-    let compact = if value.len() == 6 && value.as_bytes()[3] == b':' {
-        format!("{}{}", &value[..3], &value[4..])
-    } else {
-        value.to_string()
-    };
-
-    let bytes = compact.as_bytes();
-    if compact.len() != 5 || !matches!(bytes[0], b'+' | b'-') {
-        return Err("Commit timezone must look like +0000, -0500, or +09:30.".to_string());
-    }
-    if !bytes[1..].iter().all(u8::is_ascii_digit) {
-        return Err("Commit timezone must look like +0000, -0500, or +09:30.".to_string());
-    }
-
-    let hours: u8 = compact[1..3]
-        .parse()
-        .map_err(|_| "Commit timezone hours must be between 00 and 23.".to_string())?;
-    let minutes: u8 = compact[3..5]
-        .parse()
-        .map_err(|_| "Commit timezone minutes must be between 00 and 59.".to_string())?;
-
-    if hours > 23 || minutes > 59 {
-        return Err("Commit timezone must use hours 00-23 and minutes 00-59.".to_string());
-    }
-
-    Ok(compact)
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2614,47 +2649,46 @@ pub fn get_repo_metadata_with(
         Option<&str>,
     ) -> Option<crate::bitbucket::BitbucketRepoMetadata>,
 ) -> RepoMetadata {
-    let Ok(repo) = open_repo(path) else {
+    let Ok(root) = repo_root(path) else {
         return RepoMetadata::Folder;
     };
 
-    if repo.find_remote("upstream").is_ok() {
+    if remote_url(&root, "upstream").is_some() {
         return RepoMetadata::Fork;
     }
 
-    let remote_name = upstream_remote(&repo)
-        .or_else(|| Some("origin".to_string()).filter(|remote| repo.find_remote(remote).is_ok()));
+    let remote_name = upstream_remote(&root).or_else(|| {
+        Some("origin".to_string()).filter(|remote| remote_url(&root, remote).is_some())
+    });
 
     if let Some(name) = remote_name {
-        if let Ok(remote) = repo.find_remote(&name) {
-            if let Ok(url) = remote.url() {
-                if let Some(slug) = crate::github::parse_github_url(url)
-                    && let Some(metadata) = github_metadata(&slug, Some(&name), Some(url))
-                {
-                    return match metadata {
-                        crate::github::GitHubRepoMetadata::Fork => RepoMetadata::Fork,
-                        crate::github::GitHubRepoMetadata::Private => RepoMetadata::Private,
-                        crate::github::GitHubRepoMetadata::Public => RepoMetadata::Public,
-                    };
-                }
-                if let Some(slug) = crate::gitlab::parse_gitlab_url(url)
-                    && let Some(metadata) = gitlab_metadata(&slug, Some(&name), Some(url))
-                {
-                    return match metadata {
-                        crate::gitlab::GitLabRepoMetadata::Fork => RepoMetadata::Fork,
-                        crate::gitlab::GitLabRepoMetadata::Private => RepoMetadata::Private,
-                        crate::gitlab::GitLabRepoMetadata::Public => RepoMetadata::Public,
-                    };
-                }
-                if let Some(slug) = crate::bitbucket::parse_bitbucket_url(url)
-                    && let Some(metadata) = bitbucket_metadata(&slug, Some(&name), Some(url))
-                {
-                    return match metadata {
-                        crate::bitbucket::BitbucketRepoMetadata::Fork => RepoMetadata::Fork,
-                        crate::bitbucket::BitbucketRepoMetadata::Private => RepoMetadata::Private,
-                        crate::bitbucket::BitbucketRepoMetadata::Public => RepoMetadata::Public,
-                    };
-                }
+        if let Some(url) = remote_url(&root, &name) {
+            if let Some(slug) = crate::github::parse_github_url(&url)
+                && let Some(metadata) = github_metadata(&slug, Some(&name), Some(&url))
+            {
+                return match metadata {
+                    crate::github::GitHubRepoMetadata::Fork => RepoMetadata::Fork,
+                    crate::github::GitHubRepoMetadata::Private => RepoMetadata::Private,
+                    crate::github::GitHubRepoMetadata::Public => RepoMetadata::Public,
+                };
+            }
+            if let Some(slug) = crate::gitlab::parse_gitlab_url(&url)
+                && let Some(metadata) = gitlab_metadata(&slug, Some(&name), Some(&url))
+            {
+                return match metadata {
+                    crate::gitlab::GitLabRepoMetadata::Fork => RepoMetadata::Fork,
+                    crate::gitlab::GitLabRepoMetadata::Private => RepoMetadata::Private,
+                    crate::gitlab::GitLabRepoMetadata::Public => RepoMetadata::Public,
+                };
+            }
+            if let Some(slug) = crate::bitbucket::parse_bitbucket_url(&url)
+                && let Some(metadata) = bitbucket_metadata(&slug, Some(&name), Some(&url))
+            {
+                return match metadata {
+                    crate::bitbucket::BitbucketRepoMetadata::Fork => RepoMetadata::Fork,
+                    crate::bitbucket::BitbucketRepoMetadata::Private => RepoMetadata::Private,
+                    crate::bitbucket::BitbucketRepoMetadata::Public => RepoMetadata::Public,
+                };
             }
         }
     }

@@ -2232,6 +2232,9 @@ fn wrap_width(state: &Rc<EditorState>, width: i32, gutter_width: f64) -> f64 {
     if !state.wrap.get() {
         return f64::MAX / 2.0;
     }
+    let width = state
+        .diff_layout
+        .wrap_viewport_width(width, state.diff_rows.borrow().is_some());
     (width as f64 - gutter_width - (CELL_PADDING * 2.0)).max(char_width(state))
 }
 

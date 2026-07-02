@@ -8,11 +8,11 @@ struct TextPreviewLoad {
     spellcheck_issues: Vec<crate::spellcheck::SpellcheckIssue>,
 }
 
-pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
+pub(in crate::ui::pages::file) fn show(request: PreviewRequest<'_>) {
     show_text(request, None);
 }
 
-pub(in crate::ui::pages::code) fn show_match(request: PreviewMatchRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_match(request: PreviewMatchRequest<'_>) {
     let selection = Some((request.start, request.end));
     show_text(request.into_preview_request(), selection);
 }

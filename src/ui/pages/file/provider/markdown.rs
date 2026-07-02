@@ -218,8 +218,8 @@ struct MarkdownPreviewLoad {
     spellcheck_issues: Vec<crate::spellcheck::SpellcheckIssue>,
 }
 
-pub(in crate::ui::pages::code) struct MarkdownPreview {
-    pub(in crate::ui::pages::code) root: webkit6::WebView,
+pub(in crate::ui::pages::file) struct MarkdownPreview {
+    pub(in crate::ui::pages::file) root: webkit6::WebView,
     signature: RefCell<Option<super::ContentSignature>>,
     base_uri: Rc<RefCell<Option<String>>>,
     allow_preview_navigation: Rc<Cell<bool>>,
@@ -228,7 +228,7 @@ pub(in crate::ui::pages::code) struct MarkdownPreview {
 }
 
 impl MarkdownPreview {
-    pub(in crate::ui::pages::code) fn new() -> Rc<Self> {
+    pub(in crate::ui::pages::file) fn new() -> Rc<Self> {
         let user_content_manager = webkit6::UserContentManager::new();
         let base_uri = Rc::new(RefCell::new(None));
         let allow_preview_navigation = Rc::new(Cell::new(false));
@@ -265,7 +265,7 @@ impl MarkdownPreview {
         })
     }
 
-    pub(in crate::ui::pages::code) fn set_markdown_html(
+    pub(in crate::ui::pages::file) fn set_markdown_html(
         &self,
         html: &str,
         signature: super::ContentSignature,
@@ -291,7 +291,7 @@ impl MarkdownPreview {
         self.root.load_html(html, next_base_uri.as_deref());
     }
 
-    pub(in crate::ui::pages::code) fn connect_source_offset_changed<F>(&self, callback: F)
+    pub(in crate::ui::pages::file) fn connect_source_offset_changed<F>(&self, callback: F)
     where
         F: Fn(usize) + 'static,
     {
@@ -300,17 +300,17 @@ impl MarkdownPreview {
             .push(Rc::new(callback));
     }
 
-    pub(in crate::ui::pages::code) fn set_source_offset(&self, offset: usize) {
+    pub(in crate::ui::pages::file) fn set_source_offset(&self, offset: usize) {
         self.target_source_offset.set(Some(offset));
         set_web_view_source_offset(&self.root, offset);
     }
 }
 
-pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
+pub(in crate::ui::pages::file) fn show(request: PreviewRequest<'_>) {
     show_markdown(request, None);
 }
 
-pub(in crate::ui::pages::code) fn show_match(request: PreviewMatchRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_match(request: PreviewMatchRequest<'_>) {
     let selection = Some((request.start, request.end));
     show_markdown(request.into_preview_request(), selection);
 }
@@ -638,7 +638,7 @@ fn source_anchor(offset: usize) -> String {
     format!(r#"<span class="source-anchor" data-source-start="{offset}"></span>"#)
 }
 
-pub(in crate::ui::pages::code) fn markdown_to_html(markdown: &str) -> String {
+pub(in crate::ui::pages::file) fn markdown_to_html(markdown: &str) -> String {
     let body = markdown_fragment_to_html(markdown);
 
     format!(
