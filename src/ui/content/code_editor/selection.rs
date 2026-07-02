@@ -31,6 +31,39 @@ impl Selection {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ui) enum SelectionMode {
+    Character,
+    Word,
+    Line,
+}
+
+impl SelectionMode {
+    pub(in crate::ui) fn for_press_count(press_count: i32) -> Self {
+        match press_count {
+            count if count >= 3 => Self::Line,
+            2 => Self::Word,
+            _ => Self::Character,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ui) enum DragSelection<T> {
+    Character { anchor: T },
+    Word { start: T, end: T },
+    Line { start: T, end: T },
+}
+
+impl<T: Copy> DragSelection<T> {
+    pub(in crate::ui) fn anchor(self) -> T {
+        match self {
+            Self::Character { anchor } => anchor,
+            Self::Word { start, .. } | Self::Line { start, .. } => start,
+        }
+    }
+}
+
 pub(in crate::ui) fn ordered_bounds(anchor: usize, focus: usize) -> Option<(usize, usize)> {
     AnchoredSelection { anchor, focus }.ordered()
 }
@@ -68,6 +101,137 @@ pub(in crate::ui) fn word_bounds_at(text: &str, offset: usize) -> Option<(usize,
     }
 
     Some((start, end))
+}
+
+pub(in crate::ui) fn selection_for_mode<T, WordBounds, LineBounds>(
+    point: T,
+    mode: SelectionMode,
+    word_bounds: WordBounds,
+    line_bounds: LineBounds,
+) -> AnchoredSelection<T>
+where
+    T: Copy,
+    WordBounds: Fn(T) -> Option<(T, T)>,
+    LineBounds: Fn(T) -> Option<(T, T)>,
+{
+    match mode {
+        SelectionMode::Character => AnchoredSelection {
+            anchor: point,
+            focus: point,
+        },
+        SelectionMode::Word => word_bounds(point)
+            .map(|(anchor, focus)| AnchoredSelection { anchor, focus })
+            .unwrap_or(AnchoredSelection {
+                anchor: point,
+                focus: point,
+            }),
+        SelectionMode::Line => line_bounds(point)
+            .map(|(anchor, focus)| AnchoredSelection { anchor, focus })
+            .unwrap_or(AnchoredSelection {
+                anchor: point,
+                focus: point,
+            }),
+    }
+}
+
+pub(in crate::ui) fn drag_for_mode<T, WordBounds, LineBounds>(
+    point: T,
+    mode: SelectionMode,
+    word_bounds: WordBounds,
+    line_bounds: LineBounds,
+) -> (DragSelection<T>, AnchoredSelection<T>)
+where
+    T: Copy,
+    WordBounds: Fn(T) -> Option<(T, T)>,
+    LineBounds: Fn(T) -> Option<(T, T)>,
+{
+    match mode {
+        SelectionMode::Character => {
+            let selection = AnchoredSelection {
+                anchor: point,
+                focus: point,
+            };
+            (DragSelection::Character { anchor: point }, selection)
+        }
+        SelectionMode::Word => {
+            if let Some((start, end)) = word_bounds(point) {
+                (
+                    DragSelection::Word { start, end },
+                    AnchoredSelection {
+                        anchor: start,
+                        focus: end,
+                    },
+                )
+            } else {
+                let selection = AnchoredSelection {
+                    anchor: point,
+                    focus: point,
+                };
+                (DragSelection::Character { anchor: point }, selection)
+            }
+        }
+        SelectionMode::Line => {
+            if let Some((start, end)) = line_bounds(point) {
+                (
+                    DragSelection::Line { start, end },
+                    AnchoredSelection {
+                        anchor: start,
+                        focus: end,
+                    },
+                )
+            } else {
+                let selection = AnchoredSelection {
+                    anchor: point,
+                    focus: point,
+                };
+                (DragSelection::Character { anchor: point }, selection)
+            }
+        }
+    }
+}
+
+pub(in crate::ui) fn selection_for_drag<T, WordBounds, LineBounds>(
+    drag: DragSelection<T>,
+    focus: T,
+    word_bounds: WordBounds,
+    line_bounds: LineBounds,
+) -> AnchoredSelection<T>
+where
+    T: Copy + Ord,
+    WordBounds: Fn(T) -> Option<(T, T)>,
+    LineBounds: Fn(T) -> Option<(T, T)>,
+{
+    match drag {
+        DragSelection::Character { anchor } => AnchoredSelection { anchor, focus },
+        DragSelection::Word { start, end } => {
+            let (focus_start, focus_end) = word_bounds(focus).unwrap_or((focus, focus));
+            if focus < start {
+                AnchoredSelection {
+                    anchor: end,
+                    focus: focus_start,
+                }
+            } else {
+                AnchoredSelection {
+                    anchor: start,
+                    focus: focus_end,
+                }
+            }
+        }
+        DragSelection::Line { start, end } => {
+            let (focus_start, focus_end) = line_bounds(focus).unwrap_or((focus, focus));
+            if focus < start {
+                AnchoredSelection {
+                    anchor: end,
+                    focus: focus_start,
+                }
+            } else {
+                AnchoredSelection {
+                    anchor: start,
+                    focus: focus_end,
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

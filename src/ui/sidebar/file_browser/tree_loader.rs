@@ -322,7 +322,6 @@ pub(super) struct RowSignature {
     capabilities: RowCapabilities,
     status: Option<String>,
     ignore: RowIgnoreDisplay,
-    loading: bool,
 }
 
 pub(super) struct TreeRowsCache {
@@ -442,7 +441,6 @@ fn status_rank(status: &str) -> u8 {
 pub(super) fn rows_signature(
     rows: &[BrowserRow],
     changed_file_statuses: &HashMap<String, String>,
-    loading_dirs: &HashSet<FileNodePath>,
 ) -> Vec<RowSignature> {
     rows.iter()
         .take(MAX_TREE_ROWS)
@@ -453,7 +451,6 @@ pub(super) fn rows_signature(
             capabilities: row.capabilities,
             status: changed_file_statuses.get(&row.path).cloned(),
             ignore: row.ignore,
-            loading: loading_dirs.contains(&row.node_path),
         })
         .collect()
 }

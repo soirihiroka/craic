@@ -18,7 +18,7 @@ use crate::ui::components::search::SearchPanel;
 use adw::prelude::*;
 use canvas::TextWidthCache;
 use gtk::gdk;
-use selection::Selection;
+use selection::{Selection, SelectionMode};
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -185,13 +185,6 @@ struct HistorySnapshot {
     before_selection: Option<Selection>,
     after_cursor: usize,
     after_selection: Option<Selection>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SelectionMode {
-    Character,
-    Word,
-    Line,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
