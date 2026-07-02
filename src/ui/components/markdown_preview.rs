@@ -8,30 +8,32 @@ mod style;
 
 use adw::prelude::*;
 use gtk::gdk;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
 
-use blocks::{MarkdownPreviewBlock, blocks_from_nodes, collect_style_css};
+use blocks::{MarkdownPreviewBlock, block_text, blocks_from_nodes, collect_style_css};
 use parse::parse_markdown;
 use render::render_document;
 use source_map::{
-    MarkdownPreviewMeasurement, MarkdownPreviewSourceAnchor, RenderedSourceAnchor,
-    measure_source_anchors, source_offset_for_y, y_for_source_offset,
+    MarkdownPreviewSourceAnchor, RenderedSourceAnchor, measure_source_anchors, source_offset_for_y,
+    y_for_source_offset,
 };
 use style::install_default_css;
 
 pub(in crate::ui) struct MarkdownPreview {
     pub(in crate::ui) root: gtk::ScrolledWindow,
     document: gtk::Box,
-    stylesheet: gtk::CssProvider,
     document_stylesheet: gtk::CssProvider,
     source_anchors: RefCell<Vec<RenderedSourceAnchor>>,
+    rendered_text: RefCell<String>,
+    whole_selection_active: Cell<bool>,
 }
 
 pub(in crate::ui) struct MarkdownPreviewDocument {
     blocks: Vec<MarkdownPreviewBlock>,
     stylesheet: String,
+    plain_text: String,
 }
 
 impl MarkdownPreviewDocument {
@@ -39,13 +41,19 @@ impl MarkdownPreviewDocument {
         let nodes = parse_markdown(markdown);
         let stylesheet = collect_style_css(&nodes);
         let blocks = blocks_from_nodes(&nodes);
+        let plain_text = block_text(&blocks).plain_text;
         log::debug!(
-            "markdown preview document parsed markdown_bytes={} blocks={} stylesheet_bytes={}",
+            "markdown preview document parsed markdown_bytes={} blocks={} stylesheet_bytes={} plain_text_bytes={}",
             markdown.len(),
             blocks.len(),
             stylesheet.len(),
+            plain_text.len(),
         );
-        Self { blocks, stylesheet }
+        Self {
+            blocks,
+            stylesheet,
+            plain_text,
+        }
     }
 }
 
@@ -73,6 +81,7 @@ impl MarkdownPreview {
             .vscrollbar_policy(gtk::PolicyType::Automatic)
             .min_content_width(0)
             .propagate_natural_width(false)
+            .focusable(true)
             .hexpand(true)
             .vexpand(true)
             .child(&document)
@@ -80,14 +89,8 @@ impl MarkdownPreview {
         root.set_size_request(0, -1);
         root.add_css_class("craic-markdown-preview");
 
-        let stylesheet = gtk::CssProvider::new();
         let document_stylesheet = gtk::CssProvider::new();
         if let Some(display) = gdk::Display::default() {
-            gtk::style_context_add_provider_for_display(
-                &display,
-                &stylesheet,
-                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-            );
             gtk::style_context_add_provider_for_display(
                 &display,
                 &document_stylesheet,
@@ -95,25 +98,16 @@ impl MarkdownPreview {
             );
         }
 
-        Rc::new(Self {
+        let preview = Rc::new(Self {
             root,
             document,
-            stylesheet,
             document_stylesheet,
             source_anchors: RefCell::new(Vec::new()),
-        })
-    }
-
-    pub(in crate::ui) fn set_markdown(&self, markdown: &str) {
-        self.set_markdown_with_base_path(markdown, None);
-    }
-
-    pub(in crate::ui) fn set_markdown_with_base_path(
-        &self,
-        markdown: &str,
-        base_path: Option<&Path>,
-    ) {
-        self.set_document_with_base_path(MarkdownPreviewDocument::parse(markdown), base_path);
+            rendered_text: RefCell::new(String::new()),
+            whole_selection_active: Cell::new(false),
+        });
+        install_preview_selection_handlers(&preview);
+        preview
     }
 
     pub(in crate::ui) fn set_document_with_base_path(
@@ -123,35 +117,14 @@ impl MarkdownPreview {
     ) {
         self.document_stylesheet
             .load_from_data(&document.stylesheet);
+        self.rendered_text.replace(document.plain_text.clone());
+        self.whole_selection_active.set(false);
         let anchors = render_document(
             &self.document,
             &document.blocks,
             base_path.map(Path::to_path_buf),
         );
         self.source_anchors.replace(anchors);
-    }
-
-    pub(in crate::ui) fn set_stylesheet(&self, css: &str) {
-        self.stylesheet.load_from_data(css);
-    }
-
-    pub(in crate::ui) fn measurement(&self) -> MarkdownPreviewMeasurement {
-        MarkdownPreviewMeasurement {
-            content_height: self.content_height(),
-            viewport_height: self.root.allocated_height().max(0),
-            source_anchors: self.source_anchors(),
-        }
-    }
-
-    pub(in crate::ui) fn content_height(&self) -> i32 {
-        self.root.vadjustment().upper().round().max(0.0) as i32
-    }
-
-    pub(in crate::ui) fn natural_height_for_width(&self, width: i32) -> i32 {
-        let (_, natural_height, _, _) = self
-            .document
-            .measure(gtk::Orientation::Vertical, width.max(0));
-        natural_height.max(0)
     }
 
     pub(in crate::ui) fn source_anchors(&self) -> Vec<MarkdownPreviewSourceAnchor> {
@@ -179,5 +152,81 @@ impl MarkdownPreview {
         let max = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
         adjustment.set_value(y.clamp(adjustment.lower(), max));
         true
+    }
+
+    fn select_all_rendered_text(&self) {
+        select_all_text_widgets(self.document.upcast_ref());
+        self.whole_selection_active.set(true);
+    }
+
+    fn copy_whole_selection(&self) -> bool {
+        if !self.whole_selection_active.get() {
+            return false;
+        }
+
+        let text = self.rendered_text.borrow();
+        if text.is_empty() {
+            return false;
+        }
+        self.root.clipboard().set_text(&text);
+        true
+    }
+}
+
+fn install_preview_selection_handlers(preview: &Rc<MarkdownPreview>) {
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed({
+        let preview = Rc::downgrade(preview);
+        move |_, key, _, modifiers| {
+            let Some(preview) = preview.upgrade() else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+            let alt = modifiers.contains(gdk::ModifierType::ALT_MASK);
+            if ctrl && !alt && matches!(key, gdk::Key::a | gdk::Key::A) {
+                preview.select_all_rendered_text();
+                return gtk::glib::Propagation::Stop;
+            }
+            if ctrl
+                && !alt
+                && matches!(key, gdk::Key::c | gdk::Key::C)
+                && preview.copy_whole_selection()
+            {
+                return gtk::glib::Propagation::Stop;
+            }
+
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    preview.root.add_controller(keys);
+
+    let clicks = gtk::GestureClick::new();
+    clicks.set_propagation_phase(gtk::PropagationPhase::Capture);
+    clicks.connect_pressed({
+        let preview = Rc::downgrade(preview);
+        move |_, _, _, _| {
+            if let Some(preview) = preview.upgrade() {
+                preview.whole_selection_active.set(false);
+            }
+        }
+    });
+    preview.document.add_controller(clicks);
+}
+
+fn select_all_text_widgets(widget: &gtk::Widget) {
+    if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+        label.select_region(0, -1);
+    }
+    if let Some(text_view) = widget.downcast_ref::<gtk::TextView>() {
+        let buffer = text_view.buffer();
+        let (start, end) = buffer.bounds();
+        buffer.select_range(&start, &end);
+    }
+
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        select_all_text_widgets(&current);
+        child = current.next_sibling();
     }
 }
