@@ -30,6 +30,7 @@ struct BlockImageState {
     pixbuf: Option<gdk_pixbuf::Pixbuf>,
     ratio: f32,
     width_limit: Option<i32>,
+    alignment: BlockAlignment,
 }
 
 static IMAGE_CACHE: OnceLock<Cache<String, Vec<u8>>> = OnceLock::new();
@@ -139,14 +140,6 @@ fn apply_label_alignment(label: &gtk::Label, alignment: BlockAlignment) {
             label.set_xalign(1.0);
             label.set_justify(gtk::Justification::Right);
         }
-    }
-}
-
-fn block_halign(alignment: BlockAlignment) -> gtk::Align {
-    match alignment {
-        BlockAlignment::Start => gtk::Align::Start,
-        BlockAlignment::Center => gtk::Align::Center,
-        BlockAlignment::End => gtk::Align::End,
     }
 }
 
@@ -480,8 +473,6 @@ fn render_block_image(
         .width
         .filter(|width| *width > 0)
         .map(|width| width.min(MAX_IMAGE_WIDTH));
-    let max_width = width_limit.unwrap_or(MAX_IMAGE_WIDTH);
-    let initial_width = width_limit.unwrap_or(0);
     let initial_height = width_limit
         .map(|width| ((width as f32 / ratio).round() as i32).max(1))
         .unwrap_or(DEFAULT_BLOCK_IMAGE_HEIGHT);
@@ -489,9 +480,10 @@ fn render_block_image(
         pixbuf: None,
         ratio,
         width_limit,
+        alignment,
     }));
     let area = gtk::DrawingArea::builder()
-        .content_width(initial_width)
+        .content_width(0)
         .content_height(initial_height)
         .hexpand(true)
         .halign(gtk::Align::Fill)
@@ -524,20 +516,7 @@ fn render_block_image(
 
     load_block_image(image, base_path, &area, &status, &state);
 
-    let clamp = adw::Clamp::builder()
-        .maximum_size(max_width)
-        .tightening_threshold(max_width)
-        .hexpand(true)
-        .halign(if width_limit.is_some() {
-            block_halign(alignment)
-        } else {
-            gtk::Align::Fill
-        })
-        .child(&overlay)
-        .build();
-    clamp.set_size_request(0, -1);
-    clamp.set_overflow(gtk::Overflow::Hidden);
-    clamp.upcast()
+    overlay.upcast()
 }
 
 fn draw_block_image(cr: &cairo::Context, width: i32, height: i32, state: &BlockImageState) {
@@ -548,12 +527,21 @@ fn draw_block_image(cr: &cairo::Context, width: i32, height: i32, state: &BlockI
     let image_height = pixbuf.height().max(1) as f64;
     let available_width = width.max(1) as f64;
     let available_height = height.max(1) as f64;
-    let scale = (available_width / image_width)
+    let target_width = width
+        .max(1)
+        .min(state.width_limit.unwrap_or(MAX_IMAGE_WIDTH))
+        .min(MAX_IMAGE_WIDTH) as f64;
+    let scale = (target_width / image_width)
         .min(available_height / image_height)
         .max(0.0);
     let draw_width = image_width * scale;
     let draw_height = image_height * scale;
-    let x = (available_width - draw_width) / 2.0;
+    let x = match state.alignment {
+        BlockAlignment::Start => 0.0,
+        BlockAlignment::Center => (available_width - draw_width) / 2.0,
+        BlockAlignment::End => available_width - draw_width,
+    }
+    .max(0.0);
     let y = (available_height - draw_height) / 2.0;
 
     let _ = cr.save();
