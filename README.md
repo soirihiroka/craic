@@ -32,7 +32,9 @@ sudo dnf install rust cargo gtk4-devel webkitgtk6.0-devel gtksourceview5-devel l
 
 ### Ubuntu / Debian
 
-> Ask ChatGPT
+```sh
+sudo apt install rustc cargo libgtk-4-dev libgtksourceview-5-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpoppler-glib-dev gobject-introspection pkg-config
+```
 
 ---
 
@@ -107,5 +109,4 @@ color = "orange-5"
 ## License
 
 Craic is distributed under the terms of the GNU General Public License Version 3. See [LICENSE](LICENSE) for details.
-
 

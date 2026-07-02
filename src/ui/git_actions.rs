@@ -7,6 +7,7 @@ use crate::git::RepositorySnapshot;
 use crate::github::{GitHubAuthAccount, GitHubPublishRepositoryRequest, GitHubRepositoryOwner};
 use crate::system::capabilities::{git::GitAccess, github::GitHubAccess};
 use adw::prelude::*;
+use gtk::gio;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
@@ -712,6 +713,7 @@ fn execute_git_action_with_snapshot(
 
     thread::spawn({
         let action = action.clone();
+        let git_access = git_access.clone();
         move || {
             let message = match action {
                 GitAction::Push => match git_access.push() {
@@ -789,6 +791,25 @@ fn execute_git_action_with_snapshot(
                         state.git_action_running.set(false);
                         state.content.clear_git_action_progress();
                         log::debug!("git action failed: {err}");
+                        if matches!(action, GitAction::Pull | GitAction::PullPush)
+                            && is_local_changes_overwritten_error(&err)
+                        {
+                            state.content.update(&snapshot, None, false, false);
+                            let files = parse_files_to_be_overwritten(&err);
+                            log::info!(
+                                "git pull blocked by local changes action={:?} overwritten_files={}",
+                                action,
+                                files.len()
+                            );
+                            show_local_changes_overwritten_dialog(
+                                &state,
+                                snapshot.clone(),
+                                action.clone(),
+                                git_access.clone(),
+                                files,
+                            );
+                            return gtk::glib::ControlFlow::Break;
+                        }
                         show_error_dialog(&state.window, "Git Action Failed", &err);
                         refresh(&state, None);
                         return gtk::glib::ControlFlow::Break;
@@ -815,6 +836,186 @@ fn execute_git_action_with_snapshot(
             gtk::glib::ControlFlow::Continue
         }
     });
+}
+
+fn show_local_changes_overwritten_dialog(
+    state: &Rc<AppState>,
+    snapshot: RepositorySnapshot,
+    action: GitAction,
+    git_access: Arc<dyn GitAccess>,
+    files: Vec<String>,
+) {
+    let body = local_changes_overwritten_body(&action, &files);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Local Changes Would Be Overwritten")
+        .body(&body)
+        .build();
+    dialog.add_response("close", "Close");
+    dialog.add_response("stash", "Stash changes and continue");
+    dialog.set_default_response(Some("stash"));
+    dialog.set_close_response("close");
+    dialog.set_response_appearance("stash", adw::ResponseAppearance::Suggested);
+
+    dialog.choose(Some(&state.window), None::<&gio::Cancellable>, {
+        let state = state.clone();
+        move |response| {
+            if response.as_str() != "stash" {
+                return;
+            }
+
+            stash_changes_and_retry_git_action(
+                &state,
+                snapshot.clone(),
+                action.clone(),
+                git_access.clone(),
+            );
+        }
+    });
+}
+
+fn local_changes_overwritten_body(action: &GitAction, files: &[String]) -> String {
+    let action_name = match action {
+        GitAction::PullPush => "pull remote changes before pushing",
+        _ => "pull",
+    };
+    let mut body = format!("Unable to {action_name} when changes are present on your branch.");
+
+    if !files.is_empty() {
+        body.push_str(" The following files would be overwritten:");
+        let visible_files = files.iter().take(12).collect::<Vec<_>>();
+        for file in visible_files {
+            body.push_str("\n  ");
+            body.push_str(file);
+        }
+        if files.len() > 12 {
+            body.push_str(&format!("\n  ... and {} more", files.len() - 12));
+        }
+    }
+
+    body.push_str("\n\nYou can stash your changes now and recover them afterwards.");
+    body
+}
+
+fn stash_changes_and_retry_git_action(
+    state: &Rc<AppState>,
+    snapshot: RepositorySnapshot,
+    action: GitAction,
+    git_access: Arc<dyn GitAccess>,
+) {
+    if state.git_action_running.get() {
+        return;
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    state.git_action_running.set(true);
+    state.content.clear_git_action_progress();
+    state.content.update(&snapshot, None, true, false);
+    state.content.set_git_action_progress("Stashing changes...");
+    log::info!(
+        "stashing local changes before retrying git action {:?}",
+        action
+    );
+
+    thread::spawn(move || {
+        let result = git_access.stash_changes().map(|output| {
+            if output.is_empty() {
+                "Changes stashed.".to_string()
+            } else {
+                output
+            }
+        });
+        let _ = sender.send(GitActionEvent::Finished(result));
+    });
+
+    gtk::glib::timeout_add_local(Duration::from_millis(100), {
+        let state = state.clone();
+        move || match receiver.try_recv() {
+            Ok(GitActionEvent::Finished(Ok(message))) => {
+                state.git_action_running.set(false);
+                state.content.clear_git_action_progress();
+                state.content.update(&snapshot, None, false, false);
+                log::info!("stash before retry completed: {message}");
+                execute_git_action(&state, action.clone());
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(GitActionEvent::Finished(Err(err))) => {
+                state.git_action_running.set(false);
+                state.content.clear_git_action_progress();
+                state.content.update(&snapshot, None, false, false);
+                log::warn!("stash before retry failed: {err}");
+                show_error_dialog(&state.window, "Stash Failed", &err);
+                refresh(&state, None);
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(GitActionEvent::Progress(progress)) => {
+                state.content.set_git_action_progress(&progress);
+                gtk::glib::ControlFlow::Continue
+            }
+            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) => {
+                state.git_action_running.set(false);
+                state.content.clear_git_action_progress();
+                state.content.update(&snapshot, None, false, false);
+                show_error_dialog(
+                    &state.window,
+                    "Stash Failed",
+                    "Stash worker stopped unexpectedly.",
+                );
+                refresh(&state, None);
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn is_local_changes_overwritten_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let would_overwrite = lower.contains("would be overwritten")
+        && (lower.contains("local changes")
+            || lower.contains("untracked working tree files")
+            || lower.contains("files would be overwritten"));
+    let rebase_dirty = lower.contains("cannot pull with rebase")
+        && (lower.contains("unstaged changes")
+            || lower.contains("uncommitted changes")
+            || lower.contains("please commit or stash"));
+    let merge_dirty = lower.contains("commit your changes or stash them")
+        && (lower.contains("merge") || lower.contains("pull"));
+
+    would_overwrite || rebase_dirty || merge_dirty
+}
+
+fn parse_files_to_be_overwritten(message: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut in_files_list = false;
+
+    for line in message.lines() {
+        if in_files_list {
+            if line.starts_with('\t') || line.starts_with("    ") {
+                let file = line.trim();
+                if !file.is_empty() {
+                    files.push(file.to_string());
+                }
+                continue;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            break;
+        }
+
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("error:")
+            && lower.contains("would be overwritten")
+            && lower.trim_end().ends_with(':')
+        {
+            in_files_list = true;
+        }
+    }
+
+    files.sort();
+    files.dedup();
+    files
 }
 
 fn active_git_access(state: &Rc<AppState>) -> Result<(String, Arc<dyn GitAccess>), String> {

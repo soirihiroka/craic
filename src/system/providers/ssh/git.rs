@@ -521,7 +521,13 @@ impl GitAccess for SshGitAccess {
     }
 
     fn pull(&self) -> Result<String, String> {
-        self.git(&["pull".into(), "--rebase".into()])
+        self.git(&[
+            "-c".into(),
+            "rebase.backend=merge".into(),
+            "pull".into(),
+            "--ff".into(),
+            "--recurse-submodules".into(),
+        ])
     }
 
     fn publish(&self, remote: &str, branch: &str) -> Result<String, String> {
