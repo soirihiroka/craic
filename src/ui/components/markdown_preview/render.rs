@@ -14,8 +14,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use super::blocks::{
-    MarkdownPreviewBlock, MarkdownPreviewBlockKind, RenderedImageItem, RenderedListItem,
-    RenderedText, pango_escape,
+    BlockAlignment, MarkdownPreviewBlock, MarkdownPreviewBlockKind, RenderedImageItem,
+    RenderedListItem, RenderedText, pango_escape,
 };
 use super::source_map::RenderedSourceAnchor;
 
@@ -71,7 +71,11 @@ fn render_block(block: &MarkdownPreviewBlock, base_path: Option<&Path>) -> gtk::
             label.add_css_class("craic-markdown-heading");
             label.upcast()
         }
-        MarkdownPreviewBlockKind::Paragraph(text) => markup_label(&text.markup, base_path).upcast(),
+        MarkdownPreviewBlockKind::Paragraph { text, alignment } => {
+            let label = markup_label(&text.markup, base_path);
+            apply_label_alignment(&label, *alignment);
+            label.upcast()
+        }
         MarkdownPreviewBlockKind::CodeBlock { code, language } => {
             render_code_block(code, language).upcast()
         }
@@ -85,7 +89,9 @@ fn render_block(block: &MarkdownPreviewBlock, base_path: Option<&Path>) -> gtk::
             rows,
             alignments,
         } => render_table(headers, rows, alignments, base_path),
-        MarkdownPreviewBlockKind::ImageGroup(images) => render_image_group(images, base_path),
+        MarkdownPreviewBlockKind::ImageGroup { images, alignment } => {
+            render_image_group(images, *alignment, base_path)
+        }
     }
 }
 
@@ -116,6 +122,31 @@ fn heading_size(level: u8) -> &'static str {
         2 => "x-large",
         3 => "large",
         _ => "medium",
+    }
+}
+
+fn apply_label_alignment(label: &gtk::Label, alignment: BlockAlignment) {
+    match alignment {
+        BlockAlignment::Start => {
+            label.set_xalign(0.0);
+            label.set_justify(gtk::Justification::Left);
+        }
+        BlockAlignment::Center => {
+            label.set_xalign(0.5);
+            label.set_justify(gtk::Justification::Center);
+        }
+        BlockAlignment::End => {
+            label.set_xalign(1.0);
+            label.set_justify(gtk::Justification::Right);
+        }
+    }
+}
+
+fn block_halign(alignment: BlockAlignment) -> gtk::Align {
+    match alignment {
+        BlockAlignment::Start => gtk::Align::Start,
+        BlockAlignment::Center => gtk::Align::Center,
+        BlockAlignment::End => gtk::Align::End,
     }
 }
 
@@ -299,117 +330,111 @@ fn render_table(
     alignments: &[Alignment],
     base_path: Option<&Path>,
 ) -> gtk::Widget {
-    let markup = table_markup(headers, rows, alignments);
-    let label = markup_label(&format!("<tt>{markup}</tt>"), base_path);
-    label.set_wrap(false);
-    label.set_natural_wrap_mode(gtk::NaturalWrapMode::None);
-    label.set_halign(gtk::Align::Start);
-    label.set_hexpand(false);
-    label.add_css_class("craic-markdown-table");
+    let grid = gtk::Grid::builder()
+        .column_spacing(0)
+        .row_spacing(0)
+        .halign(gtk::Align::Start)
+        .hexpand(false)
+        .build();
+    grid.add_css_class("craic-markdown-table");
+
+    for (column, header) in headers.iter().enumerate() {
+        let label = table_cell_label(header, alignments.get(column), true, base_path);
+        grid.attach(&label, column as i32, 0, 1, 1);
+    }
+
+    for (row_index, row) in rows.iter().enumerate() {
+        for column in 0..headers.len() {
+            let empty = RenderedText {
+                markup: String::new(),
+                plain_text: String::new(),
+            };
+            let cell = row.get(column).unwrap_or(&empty);
+            let label = table_cell_label(cell, alignments.get(column), false, base_path);
+            grid.attach(&label, column as i32, row_index as i32 + 1, 1, 1);
+        }
+    }
 
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vscrollbar_policy(gtk::PolicyType::Never)
         .min_content_width(0)
         .propagate_natural_width(false)
+        .propagate_natural_height(true)
         .hexpand(true)
         .halign(gtk::Align::Fill)
-        .child(&label)
+        .child(&grid)
         .build();
     scroller.set_size_request(0, -1);
     scroller.add_css_class("craic-markdown-table-scroller");
     scroller.upcast()
 }
 
-fn table_markup(
-    headers: &[RenderedText],
-    rows: &[Vec<RenderedText>],
-    alignments: &[Alignment],
-) -> String {
-    if headers.is_empty() {
-        return String::new();
-    }
-
-    let column_count = headers.len();
-    let mut widths = vec![0usize; column_count];
-    for (index, cell) in headers.iter().enumerate() {
-        widths[index] = widths[index].max(cell.plain_text.chars().count());
-    }
-    for row in rows {
-        for (index, cell) in row.iter().enumerate().take(column_count) {
-            widths[index] = widths[index].max(cell.plain_text.chars().count());
+fn table_cell_label(
+    cell: &RenderedText,
+    alignment: Option<&Alignment>,
+    heading: bool,
+    base_path: Option<&Path>,
+) -> gtk::Label {
+    let markup = if heading {
+        format!("<b>{}</b>", cell.markup)
+    } else {
+        cell.markup.clone()
+    };
+    let label = markup_label(&markup, base_path);
+    label.set_wrap(false);
+    label.set_natural_wrap_mode(gtk::NaturalWrapMode::None);
+    label.set_hexpand(false);
+    label.set_halign(gtk::Align::Fill);
+    match alignment.unwrap_or(&Alignment::None) {
+        Alignment::Center => {
+            label.set_xalign(0.5);
+            label.set_justify(gtk::Justification::Center);
+        }
+        Alignment::Right => {
+            label.set_xalign(1.0);
+            label.set_justify(gtk::Justification::Right);
+        }
+        Alignment::None | Alignment::Left => {
+            label.set_xalign(0.0);
+            label.set_justify(gtk::Justification::Left);
         }
     }
-
-    let mut lines = Vec::new();
-    lines.push(table_row_markup(headers, &widths, alignments, true));
-    lines.push(format!(
-        "<span alpha=\"45%\">{}</span>",
-        "─".repeat(widths.iter().sum::<usize>() + (column_count.saturating_sub(1) * 2))
-    ));
-    for row in rows {
-        lines.push(table_row_markup(row, &widths, alignments, false));
-    }
-    lines.join("\n")
+    label.add_css_class("craic-markdown-table-cell");
+    label
 }
 
-fn table_row_markup(
-    cells: &[RenderedText],
-    widths: &[usize],
-    alignments: &[Alignment],
-    bold: bool,
-) -> String {
-    widths
-        .iter()
-        .enumerate()
-        .map(|(column, width)| {
-            let empty = RenderedText {
-                markup: String::new(),
-                plain_text: String::new(),
-            };
-            let cell = cells.get(column).unwrap_or(&empty);
-            let body_len = cell.plain_text.chars().count();
-            let pad = width.saturating_sub(body_len);
-            let left = match alignments.get(column).unwrap_or(&Alignment::None) {
-                Alignment::Right => pad,
-                Alignment::Center => pad / 2,
-                Alignment::None | Alignment::Left => 0,
-            };
-            let right = pad.saturating_sub(left);
-            let body = if bold {
-                format!("<b>{}</b>", cell.markup)
-            } else {
-                cell.markup.clone()
-            };
-            format!("{}{}{}", " ".repeat(left), body, " ".repeat(right))
-        })
-        .collect::<Vec<_>>()
-        .join("  ")
-}
-
-fn render_image_group(images: &[RenderedImageItem], base_path: Option<&Path>) -> gtk::Widget {
+fn render_image_group(
+    images: &[RenderedImageItem],
+    alignment: BlockAlignment,
+    base_path: Option<&Path>,
+) -> gtk::Widget {
     if images.len() == 1
         && images
             .first()
             .and_then(|image| image.link_destination.as_ref())
             .is_none()
     {
-        return render_block_image(&images[0], base_path);
+        return render_block_image(&images[0], alignment, base_path);
     }
 
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .hexpand(false)
-        .halign(gtk::Align::Start)
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
         .build();
-    row.add_css_class("craic-markdown-image-group");
+    column.add_css_class("craic-markdown-image-group");
 
     for image in images {
-        row.append(&render_inline_image(image, base_path));
+        if image.link_destination.is_none() {
+            column.append(&render_block_image(image, alignment, base_path));
+        } else {
+            column.append(&render_inline_image(image, base_path));
+        }
     }
 
-    row.upcast()
+    column.upcast()
 }
 
 fn render_inline_image(image: &RenderedImageItem, base_path: Option<&Path>) -> gtk::Widget {
@@ -445,13 +470,18 @@ fn render_inline_image(image: &RenderedImageItem, base_path: Option<&Path>) -> g
     widget
 }
 
-fn render_block_image(image: &RenderedImageItem, base_path: Option<&Path>) -> gtk::Widget {
+fn render_block_image(
+    image: &RenderedImageItem,
+    alignment: BlockAlignment,
+    base_path: Option<&Path>,
+) -> gtk::Widget {
     let ratio = image_ratio(image).unwrap_or(16.0 / 9.0);
     let width_limit = image
         .width
         .filter(|width| *width > 0)
         .map(|width| width.min(MAX_IMAGE_WIDTH));
     let max_width = width_limit.unwrap_or(MAX_IMAGE_WIDTH);
+    let initial_width = width_limit.unwrap_or(0);
     let initial_height = width_limit
         .map(|width| ((width as f32 / ratio).round() as i32).max(1))
         .unwrap_or(DEFAULT_BLOCK_IMAGE_HEIGHT);
@@ -461,7 +491,7 @@ fn render_block_image(image: &RenderedImageItem, base_path: Option<&Path>) -> gt
         width_limit,
     }));
     let area = gtk::DrawingArea::builder()
-        .content_width(0)
+        .content_width(initial_width)
         .content_height(initial_height)
         .hexpand(true)
         .halign(gtk::Align::Fill)
@@ -498,7 +528,11 @@ fn render_block_image(image: &RenderedImageItem, base_path: Option<&Path>) -> gt
         .maximum_size(max_width)
         .tightening_threshold(max_width)
         .hexpand(true)
-        .halign(gtk::Align::Fill)
+        .halign(if width_limit.is_some() {
+            block_halign(alignment)
+        } else {
+            gtk::Align::Fill
+        })
         .child(&overlay)
         .build();
     clamp.set_size_request(0, -1);
