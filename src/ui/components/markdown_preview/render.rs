@@ -29,6 +29,7 @@ type ImageLoadResult = Result<Vec<u8>, String>;
 struct BlockImageState {
     pixbuf: Option<gdk_pixbuf::Pixbuf>,
     ratio: f32,
+    width_limit: Option<i32>,
 }
 
 static IMAGE_CACHE: OnceLock<Cache<String, Vec<u8>>> = OnceLock::new();
@@ -446,13 +447,22 @@ fn render_inline_image(image: &RenderedImageItem, base_path: Option<&Path>) -> g
 
 fn render_block_image(image: &RenderedImageItem, base_path: Option<&Path>) -> gtk::Widget {
     let ratio = image_ratio(image).unwrap_or(16.0 / 9.0);
+    let width_limit = image
+        .width
+        .filter(|width| *width > 0)
+        .map(|width| width.min(MAX_IMAGE_WIDTH));
+    let max_width = width_limit.unwrap_or(MAX_IMAGE_WIDTH);
+    let initial_height = width_limit
+        .map(|width| ((width as f32 / ratio).round() as i32).max(1))
+        .unwrap_or(DEFAULT_BLOCK_IMAGE_HEIGHT);
     let state = Rc::new(RefCell::new(BlockImageState {
         pixbuf: None,
         ratio,
+        width_limit,
     }));
     let area = gtk::DrawingArea::builder()
         .content_width(0)
-        .content_height(DEFAULT_BLOCK_IMAGE_HEIGHT)
+        .content_height(initial_height)
         .hexpand(true)
         .halign(gtk::Align::Fill)
         .build();
@@ -464,7 +474,10 @@ fn render_block_image(image: &RenderedImageItem, base_path: Option<&Path>) -> gt
     });
     area.connect_resize({
         let state = state.clone();
-        move |area, width, _| update_block_image_height(area, width, state.borrow().ratio)
+        move |area, width, _| {
+            let state = state.borrow();
+            update_block_image_height(area, width, state.ratio, state.width_limit);
+        }
     });
 
     let status = unresolved_image_label(&image_alt_text(image), "loading image");
@@ -482,8 +495,8 @@ fn render_block_image(image: &RenderedImageItem, base_path: Option<&Path>) -> gt
     load_block_image(image, base_path, &area, &status, &state);
 
     let clamp = adw::Clamp::builder()
-        .maximum_size(MAX_IMAGE_WIDTH)
-        .tightening_threshold(MAX_IMAGE_WIDTH)
+        .maximum_size(max_width)
+        .tightening_threshold(max_width)
         .hexpand(true)
         .halign(gtk::Align::Fill)
         .child(&overlay)
@@ -519,11 +532,24 @@ fn draw_block_image(cr: &cairo::Context, width: i32, height: i32, state: &BlockI
     let _ = cr.restore();
 }
 
-fn update_block_image_height(area: &gtk::DrawingArea, width: i32, ratio: f32) {
-    if width <= 0 || ratio <= 0.0 {
+fn update_block_image_height(
+    area: &gtk::DrawingArea,
+    width: i32,
+    ratio: f32,
+    width_limit: Option<i32>,
+) {
+    if ratio <= 0.0 {
         return;
     }
-    let content_width = width.min(MAX_IMAGE_WIDTH).max(1);
+    let content_width = if width > 0 {
+        width.min(width_limit.unwrap_or(MAX_IMAGE_WIDTH))
+    } else if let Some(width_limit) = width_limit {
+        width_limit
+    } else {
+        return;
+    }
+    .min(MAX_IMAGE_WIDTH)
+    .max(1);
     let content_height = ((content_width as f32 / ratio).round() as i32).max(1);
     if area.content_height() != content_height {
         area.set_content_height(content_height);
@@ -544,7 +570,10 @@ fn set_block_image_pixbuf(
         state.pixbuf = Some(pixbuf);
     }
     status.set_visible(false);
-    update_block_image_height(area, area.allocated_width(), state.borrow().ratio);
+    {
+        let state = state.borrow();
+        update_block_image_height(area, area.allocated_width(), state.ratio, state.width_limit);
+    }
     area.queue_draw();
 }
 
