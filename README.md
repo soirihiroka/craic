@@ -4,9 +4,14 @@ A development environment made by me for me :D
 
 <img width="1207" height="764" alt="image" src="https://github.com/user-attachments/assets/511380e1-a28e-42b3-b03c-7896885072ce" />
 
-Craic lets you develop code alongside autonomous AI agents (Codex, Antigravity, OpenCode, Ollama) with integrated Git workflow, an embedded terminal, and a syntax-highlighted code editor.
-
 ---
+
+## Features
+
+- Git integration with auto generated commit messages.
+- Docker integration
+- SSH Remote connection
+- Vibe coding integration with Codex, AGY, OpenCode, and Ollama.
 
 ## Requirements
 
