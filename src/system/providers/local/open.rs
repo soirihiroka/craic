@@ -2,8 +2,13 @@ use crate::system::capabilities::open::{
     DesktopOpenAccess, DesktopOpenActivation, DesktopOpenTargetKind,
 };
 use crate::system::path::{FileNodePath, WorkspacePath, WorkspaceRef};
-use gtk::gio;
+use gtk::gio::prelude::{AppLaunchContextExt, DBusProxyExt};
+use gtk::glib::variant::ToVariant;
+use gtk::prelude::{DisplayExt, GdkAppLaunchContextExt};
+use gtk::{gio, glib};
+use std::fs::File;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalDesktopOpenAccess {
@@ -68,10 +73,18 @@ impl LocalDesktopOpenAccess {
         );
     }
 
-    fn open_containing_folder(&self, local_path: &PathBuf, activation: DesktopOpenActivation) {
-        // Use GtkFileLauncher instead of calling FileManager1 directly. GTK
-        // routes through the portal/native implementation and supplies the
-        // parent-window activation data Wayland compositors require for focus.
+    fn portal_activation_token(
+        local_path: &PathBuf,
+        activation: &DesktopOpenActivation,
+    ) -> Option<glib::GString> {
+        let parent = activation.parent.as_ref()?;
+        let context = gtk::prelude::WidgetExt::display(parent).app_launch_context();
+        context.set_timestamp(gtk::gdk::CURRENT_TIME);
+        let files = [gio::File::for_path(local_path)];
+        context.startup_notify_id(gio::AppInfo::NONE, &files)
+    }
+
+    fn launch_containing_folder(&self, local_path: &PathBuf, activation: DesktopOpenActivation) {
         let path_display = local_path.display().to_string();
         let workspace_name = self.workspace.display_name.clone();
         let file = gio::File::for_path(local_path);
@@ -91,6 +104,130 @@ impl LocalDesktopOpenAccess {
                     path_display,
                     err
                 ),
+            },
+        );
+    }
+
+    fn activate_parent_folder_after_reveal(
+        &self,
+        local_path: &PathBuf,
+        activation: DesktopOpenActivation,
+    ) {
+        let Some(parent_dir) = local_path.parent().map(PathBuf::from) else {
+            return;
+        };
+        let opener = self.clone();
+        let path_display = local_path.display().to_string();
+        let workspace_name = self.workspace.display_name.clone();
+        glib::timeout_add_local_once(Duration::from_millis(120), move || {
+            log::debug!(
+                "local file reveal activating parent folder workspace={} path={}",
+                workspace_name,
+                path_display
+            );
+            opener.launch_file(&parent_dir, activation);
+        });
+    }
+
+    fn open_containing_folder(&self, local_path: &PathBuf, activation: DesktopOpenActivation) {
+        let file = match File::open(local_path) {
+            Ok(file) => file,
+            Err(err) => {
+                log::warn!(
+                    "local file reveal fd open failed workspace={} path={}: {}",
+                    self.workspace.display_name,
+                    local_path.display(),
+                    err
+                );
+                self.launch_containing_folder(local_path, activation);
+                return;
+            }
+        };
+
+        // Maintainer warning: do not simplify this unless you have re-tested
+        // both selection and focus on Wayland. "Show in file manager" is not
+        // equivalent to opening a path. GtkFileLauncher::open_containing_folder
+        // and raw FileManager1.ShowItems can reveal the item but fail to
+        // activate an existing file-manager window under Wayland focus rules.
+        // xdg-open is also intentionally not used here because it cannot pass
+        // portal activation data. The sequence below uses the native
+        // xdg-desktop-portal OpenDirectory fd API to select the item, then
+        // activates the parent folder through the normal folder-open path that
+        // GTK already handles correctly for focus. The order matters: reveal
+        // first, focus the folder window second.
+        let path_display = local_path.display().to_string();
+        let workspace_name = self.workspace.display_name.clone();
+        let fd_list = gio::UnixFDList::from_array([file]);
+        let options = glib::VariantDict::default();
+        if let Some(token) = Self::portal_activation_token(local_path, &activation) {
+            options.insert("activation_token", token.as_str());
+        } else {
+            log::debug!(
+                "local file reveal portal activation token unavailable workspace={} path={}",
+                workspace_name,
+                path_display
+            );
+        }
+        let parameters = ("", glib::variant::Handle::from(0), options).to_variant();
+        let fallback = self.clone();
+        let fallback_path = local_path.clone();
+        let fallback_activation = activation.clone();
+        let focus_opener = self.clone();
+        let focus_path = local_path.clone();
+        let focus_activation = activation.clone();
+
+        gio::DBusProxy::for_bus(
+            gio::BusType::Session,
+            gio::DBusProxyFlags::DO_NOT_LOAD_PROPERTIES
+                | gio::DBusProxyFlags::DO_NOT_CONNECT_SIGNALS,
+            None::<&gio::DBusInterfaceInfo>,
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.OpenURI",
+            None::<&gio::Cancellable>,
+            move |proxy| match proxy {
+                Ok(proxy) => {
+                    proxy.call_with_unix_fd_list(
+                        "OpenDirectory",
+                        Some(&parameters),
+                        gio::DBusCallFlags::NONE,
+                        -1,
+                        Some(&fd_list),
+                        None::<&gio::Cancellable>,
+                        move |result| match result {
+                            Ok(_) => {
+                                log::info!(
+                                    "local file reveal portal complete workspace={} path={}",
+                                    workspace_name,
+                                    path_display
+                                );
+                                focus_opener.activate_parent_folder_after_reveal(
+                                    &focus_path,
+                                    focus_activation,
+                                );
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "local file reveal portal failed workspace={} path={}: {}",
+                                    workspace_name,
+                                    path_display,
+                                    err
+                                );
+                                fallback
+                                    .launch_containing_folder(&fallback_path, fallback_activation);
+                            }
+                        },
+                    );
+                }
+                Err(err) => {
+                    log::warn!(
+                        "local file reveal portal proxy failed workspace={} path={}: {}",
+                        workspace_name,
+                        path_display,
+                        err
+                    );
+                    fallback.launch_containing_folder(&fallback_path, fallback_activation);
+                }
             },
         );
     }
