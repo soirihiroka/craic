@@ -1,6 +1,6 @@
 use adw::prelude::*;
 use gtk::{gdk, gio};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 use vte4::prelude::*;
 
@@ -445,15 +445,6 @@ pub(crate) fn retain_context_menu(
     if let Some(existing) = active_context_menu.borrow_mut().replace(popover.clone()) {
         existing.popdown();
     }
-}
-
-pub(crate) fn track_context_menu_event_time(popover: &gtk::PopoverMenu, event_time: Rc<Cell<u32>>) {
-    let click = gtk::GestureClick::builder().button(0).build();
-    click.set_propagation_phase(gtk::PropagationPhase::Capture);
-    click.connect_pressed(move |gesture, _, _, _| {
-        event_time.set(gesture.current_event_time());
-    });
-    popover.add_controller(click);
 }
 
 pub(crate) fn add_string_menu_action<F>(

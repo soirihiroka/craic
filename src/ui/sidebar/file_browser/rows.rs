@@ -90,13 +90,7 @@ impl FileBrowser {
                     3 => {
                         let target =
                             browser.target_for_node_path(browser.gap_context_folder(content_y));
-                        show_row_context_menu(
-                            &browser,
-                            &browser.tree.scroller,
-                            target,
-                            x,
-                            y,
-                        );
+                        show_row_context_menu(&browser, &browser.tree.scroller, target, x, y);
                         gesture.set_state(gtk::EventSequenceState::Claimed);
                     }
                     _ => {}
@@ -631,13 +625,7 @@ impl FileBrowser {
                         + y;
                     let target =
                         browser.target_for_node_path(browser.gap_context_folder(content_y));
-                    show_row_context_menu(
-                        &browser,
-                        parent,
-                        target,
-                        x,
-                        y,
-                    );
+                    show_row_context_menu(&browser, parent, target, x, y);
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                 }
             })
@@ -1077,13 +1065,7 @@ fn tree_secondary_click_handler(
                 .parent()
                 .unwrap_or_else(|| browser.root_node_path())
         });
-        show_row_context_menu(
-            &browser,
-            parent,
-            BrowserTarget::from_row(&row),
-            x,
-            y,
-        );
+        show_row_context_menu(&browser, parent, BrowserTarget::from_row(&row), x, y);
         gesture.set_state(gtk::EventSequenceState::Claimed);
     }
 }

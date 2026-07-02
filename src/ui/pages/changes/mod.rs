@@ -338,7 +338,6 @@ impl ChangesPage {
         actions.open_terminal.set_sensitive(local_workspace);
         actions.show_files.set_sensitive(desktop_open_available);
         let terminal_event_time = track_button_event_time(&actions.open_terminal);
-        let files_event_time = track_button_event_time(&actions.show_files);
 
         // Repository suggestions are app-launch affordances. Do not route them
         // to integrated Craic UI: Ghostty must open external Ghostty, and Files
@@ -355,7 +354,7 @@ impl ChangesPage {
 
         actions.show_files.connect_clicked({
             let ctx = self.ctx.clone();
-            move |_| open_repository_in_files(&ctx, files_event_time.get())
+            move |_| open_repository_in_files(&ctx)
         });
 
         actions.view_github.connect_clicked({
@@ -401,7 +400,6 @@ impl ChangesPage {
                     return;
                 }
 
-                let event_time = gesture.current_event_time();
                 let parent = files_list.clone();
                 let ctx = ctx.clone();
                 let active_context_menu = active_context_menu.clone();
@@ -413,7 +411,6 @@ impl ChangesPage {
                         &file_path,
                         x,
                         y,
-                        event_time,
                     );
                 });
                 gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -1426,11 +1423,9 @@ fn show_changed_file_context_menu(
     file_path: &str,
     x: f64,
     y: f64,
-    event_time: u32,
 ) {
     let local_workspace = ctx.system_ref().provider_kind == ProviderKind::Local;
     let menu = changed_file_menu(file_path, local_workspace);
-    let _ = event_time;
     let actions = changed_file_action_group(ctx, local_workspace);
     menu.popup(parent, x, y, &actions, active_context_menu);
 }
@@ -1458,10 +1453,7 @@ fn changed_file_menu(
         .target_item("Discard Changes...", "discard", file_path)
 }
 
-fn changed_file_action_group(
-    ctx: &PageContext,
-    local_workspace: bool,
-) -> gio::SimpleActionGroup {
+fn changed_file_action_group(ctx: &PageContext, local_workspace: bool) -> gio::SimpleActionGroup {
     let actions = gio::SimpleActionGroup::new();
     let desktop_open_available = local_workspace && ctx.desktop_opener().is_some();
     let parent_window = ctx.window().map(|window| window.upcast::<gtk::Window>());
@@ -1659,8 +1651,7 @@ fn ignore_pattern(ctx: &PageContext, pattern: &str) {
     }
 }
 
-fn open_repository_in_files(ctx: &PageContext, event_time: u32) {
-    let _ = event_time;
+fn open_repository_in_files(ctx: &PageContext) {
     let Some(desktop_opener) = ctx.desktop_opener() else {
         ctx.show_error("Open Failed", &ctx.desktop_opener_unavailable_message());
         return;

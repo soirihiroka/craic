@@ -3,7 +3,6 @@ use crate::system::capabilities::open::{
 };
 use crate::system::path::{FileNodePath, WorkspacePath, WorkspaceRef};
 use gtk::gio;
-use gtk::prelude::*;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -45,11 +44,7 @@ impl LocalDesktopOpenAccess {
         self.local_path_for_workspace(&workspace_path)
     }
 
-    fn launch_file(
-        &self,
-        local_path: &PathBuf,
-        activation: DesktopOpenActivation,
-    ) {
+    fn launch_file(&self, local_path: &PathBuf, activation: DesktopOpenActivation) {
         let path_display = local_path.display().to_string();
         let workspace_name = self.workspace.display_name.clone();
         let file = gio::File::for_path(local_path);
@@ -73,11 +68,7 @@ impl LocalDesktopOpenAccess {
         );
     }
 
-    fn open_containing_folder(
-        &self,
-        local_path: &PathBuf,
-        activation: DesktopOpenActivation,
-    ) {
+    fn open_containing_folder(&self, local_path: &PathBuf, activation: DesktopOpenActivation) {
         // Use GtkFileLauncher instead of calling FileManager1 directly. GTK
         // routes through the portal/native implementation and supplies the
         // parent-window activation data Wayland compositors require for focus.
