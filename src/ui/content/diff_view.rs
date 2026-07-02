@@ -1,5 +1,6 @@
 use super::{diff_canvas::DiffCanvas, widgets};
 use crate::git::{DiffKind, FileComparison, FileDiffRow};
+use crate::ui::components::search::SearchPanel;
 use adw::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -13,6 +14,7 @@ pub(in crate::ui) struct DiffView {
     stats: gtk::Box,
     added: gtk::Label,
     deleted: gtk::Label,
+    search_panel: SearchPanel,
     canvas: DiffCanvas,
     full_rows: Rc<RefCell<Vec<FileDiffRow>>>,
     folds: Rc<RefCell<Vec<DiffFoldRange>>>,
@@ -53,6 +55,9 @@ impl DiffView {
         header.append(&stats);
 
         let canvas = DiffCanvas::new();
+        let search_panel = SearchPanel::new("Search diff");
+        search_panel.set_clear_on_close(false);
+        search_panel.set_options_visible(false);
 
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -61,11 +66,16 @@ impl DiffView {
             .vexpand(true)
             .build();
         root.append(&header);
+        root.append(&search_panel.widget());
         root.append(&canvas.root);
+        search_panel.set_key_capture_widget(&root);
+        search_panel.install_shortcuts(&root);
+        search_panel.install_shortcuts(&canvas.root);
+        connect_diff_search(&search_panel, &canvas);
 
         let full_rows = Rc::new(RefCell::new(Vec::new()));
         let folds = Rc::new(RefCell::new(Vec::new()));
-        connect_diff_folds(&canvas, &full_rows, &folds);
+        connect_diff_folds(&canvas, &search_panel, &full_rows, &folds);
 
         Self {
             root,
@@ -73,6 +83,7 @@ impl DiffView {
             stats,
             added,
             deleted,
+            search_panel,
             canvas,
             full_rows,
             folds,
@@ -126,6 +137,7 @@ impl DiffView {
         self.canvas
             .set_syntax_for_file(file_path, comparison.fingerprint, &comparison.rows);
         refresh_canvas(&self.canvas, &self.full_rows, &self.folds, scroll_y);
+        self.search_panel.set_status(&self.canvas.search_status());
         self.current_signature.replace(Some(signature));
     }
 
@@ -136,6 +148,11 @@ impl DiffView {
         self.full_rows.borrow_mut().clear();
         self.folds.borrow_mut().clear();
         self.canvas.clear();
+        self.search_panel.set_status(&self.canvas.search_status());
+    }
+
+    pub(in crate::ui) fn toggle_search(&self) {
+        self.search_panel.toggle();
     }
 }
 
@@ -165,11 +182,13 @@ struct DiffFoldRange {
 
 fn connect_diff_folds(
     canvas: &DiffCanvas,
+    search_panel: &SearchPanel,
     full_rows: &Rc<RefCell<Vec<FileDiffRow>>>,
     folds: &Rc<RefCell<Vec<DiffFoldRange>>>,
 ) {
     canvas.set_fold_callback({
         let canvas = canvas.clone();
+        let search_panel = search_panel.clone();
         let full_rows = full_rows.clone();
         let folds = folds.clone();
         move |fold_index| {
@@ -178,6 +197,51 @@ fn connect_diff_folds(
             }
             let scroll_y = canvas.scroll_y();
             refresh_canvas(&canvas, &full_rows, &folds, scroll_y);
+            search_panel.set_status(&canvas.search_status());
+        }
+    });
+}
+
+fn connect_diff_search(search_panel: &SearchPanel, canvas: &DiffCanvas) {
+    search_panel.connect_query_changed({
+        let search_panel = search_panel.clone();
+        let canvas = canvas.clone();
+
+        move |query| {
+            canvas.set_search_query(&query);
+            search_panel.set_status(&canvas.search_status());
+        }
+    });
+    search_panel.connect_opened({
+        let search_panel = search_panel.clone();
+        let canvas = canvas.clone();
+
+        move || {
+            canvas.set_search_query(&search_panel.query());
+            search_panel.set_status(&canvas.search_status());
+        }
+    });
+    search_panel.connect_closed({
+        let canvas = canvas.clone();
+
+        move || canvas.focus()
+    });
+    search_panel.connect_previous({
+        let search_panel = search_panel.clone();
+        let canvas = canvas.clone();
+
+        move || {
+            canvas.search_previous();
+            search_panel.set_status(&canvas.search_status());
+        }
+    });
+    search_panel.connect_next({
+        let search_panel = search_panel.clone();
+        let canvas = canvas.clone();
+
+        move || {
+            canvas.search_next();
+            search_panel.set_status(&canvas.search_status());
         }
     });
 }

@@ -116,6 +116,14 @@ impl ChangesRight {
         self.root.set_visible_child_name("diff");
     }
 
+    pub(super) fn toggle_search(&self) -> bool {
+        if self.root.visible_child_name().as_deref() != Some("diff") {
+            return false;
+        }
+        self.diff.toggle_search();
+        true
+    }
+
     pub(super) fn show_binary_comparison(&self, file_path: &str, comparison: &BytesComparison) {
         if !should_update_preview(
             &self.preview_reconciler,
