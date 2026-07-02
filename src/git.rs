@@ -12,7 +12,7 @@ const COMMIT_TIMEZONE_KEY: &str = "craic.commitTimezone";
 const USE_SYSTEM_TIMEZONE_KEY: &str = "craic.useSystemTimezone";
 const SHOW_REMOTE_OWNER_WARNING_KEY: &str = "craic.showRemoteOwnerWarning";
 const DEFAULT_COMMIT_TIMEZONE: &str = "+0000";
-const MAX_TEXT_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_TEXT_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
 
 struct GitSnapshotTimer {
     repo: String,
@@ -145,14 +145,18 @@ pub struct BranchInfo {
     pub is_recent: bool,
 }
 
+#[derive(Clone, Debug)]
 pub struct FileComparison {
     pub rows: Vec<FileDiffRow>,
+    pub fingerprint: u64,
+    pub insertions: usize,
+    pub deletions: usize,
 }
 
 #[derive(Clone, Debug, Default)]
-struct FilePathPair {
-    old_path: Option<String>,
-    new_path: Option<String>,
+pub(crate) struct FilePathPair {
+    pub(crate) old_path: Option<String>,
+    pub(crate) new_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -164,9 +168,11 @@ pub(crate) struct GitStatusEntry {
     untracked: bool,
 }
 
+#[derive(Clone, Debug)]
 pub struct BytesComparison {
     pub before: Option<Vec<u8>>,
     pub after: Option<Vec<u8>>,
+    pub fingerprint: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +191,117 @@ pub struct FileDiffRow {
     pub right_text: Option<String>,
     pub left_kind: DiffKind,
     pub right_kind: DiffKind,
+}
+
+impl FileComparison {
+    fn from_rows(rows: Vec<FileDiffRow>) -> Self {
+        let fingerprint = fingerprint_diff_rows(&rows);
+        let insertions = rows
+            .iter()
+            .filter(|row| row.right_kind == DiffKind::Added)
+            .count();
+        let deletions = rows
+            .iter()
+            .filter(|row| row.left_kind == DiffKind::Deleted)
+            .count();
+        Self {
+            rows,
+            fingerprint,
+            insertions,
+            deletions,
+        }
+    }
+}
+
+impl BytesComparison {
+    pub(crate) fn from_parts(before: Option<Vec<u8>>, after: Option<Vec<u8>>) -> Self {
+        let fingerprint = fingerprint_optional_bytes(before.as_deref(), after.as_deref());
+        Self {
+            before,
+            after,
+            fingerprint,
+        }
+    }
+}
+
+fn fingerprint_diff_rows(rows: &[FileDiffRow]) -> u64 {
+    let mut fingerprint = 0xcbf29ce484222325;
+    hash_usize(&mut fingerprint, rows.len());
+    for row in rows {
+        hash_option_usize(&mut fingerprint, row.left_number);
+        hash_option_usize(&mut fingerprint, row.right_number);
+        hash_kind(&mut fingerprint, row.left_kind);
+        hash_kind(&mut fingerprint, row.right_kind);
+        hash_option_text(&mut fingerprint, row.left_text.as_deref());
+        hash_option_text(&mut fingerprint, row.right_text.as_deref());
+    }
+    fingerprint
+}
+
+fn fingerprint_optional_bytes(before: Option<&[u8]>, after: Option<&[u8]>) -> u64 {
+    let mut fingerprint = 0xcbf29ce484222325;
+    hash_optional_bytes(&mut fingerprint, before);
+    hash_optional_bytes(&mut fingerprint, after);
+    fingerprint
+}
+
+fn hash_option_usize(fingerprint: &mut u64, value: Option<usize>) {
+    match value {
+        Some(value) => {
+            hash_u8(fingerprint, 1);
+            hash_usize(fingerprint, value);
+        }
+        None => hash_u8(fingerprint, 0),
+    }
+}
+
+fn hash_kind(fingerprint: &mut u64, kind: DiffKind) {
+    hash_u8(
+        fingerprint,
+        match kind {
+            DiffKind::Context => 0,
+            DiffKind::Deleted => 1,
+            DiffKind::Added => 2,
+            DiffKind::Fold => 3,
+        },
+    );
+}
+
+fn hash_option_text(fingerprint: &mut u64, text: Option<&str>) {
+    match text {
+        Some(text) => {
+            hash_u8(fingerprint, 1);
+            hash_usize(fingerprint, text.len());
+            hash_bytes(fingerprint, text.as_bytes());
+        }
+        None => hash_u8(fingerprint, 0),
+    }
+}
+
+fn hash_optional_bytes(fingerprint: &mut u64, bytes: Option<&[u8]>) {
+    match bytes {
+        Some(bytes) => {
+            hash_u8(fingerprint, 1);
+            hash_usize(fingerprint, bytes.len());
+            hash_bytes(fingerprint, bytes);
+        }
+        None => hash_u8(fingerprint, 0),
+    }
+}
+
+fn hash_usize(fingerprint: &mut u64, value: usize) {
+    hash_bytes(fingerprint, &value.to_le_bytes());
+}
+
+fn hash_u8(fingerprint: &mut u64, value: u8) {
+    hash_bytes(fingerprint, &[value]);
+}
+
+fn hash_bytes(fingerprint: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *fingerprint ^= u64::from(*byte);
+        *fingerprint = fingerprint.wrapping_mul(0x100000001b3);
+    }
 }
 
 pub fn snapshot(path: &Path) -> Result<RepositorySnapshot, String> {
@@ -736,6 +853,7 @@ pub fn remote_commit_web_url(remote_url: &str, hash: &str) -> String {
 }
 
 pub fn comparison(path: &Path, file_path: &str) -> Result<FileComparison, String> {
+    let start = Instant::now();
     let paths = worktree_file_path_pair(path, file_path)?;
     let old_path = paths.old_path.as_deref().unwrap_or(file_path);
     let new_path = paths.new_path.as_deref().unwrap_or(file_path);
@@ -748,8 +866,14 @@ pub fn comparison(path: &Path, file_path: &str) -> Result<FileComparison, String
         &workdir_file_lines(path, new_path)?,
         paths_changed(&paths),
     );
+    log::info!(
+        "git worktree comparison complete path={} rows={} elapsed_ms={}",
+        file_path,
+        rows.len(),
+        start.elapsed().as_millis()
+    );
 
-    Ok(FileComparison { rows })
+    Ok(FileComparison::from_rows(rows))
 }
 
 pub fn commit_details(path: &Path, hash: &str) -> Result<Commit, String> {
@@ -849,6 +973,7 @@ pub fn commit_comparison(
     hash: &str,
     file_path: &str,
 ) -> Result<FileComparison, String> {
+    let start = Instant::now();
     let paths = commit_file_path_pair(path, hash, file_path)?;
     let old_path = paths.old_path.as_deref().unwrap_or(file_path);
     let new_path = paths.new_path.as_deref().unwrap_or(file_path);
@@ -861,8 +986,15 @@ pub fn commit_comparison(
         &tree_file_lines(path, hash, new_path)?,
         paths_changed(&paths),
     );
+    log::info!(
+        "git commit comparison complete hash={} path={} rows={} elapsed_ms={}",
+        short_hash(hash),
+        file_path,
+        rows.len(),
+        start.elapsed().as_millis()
+    );
 
-    Ok(FileComparison { rows })
+    Ok(FileComparison::from_rows(rows))
 }
 
 fn repo_root(path: &Path) -> Result<PathBuf, String> {
@@ -1741,17 +1873,17 @@ fn plural(value: i64, unit: &str) -> String {
     }
 }
 
-const MAX_BINARY_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_BINARY_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
 
 pub fn bytes_comparison(path: &Path, file_path: &str) -> Result<BytesComparison, String> {
     let paths = worktree_file_path_pair(path, file_path)?;
     let old_path = paths.old_path.as_deref().unwrap_or(file_path);
     let new_path = paths.new_path.as_deref().unwrap_or(file_path);
 
-    Ok(BytesComparison {
-        before: tree_file_binary_bytes_opt(path, Some("HEAD"), old_path)?,
-        after: workdir_binary_bytes(path, new_path)?,
-    })
+    Ok(BytesComparison::from_parts(
+        tree_file_binary_bytes_opt(path, Some("HEAD"), old_path)?,
+        workdir_binary_bytes(path, new_path)?,
+    ))
 }
 
 pub fn commit_bytes_comparison(
@@ -1764,10 +1896,10 @@ pub fn commit_bytes_comparison(
     let new_path = paths.new_path.as_deref().unwrap_or(file_path);
     let parent = commit_parent_hash(path, hash)?;
 
-    Ok(BytesComparison {
-        before: tree_file_binary_bytes_opt(path, parent.as_deref(), old_path)?,
-        after: tree_file_binary_bytes_opt(path, Some(hash), new_path)?,
-    })
+    Ok(BytesComparison::from_parts(
+        tree_file_binary_bytes_opt(path, parent.as_deref(), old_path)?,
+        tree_file_binary_bytes_opt(path, Some(hash), new_path)?,
+    ))
 }
 
 fn ensure_worktree_text_previewable(
@@ -1897,13 +2029,20 @@ fn is_file_path_match(file_path: &str, paths: &FilePathPair) -> bool {
             .is_some_and(|new_path| new_path == file_path)
 }
 
-fn paths_changed(paths: &FilePathPair) -> bool {
+pub(crate) fn paths_changed(paths: &FilePathPair) -> bool {
     paths.old_path.is_some() && paths.new_path.is_some() && paths.old_path != paths.new_path
 }
 
 fn worktree_file_path_pair(path: &Path, file_path: &str) -> Result<FilePathPair, String> {
     let entries = status_entries(path)?;
-    Ok(entries
+    Ok(worktree_file_path_pair_from_entries(&entries, file_path))
+}
+
+pub(crate) fn worktree_file_path_pair_from_entries(
+    entries: &[GitStatusEntry],
+    file_path: &str,
+) -> FilePathPair {
+    entries
         .iter()
         .find(|entry| porcelain_entry_matches_path(entry, file_path))
         .map(|entry| FilePathPair {
@@ -1917,7 +2056,7 @@ fn worktree_file_path_pair(path: &Path, file_path: &str) -> Result<FilePathPair,
         .unwrap_or_else(|| FilePathPair {
             old_path: Some(file_path.to_string()),
             new_path: Some(file_path.to_string()),
-        }))
+        })
 }
 
 fn commit_file_path_pair(path: &Path, hash: &str, file_path: &str) -> Result<FilePathPair, String> {
@@ -1945,6 +2084,19 @@ fn commit_name_status_entries(path: &Path, hash: &str) -> Result<Vec<FilePathPai
         ],
     )?;
     Ok(parse_name_status_path_pairs_z(&output))
+}
+
+pub(crate) fn commit_file_path_pair_from_name_status_bytes(
+    bytes: &[u8],
+    file_path: &str,
+) -> FilePathPair {
+    parse_name_status_path_pairs_z(bytes)
+        .into_iter()
+        .find(|paths| is_file_path_match(file_path, paths))
+        .unwrap_or_else(|| FilePathPair {
+            old_path: Some(file_path.to_string()),
+            new_path: Some(file_path.to_string()),
+        })
 }
 
 fn worktree_diff(path: &Path, paths: &FilePathPair, fallback_path: &str) -> Result<String, String> {
@@ -2007,7 +2159,7 @@ fn commit_diff(
     run_git_owned(path, &args)
 }
 
-fn diff_args_for_paths(paths: &[Option<&str>]) -> Vec<String> {
+pub(crate) fn diff_args_for_paths(paths: &[Option<&str>]) -> Vec<String> {
     let mut args = vec!["--".to_string()];
     let mut seen = HashSet::new();
     for path in paths.iter().flatten().filter(|path| !path.is_empty()) {
@@ -2047,6 +2199,28 @@ fn tree_file_lines(repo_path: &Path, rev: &str, file_path: &str) -> Result<Vec<S
     };
     ensure_blob_text_previewable(&bytes)?;
     Ok(lines_from_bytes(&bytes))
+}
+
+pub(crate) fn comparison_from_unified_diff(
+    diff: &str,
+    left_lines: &[String],
+    right_lines: &[String],
+    complete_empty: bool,
+) -> FileComparison {
+    FileComparison::from_rows(complete_diff_rows(
+        parse_unified_diff(diff),
+        left_lines,
+        right_lines,
+        complete_empty,
+    ))
+}
+
+pub(crate) fn text_preview_lines(bytes: Option<&[u8]>) -> Result<Vec<String>, String> {
+    let Some(bytes) = bytes else {
+        return Ok(Vec::new());
+    };
+    ensure_blob_text_previewable(bytes)?;
+    Ok(lines_from_bytes(bytes))
 }
 
 fn lines_from_bytes(bytes: &[u8]) -> Vec<String> {
@@ -2162,7 +2336,7 @@ fn is_binary_bytes(bytes: &[u8]) -> bool {
     bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
 }
 
-fn file_name(path: &str) -> &str {
+pub(crate) fn file_name(path: &str) -> &str {
     path.rsplit('/')
         .find(|segment| !segment.is_empty())
         .unwrap_or(path)

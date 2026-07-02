@@ -20,6 +20,7 @@ mod changes;
 mod containers;
 mod file;
 mod history;
+mod preview_reconcile;
 
 pub(crate) trait Page {
     fn label(&self) -> &'static str;

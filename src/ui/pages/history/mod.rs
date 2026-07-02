@@ -8,17 +8,77 @@ use crate::ui::sidebar::history::HistoryList;
 use adw::prelude::*;
 use gtk::gio;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod right;
 
+const HISTORY_PREVIEW_CACHE_LIMIT: usize = 48;
+
+#[derive(Clone, Debug)]
 enum HistoryFilePreview {
     Diff(FileComparison),
     Bytes(BytesComparison),
+    PreviewLimit(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryPreviewKey {
+    hash: String,
+    path: String,
+    kind: PreviewKind,
+}
+
+struct HistoryPreviewWorkerResult {
+    key: HistoryPreviewKey,
+    result: Result<HistoryFilePreview, String>,
+    duration: Duration,
+}
+
+struct BoundedPreviewCache<K, V> {
+    limit: usize,
+    entries: VecDeque<(K, V)>,
+}
+
+impl<K: Eq + Clone, V: Clone> BoundedPreviewCache<K, V> {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<V> {
+        let index = self.entries.iter().position(|(entry, _)| entry == key)?;
+        let (key, value) = self.entries.remove(index)?;
+        let cloned = value.clone();
+        self.entries.push_front((key, value));
+        Some(cloned)
+    }
+
+    fn insert(&mut self, key: K, value: V) -> usize {
+        if let Some(index) = self.entries.iter().position(|(entry, _)| entry == &key) {
+            self.entries.remove(index);
+        }
+        self.entries.push_front((key, value));
+
+        let mut evicted = 0;
+        while self.entries.len() > self.limit {
+            self.entries.pop_back();
+            evicted += 1;
+        }
+        evicted
+    }
+
+    fn clear(&mut self) -> usize {
+        let count = self.entries.len();
+        self.entries.clear();
+        count
+    }
 }
 
 pub(super) struct HistoryPage {
@@ -26,6 +86,8 @@ pub(super) struct HistoryPage {
     left: HistoryList,
     right: Rc<right::HistoryRight>,
     selected_commit: Rc<RefCell<Option<String>>>,
+    preview_cache: Rc<RefCell<BoundedPreviewCache<HistoryPreviewKey, HistoryFilePreview>>>,
+    preview_workspace_key: Rc<RefCell<Option<String>>>,
     active_context_menu: Rc<RefCell<Option<gtk::Popover>>>,
 }
 
@@ -36,6 +98,10 @@ impl HistoryPage {
             left: HistoryList::new(),
             right: Rc::new(right::HistoryRight::new()),
             selected_commit: Rc::new(RefCell::new(None)),
+            preview_cache: Rc::new(RefCell::new(BoundedPreviewCache::new(
+                HISTORY_PREVIEW_CACHE_LIMIT,
+            ))),
+            preview_workspace_key: Rc::new(RefCell::new(None)),
             active_context_menu: Rc::new(RefCell::new(None)),
         };
         page.connect_commit_selection();
@@ -68,6 +134,7 @@ impl HistoryPage {
             let ctx = self.ctx.clone();
             let right = self.right.clone();
             let selected_commit = self.selected_commit.clone();
+            let preview_cache = self.preview_cache.clone();
 
             move |file_path| {
                 let Some(file_path) = file_path else {
@@ -77,7 +144,14 @@ impl HistoryPage {
                     return;
                 };
 
-                show_history_file_preview(&ctx, &right, &selected_commit, hash, file_path);
+                show_history_file_preview(
+                    &ctx,
+                    &right,
+                    &selected_commit,
+                    &preview_cache,
+                    hash,
+                    file_path,
+                );
             }
         });
     }
@@ -124,16 +198,31 @@ impl Page for HistoryPage {
     }
 
     fn refresh(&self, snapshot: &RepositorySnapshot) {
+        sync_history_preview_workspace(
+            &self.preview_workspace_key,
+            &self.preview_cache,
+            &self.ctx.workspace_key(),
+        );
         self.left
             .update(snapshot, self.ctx.workspace_key(), self.ctx.git());
         if snapshot.history_head.is_none() {
             self.selected_commit.borrow_mut().take();
+            clear_history_preview_cache(
+                &self.preview_cache,
+                "no-history",
+                &self.ctx.workspace_key(),
+            );
             self.right.show_empty();
         }
     }
 
     fn set_error(&self, message: &str) {
         self.selected_commit.borrow_mut().take();
+        clear_history_preview_cache(
+            &self.preview_cache,
+            "repository-error",
+            &self.ctx.workspace_key(),
+        );
         self.left.clear();
         self.right.show_error(message);
     }
@@ -226,22 +315,56 @@ fn show_history_file_preview(
     ctx: &PageContext,
     right: &Rc<right::HistoryRight>,
     selected_commit: &Rc<RefCell<Option<String>>>,
+    preview_cache: &Rc<RefCell<BoundedPreviewCache<HistoryPreviewKey, HistoryFilePreview>>>,
     hash: String,
     file_path: String,
 ) {
+    let kind = crate::ui::file_type::preview_kind_for_path(&file_path, false);
+    let key = HistoryPreviewKey {
+        hash,
+        path: file_path,
+        kind,
+    };
+
+    if let Some(preview) = preview_cache.borrow_mut().get(&key) {
+        log::info!(
+            "history preview cache hit workspace={} hash={} path={} kind={:?} {}",
+            ctx.workspace_key(),
+            key.hash.as_str(),
+            key.path,
+            key.kind,
+            history_preview_summary(&preview)
+        );
+        show_history_preview_outcome(right, &key.path, &preview);
+        return;
+    }
+
+    log::info!(
+        "history preview cache miss workspace={} hash={} path={} kind={:?}",
+        ctx.workspace_key(),
+        key.hash.as_str(),
+        key.path,
+        key.kind
+    );
+
     let Some(git_access) = ctx.git() else {
         ctx.show_error("Diff Failed", &ctx.git_unavailable_message());
         return;
     };
     let (sender, receiver) = mpsc::channel();
+    let workspace_key = ctx.workspace_key();
 
     thread::spawn({
-        let hash = hash.clone();
-        let file_path = file_path.clone();
+        let key = key.clone();
 
         move || {
-            let result = commit_file_preview(git_access.as_ref(), &hash, &file_path);
-            let _ = sender.send(result);
+            let start = Instant::now();
+            let result = commit_file_preview(git_access.as_ref(), &key);
+            let _ = sender.send(HistoryPreviewWorkerResult {
+                key,
+                result,
+                duration: start.elapsed(),
+            });
         }
     });
 
@@ -249,28 +372,62 @@ fn show_history_file_preview(
         let ctx = ctx.clone();
         let right = right.clone();
         let selected_commit = selected_commit.clone();
+        let preview_cache = preview_cache.clone();
 
         move || match receiver.try_recv() {
-            Ok(Ok(preview)) => {
-                if !is_current_history_file_selection(&right, &selected_commit, &hash, &file_path) {
+            Ok(result) => {
+                if !ctx.workspace_is_current(&workspace_key)
+                    || !is_current_history_file_selection(
+                        &right,
+                        &selected_commit,
+                        &result.key.hash,
+                        &result.key.path,
+                    )
+                {
+                    log::info!(
+                        "history preview stale result dropped workspace={} hash={} path={} kind={:?} duration_ms={}",
+                        workspace_key,
+                        result.key.hash.as_str(),
+                        result.key.path,
+                        result.key.kind,
+                        result.duration.as_millis()
+                    );
                     return gtk::glib::ControlFlow::Break;
                 }
 
-                match preview {
-                    HistoryFilePreview::Diff(comparison) => {
-                        right.show_comparison(&file_path, &comparison);
+                match result.result {
+                    Ok(preview) => {
+                        log::info!(
+                            "history preview loaded workspace={} hash={} path={} kind={:?} duration_ms={} {}",
+                            workspace_key,
+                            result.key.hash.as_str(),
+                            result.key.path,
+                            result.key.kind,
+                            result.duration.as_millis(),
+                            history_preview_summary(&preview)
+                        );
+                        let evicted = preview_cache
+                            .borrow_mut()
+                            .insert(result.key.clone(), preview.clone());
+                        if evicted > 0 {
+                            log::info!(
+                                "history preview cache invalidation workspace={} reason=evict count={}",
+                                workspace_key,
+                                evicted
+                            );
+                        }
+                        show_history_preview_outcome(&right, &result.key.path, &preview);
                     }
-                    HistoryFilePreview::Bytes(comparison) => {
-                        right.show_binary_comparison(&file_path, &comparison);
-                    }
-                }
-                gtk::glib::ControlFlow::Break
-            }
-            Ok(Err(err)) => {
-                if is_current_history_file_selection(&right, &selected_commit, &hash, &file_path) {
-                    if is_preview_limit_message(&err) {
-                        right.show_preview_unavailable(&file_path, &err);
-                    } else {
+                    Err(err) => {
+                        log::warn!(
+                            "history preview load failed workspace={} hash={} path={} kind={:?} duration_ms={} err={}",
+                            workspace_key,
+                            result.key.hash.as_str(),
+                            result.key.path,
+                            result.key.kind,
+                            result.duration.as_millis(),
+                            err
+                        );
                         ctx.show_error("Diff Failed", &err);
                     }
                 }
@@ -278,7 +435,14 @@ fn show_history_file_preview(
             }
             Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
             Err(TryRecvError::Disconnected) => {
-                if is_current_history_file_selection(&right, &selected_commit, &hash, &file_path) {
+                if ctx.workspace_is_current(&workspace_key)
+                    && is_current_history_file_selection(
+                        &right,
+                        &selected_commit,
+                        &key.hash,
+                        &key.path,
+                    )
+                {
                     ctx.show_error("Diff Failed", "Diff loading did not return a result.");
                 }
                 gtk::glib::ControlFlow::Break
@@ -289,20 +453,88 @@ fn show_history_file_preview(
 
 fn commit_file_preview(
     git_access: &dyn GitAccess,
-    hash: &str,
-    file_path: &str,
+    key: &HistoryPreviewKey,
 ) -> Result<HistoryFilePreview, String> {
-    match crate::ui::file_type::preview_kind_for_path(file_path, false) {
+    let result = match key.kind {
         PreviewKind::Image
         | PreviewKind::Audio
         | PreviewKind::Video
         | PreviewKind::Font
         | PreviewKind::Pdf => git_access
-            .commit_bytes_comparison(hash, file_path)
+            .commit_bytes_comparison(&key.hash, &key.path)
             .map(HistoryFilePreview::Bytes),
         _ => git_access
-            .commit_comparison(hash, file_path)
+            .commit_comparison(&key.hash, &key.path)
             .map(HistoryFilePreview::Diff),
+    };
+
+    match result {
+        Ok(preview) => Ok(preview),
+        Err(err) if is_preview_limit_message(&err) => Ok(HistoryFilePreview::PreviewLimit(err)),
+        Err(err) => Err(err),
+    }
+}
+
+fn show_history_preview_outcome(
+    right: &right::HistoryRight,
+    file_path: &str,
+    preview: &HistoryFilePreview,
+) {
+    match preview {
+        HistoryFilePreview::Diff(comparison) => right.show_comparison(file_path, comparison),
+        HistoryFilePreview::Bytes(comparison) => {
+            right.show_binary_comparison(file_path, comparison)
+        }
+        HistoryFilePreview::PreviewLimit(message) => {
+            right.show_preview_unavailable(file_path, message);
+        }
+    }
+}
+
+fn history_preview_summary(preview: &HistoryFilePreview) -> String {
+    match preview {
+        HistoryFilePreview::Diff(comparison) => format!("rows={}", comparison.rows.len()),
+        HistoryFilePreview::Bytes(comparison) => format!(
+            "before_bytes={} after_bytes={}",
+            comparison.before.as_ref().map(Vec::len).unwrap_or(0),
+            comparison.after.as_ref().map(Vec::len).unwrap_or(0)
+        ),
+        HistoryFilePreview::PreviewLimit(_) => "preview_limit=true".to_string(),
+    }
+}
+
+fn sync_history_preview_workspace(
+    preview_workspace_key: &Rc<RefCell<Option<String>>>,
+    preview_cache: &Rc<RefCell<BoundedPreviewCache<HistoryPreviewKey, HistoryFilePreview>>>,
+    workspace_key: &str,
+) {
+    if preview_workspace_key.borrow().as_deref() == Some(workspace_key) {
+        return;
+    }
+
+    let previous = preview_workspace_key.replace(Some(workspace_key.to_string()));
+    let invalidated = preview_cache.borrow_mut().clear();
+    log::info!(
+        "history preview cache invalidation workspace={} previous_workspace={:?} reason=workspace-change count={}",
+        workspace_key,
+        previous,
+        invalidated
+    );
+}
+
+fn clear_history_preview_cache(
+    preview_cache: &Rc<RefCell<BoundedPreviewCache<HistoryPreviewKey, HistoryFilePreview>>>,
+    reason: &str,
+    workspace_key: &str,
+) {
+    let invalidated = preview_cache.borrow_mut().clear();
+    if invalidated > 0 {
+        log::info!(
+            "history preview cache invalidation workspace={} reason={} count={}",
+            workspace_key,
+            reason,
+            invalidated
+        );
     }
 }
 

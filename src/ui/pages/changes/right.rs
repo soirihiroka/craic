@@ -1,3 +1,7 @@
+use super::super::preview_reconcile::{
+    RightPreviewReconciler, RightPreviewState, binary_state, diff_state, should_update_preview,
+    unavailable_state,
+};
 use crate::git::{BytesComparison, FileComparison, RepositorySnapshot};
 use crate::ui::content::binary_preview::{
     BinaryPreviewWidgets, set_audio_preview, set_font_preview, set_image_preview, set_pdf_preview,
@@ -7,6 +11,7 @@ use crate::ui::content::diff_view::DiffView;
 use crate::ui::content::{self, SuggestionsActions, SuggestionsPanel};
 use crate::ui::file_type::PreviewKind;
 use adw::prelude::*;
+use std::cell::RefCell;
 
 pub(super) struct ChangesRight {
     pub(super) root: gtk::Stack,
@@ -17,6 +22,7 @@ pub(super) struct ChangesRight {
     diff: DiffView,
     file_preview: BinaryPreviewWidgets,
     pub(super) suggestions_actions: SuggestionsActions,
+    preview_reconciler: RefCell<RightPreviewReconciler>,
 }
 
 impl ChangesRight {
@@ -58,6 +64,7 @@ impl ChangesRight {
             diff,
             file_preview,
             suggestions_actions: suggestions.actions,
+            preview_reconciler: RefCell::new(RightPreviewReconciler::new()),
         }
     }
 
@@ -91,15 +98,32 @@ impl ChangesRight {
     }
 
     pub(super) fn show_home(&self) {
+        if !should_update_preview(&self.preview_reconciler, RightPreviewState::Home, "changes") {
+            return;
+        }
         self.root.set_visible_child_name("suggestions");
     }
 
     pub(super) fn show_comparison(&self, file_path: &str, comparison: &FileComparison) {
+        if !should_update_preview(
+            &self.preview_reconciler,
+            diff_state(file_path, comparison),
+            "changes",
+        ) {
+            return;
+        }
         self.diff.set_diff(file_path, comparison);
         self.root.set_visible_child_name("diff");
     }
 
     pub(super) fn show_binary_comparison(&self, file_path: &str, comparison: &BytesComparison) {
+        if !should_update_preview(
+            &self.preview_reconciler,
+            binary_state(file_path, comparison),
+            "changes",
+        ) {
+            return;
+        }
         match crate::ui::file_type::preview_kind_for_path(file_path, false) {
             PreviewKind::Image => set_image_preview(&self.file_preview, file_path, comparison),
             PreviewKind::Audio => set_audio_preview(&self.file_preview, file_path, comparison),
@@ -116,6 +140,13 @@ impl ChangesRight {
     }
 
     pub(super) fn show_preview_unavailable(&self, file_path: &str, message: &str) {
+        if !should_update_preview(
+            &self.preview_reconciler,
+            unavailable_state(file_path, message),
+            "changes",
+        ) {
+            return;
+        }
         set_unavailable_preview(&self.file_preview, file_path, message);
         self.root.set_visible_child_name("preview");
     }

@@ -14,7 +14,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SSH_GIT_WATCH_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -926,35 +926,37 @@ printf '],"has_more":%s}}\n' "$has_more""#,
     }
 
     fn comparison(&self, file_path: &str) -> Result<git::FileComparison, String> {
-        let diff = self.git(&["diff".into(), "--".into(), file_path.into()])?;
-        Ok(git::FileComparison {
-            rows: parse_unified_diff(&diff),
-        })
+        let start = Instant::now();
+        let paths = self.worktree_file_path_pair(file_path)?;
+        let old_path = paths.old_path.as_deref().unwrap_or(file_path);
+        let new_path = paths.new_path.as_deref().unwrap_or(file_path);
+        let left_lines = self.tree_file_text_lines_opt(Some("HEAD"), old_path)?;
+        let right_lines = self.workdir_text_lines(new_path)?;
+        let diff = self.worktree_diff(&paths, file_path)?;
+        let comparison = git::comparison_from_unified_diff(
+            &diff,
+            &left_lines,
+            &right_lines,
+            git::paths_changed(&paths),
+        );
+        log::info!(
+            "ssh git worktree comparison complete workspace={} path={} rows={} elapsed_ms={}",
+            self.workspace.display_name,
+            file_path,
+            comparison.rows.len(),
+            start.elapsed().as_millis()
+        );
+        Ok(comparison)
     }
 
     fn bytes_comparison(&self, file_path: &str) -> Result<git::BytesComparison, String> {
-        let before_script = format!(
-            "cd {} && git show HEAD:{} 2>/dev/null || true",
-            shell_quote(&self.workspace.root.absolute),
-            shell_quote(file_path)
-        );
-        let after_script = format!(
-            "cd {} && cat -- {} 2>/dev/null || true",
-            shell_quote(&self.workspace.root.absolute),
-            shell_quote(file_path)
-        );
-        Ok(git::BytesComparison {
-            before: Some(
-                self.runner
-                    .run_script("git bytes before", &before_script)?
-                    .stdout,
-            ),
-            after: Some(
-                self.runner
-                    .run_script("git bytes after", &after_script)?
-                    .stdout,
-            ),
-        })
+        let paths = self.worktree_file_path_pair(file_path)?;
+        let old_path = paths.old_path.as_deref().unwrap_or(file_path);
+        let new_path = paths.new_path.as_deref().unwrap_or(file_path);
+        Ok(git::BytesComparison::from_parts(
+            self.tree_file_binary_bytes_opt(Some("HEAD"), old_path)?,
+            self.workdir_binary_bytes(new_path)?,
+        ))
     }
 
     fn commit_comparison(
@@ -968,18 +970,29 @@ printf '],"has_more":%s}}\n' "$has_more""#,
             short_hash(hash),
             file_path
         );
-        let diff = self.git(&[
-            "show".into(),
-            "--format=".into(),
-            "--find-renames".into(),
-            "--no-ext-diff".into(),
-            hash.into(),
-            "--".into(),
-            file_path.into(),
-        ])?;
-        Ok(git::FileComparison {
-            rows: parse_unified_diff(&diff),
-        })
+        let start = Instant::now();
+        let paths = self.commit_file_path_pair(hash, file_path)?;
+        let old_path = paths.old_path.as_deref().unwrap_or(file_path);
+        let new_path = paths.new_path.as_deref().unwrap_or(file_path);
+        let parent = self.commit_parent_hash(hash)?;
+        let left_lines = self.tree_file_text_lines_opt(parent.as_deref(), old_path)?;
+        let right_lines = self.tree_file_text_lines_opt(Some(hash), new_path)?;
+        let diff = self.commit_diff(hash, &paths, file_path)?;
+        let comparison = git::comparison_from_unified_diff(
+            &diff,
+            &left_lines,
+            &right_lines,
+            git::paths_changed(&paths),
+        );
+        log::info!(
+            "ssh git commit comparison complete workspace={} hash={} path={} rows={} elapsed_ms={}",
+            self.workspace.display_name,
+            short_hash(hash),
+            file_path,
+            comparison.rows.len(),
+            start.elapsed().as_millis()
+        );
+        Ok(comparison)
     }
 
     fn commit_bytes_comparison(
@@ -993,12 +1006,13 @@ printf '],"has_more":%s}}\n' "$has_more""#,
             short_hash(hash),
             file_path
         );
-        let before = match self.commit_parent_hash(hash)? {
-            Some(parent_hash) => self.tree_file_bytes(&parent_hash, file_path)?,
-            None => None,
-        };
-        let after = self.tree_file_bytes(hash, file_path)?;
-        Ok(git::BytesComparison { before, after })
+        let paths = self.commit_file_path_pair(hash, file_path)?;
+        let old_path = paths.old_path.as_deref().unwrap_or(file_path);
+        let new_path = paths.new_path.as_deref().unwrap_or(file_path);
+        let parent = self.commit_parent_hash(hash)?;
+        let before = self.tree_file_binary_bytes_opt(parent.as_deref(), old_path)?;
+        let after = self.tree_file_binary_bytes_opt(Some(hash), new_path)?;
+        Ok(git::BytesComparison::from_parts(before, after))
     }
 }
 
@@ -1058,6 +1072,175 @@ impl SshGitAccess {
                 .then_with(|| left.status.cmp(&right.status))
         });
         Ok(files)
+    }
+
+    fn status_entries(&self) -> Result<Vec<git::GitStatusEntry>, String> {
+        let script = format!(
+            "cd {} && git --no-optional-locks status --untracked-files=all --branch --porcelain=2 -z",
+            shell_quote(&self.workspace.root.absolute)
+        );
+        let output = self.runner.run_script("git status entries", &script)?;
+        Ok(git::parse_porcelain_status_entries(&output.stdout))
+    }
+
+    fn worktree_file_path_pair(&self, file_path: &str) -> Result<git::FilePathPair, String> {
+        Ok(git::worktree_file_path_pair_from_entries(
+            &self.status_entries()?,
+            file_path,
+        ))
+    }
+
+    fn commit_file_path_pair(
+        &self,
+        hash: &str,
+        file_path: &str,
+    ) -> Result<git::FilePathPair, String> {
+        let script = format!(
+            "cd {} && git diff-tree --root --no-commit-id --name-status -r -M -z {}",
+            shell_quote(&self.workspace.root.absolute),
+            shell_quote(hash)
+        );
+        let output = self.runner.run_script("git commit path pairs", &script)?;
+        Ok(git::commit_file_path_pair_from_name_status_bytes(
+            &output.stdout,
+            file_path,
+        ))
+    }
+
+    fn worktree_diff(
+        &self,
+        paths: &git::FilePathPair,
+        fallback_path: &str,
+    ) -> Result<String, String> {
+        if paths.old_path.is_none()
+            && let Some(new_path) = paths.new_path.as_deref()
+        {
+            let script = format!(
+                "cd {} || exit 2\n\
+                 git diff --no-index --no-ext-diff --no-color --unified=3 -- /dev/null {}\n\
+                 status=$?\n\
+                 if [ \"$status\" -eq 0 ] || [ \"$status\" -eq 1 ]; then exit 0; fi\n\
+                 exit \"$status\"",
+                shell_quote(&self.workspace.root.absolute),
+                shell_quote(new_path)
+            );
+            return self.runner.run_text("git worktree no-index diff", &script);
+        }
+
+        let mut args = vec![
+            "diff".to_string(),
+            "HEAD".to_string(),
+            "--no-ext-diff".to_string(),
+            "--find-renames".to_string(),
+            "--no-color".to_string(),
+            "--unified=3".to_string(),
+        ];
+        args.extend(git::diff_args_for_paths(&[
+            paths.old_path.as_deref(),
+            paths.new_path.as_deref(),
+            Some(fallback_path),
+        ]));
+        self.git(&args)
+    }
+
+    fn commit_diff(
+        &self,
+        hash: &str,
+        paths: &git::FilePathPair,
+        fallback_path: &str,
+    ) -> Result<String, String> {
+        let mut args = vec![
+            "show".to_string(),
+            "--format=".to_string(),
+            "--find-renames".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-color".to_string(),
+            "--unified=3".to_string(),
+            hash.to_string(),
+        ];
+        args.extend(git::diff_args_for_paths(&[
+            paths.old_path.as_deref(),
+            paths.new_path.as_deref(),
+            Some(fallback_path),
+        ]));
+        self.git(&args)
+    }
+
+    fn tree_file_text_lines_opt(
+        &self,
+        rev: Option<&str>,
+        file_path: &str,
+    ) -> Result<Vec<String>, String> {
+        let bytes = self.tree_file_bytes_opt(rev, file_path, git::MAX_TEXT_PREVIEW_BYTES, true)?;
+        git::text_preview_lines(bytes.as_deref())
+    }
+
+    fn workdir_text_lines(&self, file_path: &str) -> Result<Vec<String>, String> {
+        let bytes = self.workdir_file_bytes(file_path, git::MAX_TEXT_PREVIEW_BYTES, true)?;
+        git::text_preview_lines(bytes.as_deref())
+    }
+
+    fn tree_file_binary_bytes_opt(
+        &self,
+        rev: Option<&str>,
+        file_path: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.tree_file_bytes_opt(rev, file_path, git::MAX_BINARY_PREVIEW_BYTES, false)
+    }
+
+    fn workdir_binary_bytes(&self, file_path: &str) -> Result<Option<Vec<u8>>, String> {
+        self.workdir_file_bytes(file_path, git::MAX_BINARY_PREVIEW_BYTES, false)
+    }
+
+    fn tree_file_bytes_opt(
+        &self,
+        rev: Option<&str>,
+        file_path: &str,
+        max_bytes: usize,
+        text_preview: bool,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let Some(rev) = rev else {
+            return Ok(None);
+        };
+        let spec = format!("{rev}:{file_path}");
+        let script = format!(
+            "cd {} || exit 2\n\
+             spec={}\n\
+             if ! git cat-file -e \"$spec\" 2>/dev/null; then printf 'CRAIC_MISSING\\n'; exit 0; fi\n\
+             size=$(git cat-file -s \"$spec\") || exit $?\n\
+             case \"$size\" in ''|*[!0-9]*) printf 'Invalid git object size: %s\\n' \"$size\" >&2; exit 2 ;; esac\n\
+             if [ \"$size\" -gt {} ]; then printf 'CRAIC_TOO_LARGE\\n'; exit 0; fi\n\
+             printf 'CRAIC_PRESENT\\n'\n\
+             git show \"$spec\"",
+            shell_quote(&self.workspace.root.absolute),
+            shell_quote(&spec),
+            max_bytes
+        );
+        let output = self.runner.run_script("git tree bytes", &script)?;
+        parse_optional_preview_bytes(&output.stdout, file_path, text_preview)
+    }
+
+    fn workdir_file_bytes(
+        &self,
+        file_path: &str,
+        max_bytes: usize,
+        text_preview: bool,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let script = format!(
+            "cd {} || exit 2\n\
+             path={}\n\
+             if [ ! -e \"$path\" ] || [ -d \"$path\" ]; then printf 'CRAIC_MISSING\\n'; exit 0; fi\n\
+             size=$(wc -c < \"$path\" | tr -d '[:space:]') || exit $?\n\
+             case \"$size\" in ''|*[!0-9]*) printf 'Invalid file size: %s\\n' \"$size\" >&2; exit 2 ;; esac\n\
+             if [ \"$size\" -gt {} ]; then printf 'CRAIC_TOO_LARGE\\n'; exit 0; fi\n\
+             printf 'CRAIC_PRESENT\\n'\n\
+             cat -- \"$path\"",
+            shell_quote(&self.workspace.root.absolute),
+            shell_quote(file_path),
+            max_bytes
+        );
+        let output = self.runner.run_script("git workdir bytes", &script)?;
+        parse_optional_preview_bytes(&output.stdout, file_path, text_preview)
     }
 
     fn commit_target_plan(&self, selected_files: &[String]) -> Result<SshCommitTargetPlan, String> {
@@ -1148,17 +1331,31 @@ impl SshGitAccess {
         }
         Ok((insertions, deletions))
     }
+}
 
-    fn tree_file_bytes(&self, rev: &str, file_path: &str) -> Result<Option<Vec<u8>>, String> {
-        let spec = format!("{}:{}", shell_quote(rev), shell_quote(file_path));
-        let script = format!(
-            "cd {} && if git cat-file -e {} 2>/dev/null; then git show {}; fi",
-            shell_quote(&self.workspace.root.absolute),
-            spec,
-            spec
-        );
-        let output = self.runner.run_script("git tree bytes", &script)?;
-        Ok(Some(output.stdout).filter(|bytes| !bytes.is_empty()))
+fn parse_optional_preview_bytes(
+    stdout: &[u8],
+    file_path: &str,
+    text_preview: bool,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(header_end) = stdout.iter().position(|byte| *byte == b'\n') else {
+        return Err("Remote preview response did not include a header.".to_string());
+    };
+    let header = &stdout[..header_end];
+    let bytes = &stdout[header_end.saturating_add(1)..];
+
+    match header {
+        b"CRAIC_MISSING" => Ok(None),
+        b"CRAIC_PRESENT" => Ok(Some(bytes.to_vec())),
+        b"CRAIC_TOO_LARGE" => {
+            let suffix = if text_preview { " as text" } else { "" };
+            Err(format!(
+                "{} is too large to preview{}.",
+                git::file_name(file_path),
+                suffix
+            ))
+        }
+        _ => Err("Remote preview response included an invalid header.".to_string()),
     }
 }
 
@@ -1406,88 +1603,4 @@ fn parse_porcelain_status(bytes: &[u8]) -> Vec<ChangedFile> {
         });
     }
     files
-}
-
-fn parse_unified_diff(diff: &str) -> Vec<git::FileDiffRow> {
-    let mut rows = Vec::new();
-    let mut next_left = None::<usize>;
-    let mut next_right = None::<usize>;
-
-    for line in diff.lines() {
-        if line.starts_with("diff --git")
-            || line.starts_with("index ")
-            || line.starts_with("---")
-            || line.starts_with("+++")
-        {
-            continue;
-        }
-        if line.starts_with("@@") {
-            if let Some((left, right)) = parse_hunk_line_numbers(line) {
-                next_left = Some(left);
-                next_right = Some(right);
-            }
-            rows.push(git::FileDiffRow {
-                left_number: None,
-                right_number: None,
-                left_text: Some(line.to_string()),
-                right_text: Some(line.to_string()),
-                left_kind: git::DiffKind::Fold,
-                right_kind: git::DiffKind::Fold,
-            });
-        } else if let Some(text) = line.strip_prefix('-') {
-            let left_number = next_left;
-            next_left = next_left.map(|number| number.saturating_add(1));
-            rows.push(git::FileDiffRow {
-                left_number,
-                right_number: None,
-                left_text: Some(text.to_string()),
-                right_text: None,
-                left_kind: git::DiffKind::Deleted,
-                right_kind: git::DiffKind::Context,
-            });
-        } else if let Some(text) = line.strip_prefix('+') {
-            let right_number = next_right;
-            next_right = next_right.map(|number| number.saturating_add(1));
-            rows.push(git::FileDiffRow {
-                left_number: None,
-                right_number,
-                left_text: None,
-                right_text: Some(text.to_string()),
-                left_kind: git::DiffKind::Context,
-                right_kind: git::DiffKind::Added,
-            });
-        } else {
-            let text = line.strip_prefix(' ').unwrap_or(line).to_string();
-            let left_number = next_left;
-            let right_number = next_right;
-            next_left = next_left.map(|number| number.saturating_add(1));
-            next_right = next_right.map(|number| number.saturating_add(1));
-            rows.push(git::FileDiffRow {
-                left_number,
-                right_number,
-                left_text: Some(text.clone()),
-                right_text: Some(text),
-                left_kind: git::DiffKind::Context,
-                right_kind: git::DiffKind::Context,
-            });
-        }
-    }
-    rows
-}
-
-fn parse_hunk_line_numbers(line: &str) -> Option<(usize, usize)> {
-    let mut parts = line.split_whitespace();
-    parts.next()?;
-    let old = parts.next()?.strip_prefix('-')?;
-    let new = parts.next()?.strip_prefix('+')?;
-    Some((parse_hunk_start(old)?, parse_hunk_start(new)?))
-}
-
-fn parse_hunk_start(value: &str) -> Option<usize> {
-    value
-        .split_once(',')
-        .map(|(start, _)| start)
-        .unwrap_or(value)
-        .parse::<usize>()
-        .ok()
 }

@@ -16,7 +16,7 @@ pub(in crate::ui) struct DiffView {
     canvas: DiffCanvas,
     full_rows: Rc<RefCell<Vec<FileDiffRow>>>,
     folds: Rc<RefCell<Vec<DiffFoldRange>>>,
-    current_signature: Rc<RefCell<Option<String>>>,
+    current_signature: Rc<RefCell<Option<DiffSignature>>>,
 }
 
 impl DiffView {
@@ -82,22 +82,50 @@ impl DiffView {
 
     pub(in crate::ui) fn set_diff(&self, file_path: &str, comparison: &FileComparison) {
         self.title.set_label(file_path);
-        let (insertions, deletions) = diff_line_stats(&comparison.rows);
-        self.added.set_label(&format!("+{insertions}"));
-        self.deleted.set_label(&format!("-{deletions}"));
+        self.added.set_label(&format!("+{}", comparison.insertions));
+        self.deleted
+            .set_label(&format!("-{}", comparison.deletions));
         self.stats.set_visible(true);
 
-        let signature = format!("{file_path}\0{:?}", comparison.rows);
-        if self.current_signature.borrow().as_ref() == Some(&signature) {
+        let signature =
+            DiffSignature::new(file_path, comparison.rows.len(), comparison.fingerprint);
+        let previous_signature = self.current_signature.borrow().clone();
+        if previous_signature.as_ref() == Some(&signature) {
+            log::debug!(
+                "diff_view unchanged path={} rows={} fingerprint={:016x}",
+                file_path,
+                signature.row_count,
+                signature.fingerprint
+            );
             return;
         }
 
         let old_scroll_y = self.canvas.scroll_y();
-        let previous_folds = self.folds.borrow().clone();
+        let preserve_scroll = previous_signature
+            .as_ref()
+            .is_some_and(|previous| previous.file_path == file_path);
+        let scroll_y = if preserve_scroll { old_scroll_y } else { 0.0 };
+        let previous_folds = if preserve_scroll {
+            self.folds.borrow().clone()
+        } else {
+            Vec::new()
+        };
         self.full_rows.replace(comparison.rows.clone());
-        self.folds
-            .replace(build_initial_folds(&comparison.rows, &previous_folds));
-        refresh_canvas(&self.canvas, &self.full_rows, &self.folds, old_scroll_y);
+        let next_folds = build_initial_folds(&comparison.rows, &previous_folds);
+        log::debug!(
+            "diff_view refresh path={} rows={} folds={} previous_folds={} preserve_scroll={} scroll_y={:.1} fingerprint={:016x}",
+            file_path,
+            signature.row_count,
+            next_folds.len(),
+            previous_folds.len(),
+            preserve_scroll,
+            scroll_y,
+            signature.fingerprint
+        );
+        self.folds.replace(next_folds);
+        self.canvas
+            .set_syntax_for_file(file_path, comparison.fingerprint, &comparison.rows);
+        refresh_canvas(&self.canvas, &self.full_rows, &self.folds, scroll_y);
         self.current_signature.replace(Some(signature));
     }
 
@@ -108,6 +136,23 @@ impl DiffView {
         self.full_rows.borrow_mut().clear();
         self.folds.borrow_mut().clear();
         self.canvas.clear();
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiffSignature {
+    file_path: String,
+    row_count: usize,
+    fingerprint: u64,
+}
+
+impl DiffSignature {
+    fn new(file_path: &str, row_count: usize, fingerprint: u64) -> Self {
+        Self {
+            file_path: file_path.to_string(),
+            row_count,
+            fingerprint,
+        }
     }
 }
 
@@ -128,20 +173,30 @@ fn connect_diff_folds(
         let full_rows = full_rows.clone();
         let folds = folds.clone();
         move |fold_index| {
-            toggle_fold(&folds, fold_index);
+            if !toggle_fold(&folds, fold_index) {
+                return;
+            }
             let scroll_y = canvas.scroll_y();
             refresh_canvas(&canvas, &full_rows, &folds, scroll_y);
         }
     });
 }
 
-fn toggle_fold(folds: &Rc<RefCell<Vec<DiffFoldRange>>>, fold_index: usize) {
+fn toggle_fold(folds: &Rc<RefCell<Vec<DiffFoldRange>>>, fold_index: usize) -> bool {
     let mut folds = folds.borrow_mut();
     let Some(fold) = folds.get_mut(fold_index) else {
         log::debug!("diff_view ignored stale fold toggle index={fold_index}");
-        return;
+        return false;
     };
     fold.expanded = !fold.expanded;
+    log::debug!(
+        "diff_view toggled fold index={} start={} end={} expanded={}",
+        fold_index,
+        fold.start,
+        fold.end,
+        fold.expanded
+    );
+    true
 }
 
 fn normalize_diff_folds(folds: &mut Vec<DiffFoldRange>, row_count: usize) {
@@ -188,6 +243,14 @@ fn refresh_canvas(
     let mut folds = folds.borrow_mut();
     normalize_diff_folds(&mut folds, full_rows.len());
     let display_rows = display_rows(&full_rows, &folds);
+    log::debug!(
+        "diff_view canvas refresh source_rows={} display_rows={} folds={} expanded_folds={} scroll_y={:.1}",
+        full_rows.len(),
+        display_rows.len(),
+        folds.len(),
+        folds.iter().filter(|fold| fold.expanded).count(),
+        scroll_y
+    );
     canvas.set_rows(display_rows);
     canvas.set_scroll_y(scroll_y);
 }
@@ -294,23 +357,6 @@ fn fold_row(fold_index: usize, fold: DiffFoldRange) -> FileDiffRow {
 
 fn is_context_row(row: &FileDiffRow) -> bool {
     row.left_kind == DiffKind::Context && row.right_kind == DiffKind::Context
-}
-
-fn is_fold_row(row: &FileDiffRow) -> bool {
-    row.left_kind == DiffKind::Fold || row.right_kind == DiffKind::Fold
-}
-
-fn diff_line_stats(rows: &[FileDiffRow]) -> (usize, usize) {
-    let insertions = rows
-        .iter()
-        .filter(|row| row.right_kind == DiffKind::Added)
-        .count();
-    let deletions = rows
-        .iter()
-        .filter(|row| row.left_kind == DiffKind::Deleted)
-        .count();
-
-    (insertions, deletions)
 }
 
 fn stats_label(text: &str) -> gtk::Label {
