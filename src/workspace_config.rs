@@ -4,10 +4,13 @@ use crate::system::path::FileNodePath;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+const REPO_CONFIG_DIR: &str = ".craic";
+const REPO_CONFIG_FILE: &str = "config.toml";
 const LOCAL_CONFIG_DIR: &str = ".craic/local";
 const LOCAL_CONFIG_FILE: &str = "config.toml";
 const LOCAL_GITIGNORE_FILE: &str = ".gitignore";
 const LOCAL_GITIGNORE_CONTENTS: &str = "*\n";
+const MAX_REPO_CONFIG_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GitConfig {
@@ -130,6 +133,64 @@ pub(crate) fn github_auth_account(path: &Path) -> Option<github::GitHubAuthAccou
     git_config(path).github_auth_account
 }
 
+pub(crate) fn markdown_lint_ignored_rules_from_file_access(files: &dyn FileAccess) -> Vec<String> {
+    let config = load_repo_config_from_file_access(files)
+        .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+    config
+        .get("markdown_lint")
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get("ignored_rules"))
+        .and_then(toml::Value::as_array)
+        .map(|rules| {
+            rules
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|rule| !rule.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn add_markdown_lint_ignore_with_file_access(
+    files: &dyn FileAccess,
+    rule_name: &str,
+) -> Result<String, String> {
+    let rule_name = rule_name.trim();
+    if rule_name.is_empty() {
+        return Err("Markdown lint rule name is empty.".to_string());
+    }
+
+    let mut config = load_repo_config_from_file_access(files)?;
+    let root = config
+        .as_table_mut()
+        .ok_or_else(|| "Repo config root must be a TOML table.".to_string())?;
+    let markdown_lint = root
+        .entry("markdown_lint")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let markdown_lint = markdown_lint
+        .as_table_mut()
+        .ok_or_else(|| "Repo config [markdown_lint] must be a TOML table.".to_string())?;
+    let ignored_rules = markdown_lint
+        .entry("ignored_rules")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let ignored_rules = ignored_rules
+        .as_array_mut()
+        .ok_or_else(|| "Repo config markdown_lint.ignored_rules must be an array.".to_string())?;
+
+    if ignored_rules
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .any(|existing| existing.eq_ignore_ascii_case(rule_name))
+    {
+        return Ok(format!("{rule_name} is already ignored in repo config."));
+    }
+    ignored_rules.push(toml::Value::String(rule_name.to_string()));
+    save_repo_config_with_file_access(files, &config)?;
+    Ok(format!("Added {rule_name} to repo markdown lint ignores."))
+}
+
 pub(crate) fn normalize_timezone(value: &str) -> Result<String, String> {
     let value = value.trim();
     let compact = if value.len() == 6 && value.as_bytes()[3] == b':' {
@@ -224,6 +285,20 @@ fn load_from_file_access(files: &dyn FileAccess) -> LocalWorkspaceConfig {
     })
 }
 
+fn load_repo_config_from_file_access(files: &dyn FileAccess) -> Result<toml::Value, String> {
+    let config_path = repo_config_node(files);
+    let contents = match files.read_text(&config_path, Some(MAX_REPO_CONFIG_BYTES)) {
+        Ok(contents) => contents,
+        Err(_) => return Ok(toml::Value::Table(toml::map::Map::new())),
+    };
+    toml::from_str(&contents).map_err(|err| {
+        format!(
+            "Failed to parse repo config {}: {err}",
+            config_path.display()
+        )
+    })
+}
+
 fn parse_config(contents: &str, label: impl FnOnce() -> String) -> LocalWorkspaceConfig {
     match toml::from_str::<LocalWorkspaceConfig>(contents) {
         Ok(config) => config,
@@ -292,6 +367,23 @@ fn save_with_file_access(
     Ok(())
 }
 
+fn save_repo_config_with_file_access(
+    files: &dyn FileAccess,
+    config: &toml::Value,
+) -> Result<(), String> {
+    let craic_dir = ensure_dir(files, &files.root(), REPO_CONFIG_DIR)?;
+    let config_path = ensure_file(files, &craic_dir, REPO_CONFIG_FILE)?;
+    let contents = toml::to_string_pretty(config)
+        .map_err(|err| format!("Failed to serialize repo config: {err}"))?;
+    files.write_text(&config_path, &contents)?;
+    log::info!(
+        "saved repo config through file access workspace={} path={}",
+        files.workspace().display_name,
+        config_path.display()
+    );
+    Ok(())
+}
+
 fn ensure_gitignore(local_dir: &Path) -> Result<(), String> {
     let gitignore_path = local_dir.join(LOCAL_GITIGNORE_FILE);
     std::fs::write(&gitignore_path, LOCAL_GITIGNORE_CONTENTS).map_err(|err| {
@@ -344,6 +436,13 @@ fn config_node(files: &dyn FileAccess) -> FileNodePath {
         .root()
         .join_child(LOCAL_CONFIG_DIR)
         .join_child(LOCAL_CONFIG_FILE)
+}
+
+fn repo_config_node(files: &dyn FileAccess) -> FileNodePath {
+    files
+        .root()
+        .join_child(REPO_CONFIG_DIR)
+        .join_child(REPO_CONFIG_FILE)
 }
 
 fn config_path(path: &Path) -> PathBuf {

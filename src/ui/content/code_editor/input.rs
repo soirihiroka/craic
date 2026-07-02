@@ -9,6 +9,7 @@ use super::{
 };
 use crate::config;
 use crate::language_support::{CompletionSet, NewlineContext, enter_newline};
+use crate::markdown_lint::{MarkdownLintEdit, MarkdownLintIssue};
 use crate::spellcheck::SpellcheckIssue;
 use crate::ui::components::context_menu::{
     self, MenuActionState, TextContextAction, TextContextMenuState,
@@ -1831,6 +1832,9 @@ fn editor_context_menu_sections(
     offset: usize,
 ) -> Vec<context_menu::ActionMenuSection<TextContextAction>> {
     let mut sections = Vec::new();
+    if let Some(section) = markdown_fix_section(state, offset) {
+        sections.push(section);
+    }
     if let Some(section) = spelling_correction_section(state, offset) {
         sections.push(section);
     }
@@ -1860,6 +1864,33 @@ fn editor_context_menu_sections(
         },
     ));
     sections
+}
+
+fn markdown_fix_section(
+    state: &Rc<EditorState>,
+    offset: usize,
+) -> Option<context_menu::ActionMenuSection<TextContextAction>> {
+    if !state.editable.get() {
+        return None;
+    }
+    let issue = markdown_lint_issue_at(state, offset)?;
+    let rule_name = issue.rule_name.clone()?;
+    let mut items = Vec::new();
+    if let Some(fix) = issue.fix {
+        items.push(context_menu::ActionMenuItem::with_icon(
+            "Fix Markdown Issue",
+            "lightbulb-symbolic",
+            TextContextAction::ApplyMarkdownFix { edits: fix.edits },
+            true,
+        ));
+    }
+    items.push(context_menu::ActionMenuItem::with_icon(
+        format!("Ignore {rule_name} in Repo Config"),
+        "lightbulb-symbolic",
+        TextContextAction::AddMarkdownLintIgnore { rule_name },
+        true,
+    ));
+    Some(context_menu::ActionMenuSection::new(items))
 }
 
 fn spelling_correction_section(
@@ -1898,8 +1929,19 @@ fn spellcheck_issue_at(state: &Rc<EditorState>, offset: usize) -> Option<Spellch
         .cloned()
 }
 
+fn markdown_lint_issue_at(state: &Rc<EditorState>, offset: usize) -> Option<MarkdownLintIssue> {
+    state
+        .markdown_lint_issues
+        .borrow()
+        .iter()
+        .find(|issue| issue.start <= offset && offset <= issue.end && issue.rule_name.is_some())
+        .cloned()
+}
+
 fn action_enabled(state: &Rc<EditorState>, action: TextContextAction) -> bool {
     match action {
+        TextContextAction::ApplyMarkdownFix { edits } => state.editable.get() && !edits.is_empty(),
+        TextContextAction::AddMarkdownLintIgnore { .. } => true,
         TextContextAction::CorrectSpelling { .. } => state.editable.get(),
         TextContextAction::Undo => state.editable.get() && !state.undo_stack.borrow().is_empty(),
         TextContextAction::Redo => state.editable.get() && !state.redo_stack.borrow().is_empty(),
@@ -1915,6 +1957,14 @@ fn action_enabled(state: &Rc<EditorState>, action: TextContextAction) -> bool {
 
 fn run_action(area: &gtk::DrawingArea, state: &Rc<EditorState>, action: TextContextAction) {
     match action {
+        TextContextAction::ApplyMarkdownFix { edits } => {
+            apply_markdown_fix(area, state, &edits);
+        }
+        TextContextAction::AddMarkdownLintIgnore { rule_name } => {
+            for callback in state.markdown_lint_ignore_callbacks.borrow().iter() {
+                callback(rule_name.clone());
+            }
+        }
         TextContextAction::CorrectSpelling {
             start,
             end,
@@ -1958,6 +2008,55 @@ fn run_action(area: &gtk::DrawingArea, state: &Rc<EditorState>, action: TextCont
         }
         TextContextAction::FoldSelection => fold_selection(area, state),
     }
+}
+
+fn apply_markdown_fix(
+    area: &gtk::DrawingArea,
+    state: &Rc<EditorState>,
+    edits: &[MarkdownLintEdit],
+) {
+    if edits.is_empty() {
+        return;
+    }
+
+    let fixed = {
+        let text = state.text.borrow();
+        let Some(fixed) = apply_markdown_edits(text.as_str(), edits) else {
+            log::warn!("markdown fix skipped reason=invalid-edit");
+            return;
+        };
+        if fixed == text.as_str() {
+            return;
+        }
+        fixed
+    };
+
+    let cursor = state.cursor.get().min(fixed.len());
+    let old_end = state.text.borrow().len();
+    commit_edit(area, state, 0, old_end, &fixed, cursor, None, true);
+}
+
+fn apply_markdown_edits(source: &str, edits: &[MarkdownLintEdit]) -> Option<String> {
+    let mut edits = edits.to_vec();
+    edits.sort_by_key(|edit| (edit.start, edit.end));
+    for window in edits.windows(2) {
+        if window[0].end > window[1].start {
+            return None;
+        }
+    }
+
+    let mut fixed = source.to_string();
+    for edit in edits.iter().rev() {
+        if edit.start > edit.end
+            || edit.end > fixed.len()
+            || !fixed.is_char_boundary(edit.start)
+            || !fixed.is_char_boundary(edit.end)
+        {
+            return None;
+        }
+        fixed.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+    Some(fixed)
 }
 
 fn copy_selection(state: &Rc<EditorState>) {

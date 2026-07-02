@@ -44,6 +44,7 @@ pub(in crate::ui) struct CodeEditor {
 }
 
 type EditCallback = Rc<dyn Fn()>;
+type MarkdownLintIgnoreCallback = Rc<dyn Fn(String)>;
 type ScrollCallback = Rc<dyn Fn(f64)>;
 
 struct EditorState {
@@ -98,6 +99,7 @@ struct EditorState {
     undo_stack: RefCell<Vec<HistorySnapshot>>,
     redo_stack: RefCell<Vec<HistorySnapshot>>,
     edit_callbacks: RefCell<Vec<EditCallback>>,
+    markdown_lint_ignore_callbacks: RefCell<Vec<MarkdownLintIgnoreCallback>>,
     scroll_callbacks: RefCell<Vec<ScrollCallback>>,
     git_added_lines: RefCell<Vec<bool>>,
     git_deleted_hint_counts: RefCell<Vec<usize>>,
@@ -314,6 +316,7 @@ impl CodeEditor {
             undo_stack: RefCell::new(Vec::new()),
             redo_stack: RefCell::new(Vec::new()),
             edit_callbacks: RefCell::new(Vec::new()),
+            markdown_lint_ignore_callbacks: RefCell::new(Vec::new()),
             scroll_callbacks: RefCell::new(Vec::new()),
             git_added_lines: RefCell::new(vec![false; line_count]),
             git_deleted_hint_counts: RefCell::new(vec![0; line_count]),
@@ -498,6 +501,16 @@ impl CodeEditor {
     {
         self.state
             .edit_callbacks
+            .borrow_mut()
+            .push(Rc::new(callback));
+    }
+
+    pub(in crate::ui) fn connect_markdown_lint_ignore<F>(&self, callback: F)
+    where
+        F: Fn(String) + 'static,
+    {
+        self.state
+            .markdown_lint_ignore_callbacks
             .borrow_mut()
             .push(Rc::new(callback));
     }

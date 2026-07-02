@@ -409,6 +409,16 @@ impl FilePage {
             });
         }
 
+        right.file_editor.connect_markdown_lint_ignore({
+            let ctx = ctx.clone();
+            let file_editor = right.file_editor.clone();
+            let file_editor_path = right.file_editor_path.clone();
+
+            move |rule_name| {
+                add_markdown_lint_ignore(&ctx, &file_editor, &file_editor_path, &rule_name)
+            }
+        });
+
         right.file_editor.connect_edit({
             let ctx = ctx.clone();
             let file_editor_path = right.file_editor_path.clone();
@@ -1018,6 +1028,43 @@ fn add_gitignore_pattern(ctx: &PageContext, pattern: &str) {
     }
 }
 
+fn add_markdown_lint_ignore(
+    ctx: &PageContext,
+    file_editor: &code_editor::CodeEditor,
+    file_editor_path: &Rc<RefCell<Option<FileNodePath>>>,
+    rule_name: &str,
+) {
+    let Some(files) = ctx.files() else {
+        ctx.show_error(
+            "Markdown Lint Ignore Failed",
+            "File access is unavailable for this workspace.",
+        );
+        return;
+    };
+    match crate::workspace_config::add_markdown_lint_ignore_with_file_access(
+        files.as_ref(),
+        rule_name,
+    ) {
+        Ok(message) => {
+            ctx.show_toast(&message);
+            if let Some(path) = file_editor_path.borrow().as_ref() {
+                let file_path = path.display();
+                let text = file_editor.document_text();
+                let ignored_rules =
+                    crate::workspace_config::markdown_lint_ignored_rules_from_file_access(
+                        files.as_ref(),
+                    );
+                file_editor.set_markdown_lint_issues(markdown_lint_issues(
+                    &file_path,
+                    &text,
+                    &ignored_rules,
+                ));
+            }
+        }
+        Err(err) => ctx.show_error("Markdown Lint Ignore Failed", &err),
+    }
+}
+
 fn run_container_file_action(ctx: &PageContext, file_path: &str, action: ContainerFileAction) {
     let Some(docker) = ctx.docker() else {
         ctx.show_error(
@@ -1274,20 +1321,23 @@ fn spellcheck_editor_document(
         file_editor.set_spellcheck_issues(Vec::new());
         return;
     };
-    let allowlist = crate::spellcheck::load_manifest_allowlist(&ctx.workspace_ref(), files);
+    let allowlist = crate::spellcheck::load_manifest_allowlist(&ctx.workspace_ref(), files.clone());
     let language = code_editor::language_hint_from_path(file_path);
     let issues = crate::spellcheck::check_document(&language, Some(file_path), text, &allowlist);
     file_editor.set_spellcheck_issues(issues);
-    file_editor.set_markdown_lint_issues(markdown_lint_issues(file_path, text));
+    let ignored_rules =
+        crate::workspace_config::markdown_lint_ignored_rules_from_file_access(files.as_ref());
+    file_editor.set_markdown_lint_issues(markdown_lint_issues(file_path, text, &ignored_rules));
 }
 
 pub(in crate::ui::pages::file) fn markdown_lint_issues(
     file_path: &str,
     text: &str,
+    ignored_rules: &[String],
 ) -> Vec<crate::markdown_lint::MarkdownLintIssue> {
     let language = code_editor::language_hint_from_path(file_path);
     if matches!(language.as_str(), "md" | "markdown" | "mdown" | "mkd") {
-        crate::markdown_lint::check_document(Some(file_path), text)
+        crate::markdown_lint::check_document(Some(file_path), text, ignored_rules)
     } else {
         Vec::new()
     }

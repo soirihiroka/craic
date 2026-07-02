@@ -8,9 +8,27 @@ const MAX_MARKDOWN_LINT_BYTES: usize = 512 * 1024;
 pub(crate) struct MarkdownLintIssue {
     pub(crate) start: usize,
     pub(crate) end: usize,
+    pub(crate) rule_name: Option<String>,
+    pub(crate) fix: Option<MarkdownLintFix>,
 }
 
-pub(crate) fn check_document(path: Option<&str>, text: &str) -> Vec<MarkdownLintIssue> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MarkdownLintFix {
+    pub(crate) edits: Vec<MarkdownLintEdit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MarkdownLintEdit {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) replacement: String,
+}
+
+pub(crate) fn check_document(
+    path: Option<&str>,
+    text: &str,
+    ignored_rules: &[String],
+) -> Vec<MarkdownLintIssue> {
     if text.len() > MAX_MARKDOWN_LINT_BYTES {
         log::debug!(
             "markdown lint skipped reason=too-large path={} bytes={}",
@@ -42,13 +60,17 @@ pub(crate) fn check_document(path: Option<&str>, text: &str) -> Vec<MarkdownLint
 
     let mut issues = warnings
         .into_iter()
+        .filter(|warning| !rule_is_ignored(warning.rule_name.as_deref(), ignored_rules))
         .filter_map(|warning| {
+            let issue_fix = warning.fix.as_ref().and_then(fix_for_warning);
             warning_range(
                 text,
+                warning.rule_name,
                 warning.line,
                 warning.column,
                 warning.end_line,
                 warning.end_column,
+                issue_fix,
             )
         })
         .collect::<Vec<_>>();
@@ -64,10 +86,12 @@ pub(crate) fn check_document(path: Option<&str>, text: &str) -> Vec<MarkdownLint
 
 fn warning_range(
     text: &str,
+    rule_name: Option<String>,
     line: usize,
     column: usize,
     end_line: usize,
     end_column: usize,
+    fix: Option<MarkdownLintFix>,
 ) -> Option<MarkdownLintIssue> {
     let start = byte_offset_for_line_column(text, line, column)?;
     let mut end = byte_offset_for_line_column(text, end_line, end_column).unwrap_or(start);
@@ -77,7 +101,38 @@ fn warning_range(
     if end <= start {
         end = next_char_boundary(text, start);
     }
-    (start < end && end <= text.len()).then_some(MarkdownLintIssue { start, end })
+    (start < end && end <= text.len()).then_some(MarkdownLintIssue {
+        start,
+        end,
+        rule_name,
+        fix,
+    })
+}
+
+fn rule_is_ignored(rule_name: Option<&str>, ignored_rules: &[String]) -> bool {
+    let Some(rule_name) = rule_name else {
+        return false;
+    };
+    ignored_rules
+        .iter()
+        .any(|ignored| ignored.eq_ignore_ascii_case(rule_name))
+}
+
+fn fix_for_warning(fix: &rumdl_lib::rule::Fix) -> Option<MarkdownLintFix> {
+    let mut edits = Vec::with_capacity(1 + fix.additional_edits.len());
+    edits.push(edit_from_fix(fix)?);
+    for extra in &fix.additional_edits {
+        edits.push(edit_from_fix(extra)?);
+    }
+    Some(MarkdownLintFix { edits })
+}
+
+fn edit_from_fix(fix: &rumdl_lib::rule::Fix) -> Option<MarkdownLintEdit> {
+    (fix.range.start <= fix.range.end).then(|| MarkdownLintEdit {
+        start: fix.range.start,
+        end: fix.range.end,
+        replacement: fix.replacement.clone(),
+    })
 }
 
 fn byte_offset_for_line_column(text: &str, line: usize, column: usize) -> Option<usize> {
