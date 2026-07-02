@@ -11,20 +11,11 @@ pub(in crate::ui::pages::agent) const TERMINAL_LOG_PREVIEW_CHARS: usize = 1200;
 
 struct TerminalTextScan {
     text: String,
-    cursor_row: i64,
-    start_row: i64,
-    end_row: i64,
-    end_col: i64,
     trimmed_empty: bool,
 }
 
 struct ActiveStateTextScan {
     text: String,
-    cursor_row: i64,
-    visible_rows: i64,
-    start_row: i64,
-    end_row: i64,
-    end_col: i64,
     trimmed_empty: bool,
 }
 
@@ -146,36 +137,21 @@ fn notification_title(title: &str) -> Option<String> {
 pub(in crate::ui::pages::agent) fn session_title(
     provider: &'static dyn AgentProvider,
     terminal: &vte4::Terminal,
-    log_scan: bool,
+    _log_scan: bool,
 ) -> Option<String> {
     let scan = recent_terminal_text(terminal)?;
     let title = provider.shell_integration().title_from_text(&scan.text);
-    if log_scan {
-        log::debug!(
-            "agent terminal text scan provider={} cursor_row={} start_row={} end_row={} end_col={} bytes={} trimmed_empty={} title={:?} preview={}",
-            provider.label(),
-            scan.cursor_row,
-            scan.start_row,
-            scan.end_row,
-            scan.end_col,
-            scan.text.len(),
-            scan.trimmed_empty,
-            title,
-            log_preview(&scan.text, TERMINAL_LOG_PREVIEW_CHARS)
-        );
-    }
     (!scan.trimmed_empty).then_some(title).flatten()
 }
 
 pub(in crate::ui::pages::agent) fn active_state(
-    session_id: u64,
+    _session_id: u64,
     provider: &'static dyn AgentProvider,
     terminal: &vte4::Terminal,
-    log_scan: bool,
+    _log_scan: bool,
 ) -> AgentActiveState {
     let window_title = terminal_window_title(terminal);
     let recent_text = Rc::new(RefCell::new(None::<Option<String>>));
-    let recent_scan = Rc::new(RefCell::new(None::<ActiveStateTextScan>));
     let active_state = provider.shell_integration().active_state(
         window_title.as_ref().map(|title| title.as_str()),
         &|| {
@@ -185,41 +161,12 @@ pub(in crate::ui::pages::agent) fn active_state(
 
             let text = recent_terminal_active_state_text(terminal).and_then(|scan| {
                 let text = (!scan.trimmed_empty).then(|| scan.text.clone());
-                recent_scan.replace(Some(scan));
                 text
             });
             recent_text.replace(Some(text.clone()));
             text
         },
     );
-    let text_for_log = recent_text.borrow().as_ref().and_then(|text| {
-        text.as_ref()
-            .map(|text| log_tail_preview(text, TERMINAL_LOG_PREVIEW_CHARS))
-    });
-
-    if log_scan {
-        if let Some(scan) = recent_scan.borrow().as_ref() {
-            log::debug!(
-                "agent terminal active_state text scan cursor_row={} visible_rows={} start_row={} end_row={} end_col={} bytes={} trimmed_empty={} tail_preview={}",
-                scan.cursor_row,
-                scan.visible_rows,
-                scan.start_row,
-                scan.end_row,
-                scan.end_col,
-                scan.text.len(),
-                scan.trimmed_empty,
-                log_tail_preview(&scan.text, TERMINAL_LOG_PREVIEW_CHARS)
-            );
-        }
-        log::debug!(
-            "agent terminal active_state session_id={} provider={} active_state={:?} window_title={:?} recent_text_preview={:?}",
-            session_id,
-            provider.label(),
-            active_state,
-            window_title,
-            text_for_log
-        );
-    }
     active_state
 }
 
@@ -243,10 +190,6 @@ fn recent_terminal_text(terminal: &vte4::Terminal) -> Option<TerminalTextScan> {
     let trimmed_empty = text.trim().is_empty();
     Some(TerminalTextScan {
         text,
-        cursor_row,
-        start_row,
-        end_row,
-        end_col,
         trimmed_empty,
     })
 }
@@ -265,11 +208,6 @@ fn recent_terminal_active_state_text(terminal: &vte4::Terminal) -> Option<Active
     let trimmed_empty = text.trim().is_empty();
     Some(ActiveStateTextScan {
         text,
-        cursor_row,
-        visible_rows: terminal.row_count(),
-        start_row,
-        end_row,
-        end_col,
         trimmed_empty,
     })
 }
@@ -292,29 +230,6 @@ pub(in crate::ui::pages::agent) fn log_preview(text: &str, max_chars: usize) -> 
     }
     if chars.next().is_some() {
         preview.push_str("...");
-    }
-    preview
-}
-
-pub(in crate::ui::pages::agent) fn log_tail_preview(text: &str, max_chars: usize) -> String {
-    let chars = text.chars().collect::<Vec<_>>();
-    let start = chars.len().saturating_sub(max_chars);
-    let mut preview = String::with_capacity(chars.len().min(max_chars));
-    if start > 0 {
-        preview.push_str("...");
-    }
-    for ch in chars[start..].iter().copied() {
-        match ch {
-            '\n' => preview.push_str("\\n"),
-            '\r' => preview.push_str("\\r"),
-            '\t' => preview.push_str("\\t"),
-            ch if ch.is_control() => {
-                use std::fmt::Write as _;
-                write!(preview, "\\u{:04x}", ch as u32)
-                    .expect("writing to a String should not fail");
-            }
-            ch => preview.push(ch),
-        }
     }
     preview
 }

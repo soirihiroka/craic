@@ -1,6 +1,5 @@
 use crate::git::{DiffKind, FileDiffRow};
 use crate::ui::canvas_scrollbar;
-use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,7 +33,6 @@ pub(super) struct Cache {
     pub(super) rows: Vec<RowLayout>,
     pub(super) markers: Vec<ScrollbarMarker>,
     pub(super) content_height: f64,
-    pub(super) max_shared_visual_line_count: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -53,7 +51,6 @@ pub(super) struct Request {
 
 pub(super) struct Result {
     pub(super) cache: Cache,
-    pub(super) duration_ms: u128,
 }
 
 impl Signature {
@@ -79,9 +76,7 @@ impl Signature {
 }
 
 pub(super) fn build(request: Request) -> Result {
-    let start = Instant::now();
     let mut y = 0.0;
-    let mut max_shared_visual_line_count = 1usize;
     let mut layouts = Vec::with_capacity(request.rows.len());
     let mut markers = Vec::new();
 
@@ -102,7 +97,6 @@ pub(super) fn build(request: Request) -> Result {
         );
         let shared_visual_line_count = left_lines.len().max(right_lines.len()).max(1);
         let height = shared_visual_line_count as f64 * request.line_height;
-        max_shared_visual_line_count = max_shared_visual_line_count.max(shared_visual_line_count);
         layouts.push(RowLayout {
             y,
             height,
@@ -118,13 +112,9 @@ pub(super) fn build(request: Request) -> Result {
         rows: layouts,
         markers,
         content_height,
-        max_shared_visual_line_count,
     };
 
-    Result {
-        cache,
-        duration_ms: start.elapsed().as_millis(),
-    }
+    Result { cache }
 }
 
 pub(super) fn visible_row_range(

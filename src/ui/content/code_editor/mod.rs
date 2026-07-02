@@ -1,5 +1,4 @@
 pub(in crate::ui) mod canvas;
-mod diff_document;
 mod input;
 mod render;
 pub(in crate::ui) mod selection;
@@ -29,13 +28,9 @@ use std::time::Duration;
 use text_buffer::{TextBuffer, clamp_to_char_boundary, next_char_boundary};
 
 pub(in crate::ui) use crate::language_support::language_hint_from_path;
-pub(in crate::ui) use diff_document::{
-    DiffEditorDocument, DiffEditorRow, EditorDiffKind, ScrollbarMarker, ScrollbarMarkerKind,
-};
 pub(in crate::ui) use text_buffer::byte_offset_for_line_column;
 
 const CELL_PADDING: f64 = 8.0;
-const DIFF_PREFIX_WIDTH: f64 = 22.0;
 const MIN_CONTENT_WIDTH: i32 = 240;
 const MAX_HISTORY_SNAPSHOTS: usize = 200;
 
@@ -49,12 +44,9 @@ pub(in crate::ui) struct CodeEditor {
 
 type EditCallback = Rc<dyn Fn()>;
 type ScrollCallback = Rc<dyn Fn(f64)>;
-type DiffFoldCallback = Rc<dyn Fn(usize)>;
-type FontSizeAdjustCallback = Rc<dyn Fn(f64)>;
 
 struct EditorState {
     text: RefCell<TextBuffer>,
-    syntax_source: RefCell<Option<String>>,
     language: RefCell<String>,
     font_size: Cell<f64>,
     char_width: Cell<f64>,
@@ -71,7 +63,6 @@ struct EditorState {
     preedit: RefCell<String>,
     folds: RefCell<Vec<FoldRange>>,
     fold_generation: Cell<u64>,
-    diff_rows: RefCell<Option<Vec<DiffEditorRow>>>,
     scrollbar_markers: RefCell<Vec<ScrollbarMarker>>,
     scroll_x: Cell<f64>,
     scroll_y: Cell<f64>,
@@ -107,11 +98,22 @@ struct EditorState {
     redo_stack: RefCell<Vec<HistorySnapshot>>,
     edit_callbacks: RefCell<Vec<EditCallback>>,
     scroll_callbacks: RefCell<Vec<ScrollCallback>>,
-    diff_fold_callback: RefCell<Option<DiffFoldCallback>>,
-    font_size_adjust_callback: RefCell<Option<FontSizeAdjustCallback>>,
     git_added_lines: RefCell<Vec<bool>>,
     git_deleted_hint_counts: RefCell<Vec<usize>>,
     spellcheck_issues: RefCell<Vec<SpellcheckIssue>>,
+}
+
+#[derive(Clone)]
+struct ScrollbarMarker {
+    row: usize,
+    kind: ScrollbarMarkerKind,
+}
+
+#[derive(Clone, Copy)]
+enum ScrollbarMarkerKind {
+    Added,
+    Deleted,
+    Mixed,
 }
 
 #[derive(Default)]
@@ -197,30 +199,13 @@ struct FoldRange {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FoldControlKey {
-    kind: FoldControlKind,
     index: usize,
 }
 
 impl FoldControlKey {
     fn editor(index: usize) -> Self {
-        Self {
-            kind: FoldControlKind::Editor,
-            index,
-        }
+        Self { index }
     }
-
-    fn diff(index: usize) -> Self {
-        Self {
-            kind: FoldControlKind::Diff,
-            index,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FoldControlKind {
-    Editor,
-    Diff,
 }
 
 #[derive(Clone, Copy)]
@@ -240,9 +225,8 @@ struct VisualLine {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::ui) enum GutterSide {
+enum GutterSide {
     Left,
-    Right,
 }
 
 struct LayoutCache {
@@ -278,7 +262,6 @@ impl CodeEditor {
 
         let state = Rc::new(EditorState {
             text: RefCell::new(TextBuffer::new(text)),
-            syntax_source: RefCell::new(None),
             language: RefCell::new(language.to_string()),
             font_size: Cell::new(font_size),
             char_width: Cell::new(font_metrics.char_width),
@@ -295,7 +278,6 @@ impl CodeEditor {
             preedit: RefCell::new(String::new()),
             folds: RefCell::new(Vec::new()),
             fold_generation: Cell::new(1),
-            diff_rows: RefCell::new(None),
             scrollbar_markers: RefCell::new(Vec::new()),
             scroll_x: Cell::new(0.0),
             scroll_y: Cell::new(0.0),
@@ -331,8 +313,6 @@ impl CodeEditor {
             redo_stack: RefCell::new(Vec::new()),
             edit_callbacks: RefCell::new(Vec::new()),
             scroll_callbacks: RefCell::new(Vec::new()),
-            diff_fold_callback: RefCell::new(None),
-            font_size_adjust_callback: RefCell::new(None),
             git_added_lines: RefCell::new(vec![false; line_count]),
             git_deleted_hint_counts: RefCell::new(vec![0; line_count]),
             spellcheck_issues: RefCell::new(Vec::new()),
@@ -432,66 +412,6 @@ impl CodeEditor {
         self.select_range(offset, offset);
     }
 
-    pub(in crate::ui) fn set_diff_document(&self, document: DiffEditorDocument) {
-        let unchanged = {
-            let rows_match = self
-                .state
-                .diff_rows
-                .borrow()
-                .as_ref()
-                .is_some_and(|rows| rows == &document.rows);
-            let source_match = self
-                .state
-                .syntax_source
-                .borrow()
-                .as_ref()
-                .is_some_and(|source| source == &document.source);
-            let language_match =
-                self.state.language.borrow().as_str() == document.language.as_str();
-            rows_match && source_match && language_match
-        };
-        if unchanged {
-            log::debug!(
-                "code_editor diff document unchanged rows={} source_bytes={}",
-                document.rows.len(),
-                document.source.len()
-            );
-            return;
-        }
-        input::dismiss_completion(&self.state);
-        let text = document
-            .rows
-            .iter()
-            .map(|row| row.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.state.text.borrow_mut().set_text(&text);
-        self.state.syntax_source.replace(Some(document.source));
-        self.state.cursor.set(0);
-        self.state.selection.borrow_mut().take();
-        self.state.undo_stack.borrow_mut().clear();
-        self.state.redo_stack.borrow_mut().clear();
-        let had_folds = !self.state.folds.borrow().is_empty();
-        self.state.folds.borrow_mut().clear();
-        if had_folds {
-            log::debug!("code_editor folds cleared reason=diff_document");
-            mark_fold_state_changed(&self.state);
-        } else {
-            clear_fold_interaction_state(&self.state);
-        }
-        self.state.diff_rows.replace(Some(document.rows));
-        self.state.language.replace(document.language.clone());
-        self.state.editable.set(false);
-        self.state.auto_folding_enabled.set(false);
-        self.area.set_focusable(true);
-        render::invalidate_layout(&self.state);
-        render::invalidate_highlights(&self.state);
-        reset_syntax_worker(&self.state);
-        reset_git_state(&self.state);
-        rebuild_search_matches(&self.area, &self.state);
-        self.refresh();
-    }
-
     pub(in crate::ui) fn set_file_diff(&self, comparison: Option<&FileComparison>) {
         apply_file_diff_marks(&self.state, comparison);
         self.area.queue_draw();
@@ -529,19 +449,6 @@ impl CodeEditor {
         self.state.text.borrow().as_str().to_string()
     }
 
-    pub(in crate::ui) fn font_size(&self) -> f64 {
-        self.state.font_size.get()
-    }
-
-    pub(in crate::ui) fn set_font_size_adjust_callback<F>(&self, callback: F)
-    where
-        F: Fn(f64) + 'static,
-    {
-        self.state
-            .font_size_adjust_callback
-            .replace(Some(Rc::new(callback)));
-    }
-
     pub(in crate::ui) fn set_editable(&self, editable: bool) {
         self.state.editable.set(editable);
         self.area.set_focusable(true);
@@ -559,23 +466,6 @@ impl CodeEditor {
         self.set_editable(!read_only);
     }
 
-    pub(in crate::ui) fn set_scrollbar_visible(&self, visible: bool) {
-        self.state.scrollbar_visible.set(visible);
-        render::invalidate_layout(&self.state);
-        self.refresh();
-    }
-
-    pub(in crate::ui) fn set_gutter_side(&self, side: GutterSide) {
-        self.state.gutter_side.set(side);
-        render::invalidate_layout(&self.state);
-        self.refresh();
-    }
-
-    pub(in crate::ui) fn set_scrollbar_markers(&self, markers: Vec<ScrollbarMarker>) {
-        self.state.scrollbar_markers.replace(markers);
-        self.area.queue_draw();
-    }
-
     pub(in crate::ui) fn connect_scroll_changed<F>(&self, callback: F)
     where
         F: Fn(f64) + 'static,
@@ -586,39 +476,12 @@ impl CodeEditor {
             .push(Rc::new(callback));
     }
 
-    pub(in crate::ui) fn set_scroll_y(&self, value: f64) {
-        render::set_scroll_y(&self.area, &self.state, value);
-    }
-
-    pub(in crate::ui) fn scroll_y(&self) -> f64 {
-        self.state.scroll_y.get()
-    }
-
     pub(in crate::ui) fn source_offset_at_scroll_top(&self) -> usize {
         render::source_offset_at_scroll_top(&self.area, &self.state)
     }
 
     pub(in crate::ui) fn set_source_offset_at_scroll_top(&self, offset: usize) {
         render::set_source_offset_at_scroll_top(&self.area, &self.state, offset);
-    }
-
-    pub(in crate::ui) fn set_auto_folding_enabled(&self, enabled: bool) {
-        if self.state.auto_folding_enabled.get() == enabled {
-            return;
-        }
-        self.state.auto_folding_enabled.set(enabled);
-        rebuild_auto_folds(&self.area, &self.state);
-        render::invalidate_layout(&self.state);
-        self.area.queue_draw();
-    }
-
-    pub(in crate::ui) fn set_diff_fold_callback<F>(&self, callback: F)
-    where
-        F: Fn(usize) + 'static,
-    {
-        self.state
-            .diff_fold_callback
-            .replace(Some(Rc::new(callback)));
     }
 
     pub(in crate::ui) fn connect_edit<F>(&self, callback: F)
@@ -656,12 +519,10 @@ impl CodeEditor {
         if text_changed {
             input::dismiss_completion(&self.state);
             self.state.text.borrow_mut().set_text(text);
-            self.state.syntax_source.borrow_mut().take();
             self.state.cursor.set(text.len());
             self.state.selection.borrow_mut().take();
             self.state.undo_stack.borrow_mut().clear();
             self.state.redo_stack.borrow_mut().clear();
-            self.state.diff_rows.borrow_mut().take();
             self.state.scrollbar_markers.borrow_mut().clear();
             self.state.spellcheck_issues.borrow_mut().clear();
             reset_git_state(&self.state);
@@ -921,14 +782,8 @@ fn install_font_size_shortcuts(area: &gtk::DrawingArea, root: &gtk::Box, state: 
                 return gtk::glib::Propagation::Proceed;
             };
 
-            let callback = state.font_size_adjust_callback.borrow().clone();
-            if let Some(callback) = callback {
-                callback(delta);
-            } else {
-                let next =
-                    set_font_size_for_state(&area, &root, &state, state.font_size.get() + delta);
-                config::save_editor_font_size(next);
-            }
+            let next = set_font_size_for_state(&area, &root, &state, state.font_size.get() + delta);
+            config::save_editor_font_size(next);
 
             gtk::glib::Propagation::Stop
         }
@@ -1063,17 +918,6 @@ fn notify_scroll(state: &Rc<EditorState>, scroll_y: f64) {
     }
 }
 
-fn notify_diff_fold(state: &Rc<EditorState>, fold_index: usize) {
-    let callback = state.diff_fold_callback.borrow().as_ref().cloned();
-    if let Some(callback) = callback {
-        eprintln!(
-            "[code-editor] diff fold action fold_index={fold_index} scroll_y={}",
-            state.scroll_y.get()
-        );
-        callback(fold_index);
-    }
-}
-
 fn log_draw_panic(state: &Rc<EditorState>, width: i32, height: i32, payload: &(dyn Any + Send)) {
     eprintln!(
         "[code-editor] draw panic: {}",
@@ -1127,40 +971,6 @@ fn log_draw_panic(state: &Rc<EditorState>, width: i32, height: i32, payload: &(d
             );
         }
         Err(_) => eprintln!("[code-editor] folds borrow failed"),
-    }
-
-    match state.diff_rows.try_borrow() {
-        Ok(rows) => {
-            if let Some(rows) = rows.as_ref() {
-                let sample = rows
-                    .iter()
-                    .enumerate()
-                    .take(8)
-                    .map(|(index, row)| {
-                        format!(
-                            "#{index}: number={:?} kind={:?} fold_index={:?} fold_expanded={} show_fold_control={} source={:?}..{:?} text_len={} paired_len={}",
-                            row.number,
-                            row.kind,
-                            row.fold_index,
-                            row.fold_expanded,
-                            row.show_fold_control,
-                            row.source_start,
-                            row.source_end,
-                            row.text.len(),
-                            row.paired_text.len()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                eprintln!(
-                    "[code-editor] diff rows count={} sample=[{sample}]",
-                    rows.len()
-                );
-            } else {
-                eprintln!("[code-editor] diff rows none");
-            }
-        }
-        Err(_) => eprintln!("[code-editor] diff rows borrow failed"),
     }
 
     match state.layout_cache.try_borrow() {
@@ -1528,19 +1338,12 @@ fn send_syntax_command(state: &Rc<EditorState>, command: SyntaxWorkerCommand) {
 fn reset_syntax_worker(state: &Rc<EditorState>) {
     let generation = next_syntax_generation(state);
     state.highlight_request_generation.set(generation);
-    let source = state
-        .syntax_source
-        .borrow()
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| state.text.borrow().as_str().to_string());
-    let diff_document = state.diff_rows.borrow().is_some();
-    let auto_folds = state.auto_folding_enabled.get() && !diff_document;
+    let source = state.text.borrow().as_str().to_string();
+    let auto_folds = state.auto_folding_enabled.get();
     log::debug!(
-        "code_editor syntax reset generation={} source_bytes={} diff_document={} auto_folds={}",
+        "code_editor syntax reset generation={} source_bytes={} auto_folds={}",
         generation,
         source.len(),
-        diff_document,
         auto_folds
     );
     send_syntax_command(
@@ -1611,13 +1414,12 @@ fn schedule_highlights(_area: &gtk::DrawingArea, state: &Rc<EditorState>, _text:
 }
 
 fn rebuild_auto_folds(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
-    let removed_auto_folds =
-        if !state.auto_folding_enabled.get() || state.diff_rows.borrow().is_some() {
-            clear_automatic_folds(state, "auto folding unavailable")
-        } else {
-            false
-        };
-    if !state.auto_folding_enabled.get() || state.diff_rows.borrow().is_some() {
+    let removed_auto_folds = if !state.auto_folding_enabled.get() {
+        clear_automatic_folds(state, "auto folding unavailable")
+    } else {
+        false
+    };
+    if !state.auto_folding_enabled.get() {
         if removed_auto_folds {
             render::refresh_size(area, state, area.allocated_width(), area.allocated_height());
             area.queue_draw();

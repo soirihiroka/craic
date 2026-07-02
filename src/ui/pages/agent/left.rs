@@ -853,23 +853,13 @@ impl AgentList {
 
         let mount_close_cb = close_cb.clone();
         let update_close_cb = close_cb.clone();
-        let stats = self.row_reconciler.borrow_mut().reconcile(
+        let _ = self.row_reconciler.borrow_mut().reconcile(
             &self.list,
             elements,
             PartialEqRenderState,
             move |_, _, state| agent_row(state, mount_close_cb.clone()).upcast::<gtk::Widget>(),
             move |_, widget, _, next| update_agent_row(widget, next, update_close_cb.clone()),
         );
-        if stats.changed() {
-            log::debug!(
-                "agent list reconciled inserted={} updated={} moved={} removed={} unchanged={}",
-                stats.inserted,
-                stats.updated,
-                stats.moved,
-                stats.removed,
-                stats.unchanged
-            );
-        }
 
         if let Some(selected) = selected.and_then(|identity| row_for_identity(&self.list, identity))
         {
