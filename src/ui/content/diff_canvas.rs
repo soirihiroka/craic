@@ -9,7 +9,7 @@ use super::{
 use crate::config;
 use crate::git::{DiffKind, FileDiffRow};
 use crate::language_support::{HighlightRange, SyntaxHighlighter, language_hint_from_path};
-use crate::ui::canvas_scrollbar;
+use crate::ui::{canvas_scroll, canvas_scrollbar};
 use adw::prelude::*;
 use gtk::cairo;
 use std::cell::{Cell, RefCell};
@@ -44,6 +44,7 @@ struct DiffCanvasState {
     scrollbar_hover_progress: Rc<Cell<f64>>,
     scrollbar_animating: Rc<Cell<bool>>,
     scrollbar_drag: Cell<Option<canvas_scrollbar::Drag>>,
+    middle_autoscroll: Rc<canvas_scroll::MiddleAutoscroll>,
     fold_callback: RefCell<Option<Rc<dyn Fn(usize)>>>,
     font_size_adjust_callback: RefCell<Option<Rc<dyn Fn(f64)>>>,
     layout_generation: Cell<u64>,
@@ -119,7 +120,6 @@ struct DiffCanvasTheme {
     added_text: Color,
     deleted_background: Color,
     deleted_text: Color,
-    missing_background: Color,
     fold_background: Color,
     fold_text: Color,
     selection_background: Color,
@@ -178,6 +178,7 @@ impl DiffCanvas {
             scrollbar_hover_progress: Rc::new(Cell::new(0.0)),
             scrollbar_animating: Rc::new(Cell::new(false)),
             scrollbar_drag: Cell::new(None),
+            middle_autoscroll: Rc::new(canvas_scroll::MiddleAutoscroll::new()),
             fold_callback: RefCell::new(None),
             font_size_adjust_callback: RefCell::new(None),
             layout_generation: Cell::new(1),
@@ -214,6 +215,7 @@ impl DiffCanvas {
         });
 
         install_scroll(&area, &state);
+        install_diff_middle_autoscroll(&area, &state);
         install_clicks(&area, &state, &spinner);
         install_motion(&area, &state);
         install_key_shortcuts(&area, &state, &spinner);
@@ -227,6 +229,7 @@ impl DiffCanvas {
     }
 
     pub(in crate::ui) fn set_rows(&self, rows: Vec<FileDiffRow>) {
+        stop_diff_middle_autoscroll(&self.area, &self.state);
         let fold_rows = rows.iter().filter(|row| is_fold_row(row)).count();
         let max_line_number = rows
             .iter()
@@ -265,6 +268,7 @@ impl DiffCanvas {
     }
 
     pub(in crate::ui) fn clear(&self) {
+        stop_diff_middle_autoscroll(&self.area, &self.state);
         self.state.rows.borrow_mut().clear();
         self.state.scroll_y.set(0.0);
         self.state.max_line_number.set(1);
@@ -308,6 +312,7 @@ impl DiffCanvas {
         if (self.state.font_size.get() - font_size).abs() <= f64::EPSILON {
             return;
         }
+        stop_diff_middle_autoscroll(&self.area, &self.state);
         self.state.font_size.set(font_size);
         self.state
             .text_width_cache
@@ -433,13 +438,12 @@ fn draw(
     });
     let rows = state.rows.borrow();
     let gutter_width = gutter_width(area, state);
-    let content_height = state
-        .layout_cache
-        .borrow()
-        .as_ref()
-        .map(|cache| cache.content_height)
-        .unwrap_or(metrics.line_height)
-        .max(metrics.line_height);
+    let cache = state.layout_cache.borrow();
+    let Some(cache) = cache.as_ref() else {
+        canvas_overshoot::draw(context, width, height, &state.overshoot);
+        return;
+    };
+    let content_height = cache.content_height.max(metrics.line_height);
     state.content_height.set(content_height);
     log_layout_change(state, rows.as_slice(), content_width, content_height);
     clamp_scroll(area, state);
@@ -454,11 +458,6 @@ fn draw(
         theme.divider,
     );
 
-    let cache = state.layout_cache.borrow();
-    let Some(cache) = cache.as_ref() else {
-        canvas_overshoot::draw(context, width, height, &state.overshoot);
-        return;
-    };
     let scroll_y = state.scroll_y.get();
     let visible_range =
         diff_layout::visible_row_range(cache, scroll_y, height as f64, metrics.line_height * 8.0);
@@ -491,6 +490,7 @@ fn draw(
 
     draw_scrollbar(area, context, width, height, state);
     canvas_overshoot::draw(context, width, height, &state.overshoot);
+    draw_middle_autoscroll_marker(context, width, height, state, theme);
 }
 
 fn request_layout(
@@ -1033,6 +1033,37 @@ fn draw_scrollbar_markers(
     let _ = context.restore();
 }
 
+fn draw_middle_autoscroll_marker(
+    context: &cairo::Context,
+    width: i32,
+    height: i32,
+    state: &Rc<DiffCanvasState>,
+    theme: DiffCanvasTheme,
+) {
+    canvas_scroll::draw_middle_autoscroll_marker(
+        context,
+        width,
+        height,
+        state.middle_autoscroll.state(),
+        canvas_scroll::AutoscrollAxes::Vertical,
+        canvas_scroll::MarkerStyle {
+            foreground: canvas_scroll::MarkerColor::rgba(
+                theme.foreground.red,
+                theme.foreground.green,
+                theme.foreground.blue,
+                theme.foreground.alpha * 0.82,
+            ),
+            background: canvas_scroll::MarkerColor::rgba(
+                theme.background.red,
+                theme.background.green,
+                theme.background.blue,
+                theme.background.alpha * 0.92,
+            ),
+            shadow: canvas_scroll::MarkerColor::rgba(0.0, 0.0, 0.0, 0.34),
+        },
+    );
+}
+
 fn install_scroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
     let scroll = gtk::EventControllerScroll::new(
         gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
@@ -1064,6 +1095,105 @@ fn install_scroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
     area.add_controller(scroll);
 }
 
+fn install_diff_middle_autoscroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+    canvas_scroll::install_middle_autoscroll(
+        area,
+        &state.middle_autoscroll,
+        canvas_scroll::AutoscrollAxes::Vertical,
+        "diff_canvas",
+        {
+            let area = area.clone();
+            let state = state.clone();
+            move || {
+                let viewport_height = area.allocated_height().max(1) as f64;
+                state.layout_cache.borrow().as_ref().is_some_and(|cache| {
+                    canvas_scrollbar::max_scroll(cache.content_height, viewport_height)
+                        > f64::EPSILON
+                })
+            }
+        },
+        {
+            let area = area.clone();
+            let state = state.clone();
+            move |autoscroll_state| {
+                let viewport_height = area.allocated_height().max(1) as f64;
+                let max_scroll = state.layout_cache.borrow().as_ref().map_or(0.0, |cache| {
+                    canvas_scrollbar::max_scroll(cache.content_height, viewport_height)
+                });
+                if max_scroll <= f64::EPSILON {
+                    return;
+                }
+
+                let delta = canvas_scroll::middle_autoscroll_delta(
+                    autoscroll_state.pointer.y - autoscroll_state.origin.y,
+                );
+                if delta.abs() <= f64::EPSILON {
+                    return;
+                }
+
+                canvas_overshoot::pull_for_delta(
+                    &area,
+                    &state.overshoot,
+                    state.scroll_y.get(),
+                    max_scroll,
+                    delta,
+                    canvas_overshoot::Edge::Top,
+                    canvas_overshoot::Edge::Bottom,
+                );
+                set_scroll_y(&area, &state, state.scroll_y.get() + delta);
+            }
+        },
+        {
+            let area = area.clone();
+            let state = state.clone();
+            move || clear_diff_autoscroll_hover(&area, &state)
+        },
+        {
+            let area = area.clone();
+            let state = state.clone();
+            move || clear_diff_autoscroll_hover(&area, &state)
+        },
+        {
+            let area = area.clone();
+            move |cursor| area.set_cursor_from_name(cursor)
+        },
+        {
+            let area = area.clone();
+            move || area.queue_draw()
+        },
+    );
+}
+
+fn clear_diff_autoscroll_hover(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+    state.scrollbar_drag.set(None);
+    state.selection_drag.set(None);
+    canvas_scrollbar::set_hover(
+        area,
+        &state.scrollbar_hover,
+        &state.scrollbar_active,
+        &state.scrollbar_hover_progress,
+        &state.scrollbar_animating,
+        false,
+    );
+    canvas_scrollbar::set_active(
+        area,
+        &state.scrollbar_hover,
+        &state.scrollbar_active,
+        &state.scrollbar_hover_progress,
+        &state.scrollbar_animating,
+        false,
+    );
+}
+
+fn stop_diff_middle_autoscroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+    if !state.middle_autoscroll.stop() {
+        return;
+    }
+    area.set_cursor_from_name(None);
+    clear_diff_autoscroll_hover(area, state);
+    area.queue_draw();
+}
+
 fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner: &adw::Spinner) {
     let click = gtk::GestureClick::new();
     click.set_button(0);
@@ -1071,6 +1201,9 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
         let area = area.clone();
         let state = state.clone();
         move |gesture, _, x, y| {
+            if gesture.current_button() == 2 || state.middle_autoscroll.is_active() {
+                return;
+            }
             area.grab_focus();
             if canvas_scrollbar::point_in_lane(
                 area.allocated_width(),
@@ -1148,6 +1281,9 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
         let state = state.clone();
         let spinner = spinner.clone();
         move |_, x, y| {
+            if state.middle_autoscroll.is_active() {
+                return;
+            }
             area.grab_focus();
             request_layout(&area, &state, &spinner);
             let width = area.allocated_width();
@@ -1187,6 +1323,9 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
         let area = area.clone();
         let state = state.clone();
         move |gesture, offset_x, offset_y| {
+            if state.middle_autoscroll.is_active() {
+                return;
+            }
             if let Some(drag) = state.scrollbar_drag.get() {
                 let Some((_, _, _, thumb_height)) = canvas_scrollbar::thumb_rect(
                     area.allocated_width(),
@@ -1251,6 +1390,10 @@ fn install_motion(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
         let area = area.clone();
         let state = state.clone();
         move |_, x, _| {
+            if state.middle_autoscroll.is_active() {
+                clear_diff_autoscroll_hover(&area, &state);
+                return;
+            }
             let hover = canvas_scrollbar::point_in_lane(
                 area.allocated_width(),
                 area.allocated_height(),
@@ -1320,6 +1463,7 @@ fn install_key_shortcuts(
                     state.font_size.get() + delta,
                     config::DEFAULT_DIFF_FONT_SIZE,
                 );
+                stop_diff_middle_autoscroll(&area, &state);
                 state.font_size.set(next);
                 state
                     .text_width_cache
@@ -1445,8 +1589,15 @@ fn text_for_side(row: &FileDiffRow, side: DiffCanvasSide) -> Option<&str> {
 }
 
 fn clamp_scroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
-    let max_scroll =
-        canvas_scrollbar::max_scroll(state.content_height.get(), area.allocated_height() as f64);
+    let Some(content_height) = state
+        .layout_cache
+        .borrow()
+        .as_ref()
+        .map(|cache| cache.content_height)
+    else {
+        return;
+    };
+    let max_scroll = canvas_scrollbar::max_scroll(content_height, area.allocated_height() as f64);
     state
         .scroll_y
         .set(state.scroll_y.get().clamp(0.0, max_scroll));
@@ -1635,7 +1786,6 @@ fn theme_for(area: &gtk::DrawingArea) -> DiffCanvasTheme {
             added_text: Color::rgba(0.64, 0.80, 0.55, 1.0),
             deleted_background: Color::rgba(0.30, 0.12, 0.14, 1.0),
             deleted_text: Color::rgba(0.92, 0.42, 0.46, 1.0),
-            missing_background: Color::rgba(0.095, 0.095, 0.11, 1.0),
             fold_background: Color::rgba(0.14, 0.14, 0.16, 1.0),
             fold_text: Color::rgba(0.62, 0.66, 0.72, 1.0),
             selection_background: Color::rgba(0.26, 0.43, 0.68, 0.42),
@@ -1651,7 +1801,6 @@ fn theme_for(area: &gtk::DrawingArea) -> DiffCanvasTheme {
             added_text: Color::rgba(0.16, 0.42, 0.20, 1.0),
             deleted_background: Color::rgba(1.0, 0.88, 0.88, 1.0),
             deleted_text: Color::rgba(0.62, 0.16, 0.18, 1.0),
-            missing_background: Color::rgba(0.92, 0.92, 0.93, 1.0),
             fold_background: Color::rgba(0.90, 0.92, 0.95, 1.0),
             fold_text: Color::rgba(0.30, 0.34, 0.40, 1.0),
             selection_background: Color::rgba(0.48, 0.66, 0.92, 0.42),
