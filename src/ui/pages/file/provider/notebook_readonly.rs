@@ -1,8 +1,5 @@
-use crate::system::FileNodePath;
-use crate::system::capabilities::files::FileAccess;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Instant;
 
 pub(super) enum RenderCell {
@@ -39,8 +36,6 @@ impl RenderCell {
 pub(super) fn show(
     right: Rc<super::super::right::RightPane>,
     load_token: super::super::right::PreviewLoadToken,
-    files: Arc<dyn FileAccess>,
-    node_path: FileNodePath,
     file_path: String,
     local_path: Option<PathBuf>,
     prefetched_bytes: Option<Vec<u8>>,
@@ -54,11 +49,7 @@ pub(super) fn show(
         file_path.clone(),
         move || {
             log::info!("readonly notebook preview reading file_path={file_path}");
-            let text = super::super::read_repository_file_from_prefetch(
-                prefetched_bytes,
-                files.as_ref(),
-                &node_path,
-            )?;
+            let text = super::super::repository_text_from_prefetch(prefetched_bytes, &file_path)?;
             log::info!(
                 "readonly notebook preview read file_path={file_path} bytes={}",
                 text.len()

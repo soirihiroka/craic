@@ -667,7 +667,7 @@ impl LocalFileAccess {
         callback(FileOperationEvent::Progress(progress));
     }
 
-    fn read_with_info_sync(
+    fn perform_read_with_info(
         &self,
         request: &FileReadRequest,
         callback: &FileOperationCallback<FileRead>,
@@ -791,7 +791,7 @@ impl LocalFileAccess {
         })
     }
 
-    fn write_node_sync(
+    fn perform_write_node(
         &self,
         request: &FileWriteRequest,
         callback: &FileOperationCallback<()>,
@@ -929,7 +929,7 @@ impl LocalFileAccess {
         Ok(())
     }
 
-    fn copy_node_sync(
+    fn perform_copy_node(
         &self,
         request: &FileCopyRequest,
         operation: FileOperation,
@@ -995,7 +995,7 @@ impl LocalFileAccess {
             total_bytes: totals.bytes,
             total_files: totals.files,
         };
-        self.copy_entry_sync(
+        self.copy_entry(
             &source_path,
             &destination_path,
             &request.source,
@@ -1008,7 +1008,7 @@ impl LocalFileAccess {
         Ok(request.destination.clone())
     }
 
-    fn copy_entry_sync(
+    fn copy_entry(
         &self,
         source_path: &Path,
         destination_path: &Path,
@@ -1076,7 +1076,7 @@ impl LocalFileAccess {
                         format!("{} already exists.", child_destination.display()),
                     ));
                 }
-                self.copy_entry_sync(
+                self.copy_entry(
                     &entry.path(),
                     &child_destination_path,
                     &child_source,
@@ -1172,7 +1172,7 @@ impl LocalFileAccess {
         Ok(())
     }
 
-    fn move_node_sync(
+    fn perform_move_node(
         &self,
         request: &FileMoveRequest,
         callback: &FileOperationCallback<FileNodePath>,
@@ -1262,8 +1262,8 @@ impl LocalFileAccess {
                     destination: destination.clone(),
                     cancel_requested: request.cancel_requested.clone(),
                 };
-                self.copy_node_sync(&copy_request, operation, callback)?;
-                self.delete_sync(
+                self.perform_copy_node(&copy_request, operation, callback)?;
+                self.perform_delete(
                     &FileDeleteRequest {
                         path: request.source.clone(),
                         cancel_requested: request.cancel_requested.clone(),
@@ -1282,7 +1282,7 @@ impl LocalFileAccess {
         }
     }
 
-    fn delete_sync(
+    fn perform_delete(
         &self,
         request: &FileDeleteRequest,
         callback: Option<&FileOperationCallback<()>>,
@@ -1496,7 +1496,7 @@ impl FileAccess for LocalFileAccess {
                 request.path.display(),
                 request.max_bytes
             );
-            let result = access.read_with_info_sync(&request, &callback);
+            let result = access.perform_read_with_info(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
     }
@@ -1513,7 +1513,7 @@ impl FileAccess for LocalFileAccess {
                 request.path.display(),
                 payload_label
             );
-            let result = access.write_node_sync(&request, &callback);
+            let result = access.perform_write_node(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
     }
@@ -1526,7 +1526,7 @@ impl FileAccess for LocalFileAccess {
                 request.source.display(),
                 request.destination.display()
             );
-            let result = access.copy_node_sync(&request, FileOperation::Copy, &callback);
+            let result = access.perform_copy_node(&request, FileOperation::Copy, &callback);
             callback(FileOperationEvent::Finished(result));
         });
     }
@@ -1540,7 +1540,7 @@ impl FileAccess for LocalFileAccess {
                 request.destination_parent.display(),
                 request.new_name
             );
-            let result = access.move_node_sync(&request, &callback);
+            let result = access.perform_move_node(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
     }
@@ -1552,7 +1552,7 @@ impl FileAccess for LocalFileAccess {
                 "local file delete worker start path={}",
                 request.path.display()
             );
-            let result = access.delete_sync(&request, Some(&callback));
+            let result = access.perform_delete(&request, Some(&callback));
             callback(FileOperationEvent::Finished(result));
         });
     }

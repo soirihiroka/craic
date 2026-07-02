@@ -37,17 +37,20 @@ pub(in crate::ui::pages::file) fn show(request: PreviewRequest<'_>) {
     let source = request.info.clone();
     let file_path = request.file_path.to_string();
     let apply_file_path = file_path.clone();
-    super::spawn_preview_load(
-        Rc::clone(&request.right),
+    let (sender, receiver) = mpsc::channel();
+    crate::system::materialize::materialize_for_view(
+        files,
+        source,
+        MAX_SQLITE_PREVIEW_BYTES,
+        move |result| {
+            let _ = sender.send(result);
+        },
+    );
+    super::receive_preview_load(
+        request.right,
         request.load_token,
         file_path,
-        move || {
-            crate::system::materialize::materialize_for_view(
-                files.as_ref(),
-                &source,
-                MAX_SQLITE_PREVIEW_BYTES,
-            )
-        },
+        receiver,
         move |right, result| match result {
             Ok(materialized) => {
                 right.show_sqlite_preview(&apply_file_path);

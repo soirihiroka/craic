@@ -7,9 +7,9 @@ use crate::git::RepositorySnapshot;
 use crate::gitignore;
 use crate::system::capabilities::docker::ComposeFileAction;
 use crate::system::capabilities::files::{
-    FileAccess, FileKind, FileNodeInfo, FileOperationEvent, FileRead, FileReadRequest,
-    FileWatchCallback, FileWatchChanges, FileWatchRequest, FileWatchSubscription, FileWriteMode,
-    FileWritePayload, FileWriteRequest,
+    FileAccess, FileKind, FileNodeInfo, FileOperationEvent, FileReadRequest, FileWatchCallback,
+    FileWatchChanges, FileWatchRequest, FileWatchSubscription, FileWriteMode, FileWritePayload,
+    FileWriteRequest,
 };
 use crate::system::path::ProviderKind;
 use crate::system::{FileNodePath, WorkspacePath, WorkspaceRef};
@@ -729,28 +729,38 @@ fn show_repository_file_location(
         return;
     }
 
-    let item = match repository_item(ctx, node_path.clone()) {
-        Ok(item) => item,
-        Err(err) => {
-            let workspace = ctx.workspace_ref();
-            file_monitor.mark_missing(&workspace, &node_path);
-            displayed_preview.borrow_mut().take();
-            right.show_unavailable(file_path, &format!("Unable to preview item: {err}"));
-            return;
-        }
-    };
-    let selection = line
-        .and_then(|line| repository_item_line_column_selection(&item, line, column.unwrap_or(1)));
+    let load_ctx = ctx.clone();
+    let callback_ctx = ctx.clone();
+    let right = Rc::clone(right);
+    let pending_save = pending_save.clone();
+    let file_monitor = Rc::clone(file_monitor);
+    let displayed_preview = displayed_preview.clone();
+    let file_path = file_path.to_string();
+    load_repository_item(&load_ctx, node_path.clone(), move |result| {
+        let item = match result {
+            Ok(item) => item,
+            Err(err) => {
+                let workspace = callback_ctx.workspace_ref();
+                file_monitor.mark_missing(&workspace, &node_path);
+                displayed_preview.borrow_mut().take();
+                right.show_unavailable(&file_path, &format!("Unable to preview item: {err}"));
+                return;
+            }
+        };
+        let selection = line.and_then(|line| {
+            repository_item_line_column_selection(&item, line, column.unwrap_or(1))
+        });
 
-    show_repository_item(
-        ctx,
-        right,
-        pending_save,
-        file_monitor,
-        displayed_preview,
-        item,
-        selection,
-    );
+        show_repository_item(
+            &callback_ctx,
+            &right,
+            &pending_save,
+            &file_monitor,
+            &displayed_preview,
+            item,
+            selection,
+        );
+    });
 }
 
 fn show_repository_file_match(
@@ -801,26 +811,34 @@ fn show_repository_node_path(
         return;
     }
 
-    let item = match repository_item(ctx, node_path.clone()) {
-        Ok(item) => item,
-        Err(err) => {
-            let workspace = ctx.workspace_ref();
-            file_monitor.mark_missing(&workspace, &node_path);
-            displayed_preview.borrow_mut().take();
-            right.show_unavailable(&file_path, &format!("Unable to preview item: {err}"));
-            return;
-        }
-    };
+    let load_ctx = ctx.clone();
+    let callback_ctx = ctx.clone();
+    let right = Rc::clone(right);
+    let pending_save = pending_save.clone();
+    let file_monitor = Rc::clone(file_monitor);
+    let displayed_preview = displayed_preview.clone();
+    load_repository_item(&load_ctx, node_path.clone(), move |result| {
+        let item = match result {
+            Ok(item) => item,
+            Err(err) => {
+                let workspace = callback_ctx.workspace_ref();
+                file_monitor.mark_missing(&workspace, &node_path);
+                displayed_preview.borrow_mut().take();
+                right.show_unavailable(&file_path, &format!("Unable to preview item: {err}"));
+                return;
+            }
+        };
 
-    show_repository_item(
-        ctx,
-        right,
-        pending_save,
-        file_monitor,
-        displayed_preview,
-        item,
-        selection,
-    );
+        show_repository_item(
+            &callback_ctx,
+            &right,
+            &pending_save,
+            &file_monitor,
+            &displayed_preview,
+            item,
+            selection,
+        );
+    });
 }
 
 fn repository_item_line_column_selection(
@@ -832,10 +850,11 @@ fn repository_item_line_column_selection(
         return None;
     }
 
-    let text = match item.prefetched_bytes.clone() {
-        Some(bytes) => text_from_repository_bytes(bytes),
-        None => read_repository_file(item.files.as_ref(), &item.node_path),
-    };
+    let text = item
+        .prefetched_bytes
+        .clone()
+        .ok_or_else(|| "File was not prefetched for location selection.".to_string())
+        .and_then(text_from_repository_bytes);
     let text = match text {
         Ok(text) => text,
         Err(err) => {
@@ -928,21 +947,63 @@ struct RepositoryItem {
     prefetched_bytes: Option<Vec<u8>>,
 }
 
-fn repository_item(ctx: &PageContext, node_path: FileNodePath) -> Result<RepositoryItem, String> {
-    let files = ctx
-        .files()
-        .ok_or_else(|| "File access is unavailable for this workspace.".to_string())?;
+fn load_repository_item<F>(ctx: &PageContext, node_path: FileNodePath, callback: F)
+where
+    F: FnOnce(Result<RepositoryItem, String>) + 'static,
+{
+    let Some(files) = ctx.files() else {
+        callback(Err(
+            "File access is unavailable for this workspace.".to_string()
+        ));
+        return;
+    };
+
     let workspace = ctx.workspace_ref();
-    let read = read_with_info(files.as_ref(), &node_path, Some(MAX_EDITOR_FILE_BYTES))?;
     let local_path = local_workspace_path(ctx, &node_path);
-    Ok(RepositoryItem {
-        files,
-        workspace,
-        node_path,
-        local_path,
-        info: read.info,
-        prefetched_bytes: read.bytes,
-    })
+    let request_path = node_path.clone();
+    let item_files = Arc::clone(&files);
+    let (sender, receiver) = mpsc::channel();
+    files.read_with_info(
+        FileReadRequest {
+            path: request_path,
+            max_bytes: Some(MAX_EDITOR_FILE_BYTES),
+            cancel_requested: None,
+        },
+        Box::new(move |event| {
+            if let FileOperationEvent::Finished(result) = event {
+                let result = result
+                    .map(|read| RepositoryItem {
+                        files: item_files.clone(),
+                        workspace: workspace.clone(),
+                        node_path: node_path.clone(),
+                        local_path: local_path.clone(),
+                        info: read.info,
+                        prefetched_bytes: read.bytes,
+                    })
+                    .map_err(|err| err.to_string());
+                let _ = sender.send(result);
+            }
+        }),
+    );
+
+    let mut callback = Some(callback);
+    gtk::glib::timeout_add_local(FILE_EVENT_POLL_INTERVAL, move || {
+        match receiver.try_recv() {
+            Ok(result) => {
+                if let Some(callback) = callback.take() {
+                    callback(result);
+                }
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if let Some(callback) = callback.take() {
+                    callback(Err("Read operation did not return a result.".to_string()));
+                }
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn show_repository_item(
@@ -1023,10 +1084,33 @@ fn add_gitignore_pattern(ctx: &PageContext, pattern: &str) {
         );
         return;
     };
-    match gitignore::add_pattern_to_workspace(files.as_ref(), &ctx.workspace_ref(), pattern) {
-        Ok(message) => ctx.refresh(Some(message)),
-        Err(err) => ctx.show_error("Ignore Failed", &err),
-    }
+    let (sender, receiver) = mpsc::channel();
+    gitignore::add_pattern_to_workspace(
+        files,
+        pattern.to_string(),
+        Box::new(move |result| {
+            let _ = sender.send(result);
+        }),
+    );
+
+    let ctx = ctx.clone();
+    gtk::glib::timeout_add_local(FILE_EVENT_POLL_INTERVAL, move || {
+        match receiver.try_recv() {
+            Ok(Ok(message)) => {
+                ctx.refresh(Some(message));
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(err)) => {
+                ctx.show_error("Ignore Failed", &err);
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                ctx.show_error("Ignore Failed", "Ignore operation did not return a result.");
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn add_markdown_lint_ignore(
@@ -1272,39 +1356,23 @@ pub(in crate::ui::pages::file) fn folder_entry_counts(
     Ok((file_count, folder_count))
 }
 
-pub(in crate::ui::pages::file) fn read_repository_file(
-    files: &dyn FileAccess,
-    path: &FileNodePath,
-) -> Result<String, String> {
-    read_with_info(files, path, Some(MAX_EDITOR_FILE_BYTES))?.into_text()
-}
-
-pub(in crate::ui::pages::file) fn read_repository_file_bytes(
-    files: &dyn FileAccess,
-    path: &FileNodePath,
-) -> Result<Vec<u8>, String> {
-    read_with_info(files, path, Some(MAX_EDITOR_FILE_BYTES))?.into_bytes()
-}
-
-pub(in crate::ui::pages::file) fn read_repository_file_from_prefetch(
+pub(in crate::ui::pages::file) fn repository_text_from_prefetch(
     prefetched_bytes: Option<Vec<u8>>,
-    files: &dyn FileAccess,
-    path: &FileNodePath,
+    file_path: &str,
 ) -> Result<String, String> {
     match prefetched_bytes {
         Some(bytes) => text_from_repository_bytes(bytes),
-        None => read_repository_file(files, path),
+        None => Err(format!("{file_path} is too large to preview.")),
     }
 }
 
-pub(in crate::ui::pages::file) fn read_repository_file_bytes_from_prefetch(
+pub(in crate::ui::pages::file) fn repository_bytes_from_prefetch(
     prefetched_bytes: Option<Vec<u8>>,
-    files: &dyn FileAccess,
-    path: &FileNodePath,
+    file_path: &str,
 ) -> Result<Vec<u8>, String> {
     match prefetched_bytes {
         Some(bytes) => Ok(bytes),
-        None => read_repository_file_bytes(files, path),
+        None => Err(format!("{file_path} is too large to preview.")),
     }
 }
 
@@ -1363,34 +1431,14 @@ fn write_repository_file(ctx: &PageContext, path: &FileNodePath, text: &str) -> 
         return Ok(());
     }
 
-    write_text(files.as_ref(), path, text)
+    write_text_via_callback(files.as_ref(), path, text)
 }
 
-fn read_with_info(
+fn write_text_via_callback(
     files: &dyn FileAccess,
     path: &FileNodePath,
-    max_bytes: Option<u64>,
-) -> Result<FileRead, String> {
-    let (sender, receiver) = mpsc::channel();
-    files.read_with_info(
-        FileReadRequest {
-            path: path.clone(),
-            max_bytes,
-            cancel_requested: None,
-        },
-        Box::new(move |event| {
-            if let FileOperationEvent::Finished(result) = event {
-                let _ = sender.send(result);
-            }
-        }),
-    );
-    receiver
-        .recv()
-        .map_err(|_| "Read operation did not return a result.".to_string())?
-        .map_err(|err| err.to_string())
-}
-
-fn write_text(files: &dyn FileAccess, path: &FileNodePath, text: &str) -> Result<(), String> {
+    text: &str,
+) -> Result<(), String> {
     let (sender, receiver) = mpsc::channel();
     files.write_node(
         FileWriteRequest {

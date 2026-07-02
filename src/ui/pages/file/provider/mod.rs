@@ -165,7 +165,7 @@ pub(in crate::ui::pages::file) fn spawn_preview_load<T, Work, Apply>(
     receive_preview_load(right, load_token, file_path, receiver, apply);
 }
 
-fn receive_preview_load<T, Apply>(
+pub(in crate::ui::pages::file) fn receive_preview_load<T, Apply>(
     right: Rc<right::RightPane>,
     load_token: right::PreviewLoadToken,
     file_path: String,

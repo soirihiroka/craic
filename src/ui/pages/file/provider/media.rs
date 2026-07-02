@@ -5,6 +5,7 @@ use gtk::{gio, prelude::*};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc;
 
 const MAX_MEDIA_PREVIEW_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -298,34 +299,40 @@ fn show_media(request: PreviewRequest<'_>, kind: MediaKind) {
     let disk_signature = disk_signature(request.info);
     let apply_file_path = file_path.clone();
 
-    super::spawn_preview_load(
-        Rc::clone(&request.right),
-        request.load_token,
-        file_path.clone(),
-        move || {
-            if !is_file {
-                return Err("Select a file to preview.".to_string());
-            }
-            let (full_path, materialized) = match local_path {
-                Some(path) => (path, None),
-                None => {
-                    let materialized = crate::system::materialize::materialize_for_view(
-                        files.as_ref(),
-                        &source,
-                        MAX_MEDIA_PREVIEW_BYTES,
-                    )?;
-                    (materialized.path().to_path_buf(), Some(materialized))
-                }
-            };
+    let (sender, receiver) = mpsc::channel();
+    if !is_file {
+        let _ = sender.send(Err("Select a file to preview.".to_string()));
+    } else if let Some(path) = local_path {
+        let _ = sender.send(Ok(MediaPreviewLoad {
+            kind,
+            file_path,
+            full_path: path,
+            materialized: None,
+            disk_signature,
+        }));
+    } else {
+        crate::system::materialize::materialize_for_view(
+            files,
+            source,
+            MAX_MEDIA_PREVIEW_BYTES,
+            move |result| {
+                let result = result.map(|materialized| MediaPreviewLoad {
+                    kind,
+                    file_path,
+                    full_path: materialized.path().to_path_buf(),
+                    materialized: Some(materialized),
+                    disk_signature,
+                });
+                let _ = sender.send(result);
+            },
+        );
+    }
 
-            Ok(MediaPreviewLoad {
-                kind,
-                file_path,
-                full_path,
-                materialized,
-                disk_signature,
-            })
-        },
+    super::receive_preview_load(
+        request.right,
+        request.load_token,
+        apply_file_path.clone(),
+        receiver,
         move |right, result| match result {
             Ok(load) => {
                 let file_path = load.file_path.clone();

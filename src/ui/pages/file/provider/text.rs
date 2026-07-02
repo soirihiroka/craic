@@ -23,7 +23,6 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
 
     let files = request.files.clone();
     let file_path = request.file_path.to_string();
-    let read_node_path = request.node_path.clone();
     let apply_node_path = request.node_path.clone();
     let git = (request.ctx.system_ref().provider_kind == crate::system::ProviderKind::Local)
         .then(|| request.ctx.git())
@@ -39,15 +38,12 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
         request.load_token,
         file_path.clone(),
         move || {
-            super::super::read_repository_file_from_prefetch(
-                prefetched_bytes,
-                files.as_ref(),
-                &read_node_path,
-            )
-            .map(|text| {
+            super::super::repository_text_from_prefetch(prefetched_bytes, &file_path).map(|text| {
                 let comparison = git.as_ref().and_then(|git| git.comparison(&file_path).ok());
-                let allowlist =
-                    crate::spellcheck::load_manifest_allowlist(&[(&file_path, text.as_str())]);
+                let allowlist = crate::spellcheck::manifest_allowlist_from_texts(&[(
+                    &file_path,
+                    text.as_str(),
+                )]);
                 let spellcheck_issues = crate::spellcheck::check_document(
                     &language,
                     Some(&file_path),
