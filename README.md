@@ -25,20 +25,21 @@ Any usage outside of my computer is out of scope and unsupported x3
 Install Rust and system dependencies:
 
 ### Fedora
+
 ```sh
-sudo dnf install rust cargo gtk4-devel webkitgtk6.0-devel libadwaita-devel vte291-gtk4-devel poppler-glib-devel gobject-introspection-devel pkgconf-pkg-config
+sudo dnf install rust cargo gtk4-devel webkitgtk6.0-devel gtksourceview5-devel libadwaita-devel vte291-gtk4-devel poppler-glib-devel gobject-introspection-devel pkgconf-pkg-config
 ```
 
 ### Ubuntu / Debian
-```sh
-sudo apt install rustc cargo libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpoppler-glib-dev gobject-introspection pkg-config
-```
+
+> Ask ChatGPT
 
 ---
 
 ## Usage
 
 ### Run
+
 ```sh
 cargo run
 ```
