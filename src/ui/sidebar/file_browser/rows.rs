@@ -1,8 +1,9 @@
 use super::{
-    BrowserTarget, FileBrowser, SearchMatch, TransferRowProgress, parent_folder,
-    show_row_context_menu,
+    BrowserTarget, FileBrowser, SearchMatch, TransferRowProgress, show_row_context_menu,
     tree::{BrowserRow, TreeRowRole},
 };
+use crate::system::FileNodePath;
+use crate::system::capabilities::files::FileNodeKind;
 use crate::ui::{canvas_scrollbar, components::tree_view, file_status, file_type};
 use gtk::gdk;
 use gtk::prelude::*;
@@ -36,7 +37,7 @@ impl BrowserListRow {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct NewEntryRow {
-    pub(super) folder: String,
+    pub(super) folder: FileNodePath,
     pub(super) default_name: String,
     pub(super) depth: usize,
     pub(super) kind: super::NewEntryKind,
@@ -78,11 +79,8 @@ impl FileBrowser {
                         gesture.set_state(gtk::EventSequenceState::Claimed);
                     }
                     3 => {
-                        let target = BrowserTarget {
-                            path: browser.gap_context_folder(content_y),
-                            is_dir: true,
-                            executable: false,
-                        };
+                        let target =
+                            browser.target_for_node_path(browser.gap_context_folder(content_y));
                         show_row_context_menu(&browser, &browser.tree.scroller, target, x, y);
                         gesture.set_state(gtk::EventSequenceState::Claimed);
                     }
@@ -331,7 +329,7 @@ impl FileBrowser {
             }
         }
         if previous_transfer_progress != transfer_progress {
-            sync_transfer_progress(self, widget, &row.path, transfer_progress);
+            sync_transfer_progress(self, widget, &row.node_path, transfer_progress);
         }
         if previous_status != status {
             sync_status_icon(widget, status);
@@ -387,7 +385,7 @@ impl FileBrowser {
     ) -> gtk::Box {
         let mut builder = tree_view::IconRow::builder(&row.name);
         if !row.is_dir {
-            builder = builder.set_icon(file_row_icon(&row.name, row.ignore.is_ignored()));
+            builder = builder.set_icon(row_file_icon(row));
         }
         builder = builder
             .depth(row.depth)
@@ -397,7 +395,7 @@ impl FileBrowser {
             .end_padding(row_end_padding())
             .on_primary_click(tree_primary_click_handler(self, row.clone(), render.sticky))
             .on_secondary_click(tree_secondary_click_handler(self, row.clone()))
-            .drag_source(file_drag_source(self, row.path.clone()));
+            .drag_source(file_drag_source(self, row.node_path.clone()));
         if row.tree_role == TreeRowRole::Branch {
             let handle = self.tree.disclosure_widget(tree_row_key(row), expanded);
             tree_view::sync_dimmed(&handle, row.ignore.is_ignored());
@@ -405,12 +403,15 @@ impl FileBrowser {
         }
         if let Some(progress) = transfer_progress {
             let browser = self.clone();
-            let row_path = row.path.clone();
+            let row_path = row.node_path.clone();
             builder = builder.progress(icon_row_progress(progress), move || {
                 if let Some(progress) = browser.transfer_progress_for_path(&row_path) {
                     browser.confirm_cancel_transfers(progress.transfer_ids);
                 }
             });
+        }
+        if !row.capabilities.writable {
+            builder = builder.trailing(read_only_icon());
         }
 
         let icon_row = builder.build();
@@ -418,7 +419,7 @@ impl FileBrowser {
         tree_view::sync_icon_row_drop_target(&icon_row.root, drop_target);
         sync_status_icon(&icon_row.root.clone().upcast(), status);
         if render.sticky && row.is_dir {
-            self.install_folder_drop_targets(&icon_row.root, row.path.clone());
+            self.install_folder_drop_targets(&icon_row.root, row.node_path.clone());
         }
         icon_row.root
     }
@@ -459,10 +460,7 @@ impl FileBrowser {
     fn rename_entry_row_widget(self: &Rc<Self>, row: &RenameEntryRow, expanded: bool) -> gtk::Box {
         let mut builder = tree_view::IconRow::builder(&row.original_name);
         if !row.row.is_dir {
-            builder = builder.set_icon(file_row_icon(
-                &row.original_name,
-                row.row.ignore.is_ignored(),
-            ));
+            builder = builder.set_icon(row_file_icon(&row.row));
         }
         builder = builder
             .depth(row.row.depth)
@@ -472,15 +470,11 @@ impl FileBrowser {
         if row.row.tree_role == TreeRowRole::Branch {
             let handle = self
                 .tree
-                .disclosure_widget(rename_row_key(&row.row.path), expanded);
+                .disclosure_widget(rename_row_key(&row.row.node_path), expanded);
             tree_view::sync_dimmed(&handle, row.row.ignore.is_ignored());
             builder = builder.disclosure(handle);
         }
-        let target = BrowserTarget {
-            path: row.row.path.clone(),
-            is_dir: row.row.is_dir,
-            executable: row.row.executable,
-        };
+        let target = BrowserTarget::from_row(&row.row);
         let browser = self.clone();
         let escape_browser = self.clone();
         let focus_browser = self.clone();
@@ -532,25 +526,24 @@ impl FileBrowser {
 
                 move |parent, gesture, x, y| {
                     browser.queue_cancel_pending_new_entry();
-                    browser
-                        .active_folder
-                        .replace(parent_folder(&search_match.path));
-                    browser.set_selected_path(search_match.path.clone());
+                    browser.active_folder.replace(
+                        search_match
+                            .node_path
+                            .parent()
+                            .unwrap_or_else(|| browser.root_node_path()),
+                    );
+                    browser.set_selected_node_path(Some(search_match.node_path.clone()));
                     show_row_context_menu(
                         &browser,
                         parent,
-                        BrowserTarget {
-                            path: search_match.path.clone(),
-                            is_dir: false,
-                            executable: false,
-                        },
+                        browser.target_for_node_path(search_match.node_path.clone()),
                         x,
                         y,
                     );
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                 }
             })
-            .drag_source(file_drag_source(self, search_match.path.clone()))
+            .drag_source(file_drag_source(self, search_match.node_path.clone()))
             .build();
         row.root.add_css_class("repo-browser-search-row");
         row.title.add_css_class("dim-label");
@@ -574,11 +567,8 @@ impl FileBrowser {
                         .map(BrowserListRow::height)
                         .sum::<f64>()
                         + y;
-                    let target = BrowserTarget {
-                        path: browser.gap_context_folder(content_y),
-                        is_dir: true,
-                        executable: false,
-                    };
+                    let target =
+                        browser.target_for_node_path(browser.gap_context_folder(content_y));
                     show_row_context_menu(&browser, parent, target, x, y);
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                 }
@@ -592,7 +582,7 @@ impl FileBrowser {
     pub(super) fn install_folder_drop_targets<W: IsA<gtk::Widget>>(
         self: &Rc<Self>,
         widget: &W,
-        folder: String,
+        folder: FileNodePath,
     ) {
         tree_view::FileDropTarget::builder(super::FILE_TRANSFER_MIME_TYPES)
             .on_file_hover({
@@ -646,16 +636,18 @@ impl FileBrowser {
             .install(widget);
     }
 
-    fn drop_target_folder_at_y(&self, y: f64) -> String {
+    fn drop_target_folder_at_y(&self, y: f64) -> FileNodePath {
         if let Some(sticky_row) = self
             .tree
             .sticky_row_at_viewport_y(y - self.tree.scroller.vadjustment().value())
             && let BrowserListRowRenderState::Tree { row, .. } = sticky_row.state
         {
             return if row.is_dir {
-                row.path
+                row.node_path
             } else {
-                parent_folder(&row.path)
+                row.node_path
+                    .parent()
+                    .unwrap_or_else(|| self.root_node_path())
             };
         }
 
@@ -664,13 +656,23 @@ impl FileBrowser {
         };
 
         match hit {
-            BrowserListRow::Tree(row) if row.is_dir => row.path,
-            BrowserListRow::Tree(row) => parent_folder(&row.path),
+            BrowserListRow::Tree(row) if row.is_dir => row.node_path,
+            BrowserListRow::Tree(row) => row
+                .node_path
+                .parent()
+                .unwrap_or_else(|| self.root_node_path()),
             BrowserListRow::NewEntry(row) => row.folder,
-            BrowserListRow::RenameEntry(row) => parent_folder(&row.row.path),
-            BrowserListRow::Search(search_match) => parent_folder(&search_match.path),
+            BrowserListRow::RenameEntry(row) => row
+                .row
+                .node_path
+                .parent()
+                .unwrap_or_else(|| self.root_node_path()),
+            BrowserListRow::Search(search_match) => search_match
+                .node_path
+                .parent()
+                .unwrap_or_else(|| self.root_node_path()),
             BrowserListRow::Status(_) => self.gap_context_folder(y),
-            BrowserListRow::RootGap => String::new(),
+            BrowserListRow::RootGap => self.root_node_path(),
         }
     }
 
@@ -681,12 +683,12 @@ impl FileBrowser {
             .filter(|row| !matches!(row, BrowserListRow::RootGap))
     }
 
-    pub(super) fn folder_for_gap_at_y(&self, y: f64) -> Option<String> {
+    pub(super) fn folder_for_gap_at_y(&self, y: f64) -> Option<FileNodePath> {
         if matches!(
             self.tree.row_at_content_y(y).map(|row| row.state.to_row()),
             Some(BrowserListRow::RootGap)
         ) {
-            return Some(String::new());
+            return Some(self.root_node_path());
         }
 
         self.tree
@@ -695,9 +697,11 @@ impl FileBrowser {
             })
             .and_then(|row| match row.state.to_row() {
                 BrowserListRow::Tree(row) => Some(if row.is_dir && self.tree_row_expanded(&row) {
-                    row.path
+                    row.node_path
                 } else {
-                    parent_folder(&row.path)
+                    row.node_path
+                        .parent()
+                        .unwrap_or_else(|| self.root_node_path())
                 }),
                 _ => None,
             })
@@ -740,7 +744,7 @@ impl FileBrowser {
     }
 
     fn browser_list_row_render_state(&self, row: &BrowserListRow) -> BrowserListRowRenderState {
-        let selected = self.selected_path.borrow().clone();
+        let selected = self.selected_node_path.borrow().clone();
         let selected_search_match = self.selected_search_match.borrow().clone();
         let drop_target = self.current_drop_target_folder();
 
@@ -748,10 +752,11 @@ impl FileBrowser {
             BrowserListRow::Tree(row) => BrowserListRowRenderState::Tree {
                 row: row.clone(),
                 expanded: self.tree_row_expanded(row),
-                selected: selected_search_match.is_none() && selected == row.path,
-                drop_target: drop_target.as_deref() == Some(row.path.as_str()),
+                selected: selected_search_match.is_none()
+                    && selected.as_ref() == Some(&row.node_path),
+                drop_target: drop_target.as_ref() == Some(&row.node_path),
                 status: self.changed_file_statuses.borrow().get(&row.path).cloned(),
-                transfer_progress: self.transfer_progress_for_path(&row.path),
+                transfer_progress: self.transfer_progress_for_path(&row.node_path),
             },
             BrowserListRow::NewEntry(row) => BrowserListRowRenderState::NewEntry(row.clone()),
             BrowserListRow::RenameEntry(row) => BrowserListRowRenderState::RenameEntry {
@@ -773,9 +778,9 @@ impl FileBrowser {
         }
 
         if !self.search_query.borrow().is_empty() {
-            !self.search_collapsed_dirs.borrow().contains(&row.path)
+            !self.search_collapsed_dirs.borrow().contains(&row.node_path)
         } else {
-            self.expanded_dirs.borrow().contains(&row.path)
+            self.expanded_dirs.borrow().contains(&row.node_path)
         }
     }
 }
@@ -804,19 +809,19 @@ fn sync_spellcheck_entry_warning(
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(super) enum BrowserListRowKey {
     Tree {
-        path: String,
+        path: FileNodePath,
         is_dir: bool,
         tree_role: TreeRowRole,
     },
     NewEntry {
-        folder: String,
+        folder: FileNodePath,
         kind: super::NewEntryKind,
     },
     RenameEntry {
-        path: String,
+        path: FileNodePath,
     },
     Search {
-        path: String,
+        path: FileNodePath,
         line_number: u64,
         start: usize,
         end: usize,
@@ -871,9 +876,9 @@ pub(super) fn browser_list_row_key(row: &BrowserListRow, index: usize) -> Browse
             folder: row.folder.clone(),
             kind: row.kind,
         },
-        BrowserListRow::RenameEntry(row) => rename_row_key(&row.row.path),
+        BrowserListRow::RenameEntry(row) => rename_row_key(&row.row.node_path),
         BrowserListRow::Search(search_match) => BrowserListRowKey::Search {
-            path: search_match.path.clone(),
+            path: search_match.node_path.clone(),
             line_number: search_match.line_number,
             start: search_match.start,
             end: search_match.end,
@@ -888,16 +893,14 @@ pub(super) fn browser_list_row_key(row: &BrowserListRow, index: usize) -> Browse
 
 pub(super) fn tree_row_key(row: &BrowserRow) -> BrowserListRowKey {
     BrowserListRowKey::Tree {
-        path: row.path.clone(),
+        path: row.node_path.clone(),
         is_dir: row.is_dir,
         tree_role: row.tree_role,
     }
 }
 
-fn rename_row_key(path: &str) -> BrowserListRowKey {
-    BrowserListRowKey::RenameEntry {
-        path: path.to_string(),
-    }
+fn rename_row_key(path: &FileNodePath) -> BrowserListRowKey {
+    BrowserListRowKey::RenameEntry { path: path.clone() }
 }
 
 fn root_gap_row_widget() -> gtk::Box {
@@ -923,21 +926,21 @@ fn tree_primary_click_handler(
     move |_, _, _, _| {
         browser.queue_cancel_pending_new_entry();
         if !browser.search_query.borrow().is_empty() && row.tree_role == TreeRowRole::Branch {
-            browser.set_selected_path(row.path.clone());
-            browser.active_folder.replace(if row.is_dir {
-                row.path.clone()
-            } else {
-                parent_folder(&row.path)
-            });
-            browser.toggle_dir(&row.path);
+            browser.set_selected_node_path(Some(row.node_path.clone()));
+            browser.active_folder.replace(row.node_path.clone());
+            browser.toggle_dir(&row.node_path);
             return;
         }
 
-        browser.set_selected_path(row.path.clone());
+        browser.set_selected_node_path(Some(row.node_path.clone()));
         if !row.is_dir {
-            browser.active_folder.replace(parent_folder(&row.path));
+            browser.active_folder.replace(
+                row.node_path
+                    .parent()
+                    .unwrap_or_else(|| browser.root_node_path()),
+            );
         } else {
-            browser.active_folder.replace(row.path.clone());
+            browser.active_folder.replace(row.node_path.clone());
         }
         if row.tree_role == TreeRowRole::Branch {
             let key = tree_row_key(&row);
@@ -948,7 +951,7 @@ fn tree_primary_click_handler(
                 browser.tree.scroll_row_below_sticky(&key);
                 return;
             }
-            browser.toggle_dir(&row.path);
+            browser.toggle_dir(&row.node_path);
         }
     }
 }
@@ -961,45 +964,34 @@ fn tree_secondary_click_handler(
 
     move |parent, gesture, x, y| {
         browser.queue_cancel_pending_new_entry();
-        browser.set_selected_path(row.path.clone());
+        browser.set_selected_node_path(Some(row.node_path.clone()));
         browser.active_folder.replace(if row.is_dir {
-            row.path.clone()
+            row.node_path.clone()
         } else {
-            parent_folder(&row.path)
+            row.node_path
+                .parent()
+                .unwrap_or_else(|| browser.root_node_path())
         });
-        show_row_context_menu(
-            &browser,
-            parent,
-            BrowserTarget {
-                path: row.path.clone(),
-                is_dir: row.is_dir,
-                executable: row.executable,
-            },
-            x,
-            y,
-        );
+        show_row_context_menu(&browser, parent, BrowserTarget::from_row(&row), x, y);
         gesture.set_state(gtk::EventSequenceState::Claimed);
     }
 }
 
-fn file_drag_source(browser: &Rc<FileBrowser>, path: String) -> tree_view::DragSource {
+fn file_drag_source(browser: &Rc<FileBrowser>, path: FileNodePath) -> tree_view::DragSource {
     tree_view::DragSource::builder()
         .prepare({
             let browser = browser.clone();
             let path = path.clone();
 
             move || {
-                let workspace_path = browser.workspace_path(&path);
-                if browser
-                    .file_access
-                    .borrow()
-                    .metadata(&workspace_path)
-                    .is_err()
-                {
+                let Ok(info) = browser.file_access.borrow().info(&path) else {
+                    return None;
+                };
+                if !info.capabilities.readable {
                     return None;
                 }
 
-                let bytes = gtk::glib::Bytes::from_owned(path.clone().into_bytes());
+                let bytes = gtk::glib::Bytes::from_owned(path.display().into_bytes());
                 Some(gdk::ContentProvider::for_bytes("text/plain", &bytes))
             }
         })
@@ -1041,12 +1033,12 @@ fn replace_row_widget(widget: &gtk::Widget, next: gtk::Widget) {
 fn sync_transfer_progress(
     browser: &Rc<FileBrowser>,
     widget: &gtk::Widget,
-    row_path: &str,
+    row_path: &FileNodePath,
     progress: Option<&TransferRowProgress>,
 ) {
     let callback = progress.map(|_| {
         let browser = browser.clone();
-        let row_path = row_path.to_string();
+        let row_path = row_path.clone();
         Rc::new(move || {
             if let Some(progress) = browser.transfer_progress_for_path(&row_path) {
                 browser.confirm_cancel_transfers(progress.transfer_ids);
@@ -1168,6 +1160,21 @@ fn sync_new_file_icon(icon: &gtk::Widget, name: &str) {
     icon.set_pixel_size(tree_view::ICON_SIZE);
 }
 
+fn row_file_icon(row: &BrowserRow) -> gtk::Image {
+    let icon = if matches!(row.kind, FileNodeKind::Archive { .. }) {
+        file_type::icon_for_name("extract-symbolic")
+    } else {
+        let detected_type = file_type::detect(&row.name, false);
+        file_type::icon(&detected_type)
+    };
+    icon.set_pixel_size(tree_view::ICON_SIZE);
+    icon.set_valign(gtk::Align::Center);
+    if row.ignore.is_ignored() {
+        icon.add_css_class("repo-browser-ignored-content");
+    }
+    icon
+}
+
 fn file_row_icon(name: &str, ignored: bool) -> gtk::Image {
     let detected_type = file_type::detect(name, false);
     let icon = file_type::icon(&detected_type);
@@ -1176,5 +1183,13 @@ fn file_row_icon(name: &str, ignored: bool) -> gtk::Image {
     if ignored {
         icon.add_css_class("repo-browser-ignored-content");
     }
+    icon
+}
+
+fn read_only_icon() -> gtk::Image {
+    let icon = file_type::icon_for_name("changes-prevent-symbolic");
+    icon.set_pixel_size(tree_view::ICON_SIZE);
+    icon.set_valign(gtk::Align::Center);
+    icon.set_tooltip_text(Some("Read-only"));
     icon
 }

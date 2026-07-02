@@ -1,4 +1,5 @@
 use super::{FileBrowser, tree::BrowserRow};
+use crate::system::FileNodePath;
 use crate::system::capabilities::files::{FileWatchCallback, FileWatchRequest};
 use gtk::glib;
 use std::collections::HashSet;
@@ -11,7 +12,7 @@ const FILE_BROWSER_WATCH_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct FileBrowserWatchSignature {
     workspace_id: String,
-    directories: Vec<String>,
+    directories: Vec<FileNodePath>,
 }
 
 impl FileBrowser {
@@ -22,7 +23,8 @@ impl FileBrowser {
         }
 
         let workspace = self.workspace.borrow().clone();
-        let directories = open_folder_watch_directories(rows, &self.expanded_dirs.borrow());
+        let root = self.root_node_path();
+        let directories = open_folder_watch_directories(rows, &self.expanded_dirs.borrow(), &root);
         let signature = FileBrowserWatchSignature {
             workspace_id: workspace.id.to_string(),
             directories,
@@ -40,11 +42,7 @@ impl FileBrowser {
         let mut subscriptions = Vec::new();
 
         let request = FileWatchRequest {
-            paths: signature
-                .directories
-                .iter()
-                .map(|relative| workspace.path(relative))
-                .collect(),
+            paths: signature.directories.clone(),
             recursive: false,
         };
         let callback: FileWatchCallback = Arc::new(move |changes| {
@@ -83,11 +81,7 @@ impl FileBrowser {
 
                 let mut changed_paths = HashSet::new();
                 while let Ok(changes) = receiver.try_recv() {
-                    changed_paths.extend(
-                        changes
-                            .into_iter()
-                            .map(|path| path.relative_or_empty().to_string()),
-                    );
+                    changed_paths.extend(changes);
                 }
 
                 if !changed_paths.is_empty() {
@@ -113,7 +107,7 @@ impl FileBrowser {
     fn refresh_watched_folder_view(
         self: &Rc<Self>,
         generation: u64,
-        changed_paths: HashSet<String>,
+        changed_paths: HashSet<FileNodePath>,
     ) {
         if self.file_watch_generation.get() != generation {
             return;
@@ -144,7 +138,7 @@ impl FileBrowser {
         {
             let mut cache = self.tree_directory_cache.borrow_mut();
             for directory in &invalidated_dirs {
-                cache.remove(directory.as_str());
+                cache.remove(directory);
             }
         }
         self.tree_rows_cache.borrow_mut().take();
@@ -158,33 +152,31 @@ impl FileBrowser {
 
 fn open_folder_watch_directories(
     rows: &[BrowserRow],
-    expanded_dirs: &HashSet<String>,
-) -> Vec<String> {
+    expanded_dirs: &HashSet<FileNodePath>,
+    root: &FileNodePath,
+) -> Vec<FileNodePath> {
     let mut directories = HashSet::new();
-    directories.insert(String::new());
+    directories.insert(root.clone());
     for row in rows {
-        if row.is_dir && expanded_dirs.contains(&row.path) {
-            directories.insert(row.path.clone());
+        if row.is_dir && row.capabilities.watchable && expanded_dirs.contains(&row.node_path) {
+            directories.insert(row.node_path.clone());
         }
     }
 
     let mut directories = directories.into_iter().collect::<Vec<_>>();
-    directories.sort();
+    directories.sort_by_key(FileNodePath::display);
     directories
 }
 
 fn watched_directories_for_changes(
-    watched_directories: &[String],
-    changed_paths: &HashSet<String>,
-) -> HashSet<String> {
-    let watched = watched_directories
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
+    watched_directories: &[FileNodePath],
+    changed_paths: &HashSet<FileNodePath>,
+) -> HashSet<FileNodePath> {
+    let watched = watched_directories.iter().collect::<HashSet<_>>();
     let mut invalidated = HashSet::new();
 
     for changed_path in changed_paths {
-        if watched.contains(changed_path.as_str()) {
+        if watched.contains(changed_path) {
             invalidated.insert(changed_path.clone());
         }
         if let Some(parent) = nearest_watched_parent(&watched, changed_path) {
@@ -195,25 +187,16 @@ fn watched_directories_for_changes(
     invalidated
 }
 
-fn nearest_watched_parent(watched: &HashSet<&str>, path: &str) -> Option<String> {
-    if path.is_empty() {
-        return watched.contains("").then(String::new);
-    }
-
-    let mut current = parent_folder(path);
-    loop {
-        if watched.contains(current.as_str()) {
-            return Some(current);
+fn nearest_watched_parent(
+    watched: &HashSet<&FileNodePath>,
+    path: &FileNodePath,
+) -> Option<FileNodePath> {
+    let mut current = path.parent();
+    while let Some(path) = current {
+        if watched.contains(&path) {
+            return Some(path);
         }
-        if current.is_empty() {
-            return None;
-        }
-        current = parent_folder(&current);
+        current = path.parent();
     }
-}
-
-fn parent_folder(path: &str) -> String {
-    path.rsplit_once('/')
-        .map(|(parent, _)| parent.to_string())
-        .unwrap_or_default()
+    None
 }

@@ -10,8 +10,8 @@ pub(in crate::ui::pages::code) mod svg;
 mod text;
 
 use super::{PageContext, right};
-use crate::system::WorkspacePath;
-use crate::system::capabilities::files::{FileAccess, FileKind, FileMetadata};
+use crate::system::FileNodePath;
+use crate::system::capabilities::files::{FileAccess, FileKind, FileNodeInfo};
 use crate::ui::file_type;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -39,9 +39,9 @@ pub(in crate::ui::pages::code) struct PreviewRequest<'a> {
     pub(in crate::ui::pages::code) load_token: right::PreviewLoadToken,
     pub(in crate::ui::pages::code) files: Arc<dyn FileAccess>,
     pub(in crate::ui::pages::code) file_path: &'a str,
-    pub(in crate::ui::pages::code) workspace_path: &'a WorkspacePath,
+    pub(in crate::ui::pages::code) node_path: &'a FileNodePath,
     pub(in crate::ui::pages::code) local_path: Option<&'a Path>,
-    pub(in crate::ui::pages::code) metadata: &'a FileMetadata,
+    pub(in crate::ui::pages::code) info: &'a FileNodeInfo,
     pub(in crate::ui::pages::code) prefetched_bytes: Option<&'a [u8]>,
 }
 
@@ -51,9 +51,9 @@ pub(in crate::ui::pages::code) struct PreviewMatchRequest<'a> {
     pub(in crate::ui::pages::code) load_token: right::PreviewLoadToken,
     pub(in crate::ui::pages::code) files: Arc<dyn FileAccess>,
     pub(in crate::ui::pages::code) file_path: &'a str,
-    pub(in crate::ui::pages::code) workspace_path: &'a WorkspacePath,
+    pub(in crate::ui::pages::code) node_path: &'a FileNodePath,
     pub(in crate::ui::pages::code) local_path: Option<&'a Path>,
-    pub(in crate::ui::pages::code) metadata: &'a FileMetadata,
+    pub(in crate::ui::pages::code) info: &'a FileNodeInfo,
     pub(in crate::ui::pages::code) prefetched_bytes: Option<&'a [u8]>,
     pub(in crate::ui::pages::code) start: usize,
     pub(in crate::ui::pages::code) end: usize,
@@ -67,9 +67,9 @@ impl<'a> PreviewMatchRequest<'a> {
             load_token: self.load_token,
             files: self.files,
             file_path: self.file_path,
-            workspace_path: self.workspace_path,
+            node_path: self.node_path,
             local_path: self.local_path,
-            metadata: self.metadata,
+            info: self.info,
             prefetched_bytes: self.prefetched_bytes,
         }
     }
@@ -77,11 +77,11 @@ impl<'a> PreviewMatchRequest<'a> {
 
 pub(in crate::ui::pages::code) fn for_file(
     file_path: &str,
-    metadata: &FileMetadata,
+    info: &FileNodeInfo,
     prefetched_bytes: Option<&[u8]>,
 ) -> Provider {
-    let is_file = metadata.kind == FileKind::File;
-    let is_dir = metadata.kind == FileKind::Directory;
+    let is_file = info.kind.is_file();
+    let is_dir = info.kind == FileKind::Directory;
     let path_preview_kind = file_type::preview_kind_for_path(file_path, is_dir);
     let preview_kind = if is_file
         && path_preview_kind != file_type::PreviewKind::Sqlite
@@ -220,9 +220,9 @@ pub(in crate::ui::pages::code) fn content_signature(bytes: &[u8]) -> ContentSign
     }
 }
 
-pub(in crate::ui::pages::code) fn disk_signature(metadata: &FileMetadata) -> DiskSignature {
+pub(in crate::ui::pages::code) fn disk_signature(info: &FileNodeInfo) -> DiskSignature {
     DiskSignature {
-        len: metadata.len,
-        modified: metadata.modified,
+        len: info.len_or_zero(),
+        modified: info.modified,
     }
 }

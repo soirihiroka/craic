@@ -1,4 +1,4 @@
-use crate::system::path::WorkspacePath;
+use crate::system::path::FileNodePath;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenTargetKind {
@@ -7,8 +7,8 @@ pub(crate) enum OpenTargetKind {
 }
 
 pub(crate) trait OpenAccess: Send + Sync {
-    fn copyable_path(&self, path: &WorkspacePath) -> String;
-    fn open_path(&self, path: &WorkspacePath, kind: OpenTargetKind) -> Result<String, String>;
-    fn reveal_path(&self, path: &WorkspacePath) -> Result<String, String>;
+    fn copyable_path(&self, path: &FileNodePath) -> String;
+    fn open_path(&self, path: &FileNodePath, kind: OpenTargetKind) -> Result<String, String>;
+    fn reveal_path(&self, path: &FileNodePath) -> Result<String, String>;
     fn open_url(&self, url: &str) -> Result<String, String>;
 }

@@ -1,4 +1,4 @@
-use crate::system::WorkspacePath;
+use crate::system::FileNodePath;
 use crate::system::capabilities::files::FileAccess;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -40,7 +40,7 @@ pub(super) fn show(
     right: Rc<super::super::right::RightPane>,
     load_token: super::super::right::PreviewLoadToken,
     files: Arc<dyn FileAccess>,
-    workspace_path: WorkspacePath,
+    node_path: FileNodePath,
     file_path: String,
     local_path: Option<PathBuf>,
     prefetched_bytes: Option<Vec<u8>>,
@@ -57,7 +57,7 @@ pub(super) fn show(
             let text = super::super::read_repository_file_from_prefetch(
                 prefetched_bytes,
                 files.as_ref(),
-                &workspace_path,
+                &node_path,
             )?;
             log::info!(
                 "readonly notebook preview read file_path={file_path} bytes={}",

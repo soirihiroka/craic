@@ -1,16 +1,23 @@
 use super::{
-    FileBrowser, MAX_TREE_ROWS, should_skip,
-    tree::{BrowserRow, RowIgnoreDisplay},
+    FileBrowser, MAX_TREE_ROWS, parent_folder, should_skip,
+    tree::{BrowserRow, RowCapabilities, RowIgnoreDisplay},
 };
-use crate::system::capabilities::files::{DirectoryEntry, DirectoryListing, FileKind};
+use crate::system::FileNodePath;
+use crate::system::capabilities::files::{DirectoryListing, FileAccess, FileNodeKind};
+use crate::system::path::FileNodeRef;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 impl FileBrowser {
     pub(super) fn visible_rows(self: &Rc<Self>) -> Vec<BrowserRow> {
         let workspace = self.workspace.borrow().clone();
         let file_access = self.file_access.borrow().clone();
-        let tree_signature = tree_rows_cache_signature(&workspace, &self.expanded_dirs.borrow());
+        let tree_signature = tree_rows_cache_signature(
+            &workspace,
+            &self.root_node_path(),
+            &self.expanded_dirs.borrow(),
+        );
         let mut rows = if let Some(cache) = self.tree_rows_cache.borrow().as_ref()
             && cache.signature == tree_signature
         {
@@ -18,7 +25,11 @@ impl FileBrowser {
         } else {
             self.load_open_directory_rows(&workspace, &file_access, &self.expanded_dirs.borrow());
             let mut rows = Vec::new();
-            self.collect_rows("", &self.expanded_dirs.borrow(), &mut rows);
+            self.collect_rows(
+                &self.root_node_path(),
+                &self.expanded_dirs.borrow(),
+                &mut rows,
+            );
             self.tree_rows_cache.replace(Some(TreeRowsCache {
                 signature: tree_signature,
                 rows: rows.clone(),
@@ -47,8 +58,8 @@ impl FileBrowser {
 
         let mut cache = self.tree_directory_cache.borrow_mut();
         for changed in changed_files {
-            let parent = super::parent_folder(&changed.path);
-            cache.remove(&parent);
+            let parent = parent_folder(&changed.path);
+            cache.remove(&self.node_path(&parent));
         }
         self.tree_rows_cache.borrow_mut().take();
         self.rows_signature.borrow_mut().clear();
@@ -57,53 +68,68 @@ impl FileBrowser {
     fn load_open_directory_rows(
         &self,
         workspace: &crate::system::WorkspaceRef,
-        file_access: &std::sync::Arc<dyn crate::system::capabilities::files::FileAccess>,
-        expanded_dirs: &HashSet<String>,
+        file_access: &Arc<dyn FileAccess>,
+        expanded_dirs: &HashSet<FileNodePath>,
     ) {
-        let open_dirs = open_directory_relatives(expanded_dirs);
+        let open_dirs = open_directory_paths(expanded_dirs, &self.root_node_path());
         let missing_dirs = {
             let cache = self.tree_directory_cache.borrow();
             open_dirs
                 .into_iter()
-                .filter(|relative| !cache.contains_key(relative))
+                .filter(|path| !cache.contains_key(path))
                 .collect::<Vec<_>>()
         };
         if missing_dirs.is_empty() {
             return;
         }
 
-        let paths = missing_dirs
-            .iter()
-            .map(|relative| workspace.path(relative))
-            .collect::<Vec<_>>();
         log::trace!(
-            "file browser list directories count={} workspace={}",
-            paths.len(),
+            "file browser list node directories count={} workspace={}",
+            missing_dirs.len(),
             workspace.display_name
         );
-        let listings = match file_access.list_dirs(&paths) {
+        let listings = match file_access.list_dirs(&missing_dirs) {
             Ok(listings) => listings,
             Err(err) => {
                 log::debug!(
-                    "file browser list directories failed workspace={} dir_count={} err={err}",
+                    "file browser list node directories failed workspace={} dir_count={} err={err}",
                     workspace.display_name,
-                    paths.len()
+                    missing_dirs.len()
                 );
                 Vec::new()
             }
         };
-        self.cache_directory_listings(listings);
+        self.cache_directory_listings(file_access, listings);
     }
 
-    fn cache_directory_listings(&self, listings: Vec<DirectoryListing>) {
+    fn cache_directory_listings(
+        &self,
+        file_access: &Arc<dyn FileAccess>,
+        listings: Vec<DirectoryListing>,
+    ) {
         let mut cache = self.tree_directory_cache.borrow_mut();
         for listing in listings {
-            let relative = listing.path.relative_or_empty().to_string();
-            let depth = directory_child_depth(&relative);
-            let mut children = listing
+            let depth = directory_child_depth(&listing.path);
+            let entry_paths = listing
                 .entries
                 .into_iter()
-                .filter_map(|entry| browser_entry_from_capability(&relative, depth, entry))
+                .filter(|path| path.file_name().is_some_and(|name| !should_skip(name)))
+                .collect::<Vec<_>>();
+            let infos = match file_access.info_many(&entry_paths) {
+                Ok(infos) => infos,
+                Err(err) => {
+                    log::debug!(
+                        "file browser node info failed path={} entries={} err={err}",
+                        listing.path.display(),
+                        entry_paths.len()
+                    );
+                    Vec::new()
+                }
+            };
+            let mut children = infos
+                .into_iter()
+                .filter(|info| !should_skip(&info.display_name))
+                .map(|info| BrowserRow::from_info(info, depth))
                 .collect::<Vec<_>>();
             children.sort_by(|left, right| {
                 right
@@ -111,14 +137,14 @@ impl FileBrowser {
                     .cmp(&left.is_dir)
                     .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
             });
-            cache.insert(relative, children);
+            cache.insert(listing.path, children);
         }
     }
 
     fn collect_rows(
         &self,
-        relative: &str,
-        expanded_dirs: &HashSet<String>,
+        node_path: &FileNodePath,
+        expanded_dirs: &HashSet<FileNodePath>,
         rows: &mut Vec<BrowserRow>,
     ) {
         if rows.len() >= MAX_TREE_ROWS {
@@ -128,12 +154,13 @@ impl FileBrowser {
         let children = self
             .tree_directory_cache
             .borrow()
-            .get(relative)
+            .get(node_path)
             .cloned()
             .unwrap_or_default();
         for child in children {
-            let should_descend = child.is_dir && expanded_dirs.contains(&child.path);
-            let child_path = child.path.clone();
+            let should_descend = child.tree_role == super::tree::TreeRowRole::Branch
+                && expanded_dirs.contains(&child.node_path);
+            let child_path = child.node_path.clone();
             rows.push(child);
             if rows.len() >= MAX_TREE_ROWS {
                 return;
@@ -147,9 +174,10 @@ impl FileBrowser {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct RowSignature {
-    path: String,
-    is_dir: bool,
+    path: FileNodePath,
+    kind: FileNodeKind,
     executable: bool,
+    capabilities: RowCapabilities,
     status: Option<String>,
     ignore: RowIgnoreDisplay,
 }
@@ -162,77 +190,70 @@ pub(super) struct TreeRowsCache {
 #[derive(PartialEq, Eq)]
 pub(super) struct TreeRowsCacheSignature {
     workspace_id: String,
-    expanded_dirs: Vec<String>,
+    root: FileNodePath,
+    expanded_dirs: Vec<FileNodePath>,
 }
 
 fn tree_rows_cache_signature(
     workspace: &crate::system::WorkspaceRef,
-    expanded_dirs: &HashSet<String>,
+    root: &FileNodePath,
+    expanded_dirs: &HashSet<FileNodePath>,
 ) -> TreeRowsCacheSignature {
     let mut expanded_dirs = expanded_dirs.iter().cloned().collect::<Vec<_>>();
-    expanded_dirs.sort();
+    expanded_dirs.sort_by_key(FileNodePath::display);
 
     TreeRowsCacheSignature {
         workspace_id: workspace.id.to_string(),
+        root: root.clone(),
         expanded_dirs,
     }
 }
 
-fn open_directory_relatives(expanded_dirs: &HashSet<String>) -> Vec<String> {
-    let mut dirs = vec![String::new()];
+fn open_directory_paths(
+    expanded_dirs: &HashSet<FileNodePath>,
+    root: &FileNodePath,
+) -> Vec<FileNodePath> {
+    let mut dirs = vec![root.clone()];
     let mut expanded_dirs = expanded_dirs.iter().cloned().collect::<Vec<_>>();
     expanded_dirs.sort_by(|left, right| {
         directory_child_depth(left)
             .cmp(&directory_child_depth(right))
-            .then_with(|| left.cmp(right))
+            .then_with(|| left.display().cmp(&right.display()))
     });
     for dir in expanded_dirs {
-        if !dir.is_empty() && expanded_directory_is_visible(&dir, dirs.as_slice()) {
+        if !dir.is_root() && expanded_directory_is_visible(&dir, dirs.as_slice()) {
             dirs.push(dir);
         }
     }
     dirs
 }
 
-fn expanded_directory_is_visible(dir: &str, visible_dirs: &[String]) -> bool {
-    let parent = parent_folder(dir);
+fn expanded_directory_is_visible(dir: &FileNodePath, visible_dirs: &[FileNodePath]) -> bool {
+    let Some(parent) = visible_parent(dir) else {
+        return false;
+    };
     visible_dirs.iter().any(|visible| visible == &parent)
 }
 
-fn directory_child_depth(relative: &str) -> usize {
-    if relative.is_empty() {
-        0
+fn visible_parent(path: &FileNodePath) -> Option<FileNodePath> {
+    let parent = path.parent()?;
+    if matches!(parent.nodes.last(), Some(FileNodeRef::ArchiveRoot { .. })) {
+        parent.parent()
     } else {
-        relative.matches('/').count() + 1
+        Some(parent)
     }
 }
 
-fn browser_entry_from_capability(
-    parent: &str,
-    depth: usize,
-    entry: DirectoryEntry,
-) -> Option<BrowserRow> {
-    let name = entry.name;
-    if should_skip(&name) {
-        return None;
-    }
-    let is_dir = entry.kind == FileKind::Directory;
-    let path = if parent.is_empty() {
-        name.clone()
+fn directory_child_depth(path: &FileNodePath) -> usize {
+    let display = path.display();
+    if display.is_empty() {
+        0
     } else {
-        format!("{parent}/{name}")
-    };
-    let mut row = if is_dir {
-        BrowserRow::folder(path, name, depth)
-    } else {
-        BrowserRow::file(path, name, depth)
-    };
-    row.executable = entry.executable;
-    row.ignore_known = entry.git_ignored.is_some();
-    if entry.git_ignored == Some(true) {
-        row.ignore = RowIgnoreDisplay::GitIgnored;
+        display
+            .split('/')
+            .filter(|segment| !segment.is_empty() && *segment != "!")
+            .count()
     }
-    Some(row)
 }
 
 pub(super) fn insert_changed_path_status(
@@ -282,17 +303,12 @@ pub(super) fn rows_signature(
     rows.iter()
         .take(MAX_TREE_ROWS)
         .map(|row| RowSignature {
-            path: row.path.clone(),
-            is_dir: row.is_dir,
+            path: row.node_path.clone(),
+            kind: row.kind,
             executable: row.executable,
+            capabilities: row.capabilities,
             status: changed_file_statuses.get(&row.path).cloned(),
             ignore: row.ignore,
         })
         .collect()
-}
-
-fn parent_folder(path: &str) -> String {
-    path.rsplit_once('/')
-        .map(|(parent, _)| parent.to_string())
-        .unwrap_or_default()
 }

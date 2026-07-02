@@ -11,7 +11,7 @@ use crate::github::PullRequestInfo;
 use crate::quick_action::{self, RunItem, RunTargetsSignature};
 use crate::system::WorkspacePath;
 use crate::system::capabilities::{
-    open::{OpenAccess, OpenTargetKind},
+    open::OpenAccess,
     shell::ShellAccess,
     terminal_link::{TerminalLinkAccess, TerminalLinkTarget},
 };
@@ -675,37 +675,13 @@ fn open_external_terminal_file<C: RepositoryActionContext>(
     file: &terminal::TerminalFileActivation,
     path: &WorkspacePath,
 ) {
-    let Some(opener) = context.opener() else {
-        let message = "Opening files outside the workspace is unavailable.".to_string();
-        log::warn!(
-            "terminal external file activation failed target={} path={} reason=no-opener",
-            file.target,
-            path.absolute
-        );
-        context.show_toast(&message);
-        return;
-    };
-
-    match opener.open_path(path, OpenTargetKind::File) {
-        Ok(message) => {
-            log::info!(
-                "terminal external file opened target={} path={} message={}",
-                file.target,
-                path.absolute,
-                message
-            );
-            context.show_toast(&message);
-        }
-        Err(err) => {
-            log::warn!(
-                "terminal external file activation failed target={} path={}: {}",
-                file.target,
-                path.absolute,
-                err
-            );
-            show_error_dialog(&context.window(), "Open File Failed", &err);
-        }
-    }
+    let message = "Opening files outside the workspace is unavailable.".to_string();
+    log::warn!(
+        "terminal external file activation failed target={} path={} reason=no-node-path",
+        file.target,
+        path.absolute
+    );
+    context.show_toast(&message);
 }
 
 fn parse_terminal_file_location(target: &str) -> TerminalFileLocation {

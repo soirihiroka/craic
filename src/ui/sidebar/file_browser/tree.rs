@@ -1,3 +1,6 @@
+use crate::system::FileNodePath;
+use crate::system::capabilities::files::{FileNodeCapabilities, FileNodeInfo, FileNodeKind};
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RowIgnoreDisplay {
     None,
@@ -11,14 +14,50 @@ impl RowIgnoreDisplay {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(super) struct RowCapabilities {
+    pub(super) readable: bool,
+    pub(super) listable: bool,
+    pub(super) writable: bool,
+    pub(super) creatable: bool,
+    pub(super) renameable: bool,
+    pub(super) deletable: bool,
+    pub(super) watchable: bool,
+    pub(super) searchable: bool,
+    pub(super) open_external: bool,
+    pub(super) reveal: bool,
+    pub(super) native: bool,
+}
+
+impl From<&FileNodeCapabilities> for RowCapabilities {
+    fn from(capabilities: &FileNodeCapabilities) -> Self {
+        Self {
+            readable: capabilities.readable,
+            listable: capabilities.listable,
+            writable: capabilities.writable,
+            creatable: capabilities.creatable,
+            renameable: capabilities.renameable,
+            deletable: capabilities.deletable,
+            watchable: capabilities.watchable,
+            searchable: capabilities.searchable,
+            open_external: capabilities.open_external,
+            reveal: capabilities.reveal,
+            native: capabilities.native,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct BrowserRow {
+    pub(super) node_path: FileNodePath,
     pub(super) path: String,
     pub(super) name: String,
     pub(super) depth: usize,
     pub(super) is_dir: bool,
+    pub(super) kind: FileNodeKind,
     pub(super) executable: bool,
     pub(super) tree_role: TreeRowRole,
+    pub(super) capabilities: RowCapabilities,
     pub(super) ignore: RowIgnoreDisplay,
     pub(super) ignore_known: bool,
 }
@@ -30,40 +69,82 @@ pub(super) enum TreeRowRole {
 }
 
 impl BrowserRow {
-    pub(super) fn folder(path: String, name: String, depth: usize) -> Self {
+    pub(super) fn from_info(info: FileNodeInfo, depth: usize) -> Self {
+        let mut kind = info.kind;
+        if matches!(kind, FileNodeKind::File)
+            && let Some(format) = crate::system::ArchiveFormat::from_name(&info.display_name)
+        {
+            kind = FileNodeKind::Archive { format };
+        }
+        let capabilities = RowCapabilities::from(&info.capabilities);
+        let is_dir = kind == FileNodeKind::Directory;
+        let tree_role =
+            if is_dir || capabilities.listable || matches!(kind, FileNodeKind::Archive { .. }) {
+                TreeRowRole::Branch
+            } else {
+                TreeRowRole::Leaf
+            };
+        let executable = info.mode.is_some_and(|mode| mode & 0o111 != 0);
+        let mut row = Self {
+            path: info.path.display(),
+            name: info.display_name,
+            depth,
+            is_dir,
+            kind,
+            executable,
+            tree_role,
+            capabilities,
+            ignore: RowIgnoreDisplay::None,
+            ignore_known: info.git_ignored.is_some(),
+            node_path: info.path,
+        };
+        if info.git_ignored == Some(true) {
+            row.ignore = RowIgnoreDisplay::GitIgnored;
+        }
+        row
+    }
+
+    pub(super) fn folder(
+        node_path: FileNodePath,
+        path: String,
+        name: String,
+        depth: usize,
+    ) -> Self {
         Self {
+            node_path,
             path,
             name,
             depth,
             is_dir: true,
+            kind: FileNodeKind::Directory,
             executable: false,
             tree_role: TreeRowRole::Branch,
+            capabilities: RowCapabilities::default(),
             ignore: RowIgnoreDisplay::None,
             ignore_known: false,
         }
     }
 
-    pub(super) fn file(path: String, name: String, depth: usize) -> Self {
+    pub(super) fn search_file_group(
+        node_path: FileNodePath,
+        path: String,
+        name: String,
+        depth: usize,
+    ) -> Self {
         Self {
+            node_path,
             path,
             name,
             depth,
             is_dir: false,
-            executable: false,
-            tree_role: TreeRowRole::Leaf,
-            ignore: RowIgnoreDisplay::None,
-            ignore_known: false,
-        }
-    }
-
-    pub(super) fn search_file_group(path: String, name: String, depth: usize) -> Self {
-        Self {
-            path,
-            name,
-            depth,
-            is_dir: false,
+            kind: FileNodeKind::File,
             executable: false,
             tree_role: TreeRowRole::Branch,
+            capabilities: RowCapabilities {
+                readable: true,
+                native: true,
+                ..RowCapabilities::default()
+            },
             ignore: RowIgnoreDisplay::None,
             ignore_known: false,
         }

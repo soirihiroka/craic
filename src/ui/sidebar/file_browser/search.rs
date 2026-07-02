@@ -1,7 +1,8 @@
 use super::{
     FileBrowser, MAX_SEARCH_FILE_BYTES, MAX_SEARCH_RESULTS, SEARCH_DEBOUNCE_MS, SEARCH_POLL_MS,
-    file_name, parent_folder, rows, skipped_names, tree::BrowserRow,
+    file_name, rows, skipped_names, tree::BrowserRow,
 };
+use crate::system::FileNodePath;
 use crate::system::capabilities::files::{FileSearchMatch, FileSearchOutput, FileSearchQuery};
 use crate::ui::components::search::SearchOption;
 use gtk::prelude::*;
@@ -54,16 +55,21 @@ impl FileBrowser {
     }
 
     pub(super) fn set_selected_search_match(self: &Rc<Self>, search_match: SearchMatch) {
-        self.active_folder
-            .replace(parent_folder(&search_match.path));
-        self.selected_path.replace(search_match.path.clone());
+        self.active_folder.replace(
+            search_match
+                .node_path
+                .parent()
+                .unwrap_or_else(|| self.root_node_path()),
+        );
+        self.selected_node_path
+            .replace(Some(search_match.node_path.clone()));
         self.selected_search_match
             .replace(Some(search_match.selection_key()));
         self.refresh_browser_row_state();
         let callbacks = self.search_match_callbacks.borrow().clone();
         for callback in callbacks {
             callback(
-                search_match.path.clone(),
+                search_match.node_path.clone(),
                 search_match.start,
                 search_match.end,
             );
@@ -83,7 +89,7 @@ impl FileBrowser {
         self.pending_rename_entry.borrow_mut().take();
         self.search_generation
             .set(self.search_generation.get().wrapping_add(1));
-        self.set_selected_path(String::new());
+        self.set_selected_node_path(None);
 
         if self.search_query.borrow().is_empty() {
             self.cancel_pending_search();
@@ -117,7 +123,7 @@ impl FileBrowser {
         self.search_output.borrow_mut().take();
         self.search_generation
             .set(self.search_generation.get().wrapping_add(1));
-        self.set_selected_path(String::new());
+        self.set_selected_node_path(None);
         if !self.search_query.borrow().is_empty() {
             self.start_search();
         }
@@ -139,8 +145,10 @@ impl FileBrowser {
             return;
         }
         let workspace = self.workspace.borrow().clone();
+        let root = self.root_node_path();
         let signature = SearchSignature {
             workspace_id: workspace.id.to_string(),
+            root,
             options: options.clone(),
             changed_files: changed_file_search_signature(&self.changed_file_statuses.borrow()),
         };
@@ -173,8 +181,10 @@ impl FileBrowser {
         self.stop_file_watch_scope();
         let file_access = self.file_access.borrow().clone();
         let workspace = self.workspace.borrow().clone();
+        let root = file_access.root();
         let signature = SearchSignature {
             workspace_id: workspace.id.to_string(),
+            root: root.clone(),
             options: options.clone(),
             changed_files: changed_file_search_signature(&self.changed_file_statuses.borrow()),
         };
@@ -186,8 +196,7 @@ impl FileBrowser {
         let (sender, receiver) = mpsc::channel();
 
         thread::spawn(move || {
-            let result =
-                search_repository_text_with_access(file_access, workspace.root.clone(), &options);
+            let result = search_repository_text_with_access(file_access, root, &options);
             let _ = sender.send(SearchResult {
                 generation,
                 options,
@@ -247,8 +256,11 @@ impl FileBrowser {
                 )]
             }
             Some(output) => {
-                let mut rows =
-                    search_tree_rows(output.matches, &self.search_collapsed_dirs.borrow());
+                let mut rows = search_tree_rows(
+                    output.matches,
+                    &self.search_collapsed_dirs.borrow(),
+                    &self.root_node_path(),
+                );
                 if output.limited {
                     rows.push(rows::BrowserListRow::Status(format!(
                         "Showing first {MAX_SEARCH_RESULTS} matches."
@@ -298,6 +310,7 @@ struct SearchOptions {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct SearchSignature {
     workspace_id: String,
+    root: FileNodePath,
     options: SearchOptions,
     changed_files: Vec<(String, String)>,
 }
@@ -316,7 +329,7 @@ pub(super) struct SearchOutput {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct SearchSelectionKey {
-    path: String,
+    node_path: FileNodePath,
     line_number: u64,
     start: usize,
     end: usize,
@@ -324,6 +337,7 @@ pub(super) struct SearchSelectionKey {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct SearchMatch {
+    pub(super) node_path: FileNodePath,
     pub(super) path: String,
     pub(super) line_number: u64,
     pub(super) start: usize,
@@ -335,7 +349,7 @@ pub(super) struct SearchMatch {
 impl SearchMatch {
     pub(super) fn selection_key(&self) -> SearchSelectionKey {
         SearchSelectionKey {
-            path: self.path.clone(),
+            node_path: self.node_path.clone(),
             line_number: self.line_number,
             start: self.start,
             end: self.end,
@@ -354,11 +368,14 @@ fn changed_file_search_signature(statuses: &HashMap<String, String>) -> Vec<(Str
 
 fn search_repository_text_with_access(
     file_access: std::sync::Arc<dyn crate::system::capabilities::files::FileAccess>,
-    root: crate::system::WorkspacePath,
+    root: FileNodePath,
     options: &SearchOptions,
 ) -> Result<SearchOutput, String> {
+    if !root.is_native() {
+        return Err("Search is unavailable for virtual file nodes.".to_string());
+    }
     let output = file_access.search_text(FileSearchQuery {
-        root,
+        root: root.clone(),
         query: options.query.clone(),
         case_sensitive: options.case_sensitive,
         whole_word: options.whole_word,
@@ -370,23 +387,28 @@ fn search_repository_text_with_access(
             .map(ToString::to_string)
             .collect(),
     })?;
-    Ok(search_output_from_capability(output))
+    Ok(search_output_from_capability(output, &root))
 }
 
-fn search_output_from_capability(output: FileSearchOutput) -> SearchOutput {
+fn search_output_from_capability(output: FileSearchOutput, root: &FileNodePath) -> SearchOutput {
     SearchOutput {
         matches: output
             .matches
             .into_iter()
-            .filter_map(search_match_from_capability)
+            .filter_map(|found| search_match_from_capability(found, root))
             .collect(),
         limited: output.limited,
     }
 }
 
-fn search_match_from_capability(found: FileSearchMatch) -> Option<SearchMatch> {
+fn search_match_from_capability(
+    found: FileSearchMatch,
+    _root: &FileNodePath,
+) -> Option<SearchMatch> {
+    let path = found.path.native_relative()?;
     Some(SearchMatch {
-        path: found.path.relative?,
+        node_path: found.path,
+        path,
         line_number: found.line_number,
         start: found.start,
         end: found.end,
@@ -397,7 +419,8 @@ fn search_match_from_capability(found: FileSearchMatch) -> Option<SearchMatch> {
 
 fn search_tree_rows(
     mut matches: Vec<SearchMatch>,
-    collapsed_dirs: &HashSet<String>,
+    collapsed_dirs: &HashSet<FileNodePath>,
+    root: &FileNodePath,
 ) -> Vec<rows::BrowserListRow> {
     let mut rows = Vec::new();
     let mut seen_dirs = HashSet::new();
@@ -409,23 +432,26 @@ fn search_tree_rows(
             .split('/')
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>();
-        let mut current = String::new();
+        let mut current_display = String::new();
+        let mut current_node = root.clone();
         let mut hidden_by_collapsed_dir = false;
         for (depth, name) in parts.iter().take(parts.len().saturating_sub(1)).enumerate() {
-            if current.is_empty() {
-                current.push_str(name);
+            current_node = current_node.join_child(*name);
+            if current_display.is_empty() {
+                current_display.push_str(name);
             } else {
-                current.push('/');
-                current.push_str(name);
+                current_display.push('/');
+                current_display.push_str(name);
             }
-            if seen_dirs.insert(current.clone()) {
+            if seen_dirs.insert(current_node.clone()) {
                 rows.push(rows::BrowserListRow::Tree(BrowserRow::folder(
-                    current.clone(),
+                    current_node.clone(),
+                    current_display.clone(),
                     (*name).to_string(),
                     depth,
                 )));
             }
-            if collapsed_dirs.contains(&current) {
+            if collapsed_dirs.contains(&current_node) {
                 hidden_by_collapsed_dir = true;
                 break;
             }
@@ -434,15 +460,16 @@ fn search_tree_rows(
             continue;
         }
 
-        if seen_files.insert(search_match.path.clone()) {
+        if seen_files.insert(search_match.node_path.clone()) {
             rows.push(rows::BrowserListRow::Tree(BrowserRow::search_file_group(
+                search_match.node_path.clone(),
                 search_match.path.clone(),
                 file_name(&search_match.path).to_string(),
                 parts.len().saturating_sub(1),
             )));
         }
 
-        if collapsed_dirs.contains(&search_match.path) {
+        if collapsed_dirs.contains(&search_match.node_path) {
             continue;
         }
 

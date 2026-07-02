@@ -7,11 +7,11 @@ use crate::git::RepositorySnapshot;
 use crate::gitignore;
 use crate::system::capabilities::docker::ComposeFileAction;
 use crate::system::capabilities::files::{
-    FileAccess, FileKind, FileMetadata, FileWatchCallback, FileWatchChanges, FileWatchRequest,
+    FileAccess, FileKind, FileNodeInfo, FileWatchCallback, FileWatchChanges, FileWatchRequest,
     FileWatchSubscription,
 };
 use crate::system::path::ProviderKind;
-use crate::system::{SystemPath, WorkspacePath, WorkspaceRef};
+use crate::system::{FileNodePath, WorkspacePath, WorkspaceRef};
 use crate::ui::content::code_editor;
 use crate::ui::file_type;
 use crate::ui::sidebar::file_browser::ContainerFileAction;
@@ -44,14 +44,15 @@ type DisplayedPreviewState = Rc<RefCell<Option<DisplayedPreview>>>;
 
 #[derive(Clone)]
 struct PendingSave {
-    path: String,
+    node_path: FileNodePath,
+    file_path: String,
     generation: u64,
     base_signature: Option<provider::DiskSignature>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DisplayedPreview {
-    system_path: SystemPath,
+    node_path: FileNodePath,
     signature: PreviewSignature,
 }
 
@@ -64,8 +65,7 @@ enum PreviewSignature {
 #[derive(Clone)]
 struct OpenedFileMonitorTarget {
     workspace: WorkspaceRef,
-    workspace_path: WorkspacePath,
-    file_path: String,
+    node_path: FileNodePath,
     local_path: Option<PathBuf>,
     signature: Option<provider::DiskSignature>,
 }
@@ -83,20 +83,16 @@ impl OpenedFileMonitorTarget {
     fn matches(
         &self,
         workspace: &WorkspaceRef,
-        workspace_path: &WorkspacePath,
+        node_path: &FileNodePath,
         local_path: Option<&Path>,
     ) -> bool {
         self.workspace == *workspace
-            && self.workspace_path == *workspace_path
+            && self.node_path == *node_path
             && self.local_path.as_deref() == local_path
     }
 
-    fn matches_selected_path(
-        &self,
-        workspace: &WorkspaceRef,
-        workspace_path: &WorkspacePath,
-    ) -> bool {
-        self.workspace == *workspace && self.workspace_path == *workspace_path
+    fn matches_selected_path(&self, workspace: &WorkspaceRef, node_path: &FileNodePath) -> bool {
+        self.workspace == *workspace && self.node_path == *node_path
     }
 }
 
@@ -118,7 +114,7 @@ impl OpenedFileMonitor {
         right: &Rc<right::RightPane>,
         pending_save: &PendingSaveState,
         workspace: &WorkspaceRef,
-        workspace_path: &WorkspacePath,
+        node_path: &FileNodePath,
         file_path: &str,
         local_path: Option<&Path>,
         signature: Option<provider::DiskSignature>,
@@ -127,7 +123,7 @@ impl OpenedFileMonitor {
             .target
             .borrow()
             .as_ref()
-            .is_some_and(|target| target.matches(workspace, workspace_path, local_path))
+            .is_some_and(|target| target.matches(workspace, node_path, local_path))
         {
             if let Some(target) = self.target.borrow_mut().as_mut() {
                 target.signature = signature;
@@ -139,8 +135,7 @@ impl OpenedFileMonitor {
 
         let target = OpenedFileMonitorTarget {
             workspace: workspace.clone(),
-            workspace_path: workspace_path.clone(),
-            file_path: file_path.to_string(),
+            node_path: node_path.clone(),
             local_path: local_path.map(Path::to_path_buf),
             signature,
         };
@@ -155,7 +150,7 @@ impl OpenedFileMonitor {
         };
 
         let request = FileWatchRequest {
-            paths: vec![workspace_path.clone()],
+            paths: vec![node_path.clone()],
             recursive: false,
         };
         let (sender, receiver) = mpsc::channel();
@@ -181,7 +176,7 @@ impl OpenedFileMonitor {
         let ctx = ctx.clone();
         let right = Rc::clone(right);
         let pending_save = pending_save.clone();
-        let watched_path = workspace_path.clone();
+        let watched_path = node_path.clone();
         let source_id = glib::timeout_add_local(CODE_FILE_EVENT_POLL_INTERVAL, move || {
             if monitor_state.generation.get() != generation {
                 return glib::ControlFlow::Break;
@@ -204,12 +199,12 @@ impl OpenedFileMonitor {
         self.event_source.replace(Some(source_id));
     }
 
-    fn mark_missing(&self, workspace: &WorkspaceRef, workspace_path: &WorkspacePath) {
+    fn mark_missing(&self, workspace: &WorkspaceRef, node_path: &FileNodePath) {
         let keep_target = self
             .target
             .borrow()
             .as_ref()
-            .is_some_and(|target| target.matches_selected_path(workspace, workspace_path));
+            .is_some_and(|target| target.matches_selected_path(workspace, node_path));
         if !keep_target {
             self.stop();
             return;
@@ -291,7 +286,7 @@ impl OpenedFileMonitor {
             return;
         }
 
-        let current_signature = disk_signature_for_path(ctx, &target.file_path)
+        let current_signature = disk_signature_for_path(ctx, &target.node_path)
             .ok()
             .flatten();
         if current_signature == target.signature {
@@ -301,20 +296,21 @@ impl OpenedFileMonitor {
         if let Some(active_target) = self.target.borrow_mut().as_mut() {
             if active_target.matches(
                 &target.workspace,
-                &target.workspace_path,
+                &target.node_path,
                 target.local_path.as_deref(),
             ) {
                 active_target.signature = current_signature;
             }
         }
 
-        show_repository_browser_path(
+        show_repository_node_path(
             ctx,
             right,
             pending_save,
             self,
             &self.displayed_preview,
-            &target.file_path,
+            target.node_path,
+            None,
         );
     }
 }
@@ -341,14 +337,15 @@ impl CodePage {
                 let file_monitor = file_monitor.clone();
                 let displayed_preview = displayed_preview.clone();
 
-                move |file_path| {
-                    show_repository_browser_path(
+                move |node_path| {
+                    show_repository_node_path(
                         &ctx,
                         &right,
                         &pending_save,
                         &file_monitor,
                         &displayed_preview,
-                        &file_path,
+                        node_path,
+                        None,
                     );
                 }
             });
@@ -356,12 +353,8 @@ impl CodePage {
             file_browser.connect_search_match_selected({
                 let ctx = ctx.clone();
 
-                move |file_path, start, end| {
-                    ctx.dispatch_command(PageCommand::OpenSearchMatch {
-                        path: file_path,
-                        start,
-                        end,
-                    });
+                move |path, start, end| {
+                    ctx.dispatch_command(PageCommand::OpenSearchMatch { path, start, end });
                 }
             });
 
@@ -420,6 +413,7 @@ impl CodePage {
             let ctx = ctx.clone();
             let file_editor_path = right.file_editor_path.clone();
             let file_editor_disk_signature = right.file_editor_disk_signature.clone();
+            let file_editor_writable = right.file_editor_writable.clone();
             let file_editor = right.file_editor.clone();
             let right = right.clone();
             let pending_save = pending_save.clone();
@@ -429,13 +423,19 @@ impl CodePage {
             let preview_generation = Rc::new(Cell::new(0_u64));
 
             move || {
-                let Some(file_path) = file_editor_path.borrow().clone() else {
+                if !file_editor_writable.get() {
+                    log::debug!("skip editor save for read-only file");
+                    return;
+                }
+                let Some(node_path) = file_editor_path.borrow().clone() else {
                     return;
                 };
+                let file_path = node_path.display();
                 let generation = save_generation.get().wrapping_add(1).max(1);
                 save_generation.set(generation);
                 pending_save.replace(Some(PendingSave {
-                    path: file_path.clone(),
+                    node_path: node_path.clone(),
+                    file_path: file_path.clone(),
                     generation,
                     base_signature: *file_editor_disk_signature.borrow(),
                 }));
@@ -447,6 +447,7 @@ impl CodePage {
                     let right = right.clone();
                     let file_editor = file_editor.clone();
                     let file_editor_path = file_editor_path.clone();
+                    let preview_node_path = node_path.clone();
                     let preview_file_path = file_path.clone();
                     let displayed_preview = displayed_preview.clone();
                     let preview_generation = preview_generation.clone();
@@ -454,8 +455,7 @@ impl CodePage {
                         if preview_generation.get() != preview_generation_value {
                             return;
                         }
-                        if file_editor_path.borrow().as_deref() != Some(preview_file_path.as_str())
-                        {
+                        if file_editor_path.borrow().as_ref() != Some(&preview_node_path) {
                             return;
                         }
 
@@ -464,6 +464,7 @@ impl CodePage {
                             &ctx,
                             &right,
                             &displayed_preview,
+                            &preview_node_path,
                             &preview_file_path,
                             &text,
                         );
@@ -483,51 +484,53 @@ impl CodePage {
                     if save_generation.get() != generation {
                         return;
                     }
-                    if !pending_save_matches(&pending_save, &file_path, generation) {
+                    if !pending_save_matches(&pending_save, &node_path, generation) {
                         return;
                     }
-                    if file_editor_path.borrow().as_deref() != Some(file_path.as_str()) {
+                    if file_editor_path.borrow().as_ref() != Some(&node_path) {
                         return;
                     }
                     let current_signature =
-                        disk_signature_for_path(&ctx, &file_path).ok().flatten();
+                        disk_signature_for_path(&ctx, &node_path).ok().flatten();
                     let Some(pending) = pending_save.borrow().clone() else {
                         return;
                     };
                     if pending.base_signature != current_signature {
-                        clear_pending_save(&pending_save, &file_path, generation);
-                        show_repository_browser_path(
+                        clear_pending_save(&pending_save, &node_path, generation);
+                        show_repository_node_path(
                             &ctx,
                             &right,
                             &pending_save,
                             &file_monitor,
                             &displayed_preview,
-                            &file_path,
+                            node_path.clone(),
+                            None,
                         );
                         return;
                     }
                     let text = file_editor.document_text();
                     spellcheck_editor_document(&ctx, &file_editor, &file_path, &text);
-                    if let Err(err) = write_repository_file(&ctx, &file_path, &text) {
+                    if let Err(err) = write_repository_file(&ctx, &node_path, &text) {
                         ctx.show_error("Save Failed", &err);
                         return;
                     }
-                    if let Ok(signature) = disk_signature_for_path(&ctx, &file_path) {
+                    if let Ok(signature) = disk_signature_for_path(&ctx, &node_path) {
                         file_editor_disk_signature.replace(signature);
                     }
-                    clear_pending_save(&pending_save, &file_path, generation);
+                    clear_pending_save(&pending_save, &node_path, generation);
                 });
             }
         });
 
         if left.file_browser.is_some() {
-            show_repository_browser_path(
+            show_repository_node_path(
                 &ctx,
                 &right,
                 &pending_save,
                 &file_monitor,
                 &displayed_preview,
-                "",
+                ctx.workspace_root_node_path(),
+                None,
             );
         } else {
             right.show_unavailable("Files", "Files are unavailable for this workspace.");
@@ -550,14 +553,14 @@ impl CodePage {
             return;
         }
         if let Some(file_browser) = &self.left.file_browser {
-            let selected_path = file_browser.selected_file_path();
-            show_repository_browser_path(
+            show_repository_node_path(
                 &self.ctx,
                 &self.right,
                 &self.pending_save,
                 &self.file_monitor,
                 &self.displayed_preview,
-                &selected_path,
+                file_browser.selected_node_path(),
+                None,
             );
         }
     }
@@ -667,13 +670,14 @@ impl Page for CodePage {
                 PageCommandResult::HandledAndActivate
             }
             PageCommand::ClearSelection => {
-                show_repository_browser_path(
+                show_repository_node_path(
                     &self.ctx,
                     &self.right,
                     &self.pending_save,
                     &self.file_monitor,
                     &self.displayed_preview,
-                    "",
+                    self.ctx.workspace_root_node_path(),
+                    None,
                 );
                 PageCommandResult::Handled
             }
@@ -694,9 +698,10 @@ fn show_repository_file_location(
     line: Option<usize>,
     column: Option<usize>,
 ) {
-    if right.file_editor_path.borrow().as_deref() == Some(file_path) {
+    let node_path = native_node_path(ctx, file_path);
+    if right.file_editor_path.borrow().as_ref() == Some(&node_path) {
         let loaded_signature = *right.file_editor_disk_signature.borrow();
-        let current_signature = disk_signature_for_path(ctx, file_path).ok().flatten();
+        let current_signature = disk_signature_for_path(ctx, &node_path).ok().flatten();
         if current_signature == loaded_signature {
             if let Some(line) = line {
                 right
@@ -705,7 +710,7 @@ fn show_repository_file_location(
             }
             return;
         }
-        if pending_save_path(pending_save).as_deref() == Some(file_path) {
+        if pending_save_node_path(pending_save).as_ref() == Some(&node_path) {
             pending_save.borrow_mut().take();
         }
     }
@@ -713,12 +718,11 @@ fn show_repository_file_location(
         return;
     }
 
-    let item = match repository_item(ctx, file_path) {
+    let item = match repository_item(ctx, node_path.clone()) {
         Ok(item) => item,
         Err(err) => {
             let workspace = ctx.workspace_ref();
-            let workspace_path = workspace.path(file_path);
-            file_monitor.mark_missing(&workspace, &workspace_path);
+            file_monitor.mark_missing(&workspace, &node_path);
             displayed_preview.borrow_mut().take();
             right.show_unavailable(file_path, &format!("Unable to preview item: {err}"));
             return;
@@ -738,69 +742,47 @@ fn show_repository_file_location(
     );
 }
 
-fn show_repository_browser_path(
-    ctx: &PageContext,
-    right: &Rc<right::RightPane>,
-    pending_save: &PendingSaveState,
-    file_monitor: &OpenedFileMonitorState,
-    displayed_preview: &DisplayedPreviewState,
-    file_path: &str,
-) {
-    if right.file_editor_path.borrow().as_deref() == Some(file_path) {
-        let loaded_signature = *right.file_editor_disk_signature.borrow();
-        let current_signature = disk_signature_for_path(ctx, file_path).ok().flatten();
-        if current_signature == loaded_signature {
-            return;
-        }
-        if pending_save_path(pending_save).as_deref() == Some(file_path) {
-            pending_save.borrow_mut().take();
-        }
-    }
-    if !flush_pending_save(ctx, right, pending_save) {
-        return;
-    }
-
-    let item = match repository_item(ctx, file_path) {
-        Ok(item) => item,
-        Err(err) => {
-            let workspace = ctx.workspace_ref();
-            let workspace_path = workspace.path(file_path);
-            file_monitor.mark_missing(&workspace, &workspace_path);
-            displayed_preview.borrow_mut().take();
-            right.show_unavailable(file_path, &format!("Unable to preview item: {err}"));
-            return;
-        }
-    };
-
-    show_repository_item(
-        ctx,
-        right,
-        pending_save,
-        file_monitor,
-        displayed_preview,
-        item,
-        None,
-    );
-}
-
 fn show_repository_file_match(
     ctx: &PageContext,
     right: &Rc<right::RightPane>,
     pending_save: &PendingSaveState,
     file_monitor: &OpenedFileMonitorState,
     displayed_preview: &DisplayedPreviewState,
-    file_path: &str,
+    node_path: &FileNodePath,
     start: usize,
     end: usize,
 ) {
-    if right.file_editor_path.borrow().as_deref() == Some(file_path) {
+    show_repository_node_path(
+        ctx,
+        right,
+        pending_save,
+        file_monitor,
+        displayed_preview,
+        node_path.clone(),
+        Some((start, end)),
+    );
+}
+
+fn show_repository_node_path(
+    ctx: &PageContext,
+    right: &Rc<right::RightPane>,
+    pending_save: &PendingSaveState,
+    file_monitor: &OpenedFileMonitorState,
+    displayed_preview: &DisplayedPreviewState,
+    node_path: FileNodePath,
+    selection: Option<(usize, usize)>,
+) {
+    let file_path = node_path.display();
+    if right.file_editor_path.borrow().as_ref() == Some(&node_path) {
         let loaded_signature = *right.file_editor_disk_signature.borrow();
-        let current_signature = disk_signature_for_path(ctx, file_path).ok().flatten();
+        let current_signature = disk_signature_for_path(ctx, &node_path).ok().flatten();
         if current_signature == loaded_signature {
-            right.file_editor.select_range(start, end);
+            if let Some((start, end)) = selection {
+                right.file_editor.select_range(start, end);
+            }
             return;
         }
-        if pending_save_path(pending_save).as_deref() == Some(file_path) {
+        if pending_save_node_path(pending_save).as_ref() == Some(&node_path) {
             pending_save.borrow_mut().take();
         }
     }
@@ -808,14 +790,13 @@ fn show_repository_file_match(
         return;
     }
 
-    let item = match repository_item(ctx, file_path) {
+    let item = match repository_item(ctx, node_path.clone()) {
         Ok(item) => item,
         Err(err) => {
             let workspace = ctx.workspace_ref();
-            let workspace_path = workspace.path(file_path);
-            file_monitor.mark_missing(&workspace, &workspace_path);
+            file_monitor.mark_missing(&workspace, &node_path);
             displayed_preview.borrow_mut().take();
-            right.show_unavailable(file_path, &format!("Unable to preview item: {err}"));
+            right.show_unavailable(&file_path, &format!("Unable to preview item: {err}"));
             return;
         }
     };
@@ -827,7 +808,7 @@ fn show_repository_file_match(
         file_monitor,
         displayed_preview,
         item,
-        Some((start, end)),
+        selection,
     );
 }
 
@@ -836,20 +817,20 @@ fn repository_item_line_column_selection(
     line: usize,
     column: usize,
 ) -> Option<(usize, usize)> {
-    if item.metadata.kind != FileKind::File {
+    if !item.info.kind.is_file() {
         return None;
     }
 
     let text = match item.prefetched_bytes.clone() {
         Some(bytes) => text_from_repository_bytes(bytes),
-        None => read_repository_file(item.files.as_ref(), &item.workspace_path),
+        None => read_repository_file(item.files.as_ref(), &item.node_path),
     };
     let text = match text {
         Ok(text) => text,
         Err(err) => {
             log::warn!(
                 "repository file location selection skipped file_path={} line={} column={}: {}",
-                item.workspace_path.relative_or_empty(),
+                item.node_path.display(),
                 line,
                 column,
                 err
@@ -865,6 +846,7 @@ fn refresh_live_file_preview(
     ctx: &PageContext,
     right: &right::RightPane,
     displayed_preview: &DisplayedPreviewState,
+    node_path: &FileNodePath,
     file_path: &str,
     text: &str,
 ) {
@@ -873,7 +855,7 @@ fn refresh_live_file_preview(
     match preview_kind {
         file_type::PreviewKind::Markdown => {
             let html = provider::markdown::markdown_to_html(text);
-            let local_path = local_workspace_path(ctx, file_path);
+            let local_path = local_workspace_path(ctx, node_path);
             right
                 .file_markdown_preview
                 .set_markdown_html(&html, signature, local_path.as_deref());
@@ -883,7 +865,7 @@ fn refresh_live_file_preview(
             right
                 .file_view_split
                 .set_end_child(Some(&right.file_markdown_preview.root));
-            set_live_displayed_preview(ctx, displayed_preview, file_path, signature);
+            set_live_displayed_preview(displayed_preview, node_path, signature);
             log::debug!("refreshed live markdown preview file_path={file_path}");
         }
         file_type::PreviewKind::Svg => {
@@ -891,7 +873,7 @@ fn refresh_live_file_preview(
             right
                 .file_view_split
                 .set_end_child(Some(&right.file_svg_preview.root));
-            set_live_displayed_preview(ctx, displayed_preview, file_path, signature);
+            set_live_displayed_preview(displayed_preview, node_path, signature);
             log::debug!("refreshed live svg preview file_path={file_path}");
         }
         _ => {}
@@ -899,52 +881,47 @@ fn refresh_live_file_preview(
 }
 
 fn set_live_displayed_preview(
-    ctx: &PageContext,
     displayed_preview: &DisplayedPreviewState,
-    file_path: &str,
+    node_path: &FileNodePath,
     signature: provider::ContentSignature,
 ) {
-    let path = ctx.workspace_ref().path(file_path);
-    let system_path = SystemPath {
-        system: ctx.system_ref(),
-        workspace: ctx.workspace_ref(),
-        path,
-    };
     displayed_preview.replace(Some(DisplayedPreview {
-        system_path,
+        node_path: node_path.clone(),
         signature: PreviewSignature::Content(signature),
     }));
 }
 
-fn local_workspace_path(ctx: &PageContext, file_path: &str) -> Option<PathBuf> {
-    (ctx.system_ref().provider_kind == ProviderKind::Local)
-        .then(|| PathBuf::from(ctx.workspace_ref().path(file_path).absolute))
+fn local_workspace_path(ctx: &PageContext, node_path: &FileNodePath) -> Option<PathBuf> {
+    if ctx.system_ref().provider_kind != ProviderKind::Local {
+        return None;
+    }
+    node_path
+        .to_workspace_path(&ctx.workspace_ref())
+        .map(|path| PathBuf::from(path.absolute))
 }
 
 struct RepositoryItem {
     files: Arc<dyn FileAccess>,
     workspace: WorkspaceRef,
-    workspace_path: WorkspacePath,
+    node_path: FileNodePath,
     local_path: Option<PathBuf>,
-    metadata: FileMetadata,
+    info: FileNodeInfo,
     prefetched_bytes: Option<Vec<u8>>,
 }
 
-fn repository_item(ctx: &PageContext, file_path: &str) -> Result<RepositoryItem, String> {
+fn repository_item(ctx: &PageContext, node_path: FileNodePath) -> Result<RepositoryItem, String> {
     let files = ctx
         .files()
         .ok_or_else(|| "File access is unavailable for this workspace.".to_string())?;
     let workspace = ctx.workspace_ref();
-    let workspace_path = workspace.path(file_path);
-    let read = files.read_with_metadata(&workspace_path, Some(MAX_EDITOR_FILE_BYTES))?;
-    let metadata = read.metadata;
-    let local_path = local_path_for_system_path(&metadata.path);
+    let read = files.read_with_info(&node_path, Some(MAX_EDITOR_FILE_BYTES))?;
+    let local_path = local_workspace_path(ctx, &node_path);
     Ok(RepositoryItem {
         files,
         workspace,
-        workspace_path,
+        node_path,
         local_path,
-        metadata,
+        info: read.info,
         prefetched_bytes: read.bytes,
     })
 }
@@ -958,35 +935,35 @@ fn show_repository_item(
     item: RepositoryItem,
     selection: Option<(usize, usize)>,
 ) {
-    let file_path = item.workspace_path.relative_or_empty();
+    let file_path = item.node_path.display();
     let displayed = DisplayedPreview {
-        system_path: item.metadata.path.clone(),
-        signature: PreviewSignature::Disk(provider::disk_signature(&item.metadata)),
+        node_path: item.node_path.clone(),
+        signature: PreviewSignature::Disk(provider::disk_signature(&item.info)),
     };
     if displayed_preview.borrow().as_ref() == Some(&displayed) {
         log::debug!("skip unchanged file preview file_path={file_path}");
         return;
     }
 
-    if item.metadata.kind == FileKind::File {
+    if item.info.kind.is_file() && item.info.capabilities.watchable {
         file_monitor.watch_file(
             ctx,
             right,
             pending_save,
             &item.workspace,
-            &item.workspace_path,
-            file_path,
+            &item.node_path,
+            &file_path,
             item.local_path.as_deref(),
-            Some(provider::disk_signature(&item.metadata)),
+            Some(provider::disk_signature(&item.info)),
         );
     } else {
         file_monitor.stop();
     }
 
     displayed_preview.replace(Some(displayed));
-    let load_token = right.begin_preview_load(file_path);
+    let load_token = right.begin_preview_load(&file_path);
     let selected_provider =
-        provider::for_file(file_path, &item.metadata, item.prefetched_bytes.as_deref());
+        provider::for_file(&file_path, &item.info, item.prefetched_bytes.as_deref());
     match selection {
         Some((start, end)) => {
             (selected_provider.show_match)(provider::PreviewMatchRequest {
@@ -994,10 +971,10 @@ fn show_repository_item(
                 right: Rc::clone(right),
                 load_token,
                 files: Arc::clone(&item.files),
-                file_path,
-                workspace_path: &item.workspace_path,
+                file_path: &file_path,
+                node_path: &item.node_path,
                 local_path: item.local_path.as_deref(),
-                metadata: &item.metadata,
+                info: &item.info,
                 prefetched_bytes: item.prefetched_bytes.as_deref(),
                 start,
                 end,
@@ -1009,10 +986,10 @@ fn show_repository_item(
                 right: Rc::clone(right),
                 load_token,
                 files: Arc::clone(&item.files),
-                file_path,
-                workspace_path: &item.workspace_path,
+                file_path: &file_path,
+                node_path: &item.node_path,
                 local_path: item.local_path.as_deref(),
-                metadata: &item.metadata,
+                info: &item.info,
                 prefetched_bytes: item.prefetched_bytes.as_deref(),
             });
         }
@@ -1117,10 +1094,16 @@ fn clear_displayed_preview_if_workspace_changed(
     displayed_preview: &DisplayedPreviewState,
     workspace: &WorkspaceRef,
 ) {
+    let workspace_id = workspace.id.to_string();
     let repo_changed = displayed_preview
         .borrow()
         .as_ref()
-        .is_some_and(|displayed| displayed.system_path.workspace != *workspace);
+        .is_some_and(|displayed| {
+            displayed
+                .node_path
+                .root_ref()
+                .is_none_or(|(root_id, _)| root_id != workspace_id)
+        });
     if repo_changed {
         displayed_preview.borrow_mut().take();
     }
@@ -1134,47 +1117,61 @@ fn flush_pending_save(
     let Some(pending) = pending_save.borrow().clone() else {
         return true;
     };
-    if right.file_editor_path.borrow().as_deref() != Some(pending.path.as_str()) {
+    if right.file_editor_path.borrow().as_ref() != Some(&pending.node_path) {
+        return true;
+    }
+    if !right.file_editor_writable.get() {
+        log::debug!(
+            "skip pending save for read-only file file_path={}",
+            pending.file_path
+        );
+        pending_save.borrow_mut().take();
         return true;
     }
 
-    let current_signature = disk_signature_for_path(ctx, &pending.path).ok().flatten();
+    let current_signature = disk_signature_for_path(ctx, &pending.node_path)
+        .ok()
+        .flatten();
     if current_signature != pending.base_signature {
         pending_save.borrow_mut().take();
         return true;
     }
 
     let text = right.file_editor.document_text();
-    if let Err(err) = write_repository_file(ctx, &pending.path, &text) {
+    if let Err(err) = write_repository_file(ctx, &pending.node_path, &text) {
         ctx.show_error("Save Failed", &err);
         return false;
     }
-    if let Ok(signature) = disk_signature_for_path(ctx, &pending.path) {
+    if let Ok(signature) = disk_signature_for_path(ctx, &pending.node_path) {
         right.file_editor_disk_signature.replace(signature);
     }
-    clear_pending_save(pending_save, &pending.path, pending.generation);
+    clear_pending_save(pending_save, &pending.node_path, pending.generation);
     true
 }
 
-fn pending_save_path(pending_save: &PendingSaveState) -> Option<String> {
+fn pending_save_node_path(pending_save: &PendingSaveState) -> Option<FileNodePath> {
     pending_save
         .borrow()
         .as_ref()
-        .map(|pending| pending.path.clone())
+        .map(|pending| pending.node_path.clone())
 }
 
-fn pending_save_matches(pending_save: &PendingSaveState, path: &str, generation: u64) -> bool {
+fn pending_save_matches(
+    pending_save: &PendingSaveState,
+    path: &FileNodePath,
+    generation: u64,
+) -> bool {
     pending_save
         .borrow()
         .as_ref()
-        .is_some_and(|pending| pending.path == path && pending.generation == generation)
+        .is_some_and(|pending| pending.node_path == *path && pending.generation == generation)
 }
 
-fn clear_pending_save(pending_save: &PendingSaveState, path: &str, generation: u64) {
+fn clear_pending_save(pending_save: &PendingSaveState, path: &FileNodePath, generation: u64) {
     let should_clear = pending_save
         .borrow()
         .as_ref()
-        .is_some_and(|pending| pending.path == path && pending.generation == generation);
+        .is_some_and(|pending| pending.node_path == *path && pending.generation == generation);
     if should_clear {
         pending_save.borrow_mut().take();
     }
@@ -1182,23 +1179,22 @@ fn clear_pending_save(pending_save: &PendingSaveState, path: &str, generation: u
 
 fn disk_signature_for_path(
     ctx: &PageContext,
-    file_path: &str,
+    path: &FileNodePath,
 ) -> Result<Option<provider::DiskSignature>, String> {
     let files = ctx
         .files()
         .ok_or_else(|| "File access is unavailable for this workspace.".to_string())?;
-    let path = ctx.workspace_ref().path(file_path);
-    let metadata = files.metadata(&path)?;
-    if metadata.kind != FileKind::File {
+    let info = files.info(path)?;
+    if !info.kind.is_file() {
         return Ok(None);
     }
 
-    Ok(Some(provider::disk_signature(&metadata)))
+    Ok(Some(provider::disk_signature(&info)))
 }
 
 pub(in crate::ui::pages::code) fn folder_entry_counts(
     files: &dyn FileAccess,
-    path: &WorkspacePath,
+    path: &FileNodePath,
 ) -> Result<(usize, usize), String> {
     let mut file_count = 0usize;
     let mut folder_count = 0usize;
@@ -1209,10 +1205,10 @@ pub(in crate::ui::pages::code) fn folder_entry_counts(
         .next()
         .map(|listing| listing.entries)
         .unwrap_or_default();
-    for entry in entries {
-        if entry.kind == FileKind::Directory {
+    for info in files.info_many(&entries)? {
+        if info.kind == FileKind::Directory {
             folder_count += 1;
-        } else if entry.kind == FileKind::File {
+        } else if info.kind.is_file() {
             file_count += 1;
         }
     }
@@ -1222,26 +1218,26 @@ pub(in crate::ui::pages::code) fn folder_entry_counts(
 
 pub(in crate::ui::pages::code) fn read_repository_file(
     files: &dyn FileAccess,
-    path: &WorkspacePath,
+    path: &FileNodePath,
 ) -> Result<String, String> {
     files
-        .read_with_metadata(path, Some(MAX_EDITOR_FILE_BYTES))?
+        .read_with_info(path, Some(MAX_EDITOR_FILE_BYTES))?
         .into_text()
 }
 
 pub(in crate::ui::pages::code) fn read_repository_file_bytes(
     files: &dyn FileAccess,
-    path: &WorkspacePath,
+    path: &FileNodePath,
 ) -> Result<Vec<u8>, String> {
     files
-        .read_with_metadata(path, Some(MAX_EDITOR_FILE_BYTES))?
+        .read_with_info(path, Some(MAX_EDITOR_FILE_BYTES))?
         .into_bytes()
 }
 
 pub(in crate::ui::pages::code) fn read_repository_file_from_prefetch(
     prefetched_bytes: Option<Vec<u8>>,
     files: &dyn FileAccess,
-    path: &WorkspacePath,
+    path: &FileNodePath,
 ) -> Result<String, String> {
     match prefetched_bytes {
         Some(bytes) => text_from_repository_bytes(bytes),
@@ -1252,7 +1248,7 @@ pub(in crate::ui::pages::code) fn read_repository_file_from_prefetch(
 pub(in crate::ui::pages::code) fn read_repository_file_bytes_from_prefetch(
     prefetched_bytes: Option<Vec<u8>>,
     files: &dyn FileAccess,
-    path: &WorkspacePath,
+    path: &FileNodePath,
 ) -> Result<Vec<u8>, String> {
     match prefetched_bytes {
         Some(bytes) => Ok(bytes),
@@ -1283,22 +1279,27 @@ fn text_from_repository_bytes(bytes: Vec<u8>) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8 text.".to_string())
 }
 
-fn write_repository_file(ctx: &PageContext, file_path: &str, text: &str) -> Result<(), String> {
+fn write_repository_file(ctx: &PageContext, path: &FileNodePath, text: &str) -> Result<(), String> {
     let files = ctx
         .files()
         .ok_or_else(|| "File access is unavailable for this workspace.".to_string())?;
-    let path = ctx.workspace_ref().path(file_path);
-    let metadata = files.metadata(&path)?;
-    if metadata.kind != FileKind::File {
+    let info = files.info(path)?;
+    if !info.kind.is_file() {
         return Err("Select a file to edit.".to_string());
     }
+    if !info.capabilities.writable {
+        log::info!(
+            "repository file save skipped read-only file_path={}",
+            path.display()
+        );
+        return Ok(());
+    }
 
-    files.write_text(&path, text)
+    files.write_text(path, text)
 }
 
-fn local_path_for_system_path(system_path: &SystemPath) -> Option<PathBuf> {
-    (system_path.system.provider_kind == ProviderKind::Local)
-        .then(|| PathBuf::from(&system_path.path.absolute))
+fn native_node_path(ctx: &PageContext, file_path: &str) -> FileNodePath {
+    ctx.workspace_ref().node_path(&ctx.system_ref(), file_path)
 }
 
 fn browser_terminal_dir(
@@ -1338,11 +1339,10 @@ fn run_repository_file_in_terminal(ctx: &PageContext, file_path: &str) -> Result
 
 fn file_watch_changes_include_path(
     changes: &FileWatchChanges,
-    watched_path: &WorkspacePath,
+    watched_path: &FileNodePath,
 ) -> bool {
     changes.is_empty()
         || changes.iter().any(|changed_path| {
-            changed_path == watched_path
-                || changed_path.relative_or_empty() == watched_path.relative_or_empty()
+            changed_path == watched_path || changed_path.is_child_of(watched_path)
         })
 }

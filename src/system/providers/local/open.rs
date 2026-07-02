@@ -1,5 +1,5 @@
 use crate::system::capabilities::open::{OpenAccess, OpenTargetKind};
-use crate::system::path::{WorkspacePath, WorkspaceRef};
+use crate::system::path::{FileNodePath, WorkspacePath, WorkspaceRef};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -15,7 +15,12 @@ impl LocalOpenAccess {
         Self { workspace, root }
     }
 
-    fn local_path(&self, path: &WorkspacePath) -> Result<PathBuf, String> {
+    fn workspace_path(&self, path: &FileNodePath) -> Result<WorkspacePath, String> {
+        path.to_workspace_path(&self.workspace)
+            .ok_or_else(|| "Opening virtual or external file nodes is unavailable.".to_string())
+    }
+
+    fn local_path_for_workspace(&self, path: &WorkspacePath) -> Result<PathBuf, String> {
         if let Some(relative) = path
             .relative
             .as_deref()
@@ -31,17 +36,21 @@ impl LocalOpenAccess {
 
         Ok(PathBuf::from(&path.absolute))
     }
+
+    fn local_path(&self, path: &FileNodePath) -> Result<PathBuf, String> {
+        let workspace_path = self.workspace_path(path)?;
+        self.local_path_for_workspace(&workspace_path)
+    }
 }
 
 impl OpenAccess for LocalOpenAccess {
-    fn copyable_path(&self, path: &WorkspacePath) -> String {
+    fn copyable_path(&self, path: &FileNodePath) -> String {
         self.local_path(path)
-            .unwrap_or_else(|_| PathBuf::from(&path.absolute))
-            .display()
-            .to_string()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| path.display())
     }
 
-    fn open_path(&self, path: &WorkspacePath, _kind: OpenTargetKind) -> Result<String, String> {
+    fn open_path(&self, path: &FileNodePath, _kind: OpenTargetKind) -> Result<String, String> {
         let local_path = self.local_path(path)?;
         log::info!(
             "local open path start workspace={} path={}",
@@ -55,7 +64,7 @@ impl OpenAccess for LocalOpenAccess {
         Ok("Opened path.".to_string())
     }
 
-    fn reveal_path(&self, path: &WorkspacePath) -> Result<String, String> {
+    fn reveal_path(&self, path: &FileNodePath) -> Result<String, String> {
         let local_path = self.local_path(path)?;
         let target = if local_path.is_dir() {
             local_path.clone()

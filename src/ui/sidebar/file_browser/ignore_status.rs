@@ -3,8 +3,8 @@ use super::{
     tree::{BrowserRow, RowIgnoreDisplay},
 };
 use crate::gitignore::IgnoreCheck;
-use crate::system::capabilities::files::{FileAccess, FileKind};
-use crate::system::{WorkspacePath, WorkspaceRef};
+use crate::system::FileNodePath;
+use crate::system::capabilities::files::{FileAccess, FileNodeKind};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
@@ -15,15 +15,18 @@ const GIT_IGNORE_CACHE_TTL: Duration = Duration::from_secs(5);
 
 impl FileBrowser {
     pub(super) fn refresh_git_ignore_cache_for_rules(&self, rows: &[BrowserRow]) {
-        if rows.iter().all(|row| row.ignore_known) {
+        if rows
+            .iter()
+            .all(|row| row.ignore_known || !row.capabilities.native)
+        {
             self.git_ignore_rules_signature.borrow_mut().take();
             self.git_ignore_cache.borrow_mut().clear();
             return;
         }
 
         let file_access = self.file_access.borrow().clone();
-        let workspace = self.workspace.borrow().clone();
-        let signature = git_ignore_rules_signature(file_access.as_ref(), &workspace, rows);
+        let root = self.root_node_path();
+        let signature = git_ignore_rules_signature(file_access.as_ref(), &root, rows);
         let mut current_signature = self.git_ignore_rules_signature.borrow_mut();
         if current_signature.as_ref() == Some(&signature) {
             return;
@@ -70,7 +73,7 @@ impl FileBrowser {
             rows.iter()
                 .take(MAX_TREE_ROWS)
                 .filter_map(|row| {
-                    if row.ignore_known {
+                    if row.ignore_known || !row.capabilities.native {
                         return None;
                     }
                     let cache_is_fresh = cache.entries.get(&row.path).is_some_and(|entry| {
@@ -228,7 +231,7 @@ impl GitIgnoreCache {
 
 #[derive(PartialEq, Eq)]
 pub(super) struct GitIgnoreRuleFileSignature {
-    path: String,
+    path: FileNodePath,
     state: GitIgnoreRuleFileState,
 }
 
@@ -249,22 +252,28 @@ struct GitIgnoreQueryResult {
 
 fn git_ignore_rules_signature(
     file_access: &dyn FileAccess,
-    workspace: &WorkspaceRef,
+    root: &FileNodePath,
     rows: &[BrowserRow],
 ) -> Vec<GitIgnoreRuleFileSignature> {
     let mut paths = rows
         .iter()
-        .filter(|row| !row.is_dir && file_name(&row.path) == ".gitignore")
-        .map(|row| row.path.clone())
+        .filter(|row| {
+            row.capabilities.native && !row.is_dir && file_name(&row.path) == ".gitignore"
+        })
+        .map(|row| row.node_path.clone())
         .collect::<Vec<_>>();
-    paths.push(".git/info/exclude".to_string());
-    paths.sort();
+    paths.push(
+        root.join_child(".git")
+            .join_child("info")
+            .join_child("exclude"),
+    );
+    paths.sort_by_key(FileNodePath::display);
     paths.dedup();
 
     paths
         .into_iter()
         .map(|path| {
-            let state = git_ignore_rule_file_state(file_access, &workspace.path(&path));
+            let state = git_ignore_rule_file_state(file_access, &path);
             GitIgnoreRuleFileSignature { path, state }
         })
         .collect()
@@ -272,12 +281,12 @@ fn git_ignore_rules_signature(
 
 fn git_ignore_rule_file_state(
     file_access: &dyn FileAccess,
-    path: &WorkspacePath,
+    path: &FileNodePath,
 ) -> GitIgnoreRuleFileState {
-    match file_access.metadata(path) {
-        Ok(metadata) if metadata.kind == FileKind::File => GitIgnoreRuleFileState::Present {
-            len: metadata.len,
-            modified: metadata.modified,
+    match file_access.info(path) {
+        Ok(info) if info.kind == FileNodeKind::File => GitIgnoreRuleFileState::Present {
+            len: info.len.unwrap_or_default(),
+            modified: info.modified,
         },
         _ => GitIgnoreRuleFileState::Missing,
     }

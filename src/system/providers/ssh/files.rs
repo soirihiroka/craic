@@ -1,11 +1,11 @@
 use super::{SshCommandRunner, remote_workspace_path, shell_quote, workspace_path_for_remote};
 use crate::gitignore;
 use crate::system::capabilities::files::{
-    DirectoryEntry, DirectoryListing, FileAccess, FileKind, FileMetadata, FileRead,
+    DirectoryListing, FileAccess, FileKind, FileNodeCapabilities, FileNodeInfo, FileRead,
     FileSearchMatch, FileSearchOutput, FileSearchQuery, FileSignature, FileWatchCallback,
     FileWatchRequest, FileWatchSubscription,
 };
-use crate::system::path::{SystemPath, SystemRef, WorkspacePath, WorkspaceRef};
+use crate::system::path::{ArchiveFormat, FileNodePath, SystemRef, WorkspacePath, WorkspaceRef};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -32,6 +32,12 @@ struct SshListDirCache {
 struct CachedDirectoryListing {
     listing: DirectoryListing,
     cached_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct SshResolvedFileNode {
+    path: FileNodePath,
+    remote_path: String,
 }
 
 #[derive(Deserialize)]
@@ -62,17 +68,132 @@ impl SshFileAccess {
             list_dir_cache: Arc::new(Mutex::new(SshListDirCache::default())),
         }
     }
+
+    fn resolve_native_node(
+        &self,
+        path: &FileNodePath,
+        operation: &str,
+    ) -> Result<SshResolvedFileNode, String> {
+        let node_display = file_node_display(path);
+        let Some((root_id, system_id)) = path.root_ref() else {
+            log::warn!(
+                "ssh file node operation denied workspace={} operation={} node={} reason=missing-root",
+                self.workspace.display_name,
+                operation,
+                node_display
+            );
+            return Err("File node does not belong to this SSH workspace.".to_string());
+        };
+
+        if root_id != self.workspace.id.as_str() || system_id != &self.system.id {
+            log::warn!(
+                "ssh file node operation denied workspace={} operation={} node={} reason=wrong-root",
+                self.workspace.display_name,
+                operation,
+                node_display
+            );
+            return Err("File node does not belong to this SSH workspace.".to_string());
+        }
+
+        if path.contains_archive() {
+            return self.reject_virtual_node(
+                path,
+                operation,
+                "SSH archive browsing is not supported for remote workspaces. Extract the archive on the remote system first.",
+            );
+        }
+
+        let Some(relative) = path.native_relative() else {
+            return self.reject_virtual_node(
+                path,
+                operation,
+                "Virtual SSH file nodes are unsupported for this operation.",
+            );
+        };
+        let workspace_path =
+            WorkspacePath::from_workspace_relative(&self.workspace.root, &relative);
+        let remote_path = remote_workspace_path(&self.workspace, &workspace_path);
+        log::info!(
+            "ssh file node resolved workspace={} operation={} node={} remote_path={}",
+            self.workspace.display_name,
+            operation,
+            node_display,
+            remote_path
+        );
+        Ok(SshResolvedFileNode {
+            path: path.clone(),
+            remote_path,
+        })
+    }
+
+    fn reject_virtual_node<T>(
+        &self,
+        path: &FileNodePath,
+        operation: &str,
+        message: &str,
+    ) -> Result<T, String> {
+        log::warn!(
+            "ssh file node operation denied workspace={} operation={} node={} reason=virtual-or-archive",
+            self.workspace.display_name,
+            operation,
+            file_node_display(path)
+        );
+        Err(message.to_string())
+    }
+
+    fn node_info(
+        &self,
+        path: FileNodePath,
+        kind: FileKind,
+        len: u64,
+        modified: Option<f64>,
+        readonly: bool,
+        executable: bool,
+        git_ignored: Option<bool>,
+    ) -> FileNodeInfo {
+        let mut node_kind = kind;
+        let mut capabilities = match kind {
+            FileKind::Directory => FileNodeCapabilities::native_directory(!readonly),
+            FileKind::File => FileNodeCapabilities::native_file(!readonly),
+            FileKind::Symlink | FileKind::Other => FileNodeCapabilities::native_other(!readonly),
+            FileKind::Archive { .. } => unreachable!(),
+        };
+        if kind == FileKind::File
+            && let Some(format) = path.file_name().and_then(ArchiveFormat::from_name)
+        {
+            node_kind = FileKind::Archive { format };
+            capabilities = FileNodeCapabilities {
+                listable: false,
+                ..FileNodeCapabilities::archive_file()
+            };
+        }
+        FileNodeInfo {
+            path: path.clone(),
+            display_name: path
+                .file_name()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| self.workspace.display_name.clone()),
+            kind: node_kind,
+            len: Some(len),
+            modified: remote_time(modified),
+            owner: None,
+            group: None,
+            mode: executable.then_some(0o111),
+            git_ignored,
+            capabilities,
+        }
+    }
 }
 
 impl SshListDirCache {
-    fn fresh_listing(&self, path: &WorkspacePath, now: Instant) -> Option<DirectoryListing> {
+    fn fresh_listing(&self, path: &FileNodePath, now: Instant) -> Option<DirectoryListing> {
         self.entries
             .get(&ssh_list_dir_cache_key(path))
             .filter(|entry| now.duration_since(entry.cached_at) <= SSH_LIST_DIR_CACHE_TTL)
             .map(|entry| entry.listing.clone())
     }
 
-    fn listing(&self, path: &WorkspacePath) -> Option<DirectoryListing> {
+    fn listing(&self, path: &FileNodePath) -> Option<DirectoryListing> {
         self.entries
             .get(&ssh_list_dir_cache_key(path))
             .map(|entry| entry.listing.clone())
@@ -89,13 +210,175 @@ impl SshListDirCache {
     }
 }
 
-fn ssh_list_dir_cache_key(path: &WorkspacePath) -> String {
-    path.relative_or_empty().to_string()
+fn ssh_list_dir_cache_key(path: &FileNodePath) -> String {
+    path.display()
+}
+
+fn file_node_display(path: &FileNodePath) -> String {
+    let display = path.display();
+    if display.is_empty() {
+        ".".to_string()
+    } else {
+        display
+    }
 }
 
 impl FileAccess for SshFileAccess {
     fn workspace(&self) -> WorkspaceRef {
         self.workspace.clone()
+    }
+
+    fn root(&self) -> FileNodePath {
+        self.workspace.root_node_path(&self.system)
+    }
+
+    fn info(&self, path: &FileNodePath) -> Result<FileNodeInfo, String> {
+        let resolved = self.resolve_native_node(path, "info")?;
+        let script = shell_metadata_script(&resolved.remote_path);
+        let raw = self.runner.run_text("file node info", &script)?;
+        parse_metadata_line(self, resolved.path, raw.trim_end(), None)
+    }
+
+    fn info_many(&self, paths: &[FileNodePath]) -> Result<Vec<FileNodeInfo>, String> {
+        let mut infos = paths
+            .iter()
+            .map(|path| self.info(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        apply_remote_git_ignore_to_infos(&self.runner, &self.workspace, &mut infos);
+        Ok(infos)
+    }
+
+    fn list_dirs(&self, paths: &[FileNodePath]) -> Result<Vec<DirectoryListing>, String> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let resolved_paths = paths
+            .iter()
+            .map(|path| self.resolve_native_node(path, "list_dirs"))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut cache = self
+            .list_dir_cache
+            .lock()
+            .map_err(|_| "SSH directory list cache is unavailable.".to_string())?;
+        let missing_paths = resolved_paths
+            .iter()
+            .filter(|resolved| {
+                cache
+                    .fresh_listing(&resolved.path, Instant::now())
+                    .is_none()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if !missing_paths.is_empty() {
+            log::debug!(
+                "ssh list directories cache miss workspace={} requested={} missing={}",
+                self.workspace.display_name,
+                paths.len(),
+                missing_paths.len()
+            );
+            let remote_paths = missing_paths
+                .iter()
+                .map(|resolved| resolved.remote_path.clone())
+                .collect::<Vec<_>>();
+            let script = shell_list_dirs_script(&remote_paths);
+            let raw = self.runner.run_text("list directories", &script)?;
+            let mut listings = parse_directory_output(&missing_paths, &raw)?;
+            for listing in &mut listings {
+                listing
+                    .entries
+                    .sort_by(|left, right| left.display().cmp(&right.display()));
+            }
+            cache.insert_listings(listings);
+        } else {
+            log::debug!(
+                "ssh list directories cache hit workspace={} requested={}",
+                self.workspace.display_name,
+                paths.len()
+            );
+        }
+
+        let listings = resolved_paths
+            .iter()
+            .filter_map(|resolved| cache.listing(&resolved.path))
+            .collect::<Vec<_>>();
+        if listings.len() != paths.len() {
+            return Err("SSH directory listing response was incomplete.".to_string());
+        }
+        Ok(listings)
+    }
+
+    fn read_with_info(
+        &self,
+        path: &FileNodePath,
+        max_bytes: Option<u64>,
+    ) -> Result<FileRead, String> {
+        let resolved = self.resolve_native_node(path, "read_with_info")?;
+        let script = shell_read_with_info_script(&resolved.remote_path, max_bytes);
+        let output = self
+            .runner
+            .run_script("read file node with info", &script)?;
+        parse_read_output(self, resolved.path, output.stdout)
+    }
+
+    fn write_bytes(&self, path: &FileNodePath, contents: &[u8]) -> Result<(), String> {
+        let resolved = self.resolve_native_node(path, "write_bytes")?;
+        let script = format!("cat > {}", shell_quote(&resolved.remote_path));
+        self.runner
+            .run_script_with_stdin("write file", &script, Some(contents))
+            .map(|_| ())
+    }
+
+    fn write_text(&self, path: &FileNodePath, contents: &str) -> Result<(), String> {
+        self.write_bytes(path, contents.as_bytes())
+    }
+
+    fn create_file(&self, parent: &FileNodePath, name: &str) -> Result<FileNodePath, String> {
+        validate_child_name(name)?;
+        let path = parent.join_child(name);
+        let resolved = self.resolve_native_node(&path, "create_file")?;
+        let script = format!(
+            "p={}; (set -C; : > \"$p\")",
+            shell_quote(&resolved.remote_path)
+        );
+        self.runner.run_script("create file", &script).map(|_| path)
+    }
+
+    fn create_dir(&self, parent: &FileNodePath, name: &str) -> Result<FileNodePath, String> {
+        validate_child_name(name)?;
+        let path = parent.join_child(name);
+        let resolved = self.resolve_native_node(&path, "create_dir")?;
+        let script = format!("mkdir -- {}", shell_quote(&resolved.remote_path));
+        self.runner
+            .run_script("create directory", &script)
+            .map(|_| path)
+    }
+
+    fn rename(
+        &self,
+        source: &FileNodePath,
+        destination_parent: &FileNodePath,
+        new_name: &str,
+    ) -> Result<FileNodePath, String> {
+        validate_child_name(new_name)?;
+        let source = self.resolve_native_node(source, "rename_source")?;
+        let destination = destination_parent.join_child(new_name);
+        let destination_resolved = self.resolve_native_node(&destination, "rename_destination")?;
+        let script = format!(
+            "[ ! -e {dst} ] && mv -- {src} {dst}",
+            src = shell_quote(&source.remote_path),
+            dst = shell_quote(&destination_resolved.remote_path)
+        );
+        self.runner
+            .run_script("rename path", &script)
+            .map(|_| destination)
+    }
+
+    fn delete(&self, path: &FileNodePath) -> Result<(), String> {
+        let resolved = self.resolve_native_node(path, "delete")?;
+        let script = format!("rm -rf -- {}", shell_quote(&resolved.remote_path));
+        self.runner.run_script("delete path", &script).map(|_| ())
     }
 
     fn watch(
@@ -104,20 +387,23 @@ impl FileAccess for SshFileAccess {
         callback: FileWatchCallback,
     ) -> Result<FileWatchSubscription, String> {
         let requested_paths = if request.paths.is_empty() {
-            vec![self.workspace.root.clone()]
+            vec![self.root()]
         } else {
             request.paths.clone()
         };
         let requested = requested_paths
             .iter()
-            .map(|path| (path.clone(), remote_workspace_path(&self.workspace, path)))
-            .collect::<Vec<_>>();
+            .map(|path| {
+                self.resolve_native_node(path, "watch")
+                    .map(|resolved| (resolved.path, resolved.remote_path))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let runner = self.runner.clone();
         let label = if requested_paths.len() == 1 {
             format!(
                 "ssh-file:{}:{}",
                 self.workspace.display_name,
-                requested_paths[0].display()
+                file_node_display(&requested_paths[0])
             )
         } else {
             format!(
@@ -141,129 +427,20 @@ impl FileAccess for SshFileAccess {
         ))
     }
 
-    fn metadata(&self, path: &WorkspacePath) -> Result<FileMetadata, String> {
-        let remote_path = remote_workspace_path(&self.workspace, path);
-        let script = shell_metadata_script(&remote_path);
-        let raw = self.runner.run_text("file metadata", &script)?;
-        parse_metadata_line(&self.system, &self.workspace, &remote_path, raw.trim_end())
-    }
-
-    fn list_dirs(&self, paths: &[WorkspacePath]) -> Result<Vec<DirectoryListing>, String> {
-        if paths.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut cache = self
-            .list_dir_cache
-            .lock()
-            .map_err(|_| "SSH directory list cache is unavailable.".to_string())?;
-        let missing_paths = paths
-            .iter()
-            .filter(|path| cache.fresh_listing(path, Instant::now()).is_none())
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if !missing_paths.is_empty() {
-            log::debug!(
-                "ssh list directories cache miss workspace={} requested={} missing={}",
-                self.workspace.display_name,
-                paths.len(),
-                missing_paths.len()
-            );
-            let requested = missing_paths
-                .iter()
-                .map(|path| (path.clone(), remote_workspace_path(&self.workspace, path)))
-                .collect::<Vec<_>>();
-            let remote_paths = requested
-                .iter()
-                .map(|(_, remote_path)| remote_path.clone())
-                .collect::<Vec<_>>();
-            let script = shell_list_dirs_script(&remote_paths);
-            let raw = self.runner.run_text("list directories", &script)?;
-            let mut listings =
-                parse_directory_output(&self.system, &self.workspace, &requested, &raw)?;
-            apply_remote_git_ignore(&self.runner, &self.workspace, &mut listings);
-            for listing in &mut listings {
-                sort_directory_entries(&mut listing.entries);
-            }
-            cache.insert_listings(listings);
-        } else {
-            log::debug!(
-                "ssh list directories cache hit workspace={} requested={}",
-                self.workspace.display_name,
-                paths.len()
-            );
-        }
-
-        let listings = paths
-            .iter()
-            .filter_map(|path| cache.listing(path))
-            .collect::<Vec<_>>();
-        Ok(listings)
-    }
-
-    fn read_with_metadata(
-        &self,
-        path: &WorkspacePath,
-        max_bytes: Option<u64>,
-    ) -> Result<FileRead, String> {
-        let remote_path = remote_workspace_path(&self.workspace, path);
-        let script = shell_read_with_metadata_script(&remote_path, max_bytes);
-        let output = self.runner.run_script("read file with metadata", &script)?;
-        parse_read_output(&self.system, &self.workspace, &remote_path, output.stdout)
-    }
-
-    fn write_bytes(&self, path: &WorkspacePath, contents: &[u8]) -> Result<(), String> {
-        let remote_path = remote_workspace_path(&self.workspace, path);
-        let script = format!("cat > {}", shell_quote(&remote_path));
-        self.runner
-            .run_script_with_stdin("write file", &script, Some(contents))
-            .map(|_| ())
-    }
-
-    fn write_text(&self, path: &WorkspacePath, contents: &str) -> Result<(), String> {
-        self.write_bytes(path, contents.as_bytes())
-    }
-
-    fn create_file(&self, path: &WorkspacePath) -> Result<(), String> {
-        let remote_path = remote_workspace_path(&self.workspace, path);
-        let script = format!("p={}; (set -C; : > \"$p\")", shell_quote(&remote_path));
-        self.runner.run_script("create file", &script).map(|_| ())
-    }
-
-    fn create_dir(&self, path: &WorkspacePath) -> Result<(), String> {
-        let remote_path = remote_workspace_path(&self.workspace, path);
-        let script = format!("mkdir -- {}", shell_quote(&remote_path));
-        self.runner
-            .run_script("create directory", &script)
-            .map(|_| ())
-    }
-
-    fn rename(&self, source: &WorkspacePath, destination: &WorkspacePath) -> Result<(), String> {
-        let source = remote_workspace_path(&self.workspace, source);
-        let destination = remote_workspace_path(&self.workspace, destination);
-        let script = format!(
-            "[ ! -e {dst} ] && mv -- {src} {dst}",
-            src = shell_quote(&source),
-            dst = shell_quote(&destination)
-        );
-        self.runner.run_script("rename path", &script).map(|_| ())
-    }
-
-    fn delete(&self, path: &WorkspacePath) -> Result<(), String> {
-        let remote_path = remote_workspace_path(&self.workspace, path);
-        let script = format!("rm -rf -- {}", shell_quote(&remote_path));
-        self.runner.run_script("delete path", &script).map(|_| ())
-    }
-
     fn search_text(&self, query: FileSearchQuery) -> Result<FileSearchOutput, String> {
-        let root = remote_workspace_path(&self.workspace, &query.root);
+        let resolved = self.resolve_native_node(&query.root, "search_text")?;
+        log::info!(
+            "file search start provider=ssh workspace={} query_len={} root={}",
+            self.workspace.display_name,
+            query.query.len(),
+            query.root.display()
+        );
         let excluded_names =
             serde_json::to_string(&query.excluded_names).unwrap_or_else(|_| json!([]).to_string());
         let script = format!(
             "python3 -c {} {} {} {} {} {} {} {} {}",
             shell_quote(SEARCH_SCRIPT),
-            shell_quote(&root),
+            shell_quote(&resolved.remote_path),
             shell_quote(&query.query),
             shell_quote(&excluded_names),
             if query.case_sensitive { "1" } else { "0" },
@@ -275,20 +452,30 @@ impl FileAccess for SshFileAccess {
         let raw = self.runner.run_text("search files", &script)?;
         let output: RemoteSearchOutput = serde_json::from_str(&raw)
             .map_err(|err| format!("Invalid remote search response: {err}"))?;
-        Ok(FileSearchOutput {
-            matches: output
-                .matches
-                .into_iter()
-                .map(|found| FileSearchMatch {
-                    path: workspace_path_for_remote(&self.workspace, &found.path),
+        let limited = output.limited;
+        let matches = output
+            .matches
+            .into_iter()
+            .map(|found| {
+                let workspace_path = workspace_path_for_remote(&self.workspace, &found.path);
+                FileSearchMatch {
+                    path: self
+                        .workspace
+                        .node_path(&self.system, workspace_path.relative_or_empty()),
                     line_number: found.line_number,
                     start: found.start,
                     end: found.end,
                     line_text: found.line_text,
-                })
-                .collect(),
-            limited: output.limited,
-        })
+                }
+            })
+            .collect::<Vec<_>>();
+        log::info!(
+            "file search complete provider=ssh workspace={} matches={} limited={}",
+            self.workspace.display_name,
+            matches.len(),
+            limited
+        );
+        Ok(FileSearchOutput { matches, limited })
     }
 }
 
@@ -320,8 +507,8 @@ printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$1" "$2" "$readonly" "$executable""#,
 
 fn remote_file_signatures(
     runner: &SshCommandRunner,
-    requested: &[(WorkspacePath, String)],
-) -> Result<HashMap<WorkspacePath, Option<FileSignature>>, String> {
+    requested: &[(FileNodePath, String)],
+) -> Result<HashMap<FileNodePath, Option<FileSignature>>, String> {
     let remote_paths = requested
         .iter()
         .map(|(_, remote_path)| remote_path.clone())
@@ -355,9 +542,9 @@ done"#,
 }
 
 fn parse_file_signature_lines(
-    requested: &[(WorkspacePath, String)],
+    requested: &[(FileNodePath, String)],
     raw: &str,
-) -> Result<HashMap<WorkspacePath, Option<FileSignature>>, String> {
+) -> Result<HashMap<FileNodePath, Option<FileSignature>>, String> {
     let mut signatures = requested
         .iter()
         .map(|(path, _)| (path.clone(), None))
@@ -373,7 +560,7 @@ fn parse_file_signature_lines(
         }
         let remote_path = fields.next().unwrap_or_default();
         let state = fields.next().unwrap_or_default();
-        let Some((workspace_path, _)) = requested
+        let Some((node_path, _)) = requested
             .iter()
             .find(|(_, requested_remote_path)| requested_remote_path == remote_path)
         else {
@@ -382,7 +569,7 @@ fn parse_file_signature_lines(
 
         match state {
             "missing" => {
-                signatures.insert(workspace_path.clone(), None);
+                signatures.insert(node_path.clone(), None);
             }
             "present" => {
                 let kind = parse_kind(fields.next().unwrap_or_default());
@@ -392,7 +579,7 @@ fn parse_file_signature_lines(
                     .ok_or_else(|| "Invalid remote file watch metadata length.".to_string())?;
                 let modified = fields.next().and_then(|value| value.parse::<f64>().ok());
                 signatures.insert(
-                    workspace_path.clone(),
+                    node_path.clone(),
                     Some(FileSignature {
                         kind,
                         len,
@@ -423,7 +610,7 @@ done"#,
     script
 }
 
-fn shell_read_with_metadata_script(remote_path: &str, max_bytes: Option<u64>) -> String {
+fn shell_read_with_info_script(remote_path: &str, max_bytes: Option<u64>) -> String {
     let max_bytes = max_bytes.map(|value| value.to_string()).unwrap_or_default();
     format!(
         r#"p={}
@@ -447,13 +634,13 @@ if [ "$readable" = 1 ]; then cat -- "$p"; fi"#,
 }
 
 fn parse_metadata_line(
-    system: &SystemRef,
-    workspace: &WorkspaceRef,
-    remote_path: &str,
+    access: &SshFileAccess,
+    path: FileNodePath,
     line: &str,
-) -> Result<FileMetadata, String> {
+    git_ignored: Option<bool>,
+) -> Result<FileNodeInfo, String> {
     let mut fields = line.split('\t');
-    let kind = fields.next().unwrap_or_default();
+    let kind = parse_kind(fields.next().unwrap_or_default());
     let len = fields
         .next()
         .and_then(|value| value.parse::<u64>().ok())
@@ -461,27 +648,17 @@ fn parse_metadata_line(
     let modified = fields.next().and_then(|value| value.parse::<f64>().ok());
     let readonly = fields.next().unwrap_or_default() == "1";
     let executable = fields.next().unwrap_or_default() == "1";
-    let path = workspace_path_for_remote(workspace, remote_path);
-    Ok(FileMetadata {
-        path: SystemPath::new(system.clone(), workspace.clone(), path),
-        kind: parse_kind(kind),
-        len,
-        modified: remote_time(modified),
-        readonly,
-        executable,
-    })
+    Ok(access.node_info(path, kind, len, modified, readonly, executable, git_ignored))
 }
 
 fn parse_directory_output(
-    system: &SystemRef,
-    workspace: &WorkspaceRef,
-    requested: &[(WorkspacePath, String)],
+    requested: &[SshResolvedFileNode],
     raw: &str,
 ) -> Result<Vec<DirectoryListing>, String> {
     let mut listings = requested
         .iter()
-        .map(|(path, _)| DirectoryListing {
-            path: path.clone(),
+        .map(|resolved| DirectoryListing {
+            path: resolved.path.clone(),
             entries: Vec::new(),
         })
         .collect::<Vec<_>>();
@@ -497,7 +674,7 @@ fn parse_directory_output(
             let remote_path = fields.next().unwrap_or_default();
             current_index = requested
                 .iter()
-                .position(|(_, requested_remote_path)| requested_remote_path == remote_path);
+                .position(|resolved| resolved.remote_path == remote_path);
             continue;
         }
         if marker != "CRAIC-ENTRY" {
@@ -509,76 +686,63 @@ fn parse_directory_output(
         let Some(name) = fields.next() else {
             continue;
         };
-        let Some(path) = fields.next() else {
-            continue;
-        };
-        let kind = parse_kind(fields.next().unwrap_or_default());
-        let len = fields
-            .next()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        let modified = fields.next().and_then(|value| value.parse::<f64>().ok());
-        let executable = fields
-            .next()
-            .and_then(|value| u32::from_str_radix(value, 8).ok())
-            .is_some_and(|mode| mode & 0o111 != 0);
-        let workspace_path = workspace_path_for_remote(workspace, path);
-        listings[index].entries.push(DirectoryEntry {
-            path: SystemPath::new(system.clone(), workspace.clone(), workspace_path),
-            name: name.to_string(),
-            kind,
-            len,
-            modified: remote_time(modified),
-            executable,
-            git_ignored: None,
-        });
+        let child = listings[index].path.join_child(name);
+        listings[index].entries.push(child);
     }
+
     Ok(listings)
 }
 
-fn apply_remote_git_ignore(
+fn apply_remote_git_ignore_to_infos(
     runner: &SshCommandRunner,
     workspace: &WorkspaceRef,
-    listings: &mut [DirectoryListing],
+    infos: &mut [FileNodeInfo],
 ) {
-    let checks = listings
+    let checks = infos
         .iter()
-        .flat_map(|listing| listing.entries.iter())
-        .filter_map(ignore_check_for_entry)
+        .filter(|info| info.capabilities.native)
+        .filter_map(|info| {
+            let path = info.path.native_relative()?;
+            (!path.is_empty()).then(|| gitignore::IgnoreCheck {
+                path,
+                is_dir: info.kind == FileKind::Directory,
+            })
+        })
         .collect::<Vec<_>>();
     if checks.is_empty() {
         return;
     }
+    let ignored_paths = remote_ignored_paths(runner, workspace, &checks);
+    for info in infos {
+        if let Some(path) = info.path.native_relative()
+            && !path.is_empty()
+        {
+            info.git_ignored = Some(ignored_paths.contains(&path));
+        }
+    }
+}
 
+fn remote_ignored_paths(
+    runner: &SshCommandRunner,
+    workspace: &WorkspaceRef,
+    checks: &[gitignore::IgnoreCheck],
+) -> HashSet<String> {
     let script = shell_check_ignore_script(&workspace.root.absolute);
     let output = match runner.run_script_with_stdin(
-        "list directory git ignore",
+        "file node git ignore",
         &script,
-        Some(&gitignore::check_ignore_stdin(&checks)),
+        Some(&gitignore::check_ignore_stdin(checks)),
     ) {
         Ok(output) => output,
         Err(err) => {
             log::debug!(
-                "ssh list dir git ignore unavailable workspace={} err={err}",
+                "ssh git ignore unavailable workspace={} err={err}",
                 workspace.display_name
             );
-            return;
+            return HashSet::new();
         }
     };
-    let ignored_paths = gitignore::parse_check_ignore_output(&checks, &output.stdout);
-    for listing in listings {
-        apply_git_ignore_flags(&mut listing.entries, &ignored_paths);
-    }
-}
-
-fn sort_directory_entries(entries: &mut [DirectoryEntry]) {
-    entries.sort_by(|left, right| {
-        right
-            .kind
-            .eq(&FileKind::Directory)
-            .cmp(&left.kind.eq(&FileKind::Directory))
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-    });
+    gitignore::parse_check_ignore_output(checks, &output.stdout)
 }
 
 fn shell_check_ignore_script(root: &str) -> String {
@@ -588,27 +752,9 @@ fn shell_check_ignore_script(root: &str) -> String {
     )
 }
 
-fn ignore_check_for_entry(entry: &DirectoryEntry) -> Option<gitignore::IgnoreCheck> {
-    let path = entry.path.path.relative_or_empty();
-    (!path.is_empty()).then(|| gitignore::IgnoreCheck {
-        path: path.to_string(),
-        is_dir: entry.kind == FileKind::Directory,
-    })
-}
-
-fn apply_git_ignore_flags(entries: &mut [DirectoryEntry], ignored_paths: &HashSet<String>) {
-    for entry in entries {
-        let path = entry.path.path.relative_or_empty();
-        if !path.is_empty() {
-            entry.git_ignored = Some(ignored_paths.contains(path));
-        }
-    }
-}
-
 fn parse_read_output(
-    system: &SystemRef,
-    workspace: &WorkspaceRef,
-    remote_path: &str,
+    access: &SshFileAccess,
+    path: FileNodePath,
     stdout: Vec<u8>,
 ) -> Result<FileRead, String> {
     let Some(header_end) = stdout.iter().position(|byte| *byte == b'\n') else {
@@ -620,7 +766,7 @@ fn parse_read_output(
     if fields.next() != Some("CRAIC-FILE-READ") {
         return Err("Invalid remote file read marker.".to_string());
     }
-    let kind = fields.next().unwrap_or_default();
+    let kind = parse_kind(fields.next().unwrap_or_default());
     let len = fields
         .next()
         .and_then(|value| value.parse::<u64>().ok())
@@ -629,17 +775,19 @@ fn parse_read_output(
     let readonly = fields.next().unwrap_or_default() == "1";
     let executable = fields.next().unwrap_or_default() == "1";
     let readable = fields.next().unwrap_or_default() == "1";
-    let path = workspace_path_for_remote(workspace, remote_path);
-    let metadata = FileMetadata {
-        path: SystemPath::new(system.clone(), workspace.clone(), path),
-        kind: parse_kind(kind),
-        len,
-        modified: remote_time(modified),
-        readonly,
-        executable,
-    };
+    let info = access.node_info(path, kind, len, modified, readonly, executable, None);
     let bytes = readable.then(|| stdout[header_end + 1..].to_vec());
-    Ok(FileRead { metadata, bytes })
+    Ok(FileRead { info, bytes })
+}
+
+fn validate_child_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Enter a name.".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("Names cannot contain path separators.".to_string());
+    }
+    Ok(())
 }
 
 const SEARCH_SCRIPT: &str = r#"

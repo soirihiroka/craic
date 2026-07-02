@@ -10,15 +10,15 @@ pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
 
     let files = request.files.clone();
     let file_path = request.file_path.to_string();
-    let workspace_path = request.workspace_path.clone();
-    let len = request.metadata.len;
+    let node_path = request.node_path.clone();
+    let len = request.info.len_or_zero();
     let apply_file_path = file_path.clone();
 
     super::spawn_preview_load(
         Rc::clone(&request.right),
         request.load_token,
         file_path.clone(),
-        move || read_font_bytes(files.as_ref(), &workspace_path, &file_path, len),
+        move || read_font_bytes(files.as_ref(), &node_path, &file_path, len),
         move |right, result| match result {
             Ok(bytes) => {
                 right
@@ -37,7 +37,7 @@ pub(in crate::ui::pages::code) fn show_match(request: PreviewMatchRequest<'_>) {
 
 fn read_font_bytes(
     files: &dyn crate::system::capabilities::files::FileAccess,
-    workspace_path: &crate::system::WorkspacePath,
+    node_path: &crate::system::FileNodePath,
     file_path: &str,
     len: u64,
 ) -> Result<Vec<u8>, String> {
@@ -46,7 +46,7 @@ fn read_font_bytes(
     }
 
     files
-        .read_with_metadata(workspace_path, Some(MAX_FONT_PREVIEW_BYTES))?
+        .read_with_info(node_path, Some(MAX_FONT_PREVIEW_BYTES))?
         .into_bytes()
         .map_err(|err| format!("Unable to preview font: {err}"))
 }

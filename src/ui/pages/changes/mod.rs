@@ -1121,7 +1121,7 @@ fn changed_file_action_group(
                 ctx.show_error("Open Failed", &ctx.opener_unavailable_message());
                 return;
             };
-            let path = ctx.workspace_ref().path(file_path);
+            let path = ctx.workspace_node_path(file_path);
             match opener.open_path(&path, OpenTargetKind::File) {
                 Ok(_) => ctx.refresh(Some("Opened file.".to_string())),
                 Err(err) => ctx.show_error("Open Failed", &err),
@@ -1151,7 +1151,7 @@ fn changed_file_action_group(
                 ctx.show_error("Open Failed", &ctx.opener_unavailable_message());
                 return;
             };
-            let path = ctx.workspace_ref().path(file_path);
+            let path = ctx.workspace_node_path(file_path);
             match opener.reveal_path(&path) {
                 Ok(_) => ctx.refresh(Some("Opened file manager.".to_string())),
                 Err(err) => ctx.show_error("Open Failed", &err),
@@ -1161,11 +1161,12 @@ fn changed_file_action_group(
     context_menu::add_string_menu_action(&actions, "copy-path", {
         let ctx = ctx.clone();
         move |file_path| {
-            let path = ctx.workspace_ref().path(file_path);
+            let workspace = ctx.workspace_ref();
+            let path = ctx.workspace_node_path(file_path);
             let text = ctx
                 .opener()
                 .map(|opener| opener.copyable_path(&path))
-                .unwrap_or_else(|| path.absolute.clone());
+                .unwrap_or_else(|| workspace.path(file_path).absolute);
             copy_to_clipboard(&ctx, &text);
         }
     });
@@ -1302,9 +1303,9 @@ fn open_repository_in_files(ctx: &PageContext, event_time: u32) {
         ctx.show_error("Open Failed", &ctx.opener_unavailable_message());
         return;
     };
-    let workspace = ctx.workspace_ref();
+    let path = ctx.workspace_root_node_path();
 
-    match opener.open_path(&workspace.root, OpenTargetKind::Folder) {
+    match opener.open_path(&path, OpenTargetKind::Folder) {
         Ok(_) => ctx.refresh(Some("Opened in Files.".to_string())),
         Err(err) => ctx.show_error("Open Failed", &err),
     }

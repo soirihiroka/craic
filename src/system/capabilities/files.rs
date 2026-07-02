@@ -1,37 +1,181 @@
-use crate::system::path::{SystemPath, WorkspacePath, WorkspaceRef};
+use crate::system::path::{ArchiveFormat, FileNodePath, WorkspaceRef};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FileKind {
+pub(crate) enum FileNodeKind {
     File,
     Directory,
     Symlink,
+    Archive { format: ArchiveFormat },
     Other,
+}
+
+pub(crate) use FileNodeKind as FileKind;
+
+impl FileNodeKind {
+    pub(crate) fn is_file(self) -> bool {
+        matches!(self, Self::File | Self::Archive { .. })
+    }
+
+    pub(crate) fn is_directory(self) -> bool {
+        matches!(self, Self::Directory)
+    }
+
+    pub(crate) fn is_archive(self) -> bool {
+        matches!(self, Self::Archive { .. })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileSignature {
-    pub(crate) kind: FileKind,
+    pub(crate) kind: FileNodeKind,
     pub(crate) len: u64,
     pub(crate) modified: Option<SystemTime>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct FileMetadata {
-    pub(crate) path: SystemPath,
-    pub(crate) kind: FileKind,
-    pub(crate) len: u64,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileNodeCapabilities {
+    pub(crate) readable: bool,
+    pub(crate) listable: bool,
+    pub(crate) writable: bool,
+    pub(crate) creatable: bool,
+    pub(crate) renameable: bool,
+    pub(crate) deletable: bool,
+    pub(crate) watchable: bool,
+    pub(crate) searchable: bool,
+    pub(crate) open_external: bool,
+    pub(crate) reveal: bool,
+    pub(crate) native: bool,
+}
+
+impl Default for FileNodeCapabilities {
+    fn default() -> Self {
+        Self {
+            readable: false,
+            listable: false,
+            writable: false,
+            creatable: false,
+            renameable: false,
+            deletable: false,
+            watchable: false,
+            searchable: false,
+            open_external: false,
+            reveal: false,
+            native: false,
+        }
+    }
+}
+
+impl FileNodeCapabilities {
+    pub(crate) fn native_file(writable: bool) -> Self {
+        Self {
+            readable: true,
+            writable,
+            renameable: writable,
+            deletable: writable,
+            watchable: true,
+            searchable: true,
+            open_external: true,
+            reveal: true,
+            native: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn native_directory(writable: bool) -> Self {
+        Self {
+            readable: true,
+            listable: true,
+            writable,
+            creatable: writable,
+            renameable: writable,
+            deletable: writable,
+            watchable: true,
+            searchable: true,
+            open_external: true,
+            reveal: true,
+            native: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn native_other(writable: bool) -> Self {
+        Self {
+            readable: true,
+            writable,
+            renameable: writable,
+            deletable: writable,
+            watchable: true,
+            open_external: true,
+            reveal: true,
+            native: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn archive_file() -> Self {
+        Self {
+            readable: true,
+            listable: true,
+            open_external: true,
+            reveal: true,
+            native: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn virtual_file() -> Self {
+        Self {
+            readable: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn virtual_directory() -> Self {
+        Self {
+            readable: true,
+            listable: true,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileNodeInfo {
+    pub(crate) path: FileNodePath,
+    pub(crate) display_name: String,
+    pub(crate) kind: FileNodeKind,
+    pub(crate) len: Option<u64>,
     pub(crate) modified: Option<SystemTime>,
-    pub(crate) readonly: bool,
-    pub(crate) executable: bool,
+    pub(crate) owner: Option<String>,
+    pub(crate) group: Option<String>,
+    pub(crate) mode: Option<u32>,
+    pub(crate) git_ignored: Option<bool>,
+    pub(crate) capabilities: FileNodeCapabilities,
+}
+
+pub(crate) type FileMetadata = FileNodeInfo;
+
+impl FileNodeInfo {
+    pub(crate) fn readonly(&self) -> bool {
+        !self.capabilities.writable
+    }
+
+    pub(crate) fn executable(&self) -> bool {
+        self.mode.is_some_and(|mode| mode & 0o111 != 0)
+    }
+
+    pub(crate) fn len_or_zero(&self) -> u64 {
+        self.len.unwrap_or(0)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct FileRead {
-    pub(crate) metadata: FileMetadata,
+    pub(crate) info: FileNodeInfo,
     pub(crate) bytes: Option<Vec<u8>>,
 }
 
@@ -39,9 +183,9 @@ impl FileRead {
     pub(crate) fn into_bytes(self) -> Result<Vec<u8>, String> {
         match self.bytes {
             Some(bytes) => Ok(bytes),
-            None if self.metadata.kind == FileKind::File => Err(format!(
+            None if self.info.kind.is_file() => Err(format!(
                 "File is too large to read ({} bytes).",
-                self.metadata.len
+                self.info.len_or_zero()
             )),
             None => Err("Select a file to read.".to_string()),
         }
@@ -57,29 +201,18 @@ impl FileRead {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DirectoryEntry {
-    pub(crate) path: SystemPath,
-    pub(crate) name: String,
-    pub(crate) kind: FileKind,
-    pub(crate) len: u64,
-    pub(crate) modified: Option<SystemTime>,
-    pub(crate) executable: bool,
-    pub(crate) git_ignored: Option<bool>,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct DirectoryListing {
-    pub(crate) path: WorkspacePath,
-    pub(crate) entries: Vec<DirectoryEntry>,
+    pub(crate) path: FileNodePath,
+    pub(crate) entries: Vec<FileNodePath>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileWatchRequest {
-    pub(crate) paths: Vec<WorkspacePath>,
+    pub(crate) paths: Vec<FileNodePath>,
     pub(crate) recursive: bool,
 }
 
-pub(crate) type FileWatchChanges = HashSet<WorkspacePath>;
+pub(crate) type FileWatchChanges = HashSet<FileNodePath>;
 pub(crate) type FileWatchCallback = Arc<dyn Fn(FileWatchChanges) + Send + Sync + 'static>;
 
 pub(crate) struct FileWatchSubscription {
@@ -95,9 +228,7 @@ impl FileWatchSubscription {
         callback: FileWatchCallback,
     ) -> Self
     where
-        F: FnMut() -> Result<HashMap<WorkspacePath, Option<FileSignature>>, String>
-            + Send
-            + 'static,
+        F: FnMut() -> Result<HashMap<FileNodePath, Option<FileSignature>>, String> + Send + 'static,
     {
         let label = label.into();
         let (stop_sender, stop_receiver) = mpsc::channel();
@@ -108,7 +239,7 @@ impl FileWatchSubscription {
                 thread_label,
                 interval.as_millis()
             );
-            let mut previous_snapshot: Option<HashMap<WorkspacePath, Option<FileSignature>>> = None;
+            let mut previous_snapshot: Option<HashMap<FileNodePath, Option<FileSignature>>> = None;
             let mut previous_error: Option<String> = None;
 
             loop {
@@ -203,7 +334,7 @@ impl Drop for FileWatchSubscription {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileSearchQuery {
-    pub(crate) root: WorkspacePath,
+    pub(crate) root: FileNodePath,
     pub(crate) query: String,
     pub(crate) case_sensitive: bool,
     pub(crate) whole_word: bool,
@@ -215,7 +346,7 @@ pub(crate) struct FileSearchQuery {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileSearchMatch {
-    pub(crate) path: WorkspacePath,
+    pub(crate) path: FileNodePath,
     pub(crate) line_number: u64,
     pub(crate) start: usize,
     pub(crate) end: usize,
@@ -230,29 +361,42 @@ pub(crate) struct FileSearchOutput {
 
 pub(crate) trait FileAccess: Send + Sync {
     fn workspace(&self) -> WorkspaceRef;
+    fn root(&self) -> FileNodePath;
+
+    fn list_dirs(&self, paths: &[FileNodePath]) -> Result<Vec<DirectoryListing>, String>;
+    fn info(&self, path: &FileNodePath) -> Result<FileNodeInfo, String>;
+    fn info_many(&self, paths: &[FileNodePath]) -> Result<Vec<FileNodeInfo>, String> {
+        paths.iter().map(|path| self.info(path)).collect()
+    }
+
+    fn read_with_info(
+        &self,
+        path: &FileNodePath,
+        max_bytes: Option<u64>,
+    ) -> Result<FileRead, String>;
+    fn read_bytes(&self, path: &FileNodePath, max_bytes: Option<u64>) -> Result<Vec<u8>, String> {
+        self.read_with_info(path, max_bytes)?.into_bytes()
+    }
+    fn read_text(&self, path: &FileNodePath, max_bytes: Option<u64>) -> Result<String, String> {
+        self.read_with_info(path, max_bytes)?.into_text()
+    }
+
+    fn write_bytes(&self, path: &FileNodePath, contents: &[u8]) -> Result<(), String>;
+    fn write_text(&self, path: &FileNodePath, contents: &str) -> Result<(), String>;
+    fn create_file(&self, parent: &FileNodePath, name: &str) -> Result<FileNodePath, String>;
+    fn create_dir(&self, parent: &FileNodePath, name: &str) -> Result<FileNodePath, String>;
+    fn rename(
+        &self,
+        source: &FileNodePath,
+        destination_parent: &FileNodePath,
+        new_name: &str,
+    ) -> Result<FileNodePath, String>;
+    fn delete(&self, path: &FileNodePath) -> Result<(), String>;
+
     fn watch(
         &self,
         request: FileWatchRequest,
         callback: FileWatchCallback,
     ) -> Result<FileWatchSubscription, String>;
-    fn metadata(&self, path: &WorkspacePath) -> Result<FileMetadata, String>;
-    fn list_dirs(&self, paths: &[WorkspacePath]) -> Result<Vec<DirectoryListing>, String>;
-    fn read_with_metadata(
-        &self,
-        path: &WorkspacePath,
-        max_bytes: Option<u64>,
-    ) -> Result<FileRead, String>;
-    fn read_bytes(&self, path: &WorkspacePath, max_bytes: Option<u64>) -> Result<Vec<u8>, String> {
-        self.read_with_metadata(path, max_bytes)?.into_bytes()
-    }
-    fn read_text(&self, path: &WorkspacePath, max_bytes: Option<u64>) -> Result<String, String> {
-        self.read_with_metadata(path, max_bytes)?.into_text()
-    }
-    fn write_bytes(&self, path: &WorkspacePath, contents: &[u8]) -> Result<(), String>;
-    fn write_text(&self, path: &WorkspacePath, contents: &str) -> Result<(), String>;
-    fn create_file(&self, path: &WorkspacePath) -> Result<(), String>;
-    fn create_dir(&self, path: &WorkspacePath) -> Result<(), String>;
-    fn rename(&self, source: &WorkspacePath, destination: &WorkspacePath) -> Result<(), String>;
-    fn delete(&self, path: &WorkspacePath) -> Result<(), String>;
     fn search_text(&self, query: FileSearchQuery) -> Result<FileSearchOutput, String>;
 }
