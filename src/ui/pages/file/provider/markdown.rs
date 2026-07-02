@@ -333,7 +333,6 @@ fn show_markdown(request: PreviewRequest<'_>, selection: Option<(usize, usize)>)
     let local_path = request.local_path.map(Path::to_path_buf);
     let disk_signature = super::disk_signature(request.info);
     let writable = request.info.capabilities.writable;
-    let workspace = request.ctx.workspace_ref();
     let language = crate::ui::content::code_editor::language_hint_from_path(&file_path);
 
     super::spawn_preview_load(
@@ -351,7 +350,7 @@ fn show_markdown(request: PreviewRequest<'_>, selection: Option<(usize, usize)>)
                 let html = markdown_to_html(&text);
                 let comparison = git.as_ref().and_then(|git| git.comparison(&file_path).ok());
                 let allowlist =
-                    crate::spellcheck::load_manifest_allowlist(&workspace, files.clone());
+                    crate::spellcheck::load_manifest_allowlist(&[(&file_path, text.as_str())]);
                 let spellcheck_issues = crate::spellcheck::check_document(
                     &language,
                     Some(&file_path),

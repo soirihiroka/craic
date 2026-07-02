@@ -1,8 +1,11 @@
 use crate::gitignore;
 use crate::system::capabilities::files::{
-    DirectoryListing, FileAccess, FileKind, FileNodeCapabilities, FileNodeInfo,
-    FileOperationCallback, FileRead, FileSearchMatch, FileSearchOutput, FileSearchQuery,
-    FileSignature, FileWatchCallback, FileWatchChanges, FileWatchRequest, FileWatchSubscription,
+    DirectoryListing, FileAccess, FileCopyRequest, FileDeleteRequest, FileKind, FileMoveRequest,
+    FileNodeCapabilities, FileNodeInfo, FileOperation, FileOperationCallback, FileOperationError,
+    FileOperationErrorKind, FileOperationEvent, FileOperationProgress, FileRead, FileReadRequest,
+    FileSearchMatch, FileSearchOutput, FileSearchQuery, FileSignature, FileWatchCallback,
+    FileWatchChanges, FileWatchRequest, FileWatchSubscription, FileWriteMode, FileWritePayload,
+    FileWriteRequest, file_operation_canceled,
 };
 use crate::system::path::{
     ArchiveFormat, FileNodePath, FileNodeRef, SystemRef, WorkspacePath, WorkspaceRef,
@@ -13,7 +16,7 @@ use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -27,6 +30,7 @@ const LOCAL_FILE_MONITOR_RATE_LIMIT_MS: i32 = 250;
 const LOCAL_FILE_MONITOR_STOP_POLL_MS: u64 = 250;
 const LOCAL_FILE_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(750);
 const LOCAL_ARCHIVE_PYTHON_CANDIDATES: &[&str] = &["python3", "python"];
+const LOCAL_FILE_OPERATION_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalFileAccess {
@@ -617,18 +621,736 @@ impl LocalFileAccess {
         Err("Archive contents are read-only.".to_string())
     }
 
-    fn delete_sync(&self, path: &FileNodePath) -> Result<(), String> {
-        if path.contains_archive() {
-            return self.deny_virtual_write("delete", path);
-        }
-        let local_path = self.local_path_for_node(path)?;
-        let metadata = fs::symlink_metadata(&local_path)
-            .map_err(|err| format!("Unable to inspect path: {err}"))?;
-        if metadata.is_dir() {
-            fs::remove_dir_all(&local_path).map_err(|err| format!("Unable to delete folder: {err}"))
+    fn operation_error(
+        operation: FileOperation,
+        kind: FileOperationErrorKind,
+        source: Option<FileNodePath>,
+        destination: Option<FileNodePath>,
+        message: impl Into<String>,
+    ) -> FileOperationError {
+        FileOperationError::from_message(operation, kind, source, destination, message)
+    }
+
+    fn io_error(
+        operation: FileOperation,
+        source: Option<FileNodePath>,
+        destination: Option<FileNodePath>,
+        action: &str,
+        err: std::io::Error,
+    ) -> FileOperationError {
+        Self::operation_error(
+            operation,
+            local_io_error_kind(&err),
+            source,
+            destination,
+            format!("{action}: {err}"),
+        )
+    }
+
+    fn canceled_error(operation: FileOperation, source: &FileNodePath) -> FileOperationError {
+        FileOperationError::canceled(operation).with_source(source.clone())
+    }
+
+    fn check_canceled(
+        operation: FileOperation,
+        source: &FileNodePath,
+        request: &Option<crate::system::capabilities::files::FileCancellation>,
+    ) -> Result<(), FileOperationError> {
+        if file_operation_canceled(request) {
+            Err(Self::canceled_error(operation, source))
         } else {
-            fs::remove_file(&local_path).map_err(|err| format!("Unable to delete file: {err}"))
+            Ok(())
         }
+    }
+
+    fn emit_progress<T>(callback: &FileOperationCallback<T>, progress: FileOperationProgress) {
+        callback(FileOperationEvent::Progress(progress));
+    }
+
+    fn read_with_info_sync(
+        &self,
+        request: &FileReadRequest,
+        callback: &FileOperationCallback<FileRead>,
+    ) -> Result<FileRead, FileOperationError> {
+        let operation = FileOperation::Read;
+        Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
+        if request.path.contains_archive() {
+            let read = self
+                .read_archive_member(&request.path, request.max_bytes)
+                .map_err(|err| {
+                    Self::operation_error(
+                        operation,
+                        FileOperationErrorKind::Unsupported,
+                        Some(request.path.clone()),
+                        None,
+                        err,
+                    )
+                })?;
+            if let Some(bytes) = read.bytes.as_ref() {
+                Self::emit_progress(
+                    callback,
+                    FileOperationProgress {
+                        operation,
+                        source: Some(request.path.clone()),
+                        current_path: Some(request.path.clone()),
+                        completed_bytes: bytes.len() as u64,
+                        total_bytes: bytes.len() as u64,
+                        completed_files: 1,
+                        total_files: 1,
+                        destination: None,
+                    },
+                );
+            }
+            return Ok(read);
+        }
+
+        let local_path = self.local_path_for_node(&request.path).map_err(|err| {
+            Self::operation_error(
+                operation,
+                FileOperationErrorKind::OutsideWorkspace,
+                Some(request.path.clone()),
+                None,
+                err,
+            )
+        })?;
+        let metadata = fs::symlink_metadata(&local_path).map_err(|err| {
+            Self::io_error(
+                operation,
+                Some(request.path.clone()),
+                None,
+                &format!("Unable to inspect {}", request.path.display()),
+                err,
+            )
+        })?;
+        let info = self.info_for_native_node(&request.path).map_err(|err| {
+            Self::operation_error(
+                operation,
+                FileOperationErrorKind::Io,
+                Some(request.path.clone()),
+                None,
+                err,
+            )
+        })?;
+        if !matches!(info.kind, FileKind::File | FileKind::Archive { .. }) {
+            return Ok(FileRead { info, bytes: None });
+        }
+        if request
+            .max_bytes
+            .is_some_and(|max_bytes| metadata.len() > max_bytes)
+        {
+            return Ok(FileRead { info, bytes: None });
+        }
+
+        let total_bytes = metadata.len();
+        let mut file = fs::File::open(&local_path).map_err(|err| {
+            Self::io_error(
+                operation,
+                Some(request.path.clone()),
+                None,
+                &format!("Unable to read {}", request.path.display()),
+                err,
+            )
+        })?;
+        let mut bytes = Vec::new();
+        let mut completed_bytes = 0u64;
+        let mut buffer = vec![0u8; LOCAL_FILE_OPERATION_CHUNK_BYTES];
+        loop {
+            Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
+            let read = file.read(&mut buffer).map_err(|err| {
+                Self::io_error(
+                    operation,
+                    Some(request.path.clone()),
+                    None,
+                    &format!("Unable to read {}", request.path.display()),
+                    err,
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            completed_bytes = completed_bytes.saturating_add(read as u64);
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.path.clone()),
+                    current_path: Some(request.path.clone()),
+                    completed_bytes,
+                    total_bytes,
+                    completed_files: (completed_bytes == total_bytes) as u64,
+                    total_files: 1,
+                    destination: None,
+                },
+            );
+        }
+
+        Ok(FileRead {
+            info,
+            bytes: Some(bytes),
+        })
+    }
+
+    fn write_node_sync(
+        &self,
+        request: &FileWriteRequest,
+        callback: &FileOperationCallback<()>,
+    ) -> Result<(), FileOperationError> {
+        let operation = FileOperation::Write;
+        Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
+        if request.path.contains_archive() {
+            return Err(Self::operation_error(
+                operation,
+                FileOperationErrorKind::Unsupported,
+                Some(request.path.clone()),
+                None,
+                "Archive contents are read-only.",
+            ));
+        }
+        let local_path = self.local_path_for_node(&request.path).map_err(|err| {
+            Self::operation_error(
+                operation,
+                FileOperationErrorKind::OutsideWorkspace,
+                Some(request.path.clone()),
+                None,
+                err,
+            )
+        })?;
+        if matches!(request.payload, FileWritePayload::Directory) {
+            if request.mode != FileWriteMode::CreateNew {
+                return Err(Self::operation_error(
+                    operation,
+                    FileOperationErrorKind::Unsupported,
+                    Some(request.path.clone()),
+                    None,
+                    "Directories can only be created with create-new mode.",
+                ));
+            }
+            fs::create_dir(&local_path).map_err(|err| {
+                Self::io_error(
+                    operation,
+                    Some(request.path.clone()),
+                    None,
+                    &format!("Unable to create {}", request.path.display()),
+                    err,
+                )
+            })?;
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.path.clone()),
+                    destination: Some(request.path.clone()),
+                    current_path: Some(request.path.clone()),
+                    completed_files: 1,
+                    total_files: 1,
+                    ..FileOperationProgress::new(operation)
+                },
+            );
+            return Ok(());
+        }
+
+        let FileWritePayload::File(contents) = &request.payload else {
+            unreachable!();
+        };
+        if let Ok(metadata) = fs::metadata(&local_path)
+            && !metadata.is_file()
+        {
+            return Err(Self::operation_error(
+                operation,
+                FileOperationErrorKind::Unsupported,
+                Some(request.path.clone()),
+                None,
+                "Select a file to write.",
+            ));
+        }
+
+        let mut options = fs::OpenOptions::new();
+        options.write(true);
+        match request.mode {
+            FileWriteMode::CreateNew => {
+                options.create_new(true);
+            }
+            FileWriteMode::Replace => {
+                options.create(true).truncate(true);
+            }
+        }
+        let mut file = options.open(&local_path).map_err(|err| {
+            Self::io_error(
+                operation,
+                Some(request.path.clone()),
+                None,
+                &format!("Unable to write {}", request.path.display()),
+                err,
+            )
+        })?;
+        let total_bytes = contents.len() as u64;
+        let mut completed_bytes = 0u64;
+        for chunk in contents.chunks(LOCAL_FILE_OPERATION_CHUNK_BYTES) {
+            Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
+            file.write_all(chunk).map_err(|err| {
+                Self::io_error(
+                    operation,
+                    Some(request.path.clone()),
+                    None,
+                    &format!("Unable to write {}", request.path.display()),
+                    err,
+                )
+            })?;
+            completed_bytes = completed_bytes.saturating_add(chunk.len() as u64);
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.path.clone()),
+                    destination: Some(request.path.clone()),
+                    current_path: Some(request.path.clone()),
+                    completed_bytes,
+                    total_bytes,
+                    completed_files: (completed_bytes == total_bytes) as u64,
+                    total_files: 1,
+                },
+            );
+        }
+        if total_bytes == 0 {
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.path.clone()),
+                    destination: Some(request.path.clone()),
+                    current_path: Some(request.path.clone()),
+                    completed_files: 1,
+                    total_files: 1,
+                    ..FileOperationProgress::new(operation)
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn copy_node_sync(
+        &self,
+        request: &FileCopyRequest,
+        operation: FileOperation,
+        callback: &FileOperationCallback<FileNodePath>,
+    ) -> Result<FileNodePath, FileOperationError> {
+        Self::check_canceled(operation, &request.source, &request.cancel_requested)?;
+        if request.source.contains_archive() || request.destination.contains_archive() {
+            return Err(Self::operation_error(
+                operation,
+                FileOperationErrorKind::Unsupported,
+                Some(request.source.clone()),
+                Some(request.destination.clone()),
+                "Archive contents are read-only.",
+            ));
+        }
+        if request.source == request.destination {
+            return Err(Self::operation_error(
+                operation,
+                FileOperationErrorKind::AlreadyExists,
+                Some(request.source.clone()),
+                Some(request.destination.clone()),
+                format!("{} already exists.", request.destination.display()),
+            ));
+        }
+        let source_path = self.local_path_for_node(&request.source).map_err(|err| {
+            Self::operation_error(
+                operation,
+                FileOperationErrorKind::OutsideWorkspace,
+                Some(request.source.clone()),
+                Some(request.destination.clone()),
+                err,
+            )
+        })?;
+        let destination_path = self
+            .local_path_for_node(&request.destination)
+            .map_err(|err| {
+                Self::operation_error(
+                    operation,
+                    FileOperationErrorKind::OutsideWorkspace,
+                    Some(request.source.clone()),
+                    Some(request.destination.clone()),
+                    err,
+                )
+            })?;
+        if destination_path.exists() {
+            return Err(Self::operation_error(
+                operation,
+                FileOperationErrorKind::AlreadyExists,
+                Some(request.source.clone()),
+                Some(request.destination.clone()),
+                format!("{} already exists.", request.destination.display()),
+            ));
+        }
+        let totals = local_copy_totals(
+            &source_path,
+            &request.source,
+            operation,
+            &request.destination,
+        )?;
+        let mut progress = LocalCopyProgress {
+            completed_bytes: 0,
+            completed_files: 0,
+            total_bytes: totals.bytes,
+            total_files: totals.files,
+        };
+        self.copy_entry_sync(
+            &source_path,
+            &destination_path,
+            &request.source,
+            &request.destination,
+            operation,
+            &request.cancel_requested,
+            &mut progress,
+            callback,
+        )?;
+        Ok(request.destination.clone())
+    }
+
+    fn copy_entry_sync(
+        &self,
+        source_path: &Path,
+        destination_path: &Path,
+        source: &FileNodePath,
+        destination: &FileNodePath,
+        operation: FileOperation,
+        cancel_requested: &Option<crate::system::capabilities::files::FileCancellation>,
+        progress: &mut LocalCopyProgress,
+        callback: &FileOperationCallback<FileNodePath>,
+    ) -> Result<(), FileOperationError> {
+        Self::check_canceled(operation, source, cancel_requested)?;
+        let metadata = fs::symlink_metadata(source_path).map_err(|err| {
+            Self::io_error(
+                operation,
+                Some(source.clone()),
+                Some(destination.clone()),
+                &format!("Unable to inspect {}", source.display()),
+                err,
+            )
+        })?;
+        if metadata.is_dir() {
+            fs::create_dir(destination_path).map_err(|err| {
+                Self::io_error(
+                    operation,
+                    Some(source.clone()),
+                    Some(destination.clone()),
+                    &format!("Unable to create {}", destination.display()),
+                    err,
+                )
+            })?;
+            progress.completed_files = progress.completed_files.saturating_add(1);
+            Self::emit_progress(
+                callback,
+                progress.to_event(operation, source, destination, destination),
+            );
+            for entry in fs::read_dir(source_path).map_err(|err| {
+                Self::io_error(
+                    operation,
+                    Some(source.clone()),
+                    Some(destination.clone()),
+                    &format!("Unable to list {}", source.display()),
+                    err,
+                )
+            })? {
+                let entry = entry.map_err(|err| {
+                    Self::io_error(
+                        operation,
+                        Some(source.clone()),
+                        Some(destination.clone()),
+                        "Unable to read directory entry",
+                        err,
+                    )
+                })?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy().to_string();
+                let child_source = source.join_child(&name);
+                let child_destination = destination.join_child(&name);
+                let child_destination_path = destination_path.join(&name);
+                if child_destination_path.exists() {
+                    return Err(Self::operation_error(
+                        operation,
+                        FileOperationErrorKind::AlreadyExists,
+                        Some(child_source),
+                        Some(child_destination.clone()),
+                        format!("{} already exists.", child_destination.display()),
+                    ));
+                }
+                self.copy_entry_sync(
+                    &entry.path(),
+                    &child_destination_path,
+                    &child_source,
+                    &child_destination,
+                    operation,
+                    cancel_requested,
+                    progress,
+                    callback,
+                )?;
+            }
+            return Ok(());
+        }
+
+        if metadata.file_type().is_symlink() {
+            copy_local_symlink(
+                source_path,
+                destination_path,
+                operation,
+                source,
+                destination,
+            )?;
+            progress.completed_files = progress.completed_files.saturating_add(1);
+            Self::emit_progress(
+                callback,
+                progress.to_event(operation, source, destination, destination),
+            );
+            return Ok(());
+        }
+
+        if !metadata.is_file() {
+            return Err(Self::operation_error(
+                operation,
+                FileOperationErrorKind::Unsupported,
+                Some(source.clone()),
+                Some(destination.clone()),
+                "Only files, folders, and symlinks can be copied.",
+            ));
+        }
+
+        let mut source_file = fs::File::open(source_path).map_err(|err| {
+            Self::io_error(
+                operation,
+                Some(source.clone()),
+                Some(destination.clone()),
+                &format!("Unable to read {}", source.display()),
+                err,
+            )
+        })?;
+        let mut destination_file = fs::File::create(destination_path).map_err(|err| {
+            Self::io_error(
+                operation,
+                Some(source.clone()),
+                Some(destination.clone()),
+                &format!("Unable to write {}", destination.display()),
+                err,
+            )
+        })?;
+        let mut buffer = vec![0u8; LOCAL_FILE_OPERATION_CHUNK_BYTES];
+        loop {
+            Self::check_canceled(operation, source, cancel_requested)?;
+            let read = source_file.read(&mut buffer).map_err(|err| {
+                Self::io_error(
+                    operation,
+                    Some(source.clone()),
+                    Some(destination.clone()),
+                    &format!("Unable to read {}", source.display()),
+                    err,
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            destination_file.write_all(&buffer[..read]).map_err(|err| {
+                Self::io_error(
+                    operation,
+                    Some(source.clone()),
+                    Some(destination.clone()),
+                    &format!("Unable to write {}", destination.display()),
+                    err,
+                )
+            })?;
+            progress.completed_bytes = progress.completed_bytes.saturating_add(read as u64);
+            Self::emit_progress(
+                callback,
+                progress.to_event(operation, source, destination, destination),
+            );
+        }
+        progress.completed_files = progress.completed_files.saturating_add(1);
+        Self::emit_progress(
+            callback,
+            progress.to_event(operation, source, destination, destination),
+        );
+        Ok(())
+    }
+
+    fn move_node_sync(
+        &self,
+        request: &FileMoveRequest,
+        callback: &FileOperationCallback<FileNodePath>,
+    ) -> Result<FileNodePath, FileOperationError> {
+        let operation = FileOperation::Move;
+        Self::check_canceled(operation, &request.source, &request.cancel_requested)?;
+        if request.source.contains_archive() || request.destination_parent.contains_archive() {
+            return Err(Self::operation_error(
+                operation,
+                FileOperationErrorKind::Unsupported,
+                Some(request.source.clone()),
+                Some(request.destination()),
+                "Archive contents are read-only.",
+            ));
+        }
+        validate_child_name(&request.new_name).map_err(|err| {
+            Self::operation_error(
+                operation,
+                FileOperationErrorKind::InvalidName,
+                Some(request.source.clone()),
+                Some(request.destination()),
+                err,
+            )
+        })?;
+        let destination = request.destination();
+        if request.source == destination {
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.source.clone()),
+                    destination: Some(destination.clone()),
+                    current_path: Some(destination.clone()),
+                    completed_files: 1,
+                    total_files: 1,
+                    ..FileOperationProgress::new(operation)
+                },
+            );
+            return Ok(destination);
+        }
+        let source_path = self.local_path_for_node(&request.source).map_err(|err| {
+            Self::operation_error(
+                operation,
+                FileOperationErrorKind::OutsideWorkspace,
+                Some(request.source.clone()),
+                Some(destination.clone()),
+                err,
+            )
+        })?;
+        let destination_path = self.local_path_for_node(&destination).map_err(|err| {
+            Self::operation_error(
+                operation,
+                FileOperationErrorKind::OutsideWorkspace,
+                Some(request.source.clone()),
+                Some(destination.clone()),
+                err,
+            )
+        })?;
+        if destination_path.exists() {
+            return Err(Self::operation_error(
+                operation,
+                FileOperationErrorKind::AlreadyExists,
+                Some(request.source.clone()),
+                Some(destination.clone()),
+                format!("{} already exists.", destination.display()),
+            ));
+        }
+        match fs::rename(&source_path, &destination_path) {
+            Ok(()) => {
+                Self::emit_progress(
+                    callback,
+                    FileOperationProgress {
+                        operation,
+                        source: Some(request.source.clone()),
+                        destination: Some(destination.clone()),
+                        current_path: Some(destination.clone()),
+                        completed_files: 1,
+                        total_files: 1,
+                        ..FileOperationProgress::new(operation)
+                    },
+                );
+                Ok(destination)
+            }
+            Err(err) if local_io_error_is_cross_device(&err) => {
+                let copy_request = FileCopyRequest {
+                    source: request.source.clone(),
+                    destination: destination.clone(),
+                    cancel_requested: request.cancel_requested.clone(),
+                };
+                self.copy_node_sync(&copy_request, operation, callback)?;
+                self.delete_sync(
+                    &FileDeleteRequest {
+                        path: request.source.clone(),
+                        cancel_requested: request.cancel_requested.clone(),
+                    },
+                    None,
+                )?;
+                Ok(destination)
+            }
+            Err(err) => Err(Self::io_error(
+                operation,
+                Some(request.source.clone()),
+                Some(destination.clone()),
+                "Unable to move file node",
+                err,
+            )),
+        }
+    }
+
+    fn delete_sync(
+        &self,
+        request: &FileDeleteRequest,
+        callback: Option<&FileOperationCallback<()>>,
+    ) -> Result<(), FileOperationError> {
+        let operation = FileOperation::Delete;
+        Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
+        if request.path.contains_archive() {
+            return Err(Self::operation_error(
+                operation,
+                FileOperationErrorKind::Unsupported,
+                Some(request.path.clone()),
+                None,
+                "Archive contents are read-only.",
+            ));
+        }
+        let local_path = self.local_path_for_node(&request.path).map_err(|err| {
+            Self::operation_error(
+                operation,
+                FileOperationErrorKind::OutsideWorkspace,
+                Some(request.path.clone()),
+                None,
+                err,
+            )
+        })?;
+        let metadata = fs::symlink_metadata(&local_path).map_err(|err| {
+            Self::io_error(
+                operation,
+                Some(request.path.clone()),
+                None,
+                "Unable to inspect path",
+                err,
+            )
+        })?;
+        if metadata.is_dir() {
+            fs::remove_dir_all(&local_path).map_err(|err| {
+                Self::io_error(
+                    operation,
+                    Some(request.path.clone()),
+                    None,
+                    "Unable to delete folder",
+                    err,
+                )
+            })?;
+        } else {
+            fs::remove_file(&local_path).map_err(|err| {
+                Self::io_error(
+                    operation,
+                    Some(request.path.clone()),
+                    None,
+                    "Unable to delete file",
+                    err,
+                )
+            })?;
+        }
+        if let Some(callback) = callback {
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.path.clone()),
+                    current_path: Some(request.path.clone()),
+                    completed_files: 1,
+                    total_files: 1,
+                    ..FileOperationProgress::new(operation)
+                },
+            );
+        }
+        Ok(())
     }
 }
 
@@ -766,125 +1488,72 @@ impl FileAccess for LocalFileAccess {
         Ok(listings)
     }
 
-    fn read_with_info(
-        &self,
-        path: &FileNodePath,
-        max_bytes: Option<u64>,
-    ) -> Result<FileRead, String> {
-        if path.contains_archive() {
-            return self.read_archive_member(path, max_bytes);
-        }
-        let local_path = self.local_path_for_node(path)?;
-        let metadata = fs::symlink_metadata(&local_path)
-            .map_err(|err| format!("Unable to read {}: {err}", path.display()))?;
-        let info = self.info_for_native_node(path)?;
-        let bytes = if matches!(info.kind, FileKind::File | FileKind::Archive { .. })
-            && max_bytes.is_none_or(|max_bytes| metadata.len() <= max_bytes)
-        {
-            Some(
-                fs::read(&local_path)
-                    .map_err(|err| format!("Unable to read {}: {err}", path.display()))?,
-            )
-        } else {
-            None
-        };
-        Ok(FileRead { info, bytes })
-    }
-
-    fn write_bytes(&self, path: &FileNodePath, contents: &[u8]) -> Result<(), String> {
-        if path.contains_archive() {
-            return self.deny_virtual_write("write_bytes", path);
-        }
-        let local_path = self.local_path_for_node(path)?;
-        fs::write(&local_path, contents)
-            .map_err(|err| format!("Unable to write {}: {err}", path.display()))
-    }
-
-    fn write_text(&self, path: &FileNodePath, contents: &str) -> Result<(), String> {
-        if path.contains_archive() {
-            return self.deny_virtual_write("write_text", path);
-        }
-        let local_path = self.local_path_for_node(path)?;
-        let metadata = fs::metadata(&local_path)
-            .map_err(|err| format!("Unable to write {}: {err}", path.display()))?;
-        if !metadata.is_file() {
-            return Err("Select a file to edit.".to_string());
-        }
-        fs::write(&local_path, contents)
-            .map_err(|err| format!("Unable to write {}: {err}", path.display()))
-    }
-
-    fn create_file(&self, parent: &FileNodePath, name: &str) -> Result<FileNodePath, String> {
-        if parent.contains_archive() {
-            log::warn!(
-                "local archive create file denied parent={}",
-                parent.display()
-            );
-            return Err("Archive contents are read-only.".to_string());
-        }
-        validate_child_name(name)?;
-        let path = parent.join_child(name);
-        let local_path = self.local_path_for_node(&path)?;
-        if let Some(parent) = local_path.parent()
-            && !parent.is_dir()
-        {
-            return Err("Parent folder does not exist.".to_string());
-        }
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&local_path)
-            .map(|_| path)
-            .map_err(|err| format!("Unable to create file: {err}"))
-    }
-
-    fn create_dir(&self, parent: &FileNodePath, name: &str) -> Result<FileNodePath, String> {
-        if parent.contains_archive() {
-            log::warn!(
-                "local archive create folder denied parent={}",
-                parent.display()
-            );
-            return Err("Archive contents are read-only.".to_string());
-        }
-        validate_child_name(name)?;
-        let path = parent.join_child(name);
-        let local_path = self.local_path_for_node(&path)?;
-        fs::create_dir(&local_path)
-            .map(|_| path)
-            .map_err(|err| format!("Unable to create folder: {err}"))
-    }
-
-    fn rename(
-        &self,
-        source: &FileNodePath,
-        destination_parent: &FileNodePath,
-        new_name: &str,
-    ) -> Result<FileNodePath, String> {
-        if source.contains_archive() || destination_parent.contains_archive() {
-            log::warn!(
-                "local archive rename denied source={} destination_parent={}",
-                source.display(),
-                destination_parent.display()
-            );
-            return Err("Archive contents are read-only.".to_string());
-        }
-        validate_child_name(new_name)?;
-        let destination = destination_parent.join_child(new_name);
-        let source_path = self.local_path_for_node(source)?;
-        let destination_path = self.local_path_for_node(&destination)?;
-        if destination_path.exists() {
-            return Err("Destination already exists.".to_string());
-        }
-        fs::rename(&source_path, &destination_path)
-            .map(|_| destination)
-            .map_err(|err| format!("Unable to rename: {err}"))
-    }
-
-    fn delete(&self, path: FileNodePath, callback: FileOperationCallback) {
+    fn read_with_info(&self, request: FileReadRequest, callback: FileOperationCallback<FileRead>) {
         let access = self.clone();
         thread::spawn(move || {
-            log::info!("local file delete worker start path={}", path.display());
-            callback(access.delete_sync(&path));
+            log::info!(
+                "local file read worker start path={} max_bytes={:?}",
+                request.path.display(),
+                request.max_bytes
+            );
+            let result = access.read_with_info_sync(&request, &callback);
+            callback(FileOperationEvent::Finished(result));
+        });
+    }
+
+    fn write_node(&self, request: FileWriteRequest, callback: FileOperationCallback<()>) {
+        let access = self.clone();
+        thread::spawn(move || {
+            let payload_label = match &request.payload {
+                FileWritePayload::File(contents) => format!("file bytes={}", contents.len()),
+                FileWritePayload::Directory => "directory".to_string(),
+            };
+            log::info!(
+                "local file write worker start path={} payload={}",
+                request.path.display(),
+                payload_label
+            );
+            let result = access.write_node_sync(&request, &callback);
+            callback(FileOperationEvent::Finished(result));
+        });
+    }
+
+    fn copy_node(&self, request: FileCopyRequest, callback: FileOperationCallback<FileNodePath>) {
+        let access = self.clone();
+        thread::spawn(move || {
+            log::info!(
+                "local file copy worker start source={} destination={}",
+                request.source.display(),
+                request.destination.display()
+            );
+            let result = access.copy_node_sync(&request, FileOperation::Copy, &callback);
+            callback(FileOperationEvent::Finished(result));
+        });
+    }
+
+    fn move_node(&self, request: FileMoveRequest, callback: FileOperationCallback<FileNodePath>) {
+        let access = self.clone();
+        thread::spawn(move || {
+            log::info!(
+                "local file move worker start source={} destination_parent={} new_name={}",
+                request.source.display(),
+                request.destination_parent.display(),
+                request.new_name
+            );
+            let result = access.move_node_sync(&request, &callback);
+            callback(FileOperationEvent::Finished(result));
+        });
+    }
+
+    fn delete(&self, request: FileDeleteRequest, callback: FileOperationCallback<()>) {
+        let access = self.clone();
+        thread::spawn(move || {
+            log::info!(
+                "local file delete worker start path={}",
+                request.path.display()
+            );
+            let result = access.delete_sync(&request, Some(&callback));
+            callback(FileOperationEvent::Finished(result));
         });
     }
 
@@ -1266,6 +1935,164 @@ fn apply_local_git_ignore_to_infos(root_path: &Path, infos: &mut [FileNodeInfo])
             info.git_ignored = Some(ignored_paths.contains(&path));
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LocalCopyTotals {
+    bytes: u64,
+    files: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LocalCopyProgress {
+    completed_bytes: u64,
+    completed_files: u64,
+    total_bytes: u64,
+    total_files: u64,
+}
+
+impl LocalCopyProgress {
+    fn to_event(
+        self,
+        operation: FileOperation,
+        source: &FileNodePath,
+        destination: &FileNodePath,
+        current_path: &FileNodePath,
+    ) -> FileOperationProgress {
+        FileOperationProgress {
+            operation,
+            source: Some(source.clone()),
+            destination: Some(destination.clone()),
+            current_path: Some(current_path.clone()),
+            completed_bytes: self.completed_bytes,
+            total_bytes: self.total_bytes,
+            completed_files: self.completed_files,
+            total_files: self.total_files,
+        }
+    }
+}
+
+fn local_copy_totals(
+    source_path: &Path,
+    source: &FileNodePath,
+    operation: FileOperation,
+    destination: &FileNodePath,
+) -> Result<LocalCopyTotals, FileOperationError> {
+    let metadata = fs::symlink_metadata(source_path).map_err(|err| {
+        LocalFileAccess::io_error(
+            operation,
+            Some(source.clone()),
+            Some(destination.clone()),
+            &format!("Unable to inspect {}", source.display()),
+            err,
+        )
+    })?;
+    if metadata.is_file() {
+        return Ok(LocalCopyTotals {
+            bytes: metadata.len(),
+            files: 1,
+        });
+    }
+    if metadata.file_type().is_symlink() {
+        return Ok(LocalCopyTotals { bytes: 0, files: 1 });
+    }
+    if !metadata.is_dir() {
+        return Err(LocalFileAccess::operation_error(
+            operation,
+            FileOperationErrorKind::Unsupported,
+            Some(source.clone()),
+            Some(destination.clone()),
+            "Only files, folders, and symlinks can be copied.",
+        ));
+    }
+
+    let mut totals = LocalCopyTotals { bytes: 0, files: 1 };
+    for entry in fs::read_dir(source_path).map_err(|err| {
+        LocalFileAccess::io_error(
+            operation,
+            Some(source.clone()),
+            Some(destination.clone()),
+            &format!("Unable to list {}", source.display()),
+            err,
+        )
+    })? {
+        let entry = entry.map_err(|err| {
+            LocalFileAccess::io_error(
+                operation,
+                Some(source.clone()),
+                Some(destination.clone()),
+                "Unable to read directory entry",
+                err,
+            )
+        })?;
+        let child_name = entry.file_name().to_string_lossy().to_string();
+        let child_source = source.join_child(&child_name);
+        let child_destination = destination.join_child(&child_name);
+        let child_totals =
+            local_copy_totals(&entry.path(), &child_source, operation, &child_destination)?;
+        totals.bytes = totals.bytes.saturating_add(child_totals.bytes);
+        totals.files = totals.files.saturating_add(child_totals.files);
+    }
+    Ok(totals)
+}
+
+#[cfg(unix)]
+fn copy_local_symlink(
+    source_path: &Path,
+    destination_path: &Path,
+    operation: FileOperation,
+    source: &FileNodePath,
+    destination: &FileNodePath,
+) -> Result<(), FileOperationError> {
+    let target = fs::read_link(source_path).map_err(|err| {
+        LocalFileAccess::io_error(
+            operation,
+            Some(source.clone()),
+            Some(destination.clone()),
+            &format!("Unable to read symlink {}", source.display()),
+            err,
+        )
+    })?;
+    std::os::unix::fs::symlink(&target, destination_path).map_err(|err| {
+        LocalFileAccess::io_error(
+            operation,
+            Some(source.clone()),
+            Some(destination.clone()),
+            &format!("Unable to copy symlink {}", source.display()),
+            err,
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn copy_local_symlink(
+    _source_path: &Path,
+    _destination_path: &Path,
+    operation: FileOperation,
+    source: &FileNodePath,
+    destination: &FileNodePath,
+) -> Result<(), FileOperationError> {
+    Err(LocalFileAccess::operation_error(
+        operation,
+        FileOperationErrorKind::Unsupported,
+        Some(source.clone()),
+        Some(destination.clone()),
+        "Copying symlinks is unsupported on this platform.",
+    ))
+}
+
+fn local_io_error_kind(err: &std::io::Error) -> FileOperationErrorKind {
+    match err.kind() {
+        ErrorKind::NotFound => FileOperationErrorKind::NotFound,
+        ErrorKind::AlreadyExists => FileOperationErrorKind::AlreadyExists,
+        ErrorKind::PermissionDenied => FileOperationErrorKind::PermissionDenied,
+        ErrorKind::InvalidInput => FileOperationErrorKind::InvalidName,
+        _ => FileOperationErrorKind::Io,
+    }
+}
+
+fn local_io_error_is_cross_device(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(18)
 }
 
 fn file_kind(metadata: &fs::Metadata) -> FileKind {

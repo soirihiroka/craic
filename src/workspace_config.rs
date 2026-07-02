@@ -1,8 +1,12 @@
 use crate::github;
-use crate::system::capabilities::files::FileAccess;
+use crate::system::capabilities::files::{
+    FileAccess, FileOperationEvent, FileRead, FileReadRequest, FileWriteMode, FileWritePayload,
+    FileWriteRequest,
+};
 use crate::system::path::FileNodePath;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 const REPO_CONFIG_DIR: &str = ".craic";
 const REPO_CONFIG_FILE: &str = "config.toml";
@@ -263,7 +267,7 @@ fn load(path: &Path) -> LocalWorkspaceConfig {
 
 fn load_from_file_access(files: &dyn FileAccess) -> LocalWorkspaceConfig {
     let config_path = config_node(files);
-    let contents = match files.read_text(&config_path, None) {
+    let contents = match read_text(files, &config_path, None) {
         Ok(contents) => contents,
         Err(err) => {
             log::debug!(
@@ -287,7 +291,7 @@ fn load_from_file_access(files: &dyn FileAccess) -> LocalWorkspaceConfig {
 
 fn load_repo_config_from_file_access(files: &dyn FileAccess) -> Result<toml::Value, String> {
     let config_path = repo_config_node(files);
-    let contents = match files.read_text(&config_path, Some(MAX_REPO_CONFIG_BYTES)) {
+    let contents = match read_text(files, &config_path, Some(MAX_REPO_CONFIG_BYTES)) {
         Ok(contents) => contents,
         Err(_) => return Ok(toml::Value::Table(toml::map::Map::new())),
     };
@@ -297,6 +301,59 @@ fn load_repo_config_from_file_access(files: &dyn FileAccess) -> Result<toml::Val
             config_path.display()
         )
     })
+}
+
+fn read_text(
+    files: &dyn FileAccess,
+    path: &FileNodePath,
+    max_bytes: Option<u64>,
+) -> Result<String, String> {
+    read_with_info(files, path, max_bytes)?.into_text()
+}
+
+fn read_with_info(
+    files: &dyn FileAccess,
+    path: &FileNodePath,
+    max_bytes: Option<u64>,
+) -> Result<FileRead, String> {
+    let (sender, receiver) = mpsc::channel();
+    files.read_with_info(
+        FileReadRequest {
+            path: path.clone(),
+            max_bytes,
+            cancel_requested: None,
+        },
+        Box::new(move |event| {
+            if let FileOperationEvent::Finished(result) = event {
+                let _ = sender.send(result);
+            }
+        }),
+    );
+    receiver
+        .recv()
+        .map_err(|_| "Read operation did not return a result.".to_string())?
+        .map_err(|err| err.to_string())
+}
+
+fn write_text(files: &dyn FileAccess, path: &FileNodePath, contents: &str) -> Result<(), String> {
+    let (sender, receiver) = mpsc::channel();
+    files.write_node(
+        FileWriteRequest {
+            path: path.clone(),
+            mode: FileWriteMode::Replace,
+            payload: FileWritePayload::File(contents.as_bytes().to_vec()),
+            cancel_requested: None,
+        },
+        Box::new(move |event| {
+            if let FileOperationEvent::Finished(result) = event {
+                let _ = sender.send(result);
+            }
+        }),
+    );
+    receiver
+        .recv()
+        .map_err(|_| "Write operation did not return a result.".to_string())?
+        .map_err(|err| err.to_string())
 }
 
 fn parse_config(contents: &str, label: impl FnOnce() -> String) -> LocalWorkspaceConfig {
@@ -348,7 +405,7 @@ fn save_with_file_access(
 ) -> Result<(), String> {
     let local_dir = ensure_config_dir(files)?;
     let gitignore_path = ensure_file(files, &local_dir, LOCAL_GITIGNORE_FILE)?;
-    files.write_text(&gitignore_path, LOCAL_GITIGNORE_CONTENTS)?;
+    write_text(files, &gitignore_path, LOCAL_GITIGNORE_CONTENTS)?;
     log::debug!(
         "initialized local workspace gitignore through file access workspace={} path={}",
         files.workspace().display_name,
@@ -358,7 +415,7 @@ fn save_with_file_access(
     let contents = toml::to_string_pretty(config)
         .map_err(|err| format!("Failed to serialize local workspace config: {err}"))?;
     let config_path = ensure_file(files, &local_dir, LOCAL_CONFIG_FILE)?;
-    files.write_text(&config_path, &contents)?;
+    write_text(files, &config_path, &contents)?;
     log::info!(
         "saved local workspace config through file access workspace={} path={}",
         files.workspace().display_name,
@@ -375,7 +432,7 @@ fn save_repo_config_with_file_access(
     let config_path = ensure_file(files, &craic_dir, REPO_CONFIG_FILE)?;
     let contents = toml::to_string_pretty(config)
         .map_err(|err| format!("Failed to serialize repo config: {err}"))?;
-    files.write_text(&config_path, &contents)?;
+    write_text(files, &config_path, &contents)?;
     log::info!(
         "saved repo config through file access workspace={} path={}",
         files.workspace().display_name,
@@ -414,7 +471,10 @@ fn ensure_dir(
     match files.info(&path) {
         Ok(info) if info.kind.is_directory() => Ok(path),
         Ok(_) => Err(format!("{} is not a directory.", path.display())),
-        Err(_) => files.create_dir(parent, name),
+        Err(_) => {
+            write_directory(files, &path)?;
+            Ok(path)
+        }
     }
 }
 
@@ -427,8 +487,51 @@ fn ensure_file(
     match files.info(&path) {
         Ok(info) if info.kind.is_file() => Ok(path),
         Ok(_) => Err(format!("{} is not a file.", path.display())),
-        Err(_) => files.create_file(parent, name),
+        Err(_) => {
+            write_empty_file(files, &path)?;
+            Ok(path)
+        }
     }
+}
+
+fn write_directory(files: &dyn FileAccess, path: &FileNodePath) -> Result<(), String> {
+    write_node(
+        files,
+        FileWriteRequest {
+            path: path.clone(),
+            mode: FileWriteMode::CreateNew,
+            payload: FileWritePayload::Directory,
+            cancel_requested: None,
+        },
+    )
+}
+
+fn write_empty_file(files: &dyn FileAccess, path: &FileNodePath) -> Result<(), String> {
+    write_node(
+        files,
+        FileWriteRequest {
+            path: path.clone(),
+            mode: FileWriteMode::CreateNew,
+            payload: FileWritePayload::File(Vec::new()),
+            cancel_requested: None,
+        },
+    )
+}
+
+fn write_node(files: &dyn FileAccess, request: FileWriteRequest) -> Result<(), String> {
+    let (sender, receiver) = mpsc::channel();
+    files.write_node(
+        request,
+        Box::new(move |event| {
+            if let FileOperationEvent::Finished(result) = event {
+                let _ = sender.send(result);
+            }
+        }),
+    );
+    receiver
+        .recv()
+        .map_err(|_| "Write operation did not return a result.".to_string())?
+        .map_err(|err| err.to_string())
 }
 
 fn config_node(files: &dyn FileAccess) -> FileNodePath {

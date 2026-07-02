@@ -1,8 +1,11 @@
 use super::path::FileNodePath;
-use crate::system::capabilities::files::{FileAccess, FileNodeInfo};
+use crate::system::capabilities::files::{
+    FileAccess, FileNodeInfo, FileOperationEvent, FileRead, FileReadRequest,
+};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -59,9 +62,7 @@ pub(crate) fn materialize_for_view(
     source: &FileNodeInfo,
     max_bytes: u64,
 ) -> Result<MaterializedFile, String> {
-    let bytes = files
-        .read_with_info(&source.path, Some(max_bytes))?
-        .into_bytes()?;
+    let bytes = read_with_info(files, &source.path, Some(max_bytes))?.into_bytes()?;
     if bytes.len() as u64 > max_bytes {
         return Err(format!(
             "{} is too large to materialize for preview.",
@@ -93,4 +94,28 @@ pub(crate) fn materialize_for_view(
         local_path,
         bytes.len() as u64,
     ))
+}
+
+fn read_with_info(
+    files: &dyn FileAccess,
+    path: &FileNodePath,
+    max_bytes: Option<u64>,
+) -> Result<FileRead, String> {
+    let (sender, receiver) = mpsc::channel();
+    files.read_with_info(
+        FileReadRequest {
+            path: path.clone(),
+            max_bytes,
+            cancel_requested: None,
+        },
+        Box::new(move |event| {
+            if let FileOperationEvent::Finished(result) = event {
+                let _ = sender.send(result);
+            }
+        }),
+    );
+    receiver
+        .recv()
+        .map_err(|_| "Read operation did not return a result.".to_string())?
+        .map_err(|err| err.to_string())
 }

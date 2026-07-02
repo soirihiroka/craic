@@ -254,10 +254,7 @@ impl FileBrowser {
         }
         self.file_access.replace(file_access);
         self.spellcheck_allowlist
-            .replace(crate::spellcheck::load_manifest_allowlist(
-                &workspace,
-                self.file_access.borrow().clone(),
-            ));
+            .replace(crate::spellcheck::SpellcheckAllowlist::default());
         let git_availability_changed = self.git_access.borrow().is_some() != git_access.is_some();
         self.git_access.replace(git_access);
         if git_availability_changed {
@@ -1080,9 +1077,7 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
         let target = target.clone();
         move || browser.copy_target(&target, TransferOperation::Move)
     });
-    cut.set_enabled(
-        !target.is_root() && target.capabilities.renameable && target.capabilities.native,
-    );
+    cut.set_enabled(!target.is_root() && target.capabilities.movable && target.capabilities.native);
     let copy = add_menu_action(&actions, "copy", {
         let browser = browser.clone();
         let target = target.clone();
@@ -1120,7 +1115,7 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
         let target = target.clone();
         move || browser.rename_target(&target)
     });
-    rename.set_enabled(!target.is_root() && target.capabilities.renameable);
+    rename.set_enabled(!target.is_root() && target.capabilities.movable);
     let delete = add_menu_action(&actions, "delete", {
         let browser = browser.clone();
         let target = target.clone();

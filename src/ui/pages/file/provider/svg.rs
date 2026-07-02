@@ -357,7 +357,6 @@ fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
     let apply_file_path = file_path.clone();
     let disk_signature = super::disk_signature(request.info);
     let writable = request.info.capabilities.writable;
-    let workspace = request.ctx.workspace_ref();
     let language = crate::ui::content::code_editor::language_hint_from_path(&file_path);
 
     super::spawn_preview_load(
@@ -368,8 +367,7 @@ fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
             read_svg_source(prefetched_bytes, files.as_ref(), &read_node_path).map(
                 |(bytes, text, signature)| {
                     let comparison = git.as_ref().and_then(|git| git.comparison(&file_path).ok());
-                    let allowlist =
-                        crate::spellcheck::load_manifest_allowlist(&workspace, files.clone());
+                    let allowlist = crate::spellcheck::SpellcheckAllowlist::default();
                     let spellcheck_issues = crate::spellcheck::check_document(
                         &language,
                         Some(&file_path),

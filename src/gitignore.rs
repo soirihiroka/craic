@@ -1,9 +1,14 @@
+use crate::system::FileNodePath;
 use crate::system::WorkspaceRef;
-use crate::system::capabilities::files::{FileAccess, FileKind};
+use crate::system::capabilities::files::{
+    FileAccess, FileKind, FileOperationEvent, FileRead, FileReadRequest, FileWriteMode,
+    FileWritePayload, FileWriteRequest,
+};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IgnoreTargetKind {
@@ -77,7 +82,7 @@ pub fn add_pattern_to_workspace(
 
     let root = files.root();
     let gitignore_path = root.join_child(".gitignore");
-    let existing = match files.read_with_info(&gitignore_path, None) {
+    let existing = match read_with_info(files, &gitignore_path, None) {
         Ok(read) if read.info.kind == FileKind::File => read.into_bytes()?,
         Ok(_) => return Err(".gitignore is not a file.".to_string()),
         Err(_) => Vec::new(),
@@ -94,11 +99,57 @@ pub fn add_pattern_to_workspace(
     next.extend_from_slice(pattern.as_bytes());
     next.push(b'\n');
 
-    if files.info(&gitignore_path).is_err() {
-        files.create_file(&root, ".gitignore")?;
-    }
-    files.write_bytes(&gitignore_path, &next)?;
+    write_file_contents(files, &gitignore_path, next)?;
     Ok(format!("Added {pattern} to .gitignore."))
+}
+
+fn read_with_info(
+    files: &dyn FileAccess,
+    path: &FileNodePath,
+    max_bytes: Option<u64>,
+) -> Result<FileRead, String> {
+    let (sender, receiver) = mpsc::channel();
+    files.read_with_info(
+        FileReadRequest {
+            path: path.clone(),
+            max_bytes,
+            cancel_requested: None,
+        },
+        Box::new(move |event| {
+            if let FileOperationEvent::Finished(result) = event {
+                let _ = sender.send(result);
+            }
+        }),
+    );
+    receiver
+        .recv()
+        .map_err(|_| "Read operation did not return a result.".to_string())?
+        .map_err(|err| err.to_string())
+}
+
+fn write_file_contents(
+    files: &dyn FileAccess,
+    path: &FileNodePath,
+    contents: Vec<u8>,
+) -> Result<(), String> {
+    let (sender, receiver) = mpsc::channel();
+    files.write_node(
+        FileWriteRequest {
+            path: path.clone(),
+            mode: FileWriteMode::Replace,
+            payload: FileWritePayload::File(contents),
+            cancel_requested: None,
+        },
+        Box::new(move |event| {
+            if let FileOperationEvent::Finished(result) = event {
+                let _ = sender.send(result);
+            }
+        }),
+    );
+    receiver
+        .recv()
+        .map_err(|_| "Write operation did not return a result.".to_string())?
+        .map_err(|err| err.to_string())
 }
 
 pub fn check_ignored_paths(

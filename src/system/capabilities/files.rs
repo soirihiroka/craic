@@ -1,6 +1,11 @@
 use crate::system::path::{ArchiveFormat, FileNodePath, WorkspaceRef};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, mpsc};
+use std::fmt;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -42,7 +47,7 @@ pub(crate) struct FileNodeCapabilities {
     pub(crate) listable: bool,
     pub(crate) writable: bool,
     pub(crate) creatable: bool,
-    pub(crate) renameable: bool,
+    pub(crate) movable: bool,
     pub(crate) deletable: bool,
     pub(crate) watchable: bool,
     pub(crate) searchable: bool,
@@ -58,7 +63,7 @@ impl Default for FileNodeCapabilities {
             listable: false,
             writable: false,
             creatable: false,
-            renameable: false,
+            movable: false,
             deletable: false,
             watchable: false,
             searchable: false,
@@ -74,7 +79,7 @@ impl FileNodeCapabilities {
         Self {
             readable: true,
             writable,
-            renameable: writable,
+            movable: writable,
             deletable: writable,
             watchable: true,
             searchable: true,
@@ -91,7 +96,7 @@ impl FileNodeCapabilities {
             listable: true,
             writable,
             creatable: writable,
-            renameable: writable,
+            movable: writable,
             deletable: writable,
             watchable: true,
             searchable: true,
@@ -106,7 +111,7 @@ impl FileNodeCapabilities {
         Self {
             readable: true,
             writable,
-            renameable: writable,
+            movable: writable,
             deletable: writable,
             watchable: true,
             open_external: true,
@@ -214,7 +219,202 @@ pub(crate) struct FileWatchRequest {
 
 pub(crate) type FileWatchChanges = HashSet<FileNodePath>;
 pub(crate) type FileWatchCallback = Arc<dyn Fn(FileWatchChanges) + Send + Sync + 'static>;
-pub(crate) type FileOperationCallback = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
+pub(crate) type FileCancellation = Arc<AtomicBool>;
+pub(crate) type FileOperationCallback<T> = Box<dyn Fn(FileOperationEvent<T>) + Send + 'static>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileOperation {
+    Read,
+    Write,
+    Copy,
+    Move,
+    Delete,
+}
+
+impl FileOperation {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Copy => "copy",
+            Self::Move => "move",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileOperationErrorKind {
+    NotFound,
+    AlreadyExists,
+    InvalidName,
+    PermissionDenied,
+    OutsideWorkspace,
+    Unsupported,
+    TooLarge,
+    Canceled,
+    Io,
+    Remote,
+    Protocol,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileOperationError {
+    pub(crate) operation: FileOperation,
+    pub(crate) kind: FileOperationErrorKind,
+    pub(crate) source: Option<FileNodePath>,
+    pub(crate) destination: Option<FileNodePath>,
+    pub(crate) message: String,
+}
+
+impl FileOperationError {
+    pub(crate) fn new(
+        operation: FileOperation,
+        kind: FileOperationErrorKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            operation,
+            kind,
+            source: None,
+            destination: None,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn with_source(mut self, source: impl Into<FileNodePath>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    pub(crate) fn with_destination(mut self, destination: impl Into<FileNodePath>) -> Self {
+        self.destination = Some(destination.into());
+        self
+    }
+
+    pub(crate) fn from_message(
+        operation: FileOperation,
+        kind: FileOperationErrorKind,
+        source: Option<FileNodePath>,
+        destination: Option<FileNodePath>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            operation,
+            kind,
+            source,
+            destination,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn canceled(operation: FileOperation) -> Self {
+        Self::new(
+            operation,
+            FileOperationErrorKind::Canceled,
+            "Operation canceled.",
+        )
+    }
+}
+
+impl fmt::Display for FileOperationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileOperationProgress {
+    pub(crate) operation: FileOperation,
+    pub(crate) source: Option<FileNodePath>,
+    pub(crate) destination: Option<FileNodePath>,
+    pub(crate) current_path: Option<FileNodePath>,
+    pub(crate) completed_bytes: u64,
+    pub(crate) total_bytes: u64,
+    pub(crate) completed_files: u64,
+    pub(crate) total_files: u64,
+}
+
+impl FileOperationProgress {
+    pub(crate) fn new(operation: FileOperation) -> Self {
+        Self {
+            operation,
+            source: None,
+            destination: None,
+            current_path: None,
+            completed_bytes: 0,
+            total_bytes: 0,
+            completed_files: 0,
+            total_files: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FileOperationEvent<T> {
+    Progress(FileOperationProgress),
+    Finished(Result<T, FileOperationError>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FileReadRequest {
+    pub(crate) path: FileNodePath,
+    pub(crate) max_bytes: Option<u64>,
+    pub(crate) cancel_requested: Option<FileCancellation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileWriteMode {
+    CreateNew,
+    Replace,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum FileWritePayload {
+    File(Vec<u8>),
+    Directory,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FileWriteRequest {
+    pub(crate) path: FileNodePath,
+    pub(crate) mode: FileWriteMode,
+    pub(crate) payload: FileWritePayload,
+    pub(crate) cancel_requested: Option<FileCancellation>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FileCopyRequest {
+    pub(crate) source: FileNodePath,
+    pub(crate) destination: FileNodePath,
+    pub(crate) cancel_requested: Option<FileCancellation>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FileMoveRequest {
+    pub(crate) source: FileNodePath,
+    pub(crate) destination_parent: FileNodePath,
+    pub(crate) new_name: String,
+    pub(crate) cancel_requested: Option<FileCancellation>,
+}
+
+impl FileMoveRequest {
+    pub(crate) fn destination(&self) -> FileNodePath {
+        self.destination_parent.join_child(&self.new_name)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FileDeleteRequest {
+    pub(crate) path: FileNodePath,
+    pub(crate) cancel_requested: Option<FileCancellation>,
+}
+
+pub(crate) fn file_operation_canceled(cancel_requested: &Option<FileCancellation>) -> bool {
+    cancel_requested
+        .as_ref()
+        .is_some_and(|cancel_requested| cancel_requested.load(Ordering::Relaxed))
+}
 
 pub(crate) struct FileWatchSubscription {
     stop_sender: Option<mpsc::Sender<()>>,
@@ -376,29 +576,12 @@ pub(crate) trait FileAccess: Send + Sync {
         paths.iter().map(|path| self.info(path)).collect()
     }
 
-    fn read_with_info(
-        &self,
-        path: &FileNodePath,
-        max_bytes: Option<u64>,
-    ) -> Result<FileRead, String>;
-    fn read_bytes(&self, path: &FileNodePath, max_bytes: Option<u64>) -> Result<Vec<u8>, String> {
-        self.read_with_info(path, max_bytes)?.into_bytes()
-    }
-    fn read_text(&self, path: &FileNodePath, max_bytes: Option<u64>) -> Result<String, String> {
-        self.read_with_info(path, max_bytes)?.into_text()
-    }
+    fn read_with_info(&self, request: FileReadRequest, callback: FileOperationCallback<FileRead>);
 
-    fn write_bytes(&self, path: &FileNodePath, contents: &[u8]) -> Result<(), String>;
-    fn write_text(&self, path: &FileNodePath, contents: &str) -> Result<(), String>;
-    fn create_file(&self, parent: &FileNodePath, name: &str) -> Result<FileNodePath, String>;
-    fn create_dir(&self, parent: &FileNodePath, name: &str) -> Result<FileNodePath, String>;
-    fn rename(
-        &self,
-        source: &FileNodePath,
-        destination_parent: &FileNodePath,
-        new_name: &str,
-    ) -> Result<FileNodePath, String>;
-    fn delete(&self, path: FileNodePath, callback: FileOperationCallback);
+    fn write_node(&self, request: FileWriteRequest, callback: FileOperationCallback<()>);
+    fn copy_node(&self, request: FileCopyRequest, callback: FileOperationCallback<FileNodePath>);
+    fn move_node(&self, request: FileMoveRequest, callback: FileOperationCallback<FileNodePath>);
+    fn delete(&self, request: FileDeleteRequest, callback: FileOperationCallback<()>);
 
     fn watch(
         &self,
