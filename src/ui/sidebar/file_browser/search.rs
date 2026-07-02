@@ -1,6 +1,7 @@
 use super::{
     BrowserTarget, FileBrowser, MAX_SEARCH_FILE_BYTES, MAX_SEARCH_RESULTS, SEARCH_DEBOUNCE_MS,
-    SEARCH_POLL_MS, file_name, rows, skipped_names, tree::BrowserRow,
+    SEARCH_POLL_MS, rows, skipped_names,
+    tree::{BrowserRow, TreeRowRole},
 };
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{FileSearchMatch, FileSearchOutput, FileSearchQuery};
@@ -250,14 +251,18 @@ impl FileBrowser {
 
     pub(super) fn rebuild_search_result_rows_from_cache(self: &Rc<Self>) {
         let rows = match self.search_output.borrow().clone() {
-            Some(output) if output.matches.is_empty() => {
+            Some(output)
+                if output.text_matches.is_empty() && output.file_name_matches.is_empty() =>
+            {
                 vec![rows::BrowserListRow::Status(
                     "No matches found.".to_string(),
                 )]
             }
             Some(output) => {
                 let mut rows = search_tree_rows(
-                    output.matches,
+                    output.text_matches,
+                    output.file_name_matches,
+                    &output.metadata_rows,
                     &self.search_collapsed_dirs.borrow(),
                     &self.root_node_path(),
                 );
@@ -275,9 +280,17 @@ impl FileBrowser {
 
     pub(super) fn remove_deleted_target_from_search_cache(&self, target: &BrowserTarget) {
         if let Some(output) = self.search_output.borrow_mut().as_mut() {
-            output.matches.retain(|search_match| {
+            output.text_matches.retain(|search_match| {
                 search_match.node_path != target.node_path
                     && !(target.is_dir && search_match.node_path.is_child_of(&target.node_path))
+            });
+            output.file_name_matches.retain(|node_path| {
+                node_path != &target.node_path
+                    && !(target.is_dir && node_path.is_child_of(&target.node_path))
+            });
+            output.metadata_rows.retain(|node_path, _| {
+                node_path != &target.node_path
+                    && !(target.is_dir && node_path.is_child_of(&target.node_path))
             });
         }
     }
@@ -332,7 +345,9 @@ enum SearchMode {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct SearchOutput {
-    matches: Vec<SearchMatch>,
+    text_matches: Vec<SearchMatch>,
+    file_name_matches: Vec<FileNodePath>,
+    metadata_rows: HashMap<FileNodePath, BrowserRow>,
     limited: bool,
 }
 
@@ -347,7 +362,6 @@ pub(super) struct SearchSelectionKey {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct SearchMatch {
     pub(super) node_path: FileNodePath,
-    pub(super) path: String,
     pub(super) line_number: u64,
     pub(super) start: usize,
     pub(super) end: usize,
@@ -396,28 +410,36 @@ fn search_repository_text_with_access(
             .map(ToString::to_string)
             .collect(),
     })?;
-    Ok(search_output_from_capability(output, &root))
+    search_output_from_capability(output, &root, file_access.as_ref())
 }
 
-fn search_output_from_capability(output: FileSearchOutput, root: &FileNodePath) -> SearchOutput {
-    SearchOutput {
-        matches: output
-            .matches
-            .into_iter()
-            .filter_map(|found| search_match_from_capability(found, root))
-            .collect(),
+fn search_output_from_capability(
+    output: FileSearchOutput,
+    root: &FileNodePath,
+    file_access: &dyn crate::system::capabilities::files::FileAccess,
+) -> Result<SearchOutput, String> {
+    let text_matches = output
+        .text_matches
+        .into_iter()
+        .filter_map(|found| search_match_from_capability(found, root))
+        .collect::<Vec<_>>();
+    let file_name_matches = normalized_file_name_matches(output.file_name_matches, root);
+    let metadata_rows = search_metadata_rows(file_access, root, &text_matches, &file_name_matches)?;
+    Ok(SearchOutput {
+        text_matches,
+        file_name_matches,
+        metadata_rows,
         limited: output.limited,
-    }
+    })
 }
 
 fn search_match_from_capability(
     found: FileSearchMatch,
     _root: &FileNodePath,
 ) -> Option<SearchMatch> {
-    let path = found.path.native_relative()?;
+    found.path.native_relative()?;
     Some(SearchMatch {
         node_path: found.path,
-        path,
         line_number: found.line_number,
         start: found.start,
         end: found.end,
@@ -426,39 +448,113 @@ fn search_match_from_capability(
     })
 }
 
+fn normalized_file_name_matches(
+    mut file_name_matches: Vec<FileNodePath>,
+    root: &FileNodePath,
+) -> Vec<FileNodePath> {
+    file_name_matches.retain(|path| path != root && path.native_relative().is_some());
+    file_name_matches.sort_by_key(FileNodePath::display);
+    file_name_matches.dedup();
+    file_name_matches
+}
+
+fn search_metadata_rows(
+    file_access: &dyn crate::system::capabilities::files::FileAccess,
+    root: &FileNodePath,
+    text_matches: &[SearchMatch],
+    file_name_matches: &[FileNodePath],
+) -> Result<HashMap<FileNodePath, BrowserRow>, String> {
+    let mut paths = Vec::new();
+    for search_match in text_matches {
+        push_search_metadata_paths(&mut paths, &search_match.node_path, root);
+    }
+    for path in file_name_matches {
+        push_search_metadata_paths(&mut paths, path, root);
+    }
+    paths.sort_by_key(FileNodePath::display);
+    paths.dedup();
+
+    let rows = file_access
+        .info_many(&paths)?
+        .into_iter()
+        .map(|info| {
+            let depth = search_node_depth(&info.path);
+            let row = BrowserRow::from_info(info, depth);
+            (row.node_path.clone(), row)
+        })
+        .collect();
+    Ok(rows)
+}
+
+fn push_search_metadata_paths(
+    paths: &mut Vec<FileNodePath>,
+    path: &FileNodePath,
+    root: &FileNodePath,
+) {
+    let mut current = Some(path.clone());
+    while let Some(path) = current {
+        if &path == root {
+            break;
+        }
+        paths.push(path.clone());
+        current = path.parent();
+    }
+}
+
+fn search_node_depth(path: &FileNodePath) -> usize {
+    path.native_relative()
+        .unwrap_or_else(|| path.display())
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .count()
+        .saturating_sub(1)
+}
+
 fn search_tree_rows(
-    mut matches: Vec<SearchMatch>,
+    mut text_matches: Vec<SearchMatch>,
+    file_name_matches: Vec<FileNodePath>,
+    metadata_rows: &HashMap<FileNodePath, BrowserRow>,
     collapsed_dirs: &HashSet<FileNodePath>,
     root: &FileNodePath,
 ) -> Vec<rows::BrowserListRow> {
     let mut rows = Vec::new();
     let mut seen_dirs = HashSet::new();
     let mut seen_files = HashSet::new();
+    let mut text_matches_by_path: HashMap<FileNodePath, Vec<SearchMatch>> = HashMap::new();
+    let mut ordered_paths = file_name_matches;
 
-    for mut search_match in matches.drain(..) {
-        let parts = search_match
-            .path
+    for search_match in text_matches.drain(..) {
+        ordered_paths.push(search_match.node_path.clone());
+        text_matches_by_path
+            .entry(search_match.node_path.clone())
+            .or_default()
+            .push(search_match);
+    }
+    ordered_paths.sort_by_key(FileNodePath::display);
+    ordered_paths.dedup();
+
+    for path in ordered_paths {
+        let mut matches = text_matches_by_path.remove(&path).unwrap_or_default();
+        let has_text_matches = !matches.is_empty();
+        let relative = path.native_relative().unwrap_or_else(|| path.display());
+        let parts = relative
             .split('/')
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>();
-        let mut current_display = String::new();
         let mut current_node = root.clone();
         let mut hidden_by_collapsed_dir = false;
         for (depth, name) in parts.iter().take(parts.len().saturating_sub(1)).enumerate() {
             current_node = current_node.join_child(*name);
-            if current_display.is_empty() {
-                current_display.push_str(name);
-            } else {
-                current_display.push('/');
-                current_display.push_str(name);
-            }
             if seen_dirs.insert(current_node.clone()) {
-                rows.push(rows::BrowserListRow::Tree(BrowserRow::folder(
-                    current_node.clone(),
-                    current_display.clone(),
-                    (*name).to_string(),
-                    depth,
-                )));
+                if let Some(row) = metadata_rows.get(&current_node) {
+                    rows.push(rows::BrowserListRow::Tree(row.clone()));
+                } else {
+                    log::debug!(
+                        "file search metadata missing ancestor path={} depth={}",
+                        current_node.display(),
+                        depth
+                    );
+                }
             }
             if collapsed_dirs.contains(&current_node) {
                 hidden_by_collapsed_dir = true;
@@ -469,21 +565,26 @@ fn search_tree_rows(
             continue;
         }
 
-        if seen_files.insert(search_match.node_path.clone()) {
-            rows.push(rows::BrowserListRow::Tree(BrowserRow::search_file_group(
-                search_match.node_path.clone(),
-                search_match.path.clone(),
-                file_name(&search_match.path).to_string(),
-                parts.len().saturating_sub(1),
-            )));
+        let Some(file_row) = metadata_rows.get(&path) else {
+            log::debug!("file search metadata missing file path={}", path.display());
+            continue;
+        };
+        if seen_files.insert(path.clone()) {
+            let mut row = file_row.clone();
+            if has_text_matches {
+                row.tree_role = TreeRowRole::Branch;
+            }
+            rows.push(rows::BrowserListRow::Tree(row));
         }
 
-        if collapsed_dirs.contains(&search_match.node_path) {
+        if collapsed_dirs.contains(&path) {
             continue;
         }
 
-        search_match.depth = parts.len();
-        rows.push(rows::BrowserListRow::Search(search_match));
+        for mut search_match in matches.drain(..) {
+            search_match.depth = parts.len();
+            rows.push(rows::BrowserListRow::Search(search_match));
+        }
     }
 
     rows

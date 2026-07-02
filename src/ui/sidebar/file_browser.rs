@@ -3,7 +3,7 @@ use crate::spellcheck::SpellcheckAllowlist;
 use crate::system::capabilities::{
     files::{FileAccess, FileNodeInfo, FileNodeKind, FileWatchSubscription},
     git::GitAccess,
-    open::OpenAccess,
+    open::{DesktopOpenAccess, DesktopOpenActivation},
 };
 use crate::system::{FileNodePath, WorkspaceRef};
 use crate::ui::components::context_menu;
@@ -74,7 +74,7 @@ pub(in crate::ui) struct FileBrowser {
     workspace: RefCell<WorkspaceRef>,
     file_access: RefCell<Arc<dyn FileAccess>>,
     git_access: RefCell<Option<Arc<dyn GitAccess>>>,
-    opener: RefCell<Option<Arc<dyn OpenAccess>>>,
+    desktop_opener: RefCell<Option<Arc<dyn DesktopOpenAccess>>>,
     expanded_dirs: RefCell<HashSet<FileNodePath>>,
     active_folder: RefCell<FileNodePath>,
     selected_node_path: Rc<RefCell<Option<FileNodePath>>>,
@@ -140,7 +140,7 @@ impl FileBrowser {
             .margin_bottom(6)
             .build();
 
-        let search_panel = SearchPanel::new("Search workspace text");
+        let search_panel = SearchPanel::new("Search workspace");
         search_panel.set_navigation_visible(false);
         header.append(&search_panel.widget());
 
@@ -171,7 +171,7 @@ impl FileBrowser {
             workspace: RefCell::new(workspace),
             file_access: RefCell::new(file_access),
             git_access: RefCell::new(git_access),
-            opener: RefCell::new(None),
+            desktop_opener: RefCell::new(None),
             expanded_dirs: RefCell::new(HashSet::new()),
             active_folder: RefCell::new(root_node_path),
             selected_node_path: Rc::new(RefCell::new(None)),
@@ -323,8 +323,11 @@ impl FileBrowser {
         node_path_for_relative(&self.root_node_path(), relative)
     }
 
-    pub(in crate::ui) fn set_opener(&self, opener: Option<Arc<dyn OpenAccess>>) {
-        self.opener.replace(opener);
+    pub(in crate::ui) fn set_desktop_opener(
+        &self,
+        desktop_opener: Option<Arc<dyn DesktopOpenAccess>>,
+    ) {
+        self.desktop_opener.replace(desktop_opener);
     }
 
     pub(in crate::ui) fn set_terminal_actions_available(&self, available: bool) {
@@ -958,8 +961,10 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
     target: BrowserTarget,
     x: f64,
     y: f64,
+    event_time: u32,
 ) {
     let actions = gio::SimpleActionGroup::new();
+    let action_event_time = Rc::new(Cell::new(event_time));
     add_menu_action(&actions, "open", {
         let browser = browser.clone();
         let target = target.clone();
@@ -980,15 +985,29 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
     let open_external = add_menu_action(&actions, "open-external", {
         let browser = browser.clone();
         let target = target.clone();
-        move || browser.open_external(&target)
+        let action_event_time = action_event_time.clone();
+        move || {
+            browser.open_external(
+                &target,
+                DesktopOpenActivation::from_event_time(action_event_time.get()),
+            )
+        }
     });
-    open_external.set_enabled(target.capabilities.open_external && target.capabilities.native);
+    let desktop_open_available =
+        browser.desktop_opener.borrow().is_some() && target.capabilities.native;
+    open_external.set_enabled(desktop_open_available && target.capabilities.open_external);
     let open_containing_folder = add_menu_action(&actions, "open-containing-folder", {
         let browser = browser.clone();
         let target = target.clone();
-        move || browser.open_containing_folder(&target)
+        let action_event_time = action_event_time.clone();
+        move || {
+            browser.open_containing_folder(
+                &target,
+                DesktopOpenActivation::from_event_time(action_event_time.get()),
+            )
+        }
     });
-    open_containing_folder.set_enabled(target.capabilities.reveal && target.capabilities.native);
+    open_containing_folder.set_enabled(desktop_open_available && target.capabilities.reveal);
     let open_terminal = add_menu_action(&actions, "open-terminal", {
         let browser = browser.clone();
         let target = target.clone();
@@ -1113,13 +1132,14 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
     let terminal_available = browser.terminal_actions_available.get() && target.capabilities.native;
     let container_actions_available =
         browser.container_actions_available.get() && target.capabilities.native;
-    menu::repository_row_menu(&target, terminal_available, container_actions_available).popup(
+    let popover = menu::repository_row_menu(&target, terminal_available, container_actions_available).popup(
         parent,
         x,
         y,
         &actions,
         &browser.active_context_menu,
     );
+    context_menu::track_context_menu_event_time(&popover, action_event_time);
 }
 
 fn add_menu_action<F>(group: &gio::SimpleActionGroup, name: &str, activate: F) -> gio::SimpleAction

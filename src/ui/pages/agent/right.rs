@@ -1904,12 +1904,12 @@ fn handle_agent_terminal_activation(
 }
 
 fn confirm_open_agent_terminal_url(ctx: PageContext, url: String) {
-    let Some(opener) = ctx.opener() else {
+    let Some(desktop_opener) = ctx.desktop_opener() else {
         ctx.show_error(
             "Open Link Failed",
             "Opening links is unavailable for this workspace.",
         );
-        log::warn!("agent terminal url activation failed reason=no-opener url={url}");
+        log::warn!("agent terminal url activation failed reason=no-desktop-opener url={url}");
         return;
     };
 
@@ -1932,7 +1932,10 @@ fn confirm_open_agent_terminal_url(ctx: PageContext, url: String) {
                 return;
             }
 
-            match opener.open_url(&url) {
+            match desktop_opener.open_url(
+                &url,
+                crate::system::capabilities::open::DesktopOpenActivation::default(),
+            ) {
                 Ok(message) => {
                     log::info!("agent terminal url opened url={url} message={message}");
                     ctx.show_toast(&message);

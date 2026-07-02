@@ -43,7 +43,8 @@ struct SshResolvedFileNode {
 
 #[derive(Deserialize)]
 struct RemoteSearchOutput {
-    matches: Vec<RemoteSearchMatch>,
+    text_matches: Vec<RemoteSearchMatch>,
+    file_name_matches: Vec<String>,
     limited: bool,
 }
 
@@ -462,8 +463,8 @@ impl FileAccess for SshFileAccess {
         let output: RemoteSearchOutput = serde_json::from_str(&raw)
             .map_err(|err| format!("Invalid remote search response: {err}"))?;
         let limited = output.limited;
-        let matches = output
-            .matches
+        let text_matches = output
+            .text_matches
             .into_iter()
             .map(|found| {
                 let workspace_path = workspace_path_for_remote(&self.workspace, &found.path);
@@ -478,13 +479,28 @@ impl FileAccess for SshFileAccess {
                 }
             })
             .collect::<Vec<_>>();
+        let mut file_name_matches = output
+            .file_name_matches
+            .into_iter()
+            .map(|path| {
+                let workspace_path = workspace_path_for_remote(&self.workspace, &path);
+                self.workspace
+                    .node_path(&self.system, workspace_path.relative_or_empty())
+            })
+            .collect::<Vec<_>>();
+        file_name_matches.sort_by_key(FileNodePath::display);
         log::info!(
-            "file search complete provider=ssh workspace={} matches={} limited={}",
+            "file search complete provider=ssh workspace={} text_matches={} file_name_matches={} limited={}",
             self.workspace.display_name,
-            matches.len(),
+            text_matches.len(),
+            file_name_matches.len(),
             limited
         );
-        Ok(FileSearchOutput { matches, limited })
+        Ok(FileSearchOutput {
+            text_matches,
+            file_name_matches,
+            limited,
+        })
     }
 }
 
@@ -815,20 +831,40 @@ flags = re.MULTILINE | re.DOTALL
 if not case_sensitive:
     flags |= re.IGNORECASE
 rx = re.compile(pattern, flags)
-matches = []
+text_matches = []
+file_name_matches = []
 limited = False
+def result_count():
+    return len(text_matches) + len(file_name_matches)
+def finish():
+    print(json.dumps({'text_matches': text_matches, 'file_name_matches': file_name_matches, 'limited': limited}))
 def preview_for_match(text, start, end):
     line_start = text.rfind('\n', 0, start) + 1
     line_end = text.find('\n', end)
     if line_end == -1:
         line_end = len(text)
     return text[line_start:line_end].strip().replace('\r', ' ').replace('\n', ' ')[:180]
+def has_nonempty_match(text):
+    for found in rx.finditer(text):
+        if found.start() != found.end():
+            return True
+    return False
 for base, dirs, files in os.walk(root):
     dirs[:] = [d for d in dirs if d not in skip]
     for name in files:
         if name in skip:
             continue
         path = os.path.join(base, name)
+        if has_nonempty_match(name):
+            if result_count() >= max_results:
+                limited = True
+                finish()
+                raise SystemExit(0)
+            file_name_matches.append(path)
+            if result_count() >= max_results:
+                limited = True
+                finish()
+                raise SystemExit(0)
         try:
             if os.path.getsize(path) > max_file_bytes:
                 continue
@@ -844,16 +880,20 @@ for base, dirs, files in os.walk(root):
         for found in rx.finditer(text):
             if found.start() == found.end():
                 continue
-            matches.append({
+            if result_count() >= max_results:
+                limited = True
+                finish()
+                raise SystemExit(0)
+            text_matches.append({
                 'path': path,
                 'line_number': text.count('\n', 0, found.start()) + 1,
                 'start': found.start(),
                 'end': found.end(),
                 'line_text': preview_for_match(text, found.start(), found.end()),
             })
-            if len(matches) >= max_results:
+            if result_count() >= max_results:
                 limited = True
-                print(json.dumps({'matches': matches, 'limited': limited}))
+                finish()
                 raise SystemExit(0)
-print(json.dumps({'matches': matches, 'limited': limited}))
+finish()
 "#;

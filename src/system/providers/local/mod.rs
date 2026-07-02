@@ -10,13 +10,13 @@ use self::docker::LocalDockerAccess;
 use self::files::LocalFileAccess;
 use self::git::LocalGitAccess;
 use self::github::LocalGitHubAccess;
-use self::open::LocalOpenAccess;
+use self::open::LocalDesktopOpenAccess;
 use self::shell::LocalShellAccess;
 use self::terminal_link::LocalTerminalLinkAccess;
 use crate::system::capabilities::github::GitHubAccess;
 use crate::system::capabilities::{
-    docker::DockerAccess, files::FileAccess, git::GitAccess, open::OpenAccess, shell::ShellAccess,
-    terminal_link::TerminalLinkAccess,
+    docker::DockerAccess, files::FileAccess, git::GitAccess, open::DesktopOpenAccess,
+    shell::ShellAccess, terminal_link::TerminalLinkAccess,
 };
 use crate::system::path::{
     ProviderKind, SystemId, SystemRef, WorkspacePath, WorkspaceRef, path_display_name,
@@ -213,22 +213,13 @@ impl SystemProvider for LocalProvider {
         Some(Arc::new(LocalDockerAccess::new(workspace.clone())))
     }
 
-    fn opener(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn OpenAccess>> {
-        if !command_exists("xdg-open") {
-            log::debug!(
-                "local open capability unavailable workspace={} root={} reason=missing-xdg-open",
-                workspace.display_name,
-                workspace.root.absolute
-            );
-            return None;
-        }
-
+    fn desktop_opener(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn DesktopOpenAccess>> {
         log::debug!(
-            "creating local open capability workspace={} root={}",
+            "creating local desktop-open capability workspace={} root={}",
             workspace.display_name,
             workspace.root.absolute
         );
-        Some(Arc::new(LocalOpenAccess::new(workspace.clone())))
+        Some(Arc::new(LocalDesktopOpenAccess::new(workspace.clone())))
     }
 
     fn terminal_links(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn TerminalLinkAccess>> {

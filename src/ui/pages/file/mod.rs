@@ -319,7 +319,7 @@ impl FilePage {
     pub(super) fn new(ctx: PageContext) -> Self {
         let left = left::LeftPane::new(ctx.files(), ctx.git());
         if let Some(file_browser) = &left.file_browser {
-            file_browser.set_opener(ctx.opener());
+            file_browser.set_desktop_opener(ctx.desktop_opener());
             file_browser.set_terminal_actions_available(ctx.shell().is_some());
             file_browser.set_container_actions_available(ctx.docker().is_some());
         }
@@ -615,12 +615,12 @@ impl Page for FilePage {
             return;
         };
         if let Some(file_access) = self.ctx.files() {
-            file_browser.set_opener(self.ctx.opener());
+            file_browser.set_desktop_opener(self.ctx.desktop_opener());
             file_browser.set_terminal_actions_available(self.ctx.shell().is_some());
             file_browser.set_container_actions_available(self.ctx.docker().is_some());
             file_browser.refresh(Some(&snapshot.changed_files), file_access, self.ctx.git());
         } else {
-            file_browser.set_opener(None);
+            file_browser.set_desktop_opener(None);
             file_browser.set_terminal_actions_available(false);
             file_browser.set_container_actions_available(false);
             self.right
