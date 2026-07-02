@@ -23,7 +23,10 @@ pub(super) enum MarkdownPreviewBlockKind {
         code: String,
         language: Option<String>,
     },
-    Blockquote(RenderedText),
+    Blockquote {
+        text: RenderedText,
+        alert: Option<MarkdownAlertKind>,
+    },
     List(Vec<RenderedListItem>),
     ThematicBreak,
     Table {
@@ -42,6 +45,15 @@ pub(super) enum BlockAlignment {
     Start,
     Center,
     End,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MarkdownAlertKind {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
 }
 
 #[derive(Clone, Debug)]
@@ -171,7 +183,10 @@ fn append_block_from_element(
             let text = block_text(&nested);
             if !text.plain_text.trim().is_empty() {
                 blocks.push(MarkdownPreviewBlock {
-                    kind: MarkdownPreviewBlockKind::Blockquote(text),
+                    kind: MarkdownPreviewBlockKind::Blockquote {
+                        text,
+                        alert: markdown_alert_kind(element),
+                    },
                     source: element.source.clone(),
                 });
             }
@@ -210,8 +225,44 @@ fn append_block_from_element(
             kind: MarkdownPreviewBlockKind::ThematicBreak,
             source: element.source.clone(),
         }),
+        "div" => append_container_blocks(blocks, element, list_depth),
         "script" | "style" => {}
         _ => append_blocks_from_nodes(blocks, &element.children, list_depth),
+    }
+}
+
+fn append_container_blocks(
+    blocks: &mut Vec<MarkdownPreviewBlock>,
+    element: &MarkdownElement,
+    list_depth: usize,
+) {
+    let alignment = block_alignment(element);
+    if let Some(images) = standalone_image_group(&element.children) {
+        blocks.push(MarkdownPreviewBlock {
+            kind: MarkdownPreviewBlockKind::ImageGroup { images, alignment },
+            source: element.source.clone(),
+        });
+        return;
+    }
+
+    let first_nested = blocks.len();
+    append_blocks_from_nodes(blocks, &element.children, list_depth);
+    if alignment == BlockAlignment::Start {
+        return;
+    }
+
+    for block in &mut blocks[first_nested..] {
+        match &mut block.kind {
+            MarkdownPreviewBlockKind::Paragraph {
+                alignment: block_alignment,
+                ..
+            }
+            | MarkdownPreviewBlockKind::ImageGroup {
+                alignment: block_alignment,
+                ..
+            } => *block_alignment = alignment,
+            _ => {}
+        }
     }
 }
 
@@ -259,6 +310,21 @@ fn css_text_align(style: &str) -> Option<&str> {
             .eq_ignore_ascii_case("text-align")
             .then(|| value.trim())
             .filter(|value| !value.is_empty())
+    })
+}
+
+fn markdown_alert_kind(element: &MarkdownElement) -> Option<MarkdownAlertKind> {
+    let class = attr_value(&element.attrs, "class")?;
+    class.split_whitespace().find_map(|class| {
+        let kind = class.strip_prefix("markdown-alert-")?;
+        match kind {
+            "note" => Some(MarkdownAlertKind::Note),
+            "tip" => Some(MarkdownAlertKind::Tip),
+            "important" => Some(MarkdownAlertKind::Important),
+            "warning" => Some(MarkdownAlertKind::Warning),
+            "caution" => Some(MarkdownAlertKind::Caution),
+            _ => None,
+        }
     })
 }
 
@@ -664,8 +730,17 @@ pub(super) fn block_text(blocks: &[MarkdownPreviewBlock]) -> RenderedText {
     for block in blocks {
         let text = match &block.kind {
             MarkdownPreviewBlockKind::Heading { text, .. }
-            | MarkdownPreviewBlockKind::Paragraph { text, .. }
-            | MarkdownPreviewBlockKind::Blockquote(text) => text.clone(),
+            | MarkdownPreviewBlockKind::Paragraph { text, .. } => text.clone(),
+            MarkdownPreviewBlockKind::Blockquote { text, alert } => {
+                if let Some(alert) = alert {
+                    RenderedText {
+                        markup: format!("<b>{}</b>\n{}", alert.title(), text.markup),
+                        plain_text: format!("{}\n{}", alert.title(), text.plain_text),
+                    }
+                } else {
+                    text.clone()
+                }
+            }
             MarkdownPreviewBlockKind::List(items) => RenderedText {
                 markup: items
                     .iter()
@@ -725,6 +800,28 @@ impl RenderedText {
         Self {
             markup: pango_escape(text),
             plain_text: text.to_string(),
+        }
+    }
+}
+
+impl MarkdownAlertKind {
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Self::Note => "Note",
+            Self::Tip => "Tip",
+            Self::Important => "Important",
+            Self::Warning => "Warning",
+            Self::Caution => "Caution",
+        }
+    }
+
+    pub(super) fn css_class(self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Tip => "tip",
+            Self::Important => "important",
+            Self::Warning => "warning",
+            Self::Caution => "caution",
         }
     }
 }

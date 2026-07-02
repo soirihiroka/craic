@@ -14,8 +14,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use super::blocks::{
-    BlockAlignment, MarkdownPreviewBlock, MarkdownPreviewBlockKind, RenderedImageItem,
-    RenderedListItem, RenderedText, pango_escape,
+    BlockAlignment, MarkdownAlertKind, MarkdownPreviewBlock, MarkdownPreviewBlockKind,
+    RenderedImageItem, RenderedListItem, RenderedText, pango_escape,
 };
 use super::source_map::RenderedSourceAnchor;
 
@@ -31,6 +31,12 @@ struct BlockImageState {
     ratio: f32,
     width_limit: Option<i32>,
     alignment: BlockAlignment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageSizing {
+    Block,
+    InlineNatural,
 }
 
 static IMAGE_CACHE: OnceLock<Cache<String, Vec<u8>>> = OnceLock::new();
@@ -80,7 +86,9 @@ fn render_block(block: &MarkdownPreviewBlock, base_path: Option<&Path>) -> gtk::
         MarkdownPreviewBlockKind::CodeBlock { code, language } => {
             render_code_block(code, language).upcast()
         }
-        MarkdownPreviewBlockKind::Blockquote(text) => render_blockquote(text, base_path).upcast(),
+        MarkdownPreviewBlockKind::Blockquote { text, alert } => {
+            render_blockquote(text, *alert, base_path).upcast()
+        }
         MarkdownPreviewBlockKind::List(items) => render_list(items, base_path).upcast(),
         MarkdownPreviewBlockKind::ThematicBreak => {
             gtk::Separator::new(gtk::Orientation::Horizontal).upcast()
@@ -264,21 +272,74 @@ fn source_style_scheme() -> Option<sourceview5::StyleScheme> {
     candidates.iter().find_map(|scheme| manager.scheme(scheme))
 }
 
-fn render_blockquote(text: &RenderedText, base_path: Option<&Path>) -> gtk::Box {
+fn render_blockquote(
+    text: &RenderedText,
+    alert: Option<MarkdownAlertKind>,
+    base_path: Option<&Path>,
+) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(12)
         .hexpand(true)
         .halign(gtk::Align::Fill)
         .build();
+    row.add_css_class("craic-markdown-blockquote-row");
+    if let Some(alert) = alert {
+        row.add_css_class("craic-markdown-alert");
+        row.add_css_class(&format!("craic-markdown-alert-{}", alert.css_class()));
+    }
+
     let separator = gtk::Separator::new(gtk::Orientation::Vertical);
     separator.add_css_class("craic-markdown-blockquote-rule");
     row.append(&separator);
 
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
+        .build();
+
+    if let Some(alert) = alert {
+        let title = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .hexpand(true)
+            .halign(gtk::Align::Fill)
+            .build();
+        title.add_css_class("craic-markdown-alert-title");
+        title.add_css_class(&format!("craic-markdown-alert-title-{}", alert.css_class()));
+
+        let icon = gtk::Image::from_icon_name(alert_icon_name(alert));
+        icon.set_pixel_size(16);
+        icon.set_valign(gtk::Align::Center);
+        icon.add_css_class(&format!("craic-markdown-alert-title-{}", alert.css_class()));
+        title.append(&icon);
+
+        let label = markup_label(&format!("<b>{}</b>", alert.title()), base_path);
+        label.set_selectable(false);
+        label.set_wrap(false);
+        label.set_hexpand(false);
+        label.set_halign(gtk::Align::Start);
+        label.add_css_class("craic-markdown-alert-title-label");
+        label.add_css_class(&format!("craic-markdown-alert-title-{}", alert.css_class()));
+        title.append(&label);
+        content.append(&title);
+    }
+
     let label = markup_label(&text.markup, base_path);
     label.add_css_class("craic-markdown-blockquote");
-    row.append(&label);
+    content.append(&label);
+    row.append(&content);
     row
+}
+
+fn alert_icon_name(alert: MarkdownAlertKind) -> &'static str {
+    match alert {
+        MarkdownAlertKind::Warning | MarkdownAlertKind::Caution => "dialog-warning-symbolic",
+        MarkdownAlertKind::Important => "dialog-information-symbolic",
+        MarkdownAlertKind::Note | MarkdownAlertKind::Tip => "dialog-information-symbolic",
+    }
 }
 
 fn render_list(items: &[RenderedListItem], base_path: Option<&Path>) -> gtk::Label {
@@ -402,65 +463,47 @@ fn render_image_group(
     alignment: BlockAlignment,
     base_path: Option<&Path>,
 ) -> gtk::Widget {
-    if images.len() == 1
-        && images
-            .first()
-            .and_then(|image| image.link_destination.as_ref())
-            .is_none()
+    if images
+        .first()
+        .is_some_and(|image| images.len() == 1 && render_single_image_as_block(image))
     {
         return render_block_image(&images[0], alignment, base_path);
     }
 
-    let column = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
+    let wrap = adw::WrapBox::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .child_spacing(4)
+        .line_spacing(6)
+        .align(wrap_alignment(alignment))
+        .justify(adw::JustifyMode::None)
+        .wrap_policy(adw::WrapPolicy::Minimum)
         .hexpand(true)
         .halign(gtk::Align::Fill)
         .build();
-    column.add_css_class("craic-markdown-image-group");
+    wrap.add_css_class("craic-markdown-image-group");
 
     for image in images {
-        if image.link_destination.is_none() {
-            column.append(&render_block_image(image, alignment, base_path));
-        } else {
-            column.append(&render_inline_image(image, base_path));
-        }
+        wrap.append(&render_inline_image(image, base_path));
     }
 
-    column.upcast()
+    wrap.upcast()
 }
 
 fn render_inline_image(image: &RenderedImageItem, base_path: Option<&Path>) -> gtk::Widget {
-    let widget = image_widget(image, base_path, Some(24), None);
-    if let Some(link) = image
-        .link_destination
-        .as_deref()
-        .filter(|link| !link.trim().is_empty())
-    {
-        let wrapper = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .halign(gtk::Align::Start)
-            .valign(gtk::Align::Center)
-            .build();
-        wrapper.add_css_class("craic-markdown-image-link");
-        wrapper.append(&widget);
-        wrapper.set_tooltip_text(Some(if image.alt.is_empty() {
-            link
-        } else {
-            &image.alt
-        }));
+    let widget = image_widget(image, base_path, ImageSizing::InlineNatural, None);
+    wrap_image_link(widget, image, base_path, gtk::Align::Start, false)
+}
 
-        let click = gtk::GestureClick::builder().button(0).build();
-        let link = link.to_string();
-        let base_path = base_path.map(Path::to_path_buf);
-        let wrapper_for_click = wrapper.clone();
-        click.connect_released(move |_, _, _, _| {
-            confirm_open_external_uri(wrapper_for_click.upcast_ref(), &link, base_path.as_deref());
-        });
-        wrapper.add_controller(click);
-        return wrapper.upcast();
+fn render_single_image_as_block(image: &RenderedImageItem) -> bool {
+    image.link_destination.is_none() || image.width.is_some() || image.height.is_some()
+}
+
+fn wrap_alignment(alignment: BlockAlignment) -> f32 {
+    match alignment {
+        BlockAlignment::Start => 0.0,
+        BlockAlignment::Center => 0.5,
+        BlockAlignment::End => 1.0,
     }
-    widget
 }
 
 fn render_block_image(
@@ -502,7 +545,8 @@ fn render_block_image(
         }
     });
 
-    let status = unresolved_image_label(&image_alt_text(image), "loading image");
+    let status =
+        unresolved_image_label(&image_alt_text(image), "loading image", ImageSizing::Block);
     status.set_valign(gtk::Align::Center);
     status.set_halign(gtk::Align::Center);
 
@@ -516,7 +560,47 @@ fn render_block_image(
 
     load_block_image(image, base_path, &area, &status, &state);
 
-    overlay.upcast()
+    wrap_image_link(overlay.upcast(), image, base_path, gtk::Align::Fill, true)
+}
+
+fn wrap_image_link(
+    widget: gtk::Widget,
+    image: &RenderedImageItem,
+    base_path: Option<&Path>,
+    halign: gtk::Align,
+    hexpand: bool,
+) -> gtk::Widget {
+    let Some(link) = image
+        .link_destination
+        .as_deref()
+        .filter(|link| !link.trim().is_empty())
+    else {
+        return widget;
+    };
+
+    let wrapper = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .halign(halign)
+        .valign(gtk::Align::Center)
+        .hexpand(hexpand)
+        .build();
+    wrapper.add_css_class("craic-markdown-image-link");
+    wrapper.append(&widget);
+    wrapper.set_tooltip_text(Some(if image.alt.is_empty() {
+        link
+    } else {
+        &image.alt
+    }));
+
+    let click = gtk::GestureClick::builder().button(0).build();
+    let link = link.to_string();
+    let base_path = base_path.map(Path::to_path_buf);
+    let wrapper_for_click = wrapper.clone();
+    click.connect_released(move |_, _, _, _| {
+        confirm_open_external_uri(wrapper_for_click.upcast_ref(), &link, base_path.as_deref());
+    });
+    wrapper.add_controller(click);
+    wrapper.upcast()
 }
 
 fn draw_block_image(cr: &cairo::Context, width: i32, height: i32, state: &BlockImageState) {
@@ -724,7 +808,7 @@ fn load_remote_block_image(
 fn image_widget(
     image: &RenderedImageItem,
     base_path: Option<&Path>,
-    preferred_height: Option<i32>,
+    sizing: ImageSizing,
     ratio_frame: Option<&gtk::AspectFrame>,
 ) -> gtk::Widget {
     let alt = image_alt_text(image);
@@ -733,15 +817,16 @@ fn image_widget(
         .as_deref()
         .filter(|source| !source.trim().is_empty())
     else {
-        return unresolved_image_label(&alt, "missing image source").upcast();
+        return unresolved_image_label(&alt, "missing image source", sizing).upcast();
     };
 
+    let inline = sizing == ImageSizing::InlineNatural;
     let picture = gtk::Picture::builder()
         .alternative_text(&alt)
-        .can_shrink(preferred_height.is_none())
+        .can_shrink(true)
         .content_fit(gtk::ContentFit::Contain)
-        .hexpand(preferred_height.is_none())
-        .halign(if preferred_height.is_some() {
+        .hexpand(!inline)
+        .halign(if inline {
             gtk::Align::Start
         } else {
             gtk::Align::Fill
@@ -749,53 +834,57 @@ fn image_widget(
         .valign(gtk::Align::Center)
         .build();
     picture.add_css_class("craic-markdown-img");
-    if let Some(height) = preferred_height {
-        picture.set_size_request(-1, height);
-    }
 
     if let Some(texture) = texture_from_data_uri(source) {
-        apply_texture_to_picture(&picture, &texture, image, preferred_height, ratio_frame);
+        apply_texture_to_picture(&picture, &texture, image, sizing, ratio_frame);
         return picture.upcast();
     }
 
     if let Some(file) = local_image_file(source, base_path) {
         if let Ok(texture) = gdk::Texture::from_file(&file) {
-            apply_texture_to_picture(&picture, &texture, image, preferred_height, ratio_frame);
+            apply_texture_to_picture(&picture, &texture, image, sizing, ratio_frame);
         } else {
-            apply_known_image_size(&picture, image, preferred_height, ratio_frame);
+            apply_known_image_size(&picture, image, sizing, ratio_frame);
             picture.set_file(Some(&file));
         }
         return picture.upcast();
     }
 
     if source.starts_with("http://") || source.starts_with("https://") {
-        return remote_image_widget(picture, image, preferred_height, ratio_frame);
+        return remote_image_widget(picture, image, sizing, ratio_frame);
     }
 
-    unresolved_image_label(&alt, source).upcast()
+    unresolved_image_label(&alt, source, sizing).upcast()
 }
 
 fn remote_image_widget(
     picture: gtk::Picture,
     image: &RenderedImageItem,
-    preferred_height: Option<i32>,
+    sizing: ImageSizing,
     ratio_frame: Option<&gtk::AspectFrame>,
 ) -> gtk::Widget {
     let alt = image_alt_text(image);
     let Some(source) = image.source.as_deref() else {
-        return unresolved_image_label(&alt, "missing image source").upcast();
+        return unresolved_image_label(&alt, "missing image source", sizing).upcast();
     };
     let image = image.clone();
     let ratio_frame = ratio_frame.cloned();
+    let inline = sizing == ImageSizing::InlineNatural;
 
     let stack = gtk::Stack::builder()
         .hhomogeneous(false)
         .vhomogeneous(false)
-        .hexpand(true)
-        .halign(gtk::Align::Fill)
+        .hexpand(!inline)
+        .halign(if inline {
+            gtk::Align::Start
+        } else {
+            gtk::Align::Fill
+        })
         .build();
-    stack.set_size_request(0, -1);
-    let status = unresolved_image_label(&alt, source);
+    if !inline {
+        stack.set_size_request(0, -1);
+    }
+    let status = unresolved_image_label(&alt, source, sizing);
     stack.add_named(&status, Some("status"));
     stack.add_named(&picture, Some("image"));
     stack.set_visible_child_name("status");
@@ -810,7 +899,7 @@ fn remote_image_widget(
             source,
             &bytes,
             &image,
-            preferred_height,
+            sizing,
             ratio_frame.as_ref(),
         );
         return stack.upcast();
@@ -861,7 +950,7 @@ fn remote_image_widget(
                     &source,
                     &bytes,
                     &image,
-                    preferred_height,
+                    sizing,
                     ratio_frame.as_ref(),
                 );
                 gtk::glib::ControlFlow::Break
@@ -897,11 +986,11 @@ fn apply_image_bytes(
     source: &str,
     bytes: &[u8],
     image: &RenderedImageItem,
-    preferred_height: Option<i32>,
+    sizing: ImageSizing,
     ratio_frame: Option<&gtk::AspectFrame>,
 ) {
     if let Some(texture) = texture_from_bytes(bytes) {
-        apply_texture_to_picture(picture, &texture, image, preferred_height, ratio_frame);
+        apply_texture_to_picture(picture, &texture, image, sizing, ratio_frame);
         stack.set_visible_child_name("image");
     } else {
         status.set_label(&format!(
@@ -916,28 +1005,27 @@ fn apply_texture_to_picture(
     picture: &gtk::Picture,
     texture: &gdk::Texture,
     image: &RenderedImageItem,
-    preferred_height: Option<i32>,
+    sizing: ImageSizing,
     ratio_frame: Option<&gtk::AspectFrame>,
 ) {
     picture.set_paintable(Some(texture));
     if image_dimensions(image).is_some() {
-        apply_known_image_size(picture, image, preferred_height, ratio_frame);
+        apply_known_image_size(picture, image, sizing, ratio_frame);
     } else {
-        apply_texture_size_to_picture(picture, texture, preferred_height, ratio_frame);
+        apply_texture_size_to_picture(picture, texture, sizing, ratio_frame);
     }
 }
 
 fn apply_known_image_size(
     picture: &gtk::Picture,
     image: &RenderedImageItem,
-    preferred_height: Option<i32>,
+    sizing: ImageSizing,
     ratio_frame: Option<&gtk::AspectFrame>,
 ) {
-    if let Some(height) = preferred_height {
-        let width = image_dimensions(image)
-            .map(|(width, image_height)| ((height * width) / image_height).max(1))
-            .unwrap_or(-1);
-        picture.set_size_request(width, height);
+    if sizing == ImageSizing::InlineNatural {
+        if let Some((width, height)) = image_dimensions(image) {
+            picture.set_size_request(width.max(1), height.max(1));
+        }
     } else if let Some(frame) = ratio_frame {
         if let Some(ratio) = image_ratio(image) {
             frame.set_ratio(ratio);
@@ -954,14 +1042,13 @@ fn apply_known_image_size(
 fn apply_texture_size_to_picture(
     picture: &gtk::Picture,
     texture: &gdk::Texture,
-    preferred_height: Option<i32>,
+    sizing: ImageSizing,
     ratio_frame: Option<&gtk::AspectFrame>,
 ) {
     let width = texture.width().max(1);
     let height = texture.height().max(1);
-    if let Some(preferred_height) = preferred_height {
-        let preferred_width = ((preferred_height * width) / height).max(1);
-        picture.set_size_request(preferred_width, preferred_height);
+    if sizing == ImageSizing::InlineNatural {
+        picture.set_size_request(width, height);
         return;
     }
     if let Some(frame) = ratio_frame {
@@ -990,17 +1077,22 @@ fn image_ratio(image: &RenderedImageItem) -> Option<f32> {
     image_dimensions(image).map(|(width, height)| width as f32 / height as f32)
 }
 
-fn unresolved_image_label(alt: &str, detail: &str) -> gtk::Label {
+fn unresolved_image_label(alt: &str, detail: &str, sizing: ImageSizing) -> gtk::Label {
     let label_text = if alt.trim().is_empty() { detail } else { alt };
+    let inline = sizing == ImageSizing::InlineNatural;
     let label = gtk::Label::builder()
         .label(&format!("[image: {label_text}]"))
         .selectable(true)
-        .wrap(true)
+        .wrap(!inline)
         .wrap_mode(pango::WrapMode::WordChar)
         .natural_wrap_mode(gtk::NaturalWrapMode::Word)
         .xalign(0.0)
-        .hexpand(true)
-        .halign(gtk::Align::Fill)
+        .hexpand(!inline)
+        .halign(if inline {
+            gtk::Align::Start
+        } else {
+            gtk::Align::Fill
+        })
         .build();
     label.add_css_class("craic-markdown-img-unresolved");
     label
