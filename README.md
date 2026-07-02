@@ -1,9 +1,8 @@
 # Craic
 
-A sleek GNOME Vibe IDE & Agentic Development Environment built with GTK 4 and libadwaita.
+A development enviroment made by me for me :D
 
 <img width="1207" height="764" alt="image" src="https://github.com/user-attachments/assets/511380e1-a28e-42b3-b03c-7896885072ce" />
-
 
 Craic lets you develop code alongside autonomous AI agents (Codex, Antigravity, OpenCode, Ollama) with integrated Git workflow, an embedded terminal, and a syntax-highlighted code editor.
 
