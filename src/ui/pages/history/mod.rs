@@ -232,6 +232,10 @@ impl Page for HistoryPage {
         true
     }
 
+    fn toggle_right_search(&self) -> bool {
+        self.right.toggle_search()
+    }
+
     fn handle_command(&self, command: &PageCommand) -> PageCommandResult {
         match command {
             PageCommand::OpenCommit(hash) => {

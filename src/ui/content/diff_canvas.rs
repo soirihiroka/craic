@@ -67,6 +67,7 @@ struct DiffCanvasState {
     selection: RefCell<Option<DiffSelection>>,
     selection_drag: Cell<Option<DragSelection<DiffSelectionPoint>>>,
     active_side: Cell<DiffCanvasSide>,
+    search: RefCell<DiffSearchState>,
 }
 
 type DiffLayoutCache = diff_layout::Cache;
@@ -107,6 +108,21 @@ struct DiffSelectionPoint {
     byte: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiffSearchMatch {
+    side: DiffCanvasSide,
+    row: usize,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Default)]
+struct DiffSearchState {
+    query: String,
+    matches: Vec<DiffSearchMatch>,
+    active: Option<usize>,
+}
+
 #[derive(Clone, Copy)]
 enum DiffContextAction {
     Copy,
@@ -127,6 +143,7 @@ struct DiffCanvasTheme {
     fold_background: Color,
     fold_text: Color,
     selection_background: Color,
+    search_match_background: Color,
 }
 
 #[derive(Clone, Copy)]
@@ -196,6 +213,7 @@ impl DiffCanvas {
             selection: RefCell::new(None),
             selection_drag: Cell::new(None),
             active_side: Cell::new(DiffCanvasSide::Right),
+            search: RefCell::new(DiffSearchState::default()),
         });
 
         area.set_draw_func({
@@ -250,6 +268,7 @@ impl DiffCanvas {
             .set(self.state.layout_generation.get().wrapping_add(1).max(1));
         self.state.layout_cache.borrow_mut().take();
         self.state.layout_pending_signature.borrow_mut().take();
+        rebuild_search_matches(&self.area, &self.state);
         request_layout(&self.area, &self.state, &self.spinner);
         clamp_scroll(&self.area, &self.state);
         self.area.queue_draw();
@@ -274,6 +293,8 @@ impl DiffCanvas {
         self.state.syntax_signature.borrow_mut().take();
         self.state.selection.borrow_mut().take();
         self.state.selection_drag.set(None);
+        self.state.search.borrow_mut().matches.clear();
+        self.state.search.borrow_mut().active = None;
         self.state
             .layout_generation
             .set(self.state.layout_generation.get().wrapping_add(1).max(1));
@@ -297,6 +318,70 @@ impl DiffCanvas {
         F: Fn(usize) + 'static,
     {
         self.state.fold_callback.replace(Some(Rc::new(callback)));
+    }
+
+    pub(in crate::ui) fn focus(&self) {
+        self.area.grab_focus();
+    }
+
+    pub(in crate::ui) fn set_search_query(&self, query: &str) {
+        let changed = {
+            let mut search = self.state.search.borrow_mut();
+            if search.query == query {
+                false
+            } else {
+                search.query = query.to_string();
+                true
+            }
+        };
+        if changed {
+            rebuild_search_matches(&self.area, &self.state);
+        } else {
+            select_active_search_match(&self.area, &self.state);
+        }
+        self.area.queue_draw();
+    }
+
+    pub(in crate::ui) fn search_next(&self) {
+        let len = self.state.search.borrow().matches.len();
+        if len == 0 {
+            return;
+        }
+        {
+            let mut search = self.state.search.borrow_mut();
+            search.active = Some(search.active.map(|active| (active + 1) % len).unwrap_or(0));
+        }
+        select_active_search_match(&self.area, &self.state);
+        self.area.queue_draw();
+    }
+
+    pub(in crate::ui) fn search_previous(&self) {
+        let len = self.state.search.borrow().matches.len();
+        if len == 0 {
+            return;
+        }
+        {
+            let mut search = self.state.search.borrow_mut();
+            search.active = Some(
+                search
+                    .active
+                    .map(|active| active.checked_sub(1).unwrap_or(len - 1))
+                    .unwrap_or(len - 1),
+            );
+        }
+        select_active_search_match(&self.area, &self.state);
+        self.area.queue_draw();
+    }
+
+    pub(in crate::ui) fn search_status(&self) -> String {
+        let search = self.state.search.borrow();
+        if search.query.is_empty() {
+            return String::new();
+        }
+        let Some(active) = search.active else {
+            return "No Results".to_string();
+        };
+        format!("{} of {}", active + 1, search.matches.len())
     }
 }
 
@@ -501,6 +586,9 @@ fn request_layout(
                 state.layout_pending_signature.borrow_mut().take();
                 spinner.set_visible(false);
                 clamp_scroll(&area, &state);
+                if state.search.borrow().active.is_some() {
+                    select_active_search_match(&area, &state);
+                }
                 area.queue_draw();
                 gtk::glib::ControlFlow::Break
             }
@@ -724,6 +812,18 @@ fn draw_side(
     let selection = *state.selection.borrow();
     for (index, line) in lines.iter().enumerate() {
         let baseline = y + baseline_offset + index as f64 * line_height;
+        draw_search_matches(
+            area,
+            context,
+            state,
+            side,
+            row_index,
+            line,
+            text_x,
+            baseline - baseline_offset,
+            line_height,
+            theme,
+        );
         if let Some((selection_start, selection_end)) =
             selection_range_for_wrapped_line(selection, side, row_index, line)
         {
@@ -866,6 +966,57 @@ fn selection_range_for_wrapped_line(
     let row_end = if row == end.row { end.byte } else { usize::MAX };
     clipped_bounds(row_start, row_end, line.start, line.end)
         .map(|(start, end)| (start - line.start, end - line.start))
+}
+
+fn draw_search_matches(
+    area: &gtk::DrawingArea,
+    context: &cairo::Context,
+    state: &Rc<DiffCanvasState>,
+    side: DiffCanvasSide,
+    row_index: usize,
+    line: &WrappedLine,
+    text_x: f64,
+    y: f64,
+    line_height: f64,
+    theme: DiffCanvasTheme,
+) {
+    let search = state.search.borrow();
+    if search.query.is_empty() || search.matches.is_empty() {
+        return;
+    }
+
+    let mut index = search
+        .matches
+        .partition_point(|search_match| search_match.row < row_index);
+    while let Some(search_match) = search.matches.get(index) {
+        if search_match.row != row_index {
+            break;
+        }
+        index += 1;
+        if search_match.side != side {
+            continue;
+        }
+        let Some((start, end)) =
+            clipped_bounds(search_match.start, search_match.end, line.start, line.end)
+        else {
+            continue;
+        };
+        let relative_start = start.saturating_sub(line.start);
+        let relative_end = end.saturating_sub(line.start);
+        let prefix = line.text.get(..relative_start).unwrap_or_default();
+        let matched = line.text.get(relative_start..relative_end);
+        let Some(matched) = matched.filter(|matched| !matched.is_empty()) else {
+            continue;
+        };
+        fill_rect(
+            context,
+            text_x + cached_text_width_for_state(area, state, prefix),
+            y,
+            cached_text_width_for_state(area, state, matched).max(2.0),
+            line_height,
+            theme.search_match_background,
+        );
+    }
 }
 
 fn draw_side_background(
@@ -1745,6 +1896,145 @@ fn text_for_side(row: &FileDiffRow, side: DiffCanvasSide) -> Option<&str> {
     }
 }
 
+fn rebuild_search_matches(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+    let query = state.search.borrow().query.clone();
+    let matches = diff_search_matches(&state.rows.borrow(), &query);
+    {
+        let mut search = state.search.borrow_mut();
+        search.matches = matches;
+        search.active = (!search.matches.is_empty()).then_some(0);
+    }
+    select_active_search_match(area, state);
+}
+
+fn diff_search_matches(rows: &[FileDiffRow], query: &str) -> Vec<DiffSearchMatch> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        if is_fold_row(row) {
+            continue;
+        }
+        if let Some(text) = row.left_text.as_deref() {
+            push_text_search_matches(&mut matches, DiffCanvasSide::Left, row_index, text, query);
+        }
+        if let Some(text) = row.right_text.as_deref() {
+            push_text_search_matches(&mut matches, DiffCanvasSide::Right, row_index, text, query);
+        }
+    }
+    matches
+}
+
+fn push_text_search_matches(
+    matches: &mut Vec<DiffSearchMatch>,
+    side: DiffCanvasSide,
+    row: usize,
+    text: &str,
+    query: &str,
+) {
+    let (haystack, needle) = if query.is_ascii() {
+        (text.to_ascii_lowercase(), query.to_ascii_lowercase())
+    } else {
+        (text.to_string(), query.to_string())
+    };
+    let mut cursor = 0usize;
+    while cursor <= haystack.len() {
+        let Some(relative) = haystack[cursor..].find(&needle) else {
+            break;
+        };
+        let start = cursor + relative;
+        let end = start + needle.len();
+        if text.is_char_boundary(start) && text.is_char_boundary(end) {
+            matches.push(DiffSearchMatch {
+                side,
+                row,
+                start,
+                end,
+            });
+            cursor = end.max(start.saturating_add(1));
+        } else {
+            cursor = start.saturating_add(1).min(text.len());
+            while cursor < text.len() && !text.is_char_boundary(cursor) {
+                cursor += 1;
+            }
+        }
+    }
+}
+
+fn select_active_search_match(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+    let search_match = {
+        let search = state.search.borrow();
+        search
+            .active
+            .and_then(|active| search.matches.get(active).copied())
+    };
+    let Some(search_match) = search_match else {
+        area.queue_draw();
+        return;
+    };
+
+    state.active_side.set(search_match.side);
+    state.selection.replace(Some(DiffSelection {
+        anchor: DiffSelectionPoint {
+            side: search_match.side,
+            row: search_match.row,
+            byte: search_match.start,
+        },
+        focus: DiffSelectionPoint {
+            side: search_match.side,
+            row: search_match.row,
+            byte: search_match.end,
+        },
+    }));
+    ensure_search_match_visible(area, state, search_match);
+}
+
+fn ensure_search_match_visible(
+    area: &gtk::DrawingArea,
+    state: &Rc<DiffCanvasState>,
+    search_match: DiffSearchMatch,
+) {
+    let viewport_height = area.allocated_height().max(1) as f64;
+    let line_height = canvas::measure_font_metrics(area, state.font_size.get(), |font_size| {
+        (font_size + 9.0).ceil()
+    })
+    .line_height;
+    let Some((target_y, target_height)) = state
+        .layout_cache
+        .borrow()
+        .as_ref()
+        .and_then(|cache| search_match_visual_bounds(cache, search_match, line_height))
+    else {
+        return;
+    };
+
+    let scroll_y = state.scroll_y.get();
+    if target_y < scroll_y {
+        set_scroll_y(area, state, target_y);
+    } else if target_y + target_height > scroll_y + viewport_height {
+        set_scroll_y(area, state, target_y + target_height - viewport_height);
+    }
+}
+
+fn search_match_visual_bounds(
+    cache: &DiffLayoutCache,
+    search_match: DiffSearchMatch,
+    line_height: f64,
+) -> Option<(f64, f64)> {
+    let layout = cache.rows.get(search_match.row)?;
+    let lines = match search_match.side {
+        DiffCanvasSide::Left => &layout.left_lines,
+        DiffCanvasSide::Right => &layout.right_lines,
+    };
+    let visual_line = lines
+        .iter()
+        .position(|line| search_match.start < line.end && search_match.end > line.start)
+        .unwrap_or(0);
+    Some((layout.y + visual_line as f64 * line_height, line_height))
+}
+
 fn word_bounds_at_point(
     state: &Rc<DiffCanvasState>,
     point: DiffSelectionPoint,
@@ -1964,6 +2254,7 @@ fn theme_for(area: &gtk::DrawingArea) -> DiffCanvasTheme {
             deleted_text: Color::rgba(0.92, 0.42, 0.46, 1.0),
             fold_background: Color::rgba(0.14, 0.14, 0.16, 1.0),
             fold_text: Color::rgba(0.62, 0.66, 0.72, 1.0),
+            search_match_background: Color::rgba(0.75, 0.56, 0.12, 0.36),
             selection_background: Color::rgba(0.26, 0.43, 0.68, 0.42),
         }
     } else {
@@ -1979,6 +2270,7 @@ fn theme_for(area: &gtk::DrawingArea) -> DiffCanvasTheme {
             deleted_text: Color::rgba(0.62, 0.16, 0.18, 1.0),
             fold_background: Color::rgba(0.90, 0.92, 0.95, 1.0),
             fold_text: Color::rgba(0.30, 0.34, 0.40, 1.0),
+            search_match_background: Color::rgba(1.0, 0.78, 0.22, 0.42),
             selection_background: Color::rgba(0.48, 0.66, 0.92, 0.42),
         }
     }

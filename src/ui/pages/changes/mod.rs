@@ -561,6 +561,10 @@ impl Page for ChangesPage {
         true
     }
 
+    fn toggle_right_search(&self) -> bool {
+        self.right.toggle_search()
+    }
+
     fn handle_command(&self, command: &PageCommand) -> PageCommandResult {
         match command {
             PageCommand::ClearSelection => {
