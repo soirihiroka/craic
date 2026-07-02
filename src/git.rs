@@ -620,7 +620,16 @@ fn conflicted_files(repo_path: &Path) -> Vec<String> {
 
 pub fn pull(path: &Path) -> Result<String, String> {
     switch_github_auth_for_workspace(path)?;
-    match run_git(path, &["pull", "--rebase"]) {
+    match run_git(
+        path,
+        &[
+            "-c",
+            "rebase.backend=merge",
+            "pull",
+            "--ff",
+            "--recurse-submodules",
+        ],
+    ) {
         Ok(output) => Ok(output),
         Err(err) => {
             let conflicts = conflicted_files(path);
@@ -633,11 +642,11 @@ pub fn pull(path: &Path) -> Result<String, String> {
                     .collect::<Vec<_>>()
                     .join("\n");
                 Err(format!(
-                    "Pull failed due to merge conflicts in the following files:\n\n{file_list}\n\nNote: The pull/rebase was aborted automatically to keep your repository in a safe state."
+                    "Pull failed due to merge conflicts in the following files:\n\n{file_list}\n\nNote: The pull operation was aborted automatically to keep your repository in a safe state."
                 ))
             } else {
                 Err(format!(
-                    "{err}\n\nNote: The pull/rebase was aborted automatically to keep your repository in a safe state."
+                    "{err}\n\nNote: The pull operation was aborted automatically to keep your repository in a safe state."
                 ))
             }
         }

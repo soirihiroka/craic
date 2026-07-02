@@ -1,6 +1,7 @@
 use super::{PreviewMatchRequest, PreviewRequest};
 use crate::git;
 use crate::language_support::SyntaxHighlighter;
+use crate::ui::components::markdown_preview::MarkdownPreviewDocument;
 use gtk::gio;
 use gtk::prelude::*;
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, html};
@@ -212,8 +213,7 @@ type SourceOffsetCallback = Rc<dyn Fn(usize)>;
 
 struct MarkdownPreviewLoad {
     text: String,
-    html: String,
-    content_signature: super::ContentSignature,
+    document: MarkdownPreviewDocument,
     comparison: Option<git::FileComparison>,
     markdown_lint_issues: Vec<crate::markdown_lint::MarkdownLintIssue>,
     spellcheck_issues: Vec<crate::spellcheck::SpellcheckIssue>,
@@ -340,8 +340,6 @@ fn show_markdown(request: PreviewRequest<'_>, selection: Option<(usize, usize)>)
         file_path.clone(),
         move || {
             super::super::repository_text_from_prefetch(prefetched_bytes, &file_path).map(|text| {
-                let content_signature = super::content_signature(text.as_bytes());
-                let html = markdown_to_html(&text);
                 let comparison = git.as_ref().and_then(|git| git.comparison(&file_path).ok());
                 let allowlist = crate::spellcheck::manifest_allowlist_from_texts(&[(
                     &file_path,
@@ -359,10 +357,10 @@ fn show_markdown(request: PreviewRequest<'_>, selection: Option<(usize, usize)>)
                     );
                 let markdown_lint_issues =
                     crate::markdown_lint::check_document(Some(&file_path), &text, &ignored_rules);
+                let document = MarkdownPreviewDocument::parse(&text);
                 MarkdownPreviewLoad {
                     text,
-                    html,
-                    content_signature,
+                    document,
                     comparison,
                     markdown_lint_issues,
                     spellcheck_issues,
@@ -386,14 +384,12 @@ fn show_markdown(request: PreviewRequest<'_>, selection: Option<(usize, usize)>)
                         .file_view_split
                         .set_end_child(Some(&right.file_markdown_status));
                 } else {
-                    right.file_markdown_preview.set_markdown_html(
-                        &load.html,
-                        load.content_signature,
-                        local_path.as_deref(),
-                    );
                     right
                         .file_markdown_preview
-                        .set_source_offset(right.file_editor.source_offset_at_scroll_top());
+                        .set_document_with_base_path(load.document, local_path.as_deref());
+                    let _ = right
+                        .file_markdown_preview
+                        .scroll_to_source_offset(right.file_editor.source_offset_at_scroll_top());
                     right
                         .file_view_split
                         .set_end_child(Some(&right.file_markdown_preview.root));

@@ -13,6 +13,7 @@ use crate::system::capabilities::files::{
 };
 use crate::system::path::ProviderKind;
 use crate::system::{FileNodePath, WorkspacePath, WorkspaceRef};
+use crate::ui::components::markdown_preview::MarkdownPreviewDocument;
 use crate::ui::content::code_editor;
 use crate::ui::file_type;
 use crate::ui::sidebar::file_browser::ContainerFileAction;
@@ -473,7 +474,7 @@ impl FilePage {
                         let text = file_editor.document_text();
                         refresh_live_file_preview(
                             &ctx,
-                            &right,
+                            right.clone(),
                             &displayed_preview,
                             &preview_node_path,
                             &preview_file_path,
@@ -874,7 +875,7 @@ fn repository_item_line_column_selection(
 
 fn refresh_live_file_preview(
     ctx: &PageContext,
-    right: &right::RightPane,
+    right: Rc<right::RightPane>,
     displayed_preview: &DisplayedPreviewState,
     node_path: &FileNodePath,
     file_path: &str,
@@ -888,22 +889,18 @@ fn refresh_live_file_preview(
                 right
                     .file_view_split
                     .set_end_child(Some(&right.file_markdown_status));
+                set_live_displayed_preview(displayed_preview, node_path, signature);
             } else {
-                let html = provider::markdown::markdown_to_html(text);
-                let local_path = local_workspace_path(ctx, node_path);
-                right.file_markdown_preview.set_markdown_html(
-                    &html,
+                refresh_live_markdown_preview(
+                    ctx,
+                    right,
+                    displayed_preview,
+                    node_path,
+                    file_path,
+                    text,
                     signature,
-                    local_path.as_deref(),
                 );
-                right
-                    .file_markdown_preview
-                    .set_source_offset(right.file_editor.source_offset_at_scroll_top());
-                right
-                    .file_view_split
-                    .set_end_child(Some(&right.file_markdown_preview.root));
             }
-            set_live_displayed_preview(displayed_preview, node_path, signature);
             log::debug!("refreshed live markdown preview file_path={file_path}");
         }
         file_type::PreviewKind::Svg => {
@@ -916,6 +913,67 @@ fn refresh_live_file_preview(
         }
         _ => {}
     }
+}
+
+fn refresh_live_markdown_preview(
+    ctx: &PageContext,
+    right: Rc<right::RightPane>,
+    displayed_preview: &DisplayedPreviewState,
+    node_path: &FileNodePath,
+    file_path: &str,
+    text: &str,
+    signature: provider::ContentSignature,
+) {
+    let local_path = local_workspace_path(ctx, node_path);
+    let node_path = node_path.clone();
+    let file_path = file_path.to_string();
+    let text = text.to_string();
+    let displayed_preview = displayed_preview.clone();
+    let (sender, receiver) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let document = MarkdownPreviewDocument::parse(&text);
+        let _ = sender.send(document);
+    });
+
+    gtk::glib::timeout_add_local(FILE_EVENT_POLL_INTERVAL, move || {
+        match receiver.try_recv() {
+            Ok(document) => {
+                if right.file_editor_path.borrow().as_ref() != Some(&node_path) {
+                    log::debug!(
+                        "skip stale live markdown preview path changed file_path={file_path}"
+                    );
+                    return gtk::glib::ControlFlow::Break;
+                }
+
+                let current_signature =
+                    provider::content_signature(right.file_editor.document_text().as_bytes());
+                if current_signature != signature {
+                    log::debug!(
+                        "skip stale live markdown preview content changed file_path={file_path}"
+                    );
+                    return gtk::glib::ControlFlow::Break;
+                }
+
+                right
+                    .file_markdown_preview
+                    .set_document_with_base_path(document, local_path.as_deref());
+                let _ = right
+                    .file_markdown_preview
+                    .scroll_to_source_offset(right.file_editor.source_offset_at_scroll_top());
+                right
+                    .file_view_split
+                    .set_end_child(Some(&right.file_markdown_preview.root));
+                set_live_displayed_preview(&displayed_preview, &node_path, signature);
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                log::warn!("live markdown preview parse did not return file_path={file_path}");
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn set_live_displayed_preview(

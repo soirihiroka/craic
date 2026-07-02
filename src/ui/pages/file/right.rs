@@ -4,6 +4,7 @@ use crate::git::FileComparison;
 use crate::markdown_lint::MarkdownLintIssue;
 use crate::spellcheck::SpellcheckIssue;
 use crate::system::FileNodePath;
+use crate::ui::components::markdown_preview::MarkdownPreview as AdwMarkdownPreview;
 use crate::ui::content::{binary_preview, code_editor, folder_view};
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -29,8 +30,7 @@ pub(super) struct RightPane {
     pub(in crate::ui::pages::file) file_editor_writable: Rc<Cell<bool>>,
     pub(in crate::ui::pages::file) file_view_split: gtk::Paned,
     pub(in crate::ui::pages::file) file_svg_preview: Rc<super::provider::svg::SvgPreview>,
-    pub(in crate::ui::pages::file) file_markdown_preview:
-        Rc<super::provider::markdown::MarkdownPreview>,
+    pub(in crate::ui::pages::file) file_markdown_preview: Rc<AdwMarkdownPreview>,
     pub(in crate::ui::pages::file) file_markdown_status: gtk::Box,
     pub(in crate::ui::pages::file) file_media_preview: Rc<super::provider::media::MediaPreview>,
     pub(in crate::ui::pages::file) file_notebook_preview:
@@ -71,7 +71,7 @@ impl RightPane {
         let editor_loading = loading_screen("Loading file preview...");
 
         let file_svg_preview = super::provider::svg::SvgPreview::new();
-        let file_markdown_preview = super::provider::markdown::MarkdownPreview::new();
+        let file_markdown_preview = AdwMarkdownPreview::new();
         let markdown_status_label = gtk::Label::builder()
             .label("No markdown preview.")
             .halign(gtk::Align::Center)
@@ -452,9 +452,11 @@ pub(in crate::ui::pages::file) fn loading_screen_with_label(label: &gtk::Label) 
 
 fn install_markdown_scroll_sync(
     editor: &code_editor::CodeEditor,
-    preview: &Rc<super::provider::markdown::MarkdownPreview>,
+    preview: &Rc<AdwMarkdownPreview>,
 ) {
     let updating_editor = Rc::new(Cell::new(false));
+
+    let preview_adjustment = preview.root.vadjustment();
 
     editor.connect_scroll_changed({
         let editor = editor.clone();
@@ -465,15 +467,19 @@ fn install_markdown_scroll_sync(
                 return;
             }
 
-            preview.set_source_offset(editor.source_offset_at_scroll_top());
+            let _ = preview.scroll_to_source_offset(editor.source_offset_at_scroll_top());
         }
     });
 
-    preview.connect_source_offset_changed({
+    preview_adjustment.connect_value_changed({
         let editor = editor.clone();
-        move |offset| {
+        let preview = Rc::clone(preview);
+        let updating_editor = Rc::clone(&updating_editor);
+        move |_| {
             updating_editor.set(true);
-            editor.set_source_offset_at_scroll_top(offset);
+            if let Some(offset) = preview.source_offset_at_viewport_top() {
+                editor.set_source_offset_at_scroll_top(offset);
+            }
             updating_editor.set(false);
         }
     });
