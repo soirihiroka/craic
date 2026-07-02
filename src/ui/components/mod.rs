@@ -1,4 +1,5 @@
 pub(crate) mod context_menu;
+pub(crate) mod markdown_preview;
 pub(crate) mod search;
 pub(crate) mod tabbed_picker;
 pub(crate) mod terminal;

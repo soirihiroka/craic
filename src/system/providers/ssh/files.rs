@@ -1,9 +1,12 @@
 use super::{SshCommandRunner, remote_workspace_path, shell_quote, workspace_path_for_remote};
 use crate::gitignore;
 use crate::system::capabilities::files::{
-    DirectoryListing, FileAccess, FileKind, FileNodeCapabilities, FileNodeInfo,
-    FileOperationCallback, FileRead, FileSearchMatch, FileSearchOutput, FileSearchQuery,
-    FileSignature, FileWatchCallback, FileWatchRequest, FileWatchSubscription,
+    DirectoryListing, FileAccess, FileCopyRequest, FileDeleteRequest, FileKind, FileMoveRequest,
+    FileNodeCapabilities, FileNodeInfo, FileOperation, FileOperationCallback, FileOperationError,
+    FileOperationErrorKind, FileOperationEvent, FileOperationProgress, FileRead, FileReadRequest,
+    FileSearchMatch, FileSearchOutput, FileSearchQuery, FileSignature, FileWatchCallback,
+    FileWatchRequest, FileWatchSubscription, FileWriteMode, FileWritePayload, FileWriteRequest,
+    file_operation_canceled,
 };
 use crate::system::path::{ArchiveFormat, FileNodePath, SystemRef, WorkspacePath, WorkspaceRef};
 use serde::Deserialize;
@@ -186,10 +189,388 @@ impl SshFileAccess {
         }
     }
 
-    fn delete_sync(&self, path: &FileNodePath) -> Result<(), String> {
-        let resolved = self.resolve_native_node(path, "delete")?;
+    fn operation_error(
+        operation: FileOperation,
+        kind: FileOperationErrorKind,
+        source: Option<FileNodePath>,
+        destination: Option<FileNodePath>,
+        message: impl Into<String>,
+    ) -> FileOperationError {
+        FileOperationError::from_message(operation, kind, source, destination, message)
+    }
+
+    fn remote_error(
+        operation: FileOperation,
+        source: Option<FileNodePath>,
+        destination: Option<FileNodePath>,
+        message: impl Into<String>,
+    ) -> FileOperationError {
+        let message = message.into();
+        let kind = if message.contains("CRAIC-ERROR\talready-exists") {
+            FileOperationErrorKind::AlreadyExists
+        } else if message.contains("CRAIC-ERROR\tnot-found") {
+            FileOperationErrorKind::NotFound
+        } else if message.contains("Permission denied") {
+            FileOperationErrorKind::PermissionDenied
+        } else {
+            FileOperationErrorKind::Remote
+        };
+        let message = message
+            .lines()
+            .find(|line| !line.starts_with("CRAIC-ERROR\t"))
+            .unwrap_or(&message)
+            .to_string();
+        Self::operation_error(operation, kind, source, destination, message)
+    }
+
+    fn canceled_error(operation: FileOperation, source: &FileNodePath) -> FileOperationError {
+        FileOperationError::canceled(operation).with_source(source.clone())
+    }
+
+    fn check_canceled(
+        operation: FileOperation,
+        source: &FileNodePath,
+        request: &Option<crate::system::capabilities::files::FileCancellation>,
+    ) -> Result<(), FileOperationError> {
+        if file_operation_canceled(request) {
+            Err(Self::canceled_error(operation, source))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn emit_progress<T>(callback: &FileOperationCallback<T>, progress: FileOperationProgress) {
+        callback(FileOperationEvent::Progress(progress));
+    }
+
+    fn read_with_info_sync(
+        &self,
+        request: &FileReadRequest,
+        callback: &FileOperationCallback<FileRead>,
+    ) -> Result<FileRead, FileOperationError> {
+        let operation = FileOperation::Read;
+        Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
+        let resolved = self
+            .resolve_native_node(&request.path, "read_with_info")
+            .map_err(|err| {
+                Self::operation_error(
+                    operation,
+                    FileOperationErrorKind::OutsideWorkspace,
+                    Some(request.path.clone()),
+                    None,
+                    err,
+                )
+            })?;
+        let script = shell_read_with_info_script(&resolved.remote_path, request.max_bytes);
+        let output = self
+            .runner
+            .run_script("read file node with info", &script)
+            .map_err(|err| Self::remote_error(operation, Some(request.path.clone()), None, err))?;
+        let read = parse_read_output(self, resolved.path, output.stdout).map_err(|err| {
+            Self::operation_error(
+                operation,
+                FileOperationErrorKind::Protocol,
+                Some(request.path.clone()),
+                None,
+                err,
+            )
+        })?;
+        if let Some(bytes) = read.bytes.as_ref() {
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.path.clone()),
+                    current_path: Some(request.path.clone()),
+                    completed_bytes: bytes.len() as u64,
+                    total_bytes: read.info.len_or_zero(),
+                    completed_files: 1,
+                    total_files: 1,
+                    destination: None,
+                },
+            );
+        }
+        Ok(read)
+    }
+
+    fn write_node_sync(
+        &self,
+        request: &FileWriteRequest,
+        callback: &FileOperationCallback<()>,
+    ) -> Result<(), FileOperationError> {
+        let operation = FileOperation::Write;
+        Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
+        let resolved = self
+            .resolve_native_node(&request.path, "write_node")
+            .map_err(|err| {
+                Self::operation_error(
+                    operation,
+                    FileOperationErrorKind::OutsideWorkspace,
+                    Some(request.path.clone()),
+                    None,
+                    err,
+                )
+            })?;
+        if matches!(request.payload, FileWritePayload::Directory) {
+            if request.mode != FileWriteMode::CreateNew {
+                return Err(Self::operation_error(
+                    operation,
+                    FileOperationErrorKind::Unsupported,
+                    Some(request.path.clone()),
+                    None,
+                    "Directories can only be created with create-new mode.",
+                ));
+            }
+            let script = format!("mkdir -- {}", shell_quote(&resolved.remote_path));
+            self.runner
+                .run_script("create directory", &script)
+                .map_err(|err| {
+                    Self::remote_error(operation, Some(request.path.clone()), None, err)
+                })?;
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.path.clone()),
+                    destination: Some(request.path.clone()),
+                    current_path: Some(request.path.clone()),
+                    completed_files: 1,
+                    total_files: 1,
+                    ..FileOperationProgress::new(operation)
+                },
+            );
+            return Ok(());
+        }
+
+        let FileWritePayload::File(contents) = &request.payload else {
+            unreachable!();
+        };
+        let script = match request.mode {
+            FileWriteMode::CreateNew => format!(
+                "p={}; (set -C; cat > \"$p\")",
+                shell_quote(&resolved.remote_path)
+            ),
+            FileWriteMode::Replace => format!("cat > {}", shell_quote(&resolved.remote_path)),
+        };
+        self.runner
+            .run_script_with_stdin("write file", &script, Some(contents))
+            .map_err(|err| Self::remote_error(operation, Some(request.path.clone()), None, err))?;
+        Self::emit_progress(
+            callback,
+            FileOperationProgress {
+                operation,
+                source: Some(request.path.clone()),
+                destination: Some(request.path.clone()),
+                current_path: Some(request.path.clone()),
+                completed_bytes: contents.len() as u64,
+                total_bytes: contents.len() as u64,
+                completed_files: 1,
+                total_files: 1,
+            },
+        );
+        Ok(())
+    }
+
+    fn copy_node_sync(
+        &self,
+        request: &FileCopyRequest,
+        callback: &FileOperationCallback<FileNodePath>,
+    ) -> Result<FileNodePath, FileOperationError> {
+        let operation = FileOperation::Copy;
+        Self::check_canceled(operation, &request.source, &request.cancel_requested)?;
+        let source = self
+            .resolve_native_node(&request.source, "copy_source")
+            .map_err(|err| {
+                Self::operation_error(
+                    operation,
+                    FileOperationErrorKind::OutsideWorkspace,
+                    Some(request.source.clone()),
+                    Some(request.destination.clone()),
+                    err,
+                )
+            })?;
+        let destination = self
+            .resolve_native_node(&request.destination, "copy_destination")
+            .map_err(|err| {
+                Self::operation_error(
+                    operation,
+                    FileOperationErrorKind::OutsideWorkspace,
+                    Some(request.source.clone()),
+                    Some(request.destination.clone()),
+                    err,
+                )
+            })?;
+        if request.source == request.destination {
+            return Err(Self::operation_error(
+                operation,
+                FileOperationErrorKind::AlreadyExists,
+                Some(request.source.clone()),
+                Some(request.destination.clone()),
+                format!("{} already exists.", request.destination.display()),
+            ));
+        }
+        let script = format!(
+            r#"src={}
+dst={}
+if [ -e "$dst" ] || [ -L "$dst" ]; then
+  printf 'CRAIC-ERROR\talready-exists\t%s\n' "$dst" >&2
+  printf '%s already exists.\n' "$dst" >&2
+  exit 17
+fi
+cp -a -- "$src" "$dst""#,
+            shell_quote(&source.remote_path),
+            shell_quote(&destination.remote_path)
+        );
+        self.runner
+            .run_script("copy path", &script)
+            .map_err(|err| {
+                Self::remote_error(
+                    operation,
+                    Some(request.source.clone()),
+                    Some(request.destination.clone()),
+                    err,
+                )
+            })?;
+        Self::emit_progress(
+            callback,
+            FileOperationProgress {
+                operation,
+                source: Some(request.source.clone()),
+                destination: Some(request.destination.clone()),
+                current_path: Some(request.destination.clone()),
+                completed_files: 1,
+                total_files: 1,
+                ..FileOperationProgress::new(operation)
+            },
+        );
+        Ok(request.destination.clone())
+    }
+
+    fn move_node_sync(
+        &self,
+        request: &FileMoveRequest,
+        callback: &FileOperationCallback<FileNodePath>,
+    ) -> Result<FileNodePath, FileOperationError> {
+        let operation = FileOperation::Move;
+        Self::check_canceled(operation, &request.source, &request.cancel_requested)?;
+        validate_child_name(&request.new_name).map_err(|err| {
+            Self::operation_error(
+                operation,
+                FileOperationErrorKind::InvalidName,
+                Some(request.source.clone()),
+                Some(request.destination()),
+                err,
+            )
+        })?;
+        let source = self
+            .resolve_native_node(&request.source, "move_source")
+            .map_err(|err| {
+                Self::operation_error(
+                    operation,
+                    FileOperationErrorKind::OutsideWorkspace,
+                    Some(request.source.clone()),
+                    Some(request.destination()),
+                    err,
+                )
+            })?;
+        let destination_path = request.destination();
+        if request.source == destination_path {
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.source.clone()),
+                    destination: Some(destination_path.clone()),
+                    current_path: Some(destination_path.clone()),
+                    completed_files: 1,
+                    total_files: 1,
+                    ..FileOperationProgress::new(operation)
+                },
+            );
+            return Ok(destination_path);
+        }
+        let destination = self
+            .resolve_native_node(&destination_path, "move_destination")
+            .map_err(|err| {
+                Self::operation_error(
+                    operation,
+                    FileOperationErrorKind::OutsideWorkspace,
+                    Some(request.source.clone()),
+                    Some(destination_path.clone()),
+                    err,
+                )
+            })?;
+        let script = format!(
+            r#"src={}
+dst={}
+if [ -e "$dst" ] || [ -L "$dst" ]; then
+  printf 'CRAIC-ERROR\talready-exists\t%s\n' "$dst" >&2
+  printf '%s already exists.\n' "$dst" >&2
+  exit 17
+fi
+mv -- "$src" "$dst""#,
+            shell_quote(&source.remote_path),
+            shell_quote(&destination.remote_path)
+        );
+        self.runner
+            .run_script("move path", &script)
+            .map_err(|err| {
+                Self::remote_error(
+                    operation,
+                    Some(request.source.clone()),
+                    Some(destination_path.clone()),
+                    err,
+                )
+            })?;
+        Self::emit_progress(
+            callback,
+            FileOperationProgress {
+                operation,
+                source: Some(request.source.clone()),
+                destination: Some(destination_path.clone()),
+                current_path: Some(destination_path.clone()),
+                completed_files: 1,
+                total_files: 1,
+                ..FileOperationProgress::new(operation)
+            },
+        );
+        Ok(destination_path)
+    }
+
+    fn delete_sync(
+        &self,
+        request: &FileDeleteRequest,
+        callback: &FileOperationCallback<()>,
+    ) -> Result<(), FileOperationError> {
+        let operation = FileOperation::Delete;
+        Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
+        let resolved = self
+            .resolve_native_node(&request.path, "delete")
+            .map_err(|err| {
+                Self::operation_error(
+                    operation,
+                    FileOperationErrorKind::OutsideWorkspace,
+                    Some(request.path.clone()),
+                    None,
+                    err,
+                )
+            })?;
         let script = format!("rm -rf -- {}", shell_quote(&resolved.remote_path));
-        self.runner.run_script("delete path", &script).map(|_| ())
+        self.runner
+            .run_script("delete path", &script)
+            .map_err(|err| Self::remote_error(operation, Some(request.path.clone()), None, err))?;
+        Self::emit_progress(
+            callback,
+            FileOperationProgress {
+                operation,
+                source: Some(request.path.clone()),
+                current_path: Some(request.path.clone()),
+                completed_files: 1,
+                total_files: 1,
+                ..FileOperationProgress::new(operation)
+            },
+        );
+        Ok(())
     }
 }
 
@@ -317,77 +698,72 @@ impl FileAccess for SshFileAccess {
         Ok(listings)
     }
 
-    fn read_with_info(
-        &self,
-        path: &FileNodePath,
-        max_bytes: Option<u64>,
-    ) -> Result<FileRead, String> {
-        let resolved = self.resolve_native_node(path, "read_with_info")?;
-        let script = shell_read_with_info_script(&resolved.remote_path, max_bytes);
-        let output = self
-            .runner
-            .run_script("read file node with info", &script)?;
-        parse_read_output(self, resolved.path, output.stdout)
-    }
-
-    fn write_bytes(&self, path: &FileNodePath, contents: &[u8]) -> Result<(), String> {
-        let resolved = self.resolve_native_node(path, "write_bytes")?;
-        let script = format!("cat > {}", shell_quote(&resolved.remote_path));
-        self.runner
-            .run_script_with_stdin("write file", &script, Some(contents))
-            .map(|_| ())
-    }
-
-    fn write_text(&self, path: &FileNodePath, contents: &str) -> Result<(), String> {
-        self.write_bytes(path, contents.as_bytes())
-    }
-
-    fn create_file(&self, parent: &FileNodePath, name: &str) -> Result<FileNodePath, String> {
-        validate_child_name(name)?;
-        let path = parent.join_child(name);
-        let resolved = self.resolve_native_node(&path, "create_file")?;
-        let script = format!(
-            "p={}; (set -C; : > \"$p\")",
-            shell_quote(&resolved.remote_path)
-        );
-        self.runner.run_script("create file", &script).map(|_| path)
-    }
-
-    fn create_dir(&self, parent: &FileNodePath, name: &str) -> Result<FileNodePath, String> {
-        validate_child_name(name)?;
-        let path = parent.join_child(name);
-        let resolved = self.resolve_native_node(&path, "create_dir")?;
-        let script = format!("mkdir -- {}", shell_quote(&resolved.remote_path));
-        self.runner
-            .run_script("create directory", &script)
-            .map(|_| path)
-    }
-
-    fn rename(
-        &self,
-        source: &FileNodePath,
-        destination_parent: &FileNodePath,
-        new_name: &str,
-    ) -> Result<FileNodePath, String> {
-        validate_child_name(new_name)?;
-        let source = self.resolve_native_node(source, "rename_source")?;
-        let destination = destination_parent.join_child(new_name);
-        let destination_resolved = self.resolve_native_node(&destination, "rename_destination")?;
-        let script = format!(
-            "[ ! -e {dst} ] && mv -- {src} {dst}",
-            src = shell_quote(&source.remote_path),
-            dst = shell_quote(&destination_resolved.remote_path)
-        );
-        self.runner
-            .run_script("rename path", &script)
-            .map(|_| destination)
-    }
-
-    fn delete(&self, path: FileNodePath, callback: FileOperationCallback) {
+    fn read_with_info(&self, request: FileReadRequest, callback: FileOperationCallback<FileRead>) {
         let access = self.clone();
         thread::spawn(move || {
-            log::info!("ssh file delete worker start path={}", path.display());
-            callback(access.delete_sync(&path));
+            log::info!(
+                "ssh file read worker start path={} max_bytes={:?}",
+                request.path.display(),
+                request.max_bytes
+            );
+            let result = access.read_with_info_sync(&request, &callback);
+            callback(FileOperationEvent::Finished(result));
+        });
+    }
+
+    fn write_node(&self, request: FileWriteRequest, callback: FileOperationCallback<()>) {
+        let access = self.clone();
+        thread::spawn(move || {
+            let payload_label = match &request.payload {
+                FileWritePayload::File(contents) => format!("file bytes={}", contents.len()),
+                FileWritePayload::Directory => "directory".to_string(),
+            };
+            log::info!(
+                "ssh file write worker start path={} payload={}",
+                request.path.display(),
+                payload_label
+            );
+            let result = access.write_node_sync(&request, &callback);
+            callback(FileOperationEvent::Finished(result));
+        });
+    }
+
+    fn copy_node(&self, request: FileCopyRequest, callback: FileOperationCallback<FileNodePath>) {
+        let access = self.clone();
+        thread::spawn(move || {
+            log::info!(
+                "ssh file copy worker start source={} destination={}",
+                request.source.display(),
+                request.destination.display()
+            );
+            let result = access.copy_node_sync(&request, &callback);
+            callback(FileOperationEvent::Finished(result));
+        });
+    }
+
+    fn move_node(&self, request: FileMoveRequest, callback: FileOperationCallback<FileNodePath>) {
+        let access = self.clone();
+        thread::spawn(move || {
+            log::info!(
+                "ssh file move worker start source={} destination_parent={} new_name={}",
+                request.source.display(),
+                request.destination_parent.display(),
+                request.new_name
+            );
+            let result = access.move_node_sync(&request, &callback);
+            callback(FileOperationEvent::Finished(result));
+        });
+    }
+
+    fn delete(&self, request: FileDeleteRequest, callback: FileOperationCallback<()>) {
+        let access = self.clone();
+        thread::spawn(move || {
+            log::info!(
+                "ssh file delete worker start path={}",
+                request.path.display()
+            );
+            let result = access.delete_sync(&request, &callback);
+            callback(FileOperationEvent::Finished(result));
         });
     }
 

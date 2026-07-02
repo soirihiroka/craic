@@ -1,6 +1,9 @@
 use super::{BrowserTarget, FileBrowser, should_skip};
 use crate::system::FileNodePath;
-use crate::system::capabilities::files::{FileAccess, FileKind};
+use crate::system::capabilities::files::{
+    FileAccess, FileCopyRequest, FileKind, FileMoveRequest, FileOperationEvent,
+    FileOperationProgress,
+};
 use crate::system::capabilities::open::{DesktopOpenActivation, DesktopOpenTargetKind};
 use adw::prelude::*;
 use gtk::gdk;
@@ -202,7 +205,7 @@ impl FileBrowser {
                 sources,
                 target_folder,
                 operation,
-                &cancel_requested,
+                cancel_requested,
                 move |progress| {
                     let _ = progress_sender.send(TransferEvent::Progress(progress));
                 },
@@ -689,14 +692,14 @@ fn transfer_workspace_paths(
     sources: Vec<FileNodePath>,
     target_folder: FileNodePath,
     operation: TransferOperation,
-    cancel_requested: &AtomicBool,
+    cancel_requested: Arc<AtomicBool>,
     mut progress: impl FnMut(TransferProgressUpdate),
 ) -> Result<Vec<FileNodePath>, String> {
     let mut destinations = Vec::new();
     let total_files = sources.len() as u64;
     let mut copied_files = 0u64;
     for source in sources {
-        check_transfer_canceled(cancel_requested)?;
+        check_transfer_canceled(cancel_requested.as_ref())?;
         let name = file_name_for_transfer(&source)?;
         let destination = target_folder.join_child(&name);
         if source == destination {
@@ -705,18 +708,18 @@ fn transfer_workspace_paths(
         if file_access.info(&destination).is_ok() {
             return Err(format!("{} already exists.", destination.display()));
         }
-        match operation {
-            TransferOperation::Copy => copy_workspace_entry(
-                file_access.clone(),
-                &source,
-                &destination,
-                cancel_requested,
-                &mut progress,
-            )?,
-            TransferOperation::Move => {
-                file_access.rename(&source, &target_folder, &name)?;
-            }
-        }
+        run_transfer_file_operation(
+            file_access.clone(),
+            operation,
+            source.clone(),
+            target_folder.clone(),
+            name,
+            destination.clone(),
+            cancel_requested.clone(),
+            copied_files,
+            total_files,
+            &mut progress,
+        )?;
         copied_files = copied_files.saturating_add(1);
         progress(TransferProgressUpdate {
             current_path: Some(destination.clone()),
@@ -730,68 +733,80 @@ fn transfer_workspace_paths(
     Ok(destinations)
 }
 
-fn copy_workspace_entry(
+fn run_transfer_file_operation(
     file_access: Arc<dyn FileAccess>,
-    source: &FileNodePath,
-    destination: &FileNodePath,
-    cancel_requested: &AtomicBool,
+    operation: TransferOperation,
+    source: FileNodePath,
+    target_folder: FileNodePath,
+    name: String,
+    destination: FileNodePath,
+    cancel_requested: Arc<AtomicBool>,
+    completed_before: u64,
+    total_files: u64,
     progress: &mut impl FnMut(TransferProgressUpdate),
-) -> Result<(), String> {
-    check_transfer_canceled(cancel_requested)?;
-    let info = file_access.info(source)?;
-    match info.kind {
-        FileKind::Directory => {
-            let parent = destination
-                .parent()
-                .ok_or_else(|| "Cannot copy over workspace root.".to_string())?;
-            let name = destination
-                .file_name()
-                .ok_or_else(|| "Cannot copy over workspace root.".to_string())?;
-            file_access.create_dir(&parent, name)?;
-            progress(TransferProgressUpdate {
-                current_path: Some(destination.clone()),
-                copied_bytes: 0,
-                total_bytes: 0,
-                copied_files: 0,
-                total_files: 0,
-            });
-            let entries = file_access
-                .list_dirs(std::slice::from_ref(source))?
-                .into_iter()
-                .next()
-                .map(|listing| listing.entries)
-                .unwrap_or_default();
-            for child_source in entries {
-                let Some(name) = child_source.file_name().map(ToString::to_string) else {
-                    continue;
-                };
-                if should_skip(&name) {
-                    continue;
-                }
-                let child_destination = destination.join_child(&name);
-                copy_workspace_entry(
-                    file_access.clone(),
-                    &child_source,
-                    &child_destination,
-                    cancel_requested,
-                    progress,
-                )?;
+) -> Result<FileNodePath, String> {
+    check_transfer_canceled(cancel_requested.as_ref())?;
+    let (sender, receiver) = mpsc::channel();
+    match operation {
+        TransferOperation::Copy => file_access.copy_node(
+            FileCopyRequest {
+                source: source.clone(),
+                destination: destination.clone(),
+                cancel_requested: Some(cancel_requested.clone()),
+            },
+            Box::new(move |event| {
+                let _ = sender.send(event);
+            }),
+        ),
+        TransferOperation::Move => file_access.move_node(
+            FileMoveRequest {
+                source: source.clone(),
+                destination_parent: target_folder,
+                new_name: name,
+                cancel_requested: Some(cancel_requested.clone()),
+            },
+            Box::new(move |event| {
+                let _ = sender.send(event);
+            }),
+        ),
+    }
+
+    loop {
+        match receiver.recv() {
+            Ok(FileOperationEvent::Progress(update)) => {
+                progress(transfer_progress_update(
+                    update,
+                    completed_before,
+                    total_files,
+                    &destination,
+                ));
+            }
+            Ok(FileOperationEvent::Finished(result)) => {
+                return result.map_err(|err| err.to_string());
+            }
+            Err(_) => {
+                return Err(format!(
+                    "{} operation did not return a result.",
+                    operation.failure_heading()
+                ));
             }
         }
-        FileKind::File | FileKind::Symlink | FileKind::Other | FileKind::Archive { .. } => {
-            let bytes = file_access.read_bytes(source, None)?;
-            let total_bytes = bytes.len() as u64;
-            file_access.write_bytes(destination, &bytes)?;
-            progress(TransferProgressUpdate {
-                current_path: Some(destination.clone()),
-                copied_bytes: total_bytes,
-                total_bytes,
-                copied_files: 1,
-                total_files: 1,
-            });
-        }
     }
-    Ok(())
+}
+
+fn transfer_progress_update(
+    update: FileOperationProgress,
+    completed_before: u64,
+    total_files: u64,
+    destination: &FileNodePath,
+) -> TransferProgressUpdate {
+    TransferProgressUpdate {
+        current_path: update.current_path.or_else(|| Some(destination.clone())),
+        copied_bytes: update.completed_bytes,
+        total_bytes: update.total_bytes,
+        copied_files: completed_before.saturating_add(update.completed_files),
+        total_files,
+    }
 }
 
 fn file_name_for_transfer(path: &FileNodePath) -> Result<String, String> {

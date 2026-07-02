@@ -2,6 +2,10 @@ use super::{
     BrowserTarget, FileBrowser, SEARCH_POLL_MS, file_name, rows, should_skip, tree::BrowserRow,
 };
 use crate::system::FileNodePath;
+use crate::system::capabilities::files::{
+    FileDeleteRequest, FileMoveRequest, FileOperationEvent, FileWriteMode, FileWritePayload,
+    FileWriteRequest,
+};
 use adw::prelude::*;
 use gtk::gio;
 use std::collections::HashSet;
@@ -139,11 +143,7 @@ impl FileBrowser {
 
         self.pending_new_entry.borrow_mut().take();
         match self.create_child(folder, &name, kind) {
-            Ok(()) => {
-                if kind == NewEntryKind::File {
-                    self.remember_created_file_extension(&name);
-                }
-            }
+            Ok(()) => {}
             Err(err) => {
                 self.rebuild();
                 self.show_error(kind.error_heading(), &err);
@@ -213,20 +213,72 @@ impl FileBrowser {
             name
         );
         let file_access = self.file_access.borrow().clone();
-        let created = match kind {
-            NewEntryKind::File => file_access.create_file(folder, name)?,
-            NewEntryKind::Folder => file_access.create_dir(folder, name)?,
+        let created = candidate.clone();
+        let payload = match kind {
+            NewEntryKind::File => FileWritePayload::File(Vec::new()),
+            NewEntryKind::Folder => FileWritePayload::Directory,
         };
+        let (sender, receiver) = mpsc::channel();
+        file_access.write_node(
+            FileWriteRequest {
+                path: created.clone(),
+                mode: FileWriteMode::CreateNew,
+                payload,
+                cancel_requested: None,
+            },
+            Box::new(move |event| {
+                if let FileOperationEvent::Finished(result) = event {
+                    let _ = sender.send(result);
+                }
+            }),
+        );
 
+        gtk::glib::timeout_add_local(Duration::from_millis(SEARCH_POLL_MS), {
+            let browser = self.clone();
+            let folder = folder.clone();
+            let name = name.to_string();
+
+            move || match receiver.try_recv() {
+                Ok(Ok(())) => {
+                    browser.finish_successful_create(&folder, &name, kind, created.clone());
+                    gtk::glib::ControlFlow::Break
+                }
+                Ok(Err(err)) => {
+                    browser.rebuild();
+                    browser.show_error(kind.error_heading(), &err.to_string());
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                Err(TryRecvError::Disconnected) => {
+                    browser.rebuild();
+                    browser.show_error(
+                        kind.error_heading(),
+                        "Create operation did not return a result.",
+                    );
+                    gtk::glib::ControlFlow::Break
+                }
+            }
+        });
+        self.refresh_browser_row_state();
+        Ok(())
+    }
+
+    fn finish_successful_create(
+        self: &Rc<Self>,
+        folder: &FileNodePath,
+        name: &str,
+        kind: NewEntryKind,
+        created: FileNodePath,
+    ) {
+        if kind == NewEntryKind::File {
+            self.remember_created_file_extension(name);
+        }
         if !folder.is_root() {
             self.expanded_dirs.borrow_mut().insert(folder.clone());
         }
         self.invalidate_tree_rows_cache();
         self.spellcheck_allowlist
-            .replace(crate::spellcheck::load_manifest_allowlist(
-                &self.workspace.borrow(),
-                self.file_access.borrow().clone(),
-            ));
+            .replace(crate::spellcheck::SpellcheckAllowlist::default());
 
         match kind {
             NewEntryKind::File => {
@@ -240,8 +292,7 @@ impl FileBrowser {
             }
         }
 
-        self.rebuild();
-        Ok(())
+        self.rebuild_if_changed();
     }
 
     pub(super) fn rename_target(self: &Rc<Self>, target: &BrowserTarget) {
@@ -329,18 +380,58 @@ impl FileBrowser {
             parent.display(),
             new_name
         );
-        let renamed = self
-            .file_access
-            .borrow()
-            .rename(&target.node_path, &parent, new_name)
-            .map_err(|err| format!("Unable to rename: {err}"))?;
+        let file_access = self.file_access.borrow().clone();
+        let (sender, receiver) = mpsc::channel();
+        file_access.move_node(
+            FileMoveRequest {
+                source: target.node_path.clone(),
+                destination_parent: parent.clone(),
+                new_name: new_name.to_string(),
+                cancel_requested: None,
+            },
+            Box::new(move |event| {
+                if let FileOperationEvent::Finished(result) = event {
+                    let _ = sender.send(result);
+                }
+            }),
+        );
 
+        gtk::glib::timeout_add_local(Duration::from_millis(SEARCH_POLL_MS), {
+            let browser = self.clone();
+            let target = target.clone();
+
+            move || match receiver.try_recv() {
+                Ok(Ok(renamed)) => {
+                    browser.finish_successful_rename(&target, parent.clone(), renamed);
+                    gtk::glib::ControlFlow::Break
+                }
+                Ok(Err(err)) => {
+                    browser.rebuild();
+                    browser.show_error("Rename Failed", &format!("Unable to rename: {err}"));
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                Err(TryRecvError::Disconnected) => {
+                    browser.rebuild();
+                    browser
+                        .show_error("Rename Failed", "Rename operation did not return a result.");
+                    gtk::glib::ControlFlow::Break
+                }
+            }
+        });
+        self.rebuild();
+        Ok(())
+    }
+
+    fn finish_successful_rename(
+        self: &Rc<Self>,
+        target: &BrowserTarget,
+        parent: FileNodePath,
+        renamed: FileNodePath,
+    ) {
         self.invalidate_tree_rows_cache();
         self.spellcheck_allowlist
-            .replace(crate::spellcheck::load_manifest_allowlist(
-                &self.workspace.borrow(),
-                self.file_access.borrow().clone(),
-            ));
+            .replace(crate::spellcheck::SpellcheckAllowlist::default());
         if target.is_dir {
             {
                 let mut expanded = self.expanded_dirs.borrow_mut();
@@ -353,7 +444,6 @@ impl FileBrowser {
             self.set_selected_node_path(Some(renamed));
         }
         self.rebuild();
-        Ok(())
     }
 
     pub(super) fn delete_selected_file(self: &Rc<Self>) {
@@ -412,9 +502,14 @@ impl FileBrowser {
         let file_access = self.file_access.borrow().clone();
         let (sender, receiver) = mpsc::channel();
         file_access.delete(
-            path.clone(),
+            FileDeleteRequest {
+                path: path.clone(),
+                cancel_requested: None,
+            },
             Box::new(move |result| {
-                let _ = sender.send(result);
+                if let FileOperationEvent::Finished(result) = result {
+                    let _ = sender.send(result);
+                }
             }),
         );
 
@@ -428,7 +523,7 @@ impl FileBrowser {
                 }
                 Ok(Err(message)) => {
                     browser.finish_failed_delete(&target.node_path);
-                    browser.show_error("Delete Failed", &message);
+                    browser.show_error("Delete Failed", &message.to_string());
                     gtk::glib::ControlFlow::Break
                 }
                 Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,

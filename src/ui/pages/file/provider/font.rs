@@ -1,5 +1,7 @@
 use super::{PreviewMatchRequest, PreviewRequest};
+use crate::system::capabilities::files::{FileOperationEvent, FileRead, FileReadRequest};
 use std::rc::Rc;
+use std::sync::mpsc;
 
 const MAX_FONT_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -45,8 +47,31 @@ fn read_font_bytes(
         return Err(format!("{file_path} is too large to preview."));
     }
 
-    files
-        .read_with_info(node_path, Some(MAX_FONT_PREVIEW_BYTES))?
+    read_with_info(files, node_path, Some(MAX_FONT_PREVIEW_BYTES))?
         .into_bytes()
         .map_err(|err| format!("Unable to preview font: {err}"))
+}
+
+fn read_with_info(
+    files: &dyn crate::system::capabilities::files::FileAccess,
+    node_path: &crate::system::FileNodePath,
+    max_bytes: Option<u64>,
+) -> Result<FileRead, String> {
+    let (sender, receiver) = mpsc::channel();
+    files.read_with_info(
+        FileReadRequest {
+            path: node_path.clone(),
+            max_bytes,
+            cancel_requested: None,
+        },
+        Box::new(move |event| {
+            if let FileOperationEvent::Finished(result) = event {
+                let _ = sender.send(result);
+            }
+        }),
+    );
+    receiver
+        .recv()
+        .map_err(|_| "Read operation did not return a result.".to_string())?
+        .map_err(|err| err.to_string())
 }

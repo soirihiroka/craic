@@ -1,8 +1,5 @@
-use crate::system::capabilities::files::{FileAccess, FileKind};
-use crate::system::path::WorkspaceRef;
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::sync::Arc;
 use typos::tokens::{Identifier, Tokenizer, Word};
 use typos::{Dictionary, Status};
 
@@ -65,32 +62,20 @@ pub(crate) fn check_filename(name: &str, allowlist: &SpellcheckAllowlist) -> Vec
     issues
 }
 
-pub(crate) fn load_manifest_allowlist(
-    workspace: &WorkspaceRef,
-    file_access: Arc<dyn FileAccess>,
-) -> SpellcheckAllowlist {
+pub(crate) fn load_manifest_allowlist(manifests: &[(&str, &str)]) -> SpellcheckAllowlist {
     let mut allowlist = SpellcheckAllowlist::default();
-    let root = file_access.root();
-    for manifest in ["Cargo.toml", "pyproject.toml", "package.json"] {
-        let path = root.join_child(manifest);
-        let Ok(info) = file_access.info(&path) else {
-            continue;
-        };
-        if info.kind != FileKind::File || info.len_or_zero() > MAX_MANIFEST_BYTES {
+    for (manifest, text) in manifests {
+        if text.len() as u64 > MAX_MANIFEST_BYTES {
             continue;
         }
-        let Ok(text) = file_access.read_text(&path, Some(MAX_MANIFEST_BYTES)) else {
-            continue;
-        };
-        match manifest {
+        match *manifest {
             "Cargo.toml" | "pyproject.toml" => collect_toml_manifest_words(&text, &mut allowlist),
             "package.json" => collect_package_json_words(&text, &mut allowlist),
             _ => {}
         }
     }
-    log::info!(
-        "spellcheck manifest allowlist loaded workspace={} words={}",
-        workspace.display_name,
+    log::debug!(
+        "spellcheck manifest allowlist parsed words={}",
         allowlist.words.len()
     );
     allowlist

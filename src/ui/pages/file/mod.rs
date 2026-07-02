@@ -7,8 +7,9 @@ use crate::git::RepositorySnapshot;
 use crate::gitignore;
 use crate::system::capabilities::docker::ComposeFileAction;
 use crate::system::capabilities::files::{
-    FileAccess, FileKind, FileNodeInfo, FileWatchCallback, FileWatchChanges, FileWatchRequest,
-    FileWatchSubscription,
+    FileAccess, FileKind, FileNodeInfo, FileOperationEvent, FileRead, FileReadRequest,
+    FileWatchCallback, FileWatchChanges, FileWatchRequest, FileWatchSubscription, FileWriteMode,
+    FileWritePayload, FileWriteRequest,
 };
 use crate::system::path::ProviderKind;
 use crate::system::{FileNodePath, WorkspacePath, WorkspaceRef};
@@ -932,7 +933,7 @@ fn repository_item(ctx: &PageContext, node_path: FileNodePath) -> Result<Reposit
         .files()
         .ok_or_else(|| "File access is unavailable for this workspace.".to_string())?;
     let workspace = ctx.workspace_ref();
-    let read = files.read_with_info(&node_path, Some(MAX_EDITOR_FILE_BYTES))?;
+    let read = read_with_info(files.as_ref(), &node_path, Some(MAX_EDITOR_FILE_BYTES))?;
     let local_path = local_workspace_path(ctx, &node_path);
     Ok(RepositoryItem {
         files,
@@ -1275,18 +1276,14 @@ pub(in crate::ui::pages::file) fn read_repository_file(
     files: &dyn FileAccess,
     path: &FileNodePath,
 ) -> Result<String, String> {
-    files
-        .read_with_info(path, Some(MAX_EDITOR_FILE_BYTES))?
-        .into_text()
+    read_with_info(files, path, Some(MAX_EDITOR_FILE_BYTES))?.into_text()
 }
 
 pub(in crate::ui::pages::file) fn read_repository_file_bytes(
     files: &dyn FileAccess,
     path: &FileNodePath,
 ) -> Result<Vec<u8>, String> {
-    files
-        .read_with_info(path, Some(MAX_EDITOR_FILE_BYTES))?
-        .into_bytes()
+    read_with_info(files, path, Some(MAX_EDITOR_FILE_BYTES))?.into_bytes()
 }
 
 pub(in crate::ui::pages::file) fn read_repository_file_from_prefetch(
@@ -1321,7 +1318,7 @@ fn spellcheck_editor_document(
         file_editor.set_spellcheck_issues(Vec::new());
         return;
     };
-    let allowlist = crate::spellcheck::load_manifest_allowlist(&ctx.workspace_ref(), files.clone());
+    let allowlist = crate::spellcheck::SpellcheckAllowlist::default();
     let language = code_editor::language_hint_from_path(file_path);
     let issues = crate::spellcheck::check_document(&language, Some(file_path), text, &allowlist);
     file_editor.set_spellcheck_issues(issues);
@@ -1366,7 +1363,52 @@ fn write_repository_file(ctx: &PageContext, path: &FileNodePath, text: &str) -> 
         return Ok(());
     }
 
-    files.write_text(path, text)
+    write_text(files.as_ref(), path, text)
+}
+
+fn read_with_info(
+    files: &dyn FileAccess,
+    path: &FileNodePath,
+    max_bytes: Option<u64>,
+) -> Result<FileRead, String> {
+    let (sender, receiver) = mpsc::channel();
+    files.read_with_info(
+        FileReadRequest {
+            path: path.clone(),
+            max_bytes,
+            cancel_requested: None,
+        },
+        Box::new(move |event| {
+            if let FileOperationEvent::Finished(result) = event {
+                let _ = sender.send(result);
+            }
+        }),
+    );
+    receiver
+        .recv()
+        .map_err(|_| "Read operation did not return a result.".to_string())?
+        .map_err(|err| err.to_string())
+}
+
+fn write_text(files: &dyn FileAccess, path: &FileNodePath, text: &str) -> Result<(), String> {
+    let (sender, receiver) = mpsc::channel();
+    files.write_node(
+        FileWriteRequest {
+            path: path.clone(),
+            mode: FileWriteMode::Replace,
+            payload: FileWritePayload::File(text.as_bytes().to_vec()),
+            cancel_requested: None,
+        },
+        Box::new(move |event| {
+            if let FileOperationEvent::Finished(result) = event {
+                let _ = sender.send(result);
+            }
+        }),
+    );
+    receiver
+        .recv()
+        .map_err(|_| "Write operation did not return a result.".to_string())?
+        .map_err(|err| err.to_string())
 }
 
 fn native_node_path(ctx: &PageContext, file_path: &str) -> FileNodePath {
