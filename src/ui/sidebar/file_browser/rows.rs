@@ -96,7 +96,6 @@ impl FileBrowser {
                             target,
                             x,
                             y,
-                            gesture.current_event_time(),
                         );
                         gesture.set_state(gtk::EventSequenceState::Claimed);
                     }
@@ -602,7 +601,6 @@ impl FileBrowser {
                         browser.target_for_node_path(search_match.node_path.clone()),
                         x,
                         y,
-                        gesture.current_event_time(),
                     );
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                 }
@@ -639,7 +637,6 @@ impl FileBrowser {
                         target,
                         x,
                         y,
-                        gesture.current_event_time(),
                     );
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                 }
@@ -1086,7 +1083,6 @@ fn tree_secondary_click_handler(
             BrowserTarget::from_row(&row),
             x,
             y,
-            gesture.current_event_time(),
         );
         gesture.set_state(gtk::EventSequenceState::Claimed);
     }

@@ -1,4 +1,5 @@
 use crate::system::path::FileNodePath;
+use gtk::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DesktopOpenTargetKind {
@@ -6,14 +7,16 @@ pub(crate) enum DesktopOpenTargetKind {
     Folder,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub(crate) struct DesktopOpenActivation {
-    pub(crate) event_time: u32,
+    pub(crate) parent: Option<gtk::Window>,
 }
 
 impl DesktopOpenActivation {
-    pub(crate) fn from_event_time(event_time: u32) -> Self {
-        Self { event_time }
+    pub(crate) fn from_parent(parent: Option<&impl IsA<gtk::Window>>) -> Self {
+        Self {
+            parent: parent.map(|parent| parent.as_ref().clone()),
+        }
     }
 }
 

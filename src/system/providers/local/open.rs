@@ -3,14 +3,8 @@ use crate::system::capabilities::open::{
 };
 use crate::system::path::{FileNodePath, WorkspacePath, WorkspaceRef};
 use gtk::gio;
-use gtk::gio::prelude::AppLaunchContextExt;
-use gtk::glib::variant::ToVariant;
 use gtk::prelude::*;
 use std::path::PathBuf;
-
-const FILE_MANAGER_DBUS_NAME: &str = "org.freedesktop.FileManager1";
-const FILE_MANAGER_DBUS_PATH: &str = "/org/freedesktop/FileManager1";
-const FILE_MANAGER_DBUS_INTERFACE: &str = "org.freedesktop.FileManager1";
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalDesktopOpenAccess {
@@ -51,82 +45,79 @@ impl LocalDesktopOpenAccess {
         self.local_path_for_workspace(&workspace_path)
     }
 
-    fn app_launch_context(
+    fn launch_file(
         &self,
+        local_path: &PathBuf,
         activation: DesktopOpenActivation,
-    ) -> Result<gtk::gdk::AppLaunchContext, String> {
-        let display = gtk::gdk::Display::default()
-            .ok_or_else(|| "GTK display is unavailable for desktop opening.".to_string())?;
-        let context = display.app_launch_context();
-        context.set_timestamp(if activation.event_time == 0 {
-            gtk::gdk::CURRENT_TIME
-        } else {
-            activation.event_time
-        });
-        Ok(context)
+    ) {
+        let path_display = local_path.display().to_string();
+        let workspace_name = self.workspace.display_name.clone();
+        let file = gio::File::for_path(local_path);
+        let launcher = gtk::FileLauncher::new(Some(&file));
+        launcher.launch(
+            activation.parent.as_ref(),
+            None::<&gio::Cancellable>,
+            move |result| match result {
+                Ok(()) => log::info!(
+                    "local file launcher complete workspace={} path={}",
+                    workspace_name,
+                    path_display
+                ),
+                Err(err) => log::warn!(
+                    "local file launcher failed workspace={} path={}: {}",
+                    workspace_name,
+                    path_display,
+                    err
+                ),
+            },
+        );
     }
 
-    fn startup_id_for_file(
+    fn open_containing_folder(
         &self,
-        context: &gtk::gdk::AppLaunchContext,
-        file: &gio::File,
-    ) -> String {
-        let files = [file.clone()];
-        let app = gio::AppInfo::default_for_type("inode/directory", true);
-        match app.as_ref() {
-            Some(app) => context.startup_notify_id(Some(app), &files),
-            None => context.startup_notify_id(None::<&gio::AppInfo>, &files),
-        }
-        .map(|id| id.to_string())
-        .unwrap_or_default()
+        local_path: &PathBuf,
+        activation: DesktopOpenActivation,
+    ) {
+        // Use GtkFileLauncher instead of calling FileManager1 directly. GTK
+        // routes through the portal/native implementation and supplies the
+        // parent-window activation data Wayland compositors require for focus.
+        let path_display = local_path.display().to_string();
+        let workspace_name = self.workspace.display_name.clone();
+        let file = gio::File::for_path(local_path);
+        let launcher = gtk::FileLauncher::new(Some(&file));
+        launcher.open_containing_folder(
+            activation.parent.as_ref(),
+            None::<&gio::Cancellable>,
+            move |result| match result {
+                Ok(()) => log::info!(
+                    "local file reveal complete workspace={} path={}",
+                    workspace_name,
+                    path_display
+                ),
+                Err(err) => log::warn!(
+                    "local file reveal failed workspace={} path={}: {}",
+                    workspace_name,
+                    path_display,
+                    err
+                ),
+            },
+        );
     }
 
-    fn show_with_file_manager(
+    fn open_path_in_file_manager(
         &self,
-        method: &str,
         local_path: &PathBuf,
         activation: DesktopOpenActivation,
     ) -> Result<(), String> {
-        // Wayland compositors require an activation/startup token to focus an
-        // existing file-manager window. Generic opener fallbacks and an empty
-        // FileManager1 startup id may open the folder but often cannot activate
-        // the current window or select the requested item.
-        let context = self.app_launch_context(activation)?;
-        let file = gio::File::for_path(local_path);
-        let startup_id = self.startup_id_for_file(&context, &file);
-        let uris = vec![file.uri().to_string()];
-        let parameters = (uris.as_slice(), startup_id.as_str()).to_variant();
-        let proxy = gio::DBusProxy::for_bus_sync(
-            gio::BusType::Session,
-            gio::DBusProxyFlags::DO_NOT_LOAD_PROPERTIES
-                | gio::DBusProxyFlags::DO_NOT_CONNECT_SIGNALS,
-            None,
-            FILE_MANAGER_DBUS_NAME,
-            FILE_MANAGER_DBUS_PATH,
-            FILE_MANAGER_DBUS_INTERFACE,
-            None::<&gio::Cancellable>,
-        )
-        .map_err(|err| format!("Unable to connect to file manager over DBus: {err}"))?;
-        proxy
-            .call_sync(
-                method,
-                Some(&parameters),
-                gio::DBusCallFlags::NONE,
-                5000,
-                None::<&gio::Cancellable>,
-            )
-            .map_err(|err| format!("Unable to reveal path through file manager DBus: {err}"))?;
+        let metadata = local_path
+            .metadata()
+            .map_err(|err| format!("Unable to inspect {}: {err}", local_path.display()))?;
+        if metadata.is_dir() {
+            self.launch_file(local_path, activation);
+        } else {
+            self.open_containing_folder(local_path, activation);
+        }
         Ok(())
-    }
-
-    fn launch_uri(
-        &self,
-        uri: &str,
-        activation: DesktopOpenActivation,
-        error: impl FnOnce(gtk::glib::Error) -> String,
-    ) -> Result<(), String> {
-        let context = self.app_launch_context(activation)?;
-        gio::AppInfo::launch_default_for_uri(uri, Some(&context)).map_err(error)
     }
 }
 
@@ -144,14 +135,11 @@ impl DesktopOpenAccess for LocalDesktopOpenAccess {
             local_path.display()
         );
         if kind == DesktopOpenTargetKind::Folder {
-            self.show_with_file_manager("ShowFolders", &local_path, activation)?;
+            self.open_path_in_file_manager(&local_path, activation)?;
             return Ok("Opened path.".to_string());
         }
 
-        let uri = gio::File::for_path(&local_path).uri();
-        self.launch_uri(&uri, activation, |err| {
-            format!("Failed to open {}: {err}", local_path.display())
-        })?;
+        self.launch_file(&local_path, activation);
         Ok("Opened path.".to_string())
     }
 
@@ -166,7 +154,7 @@ impl DesktopOpenAccess for LocalDesktopOpenAccess {
             self.workspace.display_name,
             local_path.display()
         );
-        self.show_with_file_manager("ShowItems", &local_path, activation)?;
+        self.open_containing_folder(&local_path, activation);
         Ok("Opened containing folder.".to_string())
     }
 }

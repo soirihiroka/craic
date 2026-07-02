@@ -468,7 +468,11 @@ impl FileBrowser {
             if !target.node_path.is_root() {
                 self.toggle_dir(&target.node_path);
             } else {
-                self.open_external(target, DesktopOpenActivation::default());
+                let parent_window = self.root.root().and_downcast::<gtk::Window>();
+                self.open_external(
+                    target,
+                    DesktopOpenActivation::from_parent(parent_window.as_ref()),
+                );
             }
         } else {
             self.set_selected_node_path(Some(target.node_path.clone()));

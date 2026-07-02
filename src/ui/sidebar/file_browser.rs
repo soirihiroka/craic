@@ -961,10 +961,9 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
     target: BrowserTarget,
     x: f64,
     y: f64,
-    event_time: u32,
 ) {
     let actions = gio::SimpleActionGroup::new();
-    let action_event_time = Rc::new(Cell::new(event_time));
+    let parent_window = parent.root().and_downcast::<gtk::Window>();
     add_menu_action(&actions, "open", {
         let browser = browser.clone();
         let target = target.clone();
@@ -985,11 +984,11 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
     let open_external = add_menu_action(&actions, "open-external", {
         let browser = browser.clone();
         let target = target.clone();
-        let action_event_time = action_event_time.clone();
+        let parent_window = parent_window.clone();
         move || {
             browser.open_external(
                 &target,
-                DesktopOpenActivation::from_event_time(action_event_time.get()),
+                DesktopOpenActivation::from_parent(parent_window.as_ref()),
             )
         }
     });
@@ -999,11 +998,11 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
     let open_containing_folder = add_menu_action(&actions, "open-containing-folder", {
         let browser = browser.clone();
         let target = target.clone();
-        let action_event_time = action_event_time.clone();
+        let parent_window = parent_window.clone();
         move || {
             browser.open_containing_folder(
                 &target,
-                DesktopOpenActivation::from_event_time(action_event_time.get()),
+                DesktopOpenActivation::from_parent(parent_window.as_ref()),
             )
         }
     });
@@ -1132,13 +1131,12 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
     let terminal_available = browser.terminal_actions_available.get() && target.capabilities.native;
     let container_actions_available =
         browser.container_actions_available.get() && target.capabilities.native;
-    let popover = menu::repository_row_menu(
+    menu::repository_row_menu(
         &target,
         terminal_available,
         container_actions_available,
     )
     .popup(parent, x, y, &actions, &browser.active_context_menu);
-    context_menu::track_context_menu_event_time(&popover, action_event_time);
 }
 
 fn add_menu_action<F>(group: &gio::SimpleActionGroup, name: &str, activate: F) -> gio::SimpleAction
