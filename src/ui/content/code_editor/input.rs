@@ -5,7 +5,7 @@ use super::selection::{
 };
 use super::{
     CompletionUi, EditorState, FoldControlKey, FoldRange, HistorySnapshot, MAX_HISTORY_SNAPSHOTS,
-    Selection, SelectionMode, notify_diff_fold, notify_edit, render, selection_bounds,
+    Selection, SelectionMode, notify_edit, render, selection_bounds,
 };
 use crate::config;
 use crate::language_support::{CompletionSet, NewlineContext, enter_newline};
@@ -62,17 +62,13 @@ pub(super) fn install_interactions(
                 } else {
                     -1.0
                 };
-                if let Some(callback) = state.font_size_adjust_callback.borrow().clone() {
-                    callback(delta);
-                } else {
-                    let next = super::set_font_size_for_state(
-                        &area,
-                        &root,
-                        &state,
-                        state.font_size.get() + delta,
-                    );
-                    config::save_editor_font_size(next);
-                }
+                let next = super::set_font_size_for_state(
+                    &area,
+                    &root,
+                    &state,
+                    state.font_size.get() + delta,
+                );
+                config::save_editor_font_size(next);
                 return gtk::glib::Propagation::Stop;
             }
             if dy.abs() > f64::EPSILON {
@@ -1063,7 +1059,7 @@ fn selected_text_drag_bounds_at(
 }
 
 fn can_drag_move_selected_text(state: &Rc<EditorState>) -> bool {
-    state.editable.get() && state.diff_rows.borrow().is_none()
+    state.editable.get()
 }
 
 fn stop_drag_autoscroll(
@@ -1870,7 +1866,7 @@ fn spelling_correction_section(
     state: &Rc<EditorState>,
     offset: usize,
 ) -> Option<context_menu::ActionMenuSection<TextContextAction>> {
-    if !state.editable.get() || state.diff_rows.borrow().is_some() {
+    if !state.editable.get() {
         return None;
     }
     let issue = spellcheck_issue_at(state, offset)?;
@@ -1903,26 +1899,17 @@ fn spellcheck_issue_at(state: &Rc<EditorState>, offset: usize) -> Option<Spellch
 }
 
 fn action_enabled(state: &Rc<EditorState>, action: TextContextAction) -> bool {
-    let is_diff_document = state.diff_rows.borrow().is_some();
     match action {
-        TextContextAction::CorrectSpelling { .. } => !is_diff_document && state.editable.get(),
-        TextContextAction::Undo => {
-            !is_diff_document && state.editable.get() && !state.undo_stack.borrow().is_empty()
-        }
-        TextContextAction::Redo => {
-            !is_diff_document && state.editable.get() && !state.redo_stack.borrow().is_empty()
-        }
+        TextContextAction::CorrectSpelling { .. } => state.editable.get(),
+        TextContextAction::Undo => state.editable.get() && !state.undo_stack.borrow().is_empty(),
+        TextContextAction::Redo => state.editable.get() && !state.redo_stack.borrow().is_empty(),
         TextContextAction::Copy => selection_bounds(state).is_some(),
-        TextContextAction::Cut => {
-            !is_diff_document && state.editable.get() && selection_bounds(state).is_some()
-        }
-        TextContextAction::Paste => !is_diff_document && state.editable.get(),
+        TextContextAction::Cut => state.editable.get() && selection_bounds(state).is_some(),
+        TextContextAction::Paste => state.editable.get(),
         TextContextAction::SelectAll => !state.text.borrow().is_empty(),
-        TextContextAction::FoldSelection => {
-            !is_diff_document && state.editable.get() && selection_spans_lines(state)
-        }
+        TextContextAction::FoldSelection => state.editable.get() && selection_spans_lines(state),
         TextContextAction::ToggleWrap => true,
-        TextContextAction::ToggleReadOnly => !is_diff_document,
+        TextContextAction::ToggleReadOnly => true,
     }
 }
 
@@ -2673,9 +2660,7 @@ fn commit_edit(
             start,
             old_end,
             replacement,
-            folds_may_change
-                && state.auto_folding_enabled.get()
-                && state.diff_rows.borrow().is_none(),
+            folds_may_change && state.auto_folding_enabled.get(),
         );
     }
     state.cursor.set(cursor);
@@ -2827,9 +2812,6 @@ fn toggle_fold_at(area: &gtk::DrawingArea, state: &Rc<EditorState>, x: f64, y: f
             super::mark_fold_state_changed(state);
             render::refresh_size(area, state, area.allocated_width(), area.allocated_height());
             area.queue_draw();
-        }
-        render::FoldAction::Reveal(fold_index) => {
-            notify_diff_fold(state, fold_index);
         }
     }
     true

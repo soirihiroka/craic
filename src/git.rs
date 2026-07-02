@@ -14,45 +14,6 @@ const SHOW_REMOTE_OWNER_WARNING_KEY: &str = "craic.showRemoteOwnerWarning";
 const DEFAULT_COMMIT_TIMEZONE: &str = "+0000";
 pub(crate) const MAX_TEXT_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
 
-struct GitSnapshotTimer {
-    repo: String,
-    start: Instant,
-    previous: Instant,
-}
-
-impl GitSnapshotTimer {
-    fn new(path: &Path) -> Self {
-        let now = Instant::now();
-        Self {
-            repo: path.display().to_string(),
-            start: now,
-            previous: now,
-        }
-    }
-
-    fn mark(&mut self, step: &str) {
-        let now = Instant::now();
-        log::info!(
-            "git snapshot step={step} repo={} step_ms={} total_ms={}",
-            self.repo,
-            now.duration_since(self.previous).as_millis(),
-            now.duration_since(self.start).as_millis()
-        );
-        self.previous = now;
-    }
-
-    fn finish(&self, branch: &str, branch_count: usize, changed_file_count: usize) {
-        log::info!(
-            "git snapshot finished repo={} total_ms={} branch={} branches={} changed_files={}",
-            self.repo,
-            self.start.elapsed().as_millis(),
-            branch,
-            branch_count,
-            changed_file_count
-        );
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RepositorySnapshot {
     pub name: String,
@@ -305,9 +266,7 @@ fn hash_bytes(fingerprint: &mut u64, bytes: &[u8]) {
 }
 
 pub fn snapshot(path: &Path) -> Result<RepositorySnapshot, String> {
-    let mut timing = GitSnapshotTimer::new(path);
     let root = repo_root(path)?;
-    timing.mark("repo-root");
 
     let name = root
         .file_name()
@@ -315,7 +274,6 @@ pub fn snapshot(path: &Path) -> Result<RepositorySnapshot, String> {
         .unwrap_or("Repository")
         .to_string();
     let branch = current_branch(&root)?;
-    timing.mark("current-branch");
 
     let remote_name = upstream_remote(&root).or_else(|| {
         Some("origin".to_string()).filter(|remote| remote_url(&root, remote).is_some())
@@ -324,10 +282,8 @@ pub fn snapshot(path: &Path) -> Result<RepositorySnapshot, String> {
         .as_deref()
         .and_then(|remote| remote_url(&root, remote));
     let remote_owner = remote_url.as_deref().and_then(remote_owner_from_remote_url);
-    timing.mark("remote-metadata");
 
     let (ahead, behind, has_upstream) = ahead_behind_count(&root);
-    timing.mark("ahead-behind");
 
     let last_fetch_at = last_fetch_at(&root);
     let user_name = config_string(&root, "user.name");
@@ -336,22 +292,15 @@ pub fn snapshot(path: &Path) -> Result<RepositorySnapshot, String> {
         .as_deref()
         .and_then(github::login_from_noreply_email)
         .map(|login| github::avatar_url_for_login(&login));
-    timing.mark("user-metadata");
 
     let branches = branches(&root, remote_name.as_deref())?;
-    timing.mark("branches");
 
     let warn_if_remote_owner_mismatch =
         local_config_bool_with_default(path, SHOW_REMOTE_OWNER_WARNING_KEY, true);
-    timing.mark("local-settings");
 
     let changed_files = changed_files(&root)?;
-    timing.mark("changed-files");
 
     let history_head = history_head(&root);
-    timing.mark("history-head");
-
-    timing.finish(&branch, branches.len(), changed_files.len());
 
     Ok(RepositorySnapshot {
         name,
@@ -1090,13 +1039,6 @@ fn branches(root: &Path, remote_name: Option<&str>) -> Result<Vec<BranchInfo>, S
             branches[index].is_recent = true;
         }
     }
-    log::debug!(
-        "branch metadata grouped root={} branches={} default={} recent={}",
-        root.display(),
-        branches.len(),
-        branches.iter().filter(|branch| branch.is_default).count(),
-        branches.iter().filter(|branch| branch.is_recent).count()
-    );
 
     branches.sort_by(|left, right| match (left.is_current, right.is_current) {
         (true, false) => std::cmp::Ordering::Less,

@@ -5,13 +5,13 @@ mod theme;
 
 use self::highlights::{draw_highlighted_slice, draw_spellcheck_issues, draw_syntax_issues};
 use self::line_numbers::{
-    LineNumberStyle, diff_prefix, draw_deleted_hint, draw_gutter, draw_line_background,
-    draw_line_number, gutter_width_for_state, gutter_x, text_bounds, viewport_width_for_state,
+    LineNumberStyle, draw_deleted_hint, draw_gutter, draw_line_number, gutter_width_for_state,
+    gutter_x, text_bounds, viewport_width_for_state,
 };
 use self::theme::{Color, EditorTheme, editor_theme, lerp_color};
 use super::{
-    CELL_PADDING, EditorDiffKind, EditorState, FoldControlKey, FoldIconState, FoldRange,
-    LayoutCache, MIN_CONTENT_WIDTH, ScrollbarMarkerKind, SearchMatch, VisualLine, canvas,
+    CELL_PADDING, EditorState, FoldControlKey, FoldIconState, FoldRange, LayoutCache,
+    MIN_CONTENT_WIDTH, ScrollbarMarkerKind, SearchMatch, VisualLine, canvas,
 };
 use crate::ui::{canvas_scroll, canvas_scrollbar};
 use adw::prelude::*;
@@ -43,7 +43,6 @@ pub(super) enum FoldAction {
         start_line: usize,
         end_line: usize,
     },
-    Reveal(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -87,7 +86,6 @@ pub(super) fn draw_editor(
         return;
     };
     let highlights = state.highlight_cache.borrow();
-    let syntax_source = state.syntax_source.borrow();
     let syntax_issues = state.syntax_issues.borrow();
     let spellcheck_issues = state.spellcheck_issues.borrow();
     let visual_lines = &layout.visual_lines;
@@ -117,66 +115,34 @@ pub(super) fn draw_editor(
         let line = &visual_lines[index];
         let y = index as f64 * line_height - scroll_y;
         let baseline = y + baseline_offset(state);
-        let line_meta = line_metadata(state, line.source_line);
-        let diff_kind = line_meta
-            .as_ref()
-            .map(|meta| meta.kind)
-            .unwrap_or(EditorDiffKind::Context);
-        draw_line_background(
-            context,
-            gutter_side,
-            width,
-            gutter,
-            y,
-            line_height,
-            diff_kind,
-            theme,
-        );
         if line.wrap_index == 0 {
-            let is_added = added_lines.get(line.source_line).copied().unwrap_or(false)
-                || diff_kind == EditorDiffKind::Added;
-            let is_deleted = diff_kind == EditorDiffKind::Deleted;
+            let is_added = added_lines.get(line.source_line).copied().unwrap_or(false);
             let deleted_count = deleted_hints.get(line.source_line).copied().unwrap_or(0);
-            let fold_index = line
+            let fold_control = line
                 .folded
-                .or_else(|| fold_index_starting_at(state, line.source_line));
-            let diff_fold_control = line_meta.as_ref().and_then(|meta| {
-                (meta.show_fold_control)
-                    .then_some(meta.fold_index?)
-                    .map(|index| (FoldControlKey::diff(index), meta.fold_expanded))
-            });
-            let editor_fold_control = diff_fold_control.is_none().then(|| {
-                fold_index.and_then(|index| {
+                .or_else(|| fold_index_starting_at(state, line.source_line))
+                .and_then(|index| {
                     state
                         .folds
                         .borrow()
                         .get(index)
                         .map(|fold| (FoldControlKey::editor(index), fold.expanded))
-                })
-            });
-            let fold_control = diff_fold_control.or_else(|| editor_fold_control.flatten());
+                });
             draw_line_number(
                 area,
                 state,
                 context,
                 gutter_x,
                 gutter,
-                line_meta
-                    .as_ref()
-                    .and_then(|meta| meta.number)
-                    .unwrap_or(line.source_line + 1),
-                line_meta.as_ref().is_some_and(|meta| meta.number.is_some()) || line_meta.is_none(),
+                line.source_line + 1,
+                true,
                 y,
                 baseline,
                 LineNumberStyle {
                     added: is_added,
-                    deleted: is_deleted,
-                    missing: diff_kind == EditorDiffKind::Missing,
-                    prefix: diff_prefix(diff_kind),
+                    deleted: false,
+                    missing: false,
                     fold_control,
-                    show_diff_fold_control: line_meta
-                        .as_ref()
-                        .is_some_and(|meta| meta.show_fold_control),
                 },
                 theme,
             );
@@ -197,18 +163,6 @@ pub(super) fn draw_editor(
                     theme.folded_text,
                 );
             }
-            continue;
-        }
-        if diff_kind == EditorDiffKind::Fold {
-            draw_plain_text(
-                area,
-                context,
-                state,
-                &text[line.start..line.end],
-                text_x,
-                baseline,
-                theme.folded_text,
-            );
             continue;
         }
         draw_search_matches(
@@ -253,47 +207,19 @@ pub(super) fn draw_editor(
         if selection.is_none() {
             draw_empty_selection_marker(context, state, line, text_x, y, theme.selection);
         }
-        if let Some((source, start, end)) =
-            highlight_source_span_for_line(state, syntax_source.as_deref(), &text, line)
-        {
-            draw_highlighted_slice(
-                area,
-                context,
-                state,
-                source,
-                &highlights,
-                start,
-                end,
-                text_x,
-                baseline,
-                text_right.min(clip_right),
-                text_left.max(clip_left),
-            );
-        } else if syntax_source.is_none() {
-            draw_highlighted_slice(
-                area,
-                context,
-                state,
-                &text,
-                &highlights,
-                line.start,
-                line.end,
-                text_x,
-                baseline,
-                text_right.min(clip_right),
-                text_left.max(clip_left),
-            );
-        } else {
-            draw_plain_text(
-                area,
-                context,
-                state,
-                &text[line.start..line.end],
-                text_x,
-                baseline,
-                (0.86, 0.86, 0.86),
-            );
-        }
+        draw_highlighted_slice(
+            area,
+            context,
+            state,
+            &text,
+            &highlights,
+            line.start,
+            line.end,
+            text_x,
+            baseline,
+            text_right.min(clip_right),
+            text_left.max(clip_left),
+        );
         draw_spellcheck_issues(
             area,
             context,
@@ -600,10 +526,7 @@ pub(super) fn vertical_cursor_target(
     }
 
     let target_line = layout.visual_lines.get(target_index)?;
-    if line_metadata(state, target_line.source_line)
-        .is_some_and(|meta| meta.kind == EditorDiffKind::Fold)
-        || target_line.folded.is_some()
-    {
+    if target_line.folded.is_some() {
         return Some(target_line.start);
     }
 
@@ -720,7 +643,6 @@ fn build_visual_lines(
     let mut lines = Vec::new();
     let mut source_line = 0;
     let folds = state.folds.borrow();
-    let diff_rows = state.diff_rows.borrow();
     let line_ranges = logical_line_ranges(text);
 
     while source_line < line_ranges.len() {
@@ -739,7 +661,7 @@ fn build_visual_lines(
                 .min(line_ranges.len());
             continue;
         }
-        let visual_count = push_wrapped_visual_lines(
+        push_wrapped_visual_lines(
             area,
             state,
             &mut lines,
@@ -748,25 +670,6 @@ fn build_visual_lines(
             line_end,
             text,
             wrap_width,
-        );
-        let required_count = diff_rows
-            .as_ref()
-            .and_then(|rows| rows.get(source_line))
-            .map(|row| {
-                visual_count.max(wrapped_line_count(
-                    area,
-                    state,
-                    &row.paired_text,
-                    wrap_width,
-                ))
-            })
-            .unwrap_or(visual_count);
-        push_padding_visual_lines(
-            &mut lines,
-            source_line,
-            line_end,
-            visual_count,
-            required_count,
         );
         source_line += 1;
     }
@@ -868,24 +771,6 @@ fn push_wrapped_visual_lines(
     wrap_index + 1
 }
 
-fn push_padding_visual_lines(
-    lines: &mut Vec<VisualLine>,
-    source_line: usize,
-    offset: usize,
-    current_count: usize,
-    required_count: usize,
-) {
-    for wrap_index in current_count..required_count {
-        lines.push(VisualLine {
-            source_line,
-            start: offset,
-            end: offset,
-            wrap_index,
-            folded: None,
-        });
-    }
-}
-
 pub(super) fn refresh_size(
     area: &gtk::DrawingArea,
     state: &Rc<EditorState>,
@@ -919,10 +804,6 @@ pub(super) fn hit_test(area: &gtk::DrawingArea, state: &Rc<EditorState>, x: f64,
     let Some(line) = layout.visual_lines.get(line_index) else {
         return text.len();
     };
-    if line_metadata(state, line.source_line).is_some_and(|meta| meta.kind == EditorDiffKind::Fold)
-    {
-        return line.start;
-    }
     if line.folded.is_some() {
         return line.start;
     }
@@ -956,10 +837,6 @@ pub(super) fn text_range_at_point(
     let line_height = line_height(state);
     let line_index = (document_y / line_height).floor() as usize;
     let line = layout.visual_lines.get(line_index)?;
-    if line_metadata(state, line.source_line).is_some_and(|meta| meta.kind == EditorDiffKind::Fold)
-    {
-        return None;
-    }
     if line.folded.is_some() || line.start >= line.end {
         return None;
     }
@@ -1225,18 +1102,6 @@ fn fold_control_hit_at_point(
     let gutter = layout.gutter_width;
     let gutter_x = gutter_x(state.gutter_side.get(), area.allocated_width(), gutter);
     let row_y = line_index as f64 * line_height - state.scroll_y.get();
-    if let Some(meta) = line_metadata(state, line.source_line) {
-        if meta.kind == EditorDiffKind::Fold {
-            let fold_index = meta.fold_index?;
-            return (meta.show_fold_control
-                && point_in_rect(x, y, fold_toggle_rect(gutter_x, gutter, row_y, line_height)))
-            .then_some(FoldControlHit {
-                key: FoldControlKey::diff(fold_index),
-                action: FoldAction::Reveal(fold_index),
-            });
-        }
-    }
-
     let fold_index = line
         .folded
         .or_else(|| fold_index_starting_at(state, line.source_line))?;
@@ -1398,89 +1263,6 @@ fn scrollbar_marker_visual_span(
     Some((first, count))
 }
 
-#[derive(Clone, Copy)]
-struct LineMeta {
-    number: Option<usize>,
-    kind: EditorDiffKind,
-    source_start: Option<usize>,
-    source_end: Option<usize>,
-    fold_index: Option<usize>,
-    fold_expanded: bool,
-    show_fold_control: bool,
-}
-
-fn line_metadata(state: &Rc<EditorState>, source_line: usize) -> Option<LineMeta> {
-    let rows = state.diff_rows.borrow();
-    let rows = rows.as_ref()?;
-    Some(
-        rows.get(source_line)
-            .map(|row| LineMeta {
-                number: row.number,
-                kind: row.kind,
-                source_start: row.source_start,
-                source_end: row.source_end,
-                fold_index: row.fold_index,
-                fold_expanded: row.fold_expanded,
-                show_fold_control: row.show_fold_control,
-            })
-            .unwrap_or(LineMeta {
-                number: None,
-                kind: EditorDiffKind::Missing,
-                source_start: None,
-                source_end: None,
-                fold_index: None,
-                fold_expanded: false,
-                show_fold_control: false,
-            }),
-    )
-}
-
-fn highlight_source_span_for_line<'a>(
-    state: &Rc<EditorState>,
-    syntax_source: Option<&'a str>,
-    display_text: &str,
-    line: &VisualLine,
-) -> Option<(&'a str, usize, usize)> {
-    let source = syntax_source?;
-    let meta = line_metadata(state, line.source_line)?;
-    let source_start = meta.source_start?;
-    let source_end = meta.source_end?;
-    if source_start > source_end
-        || source_end > source.len()
-        || !source.is_char_boundary(source_start)
-        || !source.is_char_boundary(source_end)
-    {
-        return None;
-    }
-
-    let display_line_start = display_line_start_for_offset(display_text, line.start)?;
-    let relative_start = line.start.checked_sub(display_line_start)?;
-    let relative_end = line.end.checked_sub(display_line_start)?;
-    let start = source_start.checked_add(relative_start)?;
-    let end = source_start.checked_add(relative_end)?;
-    if start > end
-        || end > source_end
-        || !source.is_char_boundary(start)
-        || !source.is_char_boundary(end)
-    {
-        return None;
-    }
-
-    let display_segment = display_text.get(line.start..line.end)?;
-    let source_segment = source.get(start..end)?;
-    (display_segment == source_segment).then_some((source, start, end))
-}
-
-fn display_line_start_for_offset(display_text: &str, offset: usize) -> Option<usize> {
-    if offset > display_text.len() || !display_text.is_char_boundary(offset) {
-        return None;
-    }
-    display_text[..offset]
-        .rfind('\n')
-        .map(|newline| newline + 1)
-        .or(Some(0))
-}
-
 fn fold_index_starting_at(state: &Rc<EditorState>, source_line: usize) -> Option<usize> {
     state
         .folds
@@ -1490,30 +1272,6 @@ fn fold_index_starting_at(state: &Rc<EditorState>, source_line: usize) -> Option
         .filter(|(_, fold)| fold.start_line == source_line)
         .max_by_key(|(_, fold)| fold.end_line)
         .map(|(index, _)| index)
-}
-
-fn wrapped_line_count(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-    text: &str,
-    wrap_width: f64,
-) -> usize {
-    if text.is_empty() || !state.wrap.get() {
-        return 1;
-    }
-
-    let wrap_width = wrap_width.max(char_width(state));
-    let mut line_width = 0.0;
-    let mut count = 1;
-    for grapheme in text.graphemes(true) {
-        let grapheme_width = text_width(area, state, grapheme);
-        if line_width > 0.0 && line_width + grapheme_width > wrap_width {
-            count += 1;
-            line_width = 0.0;
-        }
-        line_width += grapheme_width;
-    }
-    count
 }
 
 fn fold_toggle_rect(gutter_x: f64, _gutter: f64, y: f64, line_height: f64) -> (f64, f64, f64, f64) {

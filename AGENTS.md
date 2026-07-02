@@ -9,7 +9,7 @@ Avoid custom CSS unless absolutely needed.
 
 Avoid async Rust.
 
-Remember to log thing.
+Remember to log while dealing with tricky life cycle problem. But avoid logging in a loop or trivial stuff.
 
 When writing docs avoid leaking personal information (ip, specific repo names etc).
 
