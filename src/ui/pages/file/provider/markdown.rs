@@ -215,6 +215,7 @@ struct MarkdownPreviewLoad {
     html: String,
     content_signature: super::ContentSignature,
     comparison: Option<git::FileComparison>,
+    markdown_lint_issues: Vec<crate::markdown_lint::MarkdownLintIssue>,
     spellcheck_issues: Vec<crate::spellcheck::SpellcheckIssue>,
 }
 
@@ -357,11 +358,14 @@ fn show_markdown(request: PreviewRequest<'_>, selection: Option<(usize, usize)>)
                     &text,
                     &allowlist,
                 );
+                let markdown_lint_issues =
+                    crate::markdown_lint::check_document(Some(&file_path), &text);
                 MarkdownPreviewLoad {
                     text,
                     html,
                     content_signature,
                     comparison,
+                    markdown_lint_issues,
                     spellcheck_issues,
                 }
             })
@@ -375,6 +379,7 @@ fn show_markdown(request: PreviewRequest<'_>, selection: Option<(usize, usize)>)
                     disk_signature,
                     writable,
                     load.comparison.as_ref(),
+                    load.markdown_lint_issues,
                     load.spellcheck_issues,
                 );
                 if load.text.trim().is_empty() {

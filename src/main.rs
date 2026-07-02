@@ -12,6 +12,7 @@ mod github;
 mod gitignore;
 mod gitlab;
 mod language_support;
+mod markdown_lint;
 mod quick_action;
 mod spellcheck;
 mod system;

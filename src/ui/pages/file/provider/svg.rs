@@ -16,6 +16,7 @@ struct SvgPreviewLoad {
     text: String,
     signature: super::ContentSignature,
     comparison: Option<git::FileComparison>,
+    markdown_lint_issues: Vec<crate::markdown_lint::MarkdownLintIssue>,
     spellcheck_issues: Vec<crate::spellcheck::SpellcheckIssue>,
 }
 
@@ -380,6 +381,7 @@ fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
                         text,
                         signature,
                         comparison,
+                        markdown_lint_issues: Vec::new(),
                         spellcheck_issues,
                     }
                 },
@@ -394,6 +396,7 @@ fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
                     disk_signature,
                     writable,
                     load.comparison.as_ref(),
+                    load.markdown_lint_issues,
                     load.spellcheck_issues,
                 );
                 right.file_svg_preview.set_svg(&load.bytes, load.signature);

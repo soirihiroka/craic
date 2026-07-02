@@ -1,6 +1,7 @@
 use super::theme::{Color, EditorTheme};
 use super::{draw_plain_text, text_width};
 use crate::language_support::{HighlightRange, SyntaxIssue};
+use crate::markdown_lint::MarkdownLintIssue;
 use crate::spellcheck::SpellcheckIssue;
 use crate::ui::content::code_editor::EditorState;
 use gtk::cairo;
@@ -158,6 +159,47 @@ pub(super) fn draw_spellcheck_issues(
             context,
             x,
             baseline + 2.0,
+            width,
+            theme.spellcheck_underline,
+        );
+    }
+}
+
+pub(super) fn draw_markdown_lint_issues(
+    area: &gtk::DrawingArea,
+    context: &cairo::Context,
+    state: &Rc<EditorState>,
+    source: &str,
+    issues: &[MarkdownLintIssue],
+    start: usize,
+    end: usize,
+    text_x: f64,
+    baseline: f64,
+    theme: EditorTheme,
+) {
+    let first_issue = issues.partition_point(|issue| issue.end <= start);
+    for issue in &issues[first_issue..] {
+        if issue.start >= end {
+            break;
+        }
+        if issue.start >= issue.end
+            || issue.end > source.len()
+            || !source.is_char_boundary(issue.start)
+            || !source.is_char_boundary(issue.end)
+        {
+            continue;
+        }
+        let issue_start = issue.start.max(start);
+        let issue_end = issue.end.min(end);
+        if issue_start >= issue_end {
+            continue;
+        }
+        let x = text_x + text_width(area, state, &source[start..issue_start]);
+        let width = text_width(area, state, &source[issue_start..issue_end]);
+        draw_wavy_underline(
+            context,
+            x,
+            baseline + 4.0,
             width,
             theme.spellcheck_underline,
         );
