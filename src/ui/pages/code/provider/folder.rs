@@ -12,9 +12,9 @@ pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
         .show_provider_loading_message(request.file_path, "Loading folder contents...");
 
     let files = request.files.clone();
-    let workspace_root = request.metadata.path.workspace.root.absolute.clone();
+    let workspace_root = request.ctx.workspace_ref().root.absolute.clone();
     let file_path = request.file_path.to_string();
-    let workspace_path = request.workspace_path.clone();
+    let node_path = request.node_path.clone();
     let apply_file_path = file_path.clone();
 
     super::spawn_preview_load(
@@ -22,7 +22,7 @@ pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
         request.load_token,
         file_path,
         move || {
-            super::super::folder_entry_counts(files.as_ref(), &workspace_path).map(
+            super::super::folder_entry_counts(files.as_ref(), &node_path).map(
                 |(file_count, folder_count)| FolderPreviewLoad {
                     file_count,
                     folder_count,

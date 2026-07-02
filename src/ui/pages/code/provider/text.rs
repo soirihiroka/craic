@@ -22,13 +22,15 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
 
     let files = request.files.clone();
     let file_path = request.file_path.to_string();
-    let workspace_path = request.workspace_path.clone();
+    let read_node_path = request.node_path.clone();
+    let apply_node_path = request.node_path.clone();
     let git = (request.ctx.system_ref().provider_kind == crate::system::ProviderKind::Local)
         .then(|| request.ctx.git())
         .flatten();
     let prefetched_bytes = request.prefetched_bytes.map(|bytes| bytes.to_vec());
     let apply_file_path = file_path.clone();
-    let disk_signature = super::disk_signature(request.metadata);
+    let disk_signature = super::disk_signature(request.info);
+    let writable = request.info.capabilities.writable;
     let workspace = request.ctx.workspace_ref();
     let language = crate::ui::content::code_editor::language_hint_from_path(&file_path);
 
@@ -40,7 +42,7 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
             super::super::read_repository_file_from_prefetch(
                 prefetched_bytes,
                 files.as_ref(),
-                &workspace_path,
+                &read_node_path,
             )
             .map(|text| {
                 let comparison = git.as_ref().and_then(|git| git.comparison(&file_path).ok());
@@ -62,9 +64,11 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
         move |right, result| match result {
             Ok(load) => {
                 right.show_editor(
+                    &apply_node_path,
                     &apply_file_path,
                     &load.text,
                     disk_signature,
+                    writable,
                     load.comparison.as_ref(),
                     load.spellcheck_issues,
                 );

@@ -1,5 +1,5 @@
-use super::path::SystemPath;
-use crate::system::capabilities::files::FileAccess;
+use super::path::FileNodePath;
+use crate::system::capabilities::files::{FileAccess, FileNodeInfo};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -8,14 +8,14 @@ use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub(crate) struct MaterializedFile {
-    pub(crate) source: SystemPath,
+    pub(crate) source: FileNodePath,
     pub(crate) local_path: PathBuf,
     pub(crate) len: u64,
     pub(crate) created_at: SystemTime,
 }
 
 impl MaterializedFile {
-    pub(crate) fn new(source: SystemPath, local_path: PathBuf, len: u64) -> Self {
+    pub(crate) fn new(source: FileNodePath, local_path: PathBuf, len: u64) -> Self {
         log::debug!(
             "materialized file source={} local_path={} len={}",
             source.display(),
@@ -56,16 +56,16 @@ impl Drop for MaterializedFile {
 
 pub(crate) fn materialize_for_view(
     files: &dyn FileAccess,
-    source: &SystemPath,
+    source: &FileNodeInfo,
     max_bytes: u64,
 ) -> Result<MaterializedFile, String> {
     let bytes = files
-        .read_with_metadata(&source.path, Some(max_bytes))?
+        .read_with_info(&source.path, Some(max_bytes))?
         .into_bytes()?;
     if bytes.len() as u64 > max_bytes {
         return Err(format!(
             "{} is too large to materialize for preview.",
-            source.display()
+            source.path.display()
         ));
     }
 
@@ -84,12 +84,12 @@ pub(crate) fn materialize_for_view(
         .map_err(|err| format!("Failed to write preview materialization: {err}"))?;
     log::info!(
         "materialized preview source={} local_path={} bytes={}",
-        source.display(),
+        source.path.display(),
         local_path.display(),
         bytes.len()
     );
     Ok(MaterializedFile::new(
-        source.clone(),
+        source.path.clone(),
         local_path,
         bytes.len() as u64,
     ))

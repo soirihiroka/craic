@@ -70,12 +70,13 @@ pub(crate) fn load_manifest_allowlist(
     file_access: Arc<dyn FileAccess>,
 ) -> SpellcheckAllowlist {
     let mut allowlist = SpellcheckAllowlist::default();
+    let root = file_access.root();
     for manifest in ["Cargo.toml", "pyproject.toml", "package.json"] {
-        let path = workspace.path(manifest);
-        let Ok(metadata) = file_access.metadata(&path) else {
+        let path = root.join_child(manifest);
+        let Ok(info) = file_access.info(&path) else {
             continue;
         };
-        if metadata.kind != FileKind::File || metadata.len > MAX_MANIFEST_BYTES {
+        if info.kind != FileKind::File || info.len_or_zero() > MAX_MANIFEST_BYTES {
             continue;
         }
         let Ok(text) = file_access.read_text(&path, Some(MAX_MANIFEST_BYTES)) else {

@@ -1,8 +1,7 @@
 use super::{
-    BrowserTarget, FileBrowser, SEARCH_POLL_MS, file_name, join_relative, parent_folder, rows,
-    should_skip, tree::BrowserRow,
+    BrowserTarget, FileBrowser, SEARCH_POLL_MS, file_name, rows, should_skip, tree::BrowserRow,
 };
-use crate::system::capabilities::files::FileKind;
+use crate::system::FileNodePath;
 use adw::prelude::*;
 use gtk::gio;
 use std::collections::HashSet;
@@ -23,7 +22,7 @@ impl FileBrowser {
             .map(|row| {
                 if pending_rename
                     .as_ref()
-                    .is_some_and(|pending| pending.path == row.path)
+                    .is_some_and(|pending| pending.path == row.node_path)
                 {
                     rows::BrowserListRow::RenameEntry(rows::RenameEntryRow {
                         original_name: row.name.clone(),
@@ -50,15 +49,15 @@ impl FileBrowser {
         list_rows
     }
 
-    pub(super) fn create_file_in_folder(self: &Rc<Self>, folder: &str) {
+    pub(super) fn create_file_in_folder(self: &Rc<Self>, folder: &FileNodePath) {
         self.start_pending_new_entry(folder, NewEntryKind::File);
     }
 
-    pub(super) fn create_folder_in_folder(self: &Rc<Self>, folder: &str) {
+    pub(super) fn create_folder_in_folder(self: &Rc<Self>, folder: &FileNodePath) {
         self.start_pending_new_entry(folder, NewEntryKind::Folder);
     }
 
-    fn start_pending_new_entry(self: &Rc<Self>, folder: &str, kind: NewEntryKind) {
+    fn start_pending_new_entry(self: &Rc<Self>, folder: &FileNodePath, kind: NewEntryKind) {
         if !self.search_query.borrow().is_empty() {
             self.search_panel.set_query("", false);
             self.update_search_query(String::new());
@@ -73,16 +72,16 @@ impl FileBrowser {
             NewEntryKind::Folder => String::new(),
         };
         self.pending_new_entry.replace(Some(PendingNewEntry {
-            folder: folder.to_string(),
+            folder: folder.clone(),
             default_name,
             kind,
         }));
         self.pending_rename_entry.borrow_mut().take();
-        self.selected_path.replace(String::new());
+        self.selected_node_path.replace(None);
         self.selected_search_match.borrow_mut().take();
-        self.active_folder.replace(folder.to_string());
-        if !folder.is_empty() {
-            self.expanded_dirs.borrow_mut().insert(folder.to_string());
+        self.active_folder.replace(folder.clone());
+        if !folder.is_root() {
+            self.expanded_dirs.borrow_mut().insert(folder.clone());
         }
 
         self.rebuild();
@@ -94,14 +93,14 @@ impl FileBrowser {
 
     pub(super) fn finish_pending_new_entry(
         self: &Rc<Self>,
-        folder: &str,
+        folder: &FileNodePath,
         kind: NewEntryKind,
         name: String,
     ) {
         let Some(pending) = self.pending_new_entry.borrow().clone() else {
             return;
         };
-        if pending.folder != folder || pending.kind != kind {
+        if pending.folder != *folder || pending.kind != kind {
             return;
         }
 
@@ -126,7 +125,7 @@ impl FileBrowser {
     }
 
     pub(super) fn unselect_file_browser(self: &Rc<Self>) {
-        self.set_selected_path(String::new());
+        self.set_selected_node_path(None);
         self.focus_browser_shell();
     }
 
@@ -155,7 +154,7 @@ impl FileBrowser {
 
     fn create_child(
         self: &Rc<Self>,
-        folder: &str,
+        folder: &FileNodePath,
         name: &str,
         kind: NewEntryKind,
     ) -> Result<(), String> {
@@ -169,25 +168,25 @@ impl FileBrowser {
             return Err("That name is hidden by the file browser.".to_string());
         }
 
-        let relative = join_relative((!folder.is_empty()).then_some(folder), name);
-        let path = self.workspace_path(&relative);
-        if self.file_access.borrow().metadata(&path).is_ok() {
+        let candidate = folder.join_child(name);
+        if self.file_access.borrow().info(&candidate).is_ok() {
             return Err(format!("{name} already exists."));
         }
 
         log::info!(
-            "file browser create start workspace={} path={} kind={kind:?}",
+            "file browser create start workspace={} parent={} name={} kind={kind:?}",
             self.workspace.borrow().display_name,
-            path.display()
+            folder.display(),
+            name
         );
         let file_access = self.file_access.borrow().clone();
-        match kind {
-            NewEntryKind::File => file_access.create_file(&path)?,
-            NewEntryKind::Folder => file_access.create_dir(&path)?,
-        }
+        let created = match kind {
+            NewEntryKind::File => file_access.create_file(folder, name)?,
+            NewEntryKind::Folder => file_access.create_dir(folder, name)?,
+        };
 
-        if !folder.is_empty() {
-            self.expanded_dirs.borrow_mut().insert(folder.to_string());
+        if !folder.is_root() {
+            self.expanded_dirs.borrow_mut().insert(folder.clone());
         }
         self.invalidate_tree_rows_cache();
         self.spellcheck_allowlist
@@ -198,13 +197,13 @@ impl FileBrowser {
 
         match kind {
             NewEntryKind::File => {
-                self.active_folder.replace(folder.to_string());
-                self.set_selected_path(relative.clone());
+                self.active_folder.replace(folder.clone());
+                self.set_selected_node_path(Some(created));
             }
             NewEntryKind::Folder => {
-                self.expanded_dirs.borrow_mut().insert(relative.clone());
-                self.active_folder.replace(relative);
-                self.set_selected_path(String::new());
+                self.expanded_dirs.borrow_mut().insert(created.clone());
+                self.active_folder.replace(created.clone());
+                self.set_selected_node_path(Some(created));
             }
         }
 
@@ -220,13 +219,17 @@ impl FileBrowser {
 
         self.pending_new_entry.borrow_mut().take();
         self.pending_rename_entry.replace(Some(PendingRenameEntry {
-            path: target.path.clone(),
+            path: target.node_path.clone(),
         }));
-        self.selected_path.replace(target.path.clone());
+        self.selected_node_path
+            .replace(Some(target.node_path.clone()));
         self.selected_search_match.borrow_mut().take();
-        let folder = parent_folder(&target.path);
+        let folder = target
+            .node_path
+            .parent()
+            .unwrap_or_else(|| self.root_node_path());
         self.active_folder.replace(folder.clone());
-        if !folder.is_empty() {
+        if !folder.is_root() {
             self.expanded_dirs.borrow_mut().insert(folder);
         }
 
@@ -241,7 +244,7 @@ impl FileBrowser {
         let Some(pending) = self.pending_rename_entry.borrow().clone() else {
             return;
         };
-        if pending.path != target.path {
+        if pending.path != target.node_path {
             return;
         }
 
@@ -278,22 +281,25 @@ impl FileBrowser {
             return Err("Names cannot contain path separators.".to_string());
         }
 
-        let parent = target.path.rsplit_once('/').map(|(parent, _)| parent);
-        let new_relative = join_relative(parent, new_name);
-        let source = self.workspace_path(&target.path);
-        let destination = self.workspace_path(&new_relative);
-        if self.file_access.borrow().metadata(&destination).is_ok() {
+        let parent = target
+            .node_path
+            .parent()
+            .unwrap_or_else(|| self.root_node_path());
+        let destination = parent.join_child(new_name);
+        if self.file_access.borrow().info(&destination).is_ok() {
             return Err(format!("{new_name} already exists."));
         }
         log::info!(
-            "file browser rename start workspace={} source={} destination={}",
+            "file browser rename start workspace={} source={} destination_parent={} new_name={}",
             self.workspace.borrow().display_name,
-            source.display(),
-            destination.display()
+            target.node_path.display(),
+            parent.display(),
+            new_name
         );
-        self.file_access
+        let renamed = self
+            .file_access
             .borrow()
-            .rename(&source, &destination)
+            .rename(&target.node_path, &parent, new_name)
             .map_err(|err| format!("Unable to rename: {err}"))?;
 
         self.invalidate_tree_rows_cache();
@@ -303,39 +309,35 @@ impl FileBrowser {
                 self.file_access.borrow().clone(),
             ));
         if target.is_dir {
-            rename_expanded_dirs(
-                &mut self.expanded_dirs.borrow_mut(),
-                &target.path,
-                &new_relative,
-            );
-            self.active_folder.replace(new_relative);
-            self.set_selected_path(String::new());
+            {
+                let mut expanded = self.expanded_dirs.borrow_mut();
+                rename_expanded_dirs(&mut expanded, &target.node_path, &renamed);
+            }
+            self.active_folder.replace(renamed.clone());
+            self.set_selected_node_path(Some(renamed));
         } else {
-            self.active_folder.replace(parent_folder(&new_relative));
-            self.set_selected_path(new_relative);
+            self.active_folder.replace(parent);
+            self.set_selected_node_path(Some(renamed));
         }
         self.rebuild();
         Ok(())
     }
 
     pub(super) fn delete_selected_file(self: &Rc<Self>) {
-        let path = self.selected_path.borrow().clone();
-        if path.is_empty() {
+        let Some(path) = self.selected_node_path.borrow().clone() else {
             return;
-        }
-        let workspace_path = self.workspace_path(&path);
-        let is_dir = match self.file_access.borrow().metadata(&workspace_path) {
-            Ok(metadata) => metadata.kind == FileKind::Directory,
+        };
+        let target = match self.file_access.borrow().info(&path) {
+            Ok(info) => BrowserTarget::from_info(info),
             Err(err) => {
-                self.show_error("Delete Failed", &format!("Unable to inspect {path}: {err}"));
+                self.show_error(
+                    "Delete Failed",
+                    &format!("Unable to inspect {}: {err}", path.display()),
+                );
                 return;
             }
         };
-        self.delete_target(BrowserTarget {
-            path,
-            is_dir,
-            executable: false,
-        });
+        self.delete_target(target);
     }
 
     pub(super) fn delete_target(self: &Rc<Self>, target: BrowserTarget) {
@@ -369,7 +371,7 @@ impl FileBrowser {
     }
 
     fn delete_confirmed(self: &Rc<Self>, target: BrowserTarget) {
-        let path = self.workspace_path(&target.path);
+        let path = target.node_path.clone();
         let file_access = self.file_access.borrow().clone();
         let (sender, receiver) = mpsc::channel();
 
@@ -384,11 +386,19 @@ impl FileBrowser {
 
             move || match receiver.try_recv() {
                 Ok(Ok(())) => {
-                    if target_affects_selection(browser.selected_path.borrow().as_str(), &target) {
-                        browser.set_selected_path(String::new());
+                    let selection_affected = {
+                        let selected = browser.selected_node_path.borrow();
+                        target_affects_selection(selected.as_ref(), &target)
+                    };
+                    if selection_affected {
+                        browser.set_selected_node_path(None);
                     }
-                    browser.active_folder.replace(parent_folder(&target.path));
-                    remove_expanded_dir(&mut browser.expanded_dirs.borrow_mut(), &target.path);
+                    let parent = target
+                        .node_path
+                        .parent()
+                        .unwrap_or_else(|| browser.root_node_path());
+                    browser.active_folder.replace(parent);
+                    remove_expanded_dir(&mut browser.expanded_dirs.borrow_mut(), &target.node_path);
                     browser.invalidate_tree_rows_cache();
                     browser.rebuild();
                     gtk::glib::ControlFlow::Break
@@ -414,14 +424,14 @@ impl FileBrowser {
 
 #[derive(Clone)]
 pub(super) struct PendingNewEntry {
-    folder: String,
+    folder: FileNodePath,
     default_name: String,
     kind: NewEntryKind,
 }
 
 #[derive(Clone)]
 pub(super) struct PendingRenameEntry {
-    path: String,
+    path: FileNodePath,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -439,26 +449,34 @@ impl NewEntryKind {
     }
 }
 
-fn target_affects_selection(selected: &str, target: &BrowserTarget) -> bool {
-    if selected == target.path {
+fn target_affects_selection(selected: Option<&FileNodePath>, target: &BrowserTarget) -> bool {
+    if selected == Some(&target.node_path) {
         return true;
     }
-    target.is_dir
-        && selected
-            .strip_prefix(&target.path)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    target
+        .is_dir
+        .then_some(())
+        .is_some_and(|_| selected.is_some_and(|path| path.is_child_of(&target.node_path)))
 }
 
-fn rename_expanded_dirs(expanded_dirs: &mut HashSet<String>, old_path: &str, new_path: &str) {
+fn rename_expanded_dirs(
+    expanded_dirs: &mut HashSet<FileNodePath>,
+    old_path: &FileNodePath,
+    new_path: &FileNodePath,
+) {
     let renamed = expanded_dirs
         .iter()
         .filter_map(|path| {
             if path == old_path {
-                Some(new_path.to_string())
+                Some(new_path.clone())
+            } else if path.is_child_of(old_path) {
+                let mut renamed = new_path.clone();
+                renamed
+                    .nodes
+                    .extend(path.nodes[old_path.nodes.len()..].iter().cloned());
+                Some(renamed)
             } else {
-                path.strip_prefix(old_path)
-                    .filter(|suffix| suffix.starts_with('/'))
-                    .map(|suffix| format!("{new_path}{suffix}"))
+                None
             }
         })
         .collect::<Vec<_>>();
@@ -466,20 +484,20 @@ fn rename_expanded_dirs(expanded_dirs: &mut HashSet<String>, old_path: &str, new
     expanded_dirs.extend(renamed);
 }
 
-fn remove_expanded_dir(expanded_dirs: &mut HashSet<String>, path: &str) {
-    expanded_dirs.retain(|expanded| {
-        expanded != path
-            && !expanded
-                .strip_prefix(path)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-    });
+fn remove_expanded_dir(expanded_dirs: &mut HashSet<FileNodePath>, path: &FileNodePath) {
+    expanded_dirs.retain(|expanded| expanded != path && !expanded.is_child_of(path));
 }
 
-fn child_depth(folder: &str) -> usize {
-    folder
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .count()
+fn child_depth(folder: &FileNodePath) -> usize {
+    let display = folder.display();
+    if display.is_empty() {
+        0
+    } else {
+        display
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .count()
+    }
 }
 
 fn pending_new_entry_insert_index(
@@ -487,13 +505,13 @@ fn pending_new_entry_insert_index(
     pending: &PendingNewEntry,
 ) -> usize {
     let child_depth = child_depth(&pending.folder);
-    let (mut index, boundary_depth) = if pending.folder.is_empty() {
+    let (mut index, boundary_depth) = if pending.folder.is_root() {
         (0, None)
     } else {
         let Some(parent_index) = rows.iter().position(|row| {
             matches!(
                 row,
-                rows::BrowserListRow::Tree(row) if row.is_dir && row.path == pending.folder
+                rows::BrowserListRow::Tree(row) if row.is_dir && row.node_path == pending.folder
             )
         }) else {
             return rows.len();

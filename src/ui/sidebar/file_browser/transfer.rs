@@ -1,4 +1,5 @@
-use super::{BrowserTarget, FileBrowser, join_relative, parent_folder, should_skip};
+use super::{BrowserTarget, FileBrowser, should_skip};
+use crate::system::FileNodePath;
 use crate::system::capabilities::files::{FileAccess, FileKind};
 use crate::system::capabilities::open::OpenTargetKind;
 use adw::prelude::*;
@@ -15,7 +16,7 @@ use std::time::Duration;
 const TRANSFER_CANCELED_MESSAGE: &str = "Transfer canceled.";
 
 impl FileBrowser {
-    pub(super) fn set_internal_drag_paths(&self, paths: Vec<String>) {
+    pub(super) fn set_internal_drag_paths(&self, paths: Vec<FileNodePath>) {
         self.internal_drag_paths.replace(Some(paths));
     }
 
@@ -27,30 +28,28 @@ impl FileBrowser {
     pub(super) fn handle_drop_hover(
         self: &Rc<Self>,
         _external_sources_available: bool,
-        target_relative: String,
+        target: FileNodePath,
         available_actions: gdk::DragAction,
         modifiers: gdk::ModifierType,
     ) -> gdk::DragAction {
-        let Some(operation) =
-            self.drop_operation_for_target(&target_relative, available_actions, modifiers)
+        let Some(operation) = self.drop_operation_for_target(&target, available_actions, modifiers)
         else {
             self.clear_drop_target_folder();
             return gdk::DragAction::empty();
         };
 
-        self.set_drop_target_folder(Some(target_relative));
+        self.set_drop_target_folder(Some(target));
         operation.drag_action()
     }
 
     pub(super) fn handle_dropped_paths(
         self: &Rc<Self>,
         external_sources_available: bool,
-        target_relative: String,
+        target: FileNodePath,
         available_actions: gdk::DragAction,
         modifiers: gdk::ModifierType,
     ) -> bool {
-        let Some(operation) =
-            self.drop_operation_for_target(&target_relative, available_actions, modifiers)
+        let Some(operation) = self.drop_operation_for_target(&target, available_actions, modifiers)
         else {
             self.clear_drop_target_folder();
             if external_sources_available {
@@ -70,24 +69,20 @@ impl FileBrowser {
             );
             return false;
         };
-        self.transfer_workspace_paths_to_folder(paths, target_relative, operation, false);
+        self.transfer_workspace_paths_to_folder(paths, target, operation, false);
         true
     }
 
     fn drop_operation_for_target(
         &self,
-        target_relative: &str,
+        target: &FileNodePath,
         available_actions: gdk::DragAction,
         modifiers: gdk::ModifierType,
     ) -> Option<TransferOperation> {
         if self.internal_drag_paths.borrow().is_none() {
             return None;
         }
-        let target = self.workspace_path(target_relative);
-        let Ok(metadata) = self.file_access.borrow().metadata(&target) else {
-            return None;
-        };
-        if metadata.kind != FileKind::Directory {
+        if !self.workspace_is_directory(target) {
             return None;
         }
 
@@ -101,7 +96,7 @@ impl FileBrowser {
             .then_some(operation)
     }
 
-    fn set_drop_target_folder(self: &Rc<Self>, target: Option<String>) {
+    fn set_drop_target_folder(self: &Rc<Self>, target: Option<FileNodePath>) {
         if *self.drop_target_folder.borrow() == target {
             return;
         }
@@ -120,8 +115,8 @@ impl FileBrowser {
         self.set_drop_target_folder(None);
     }
 
-    fn schedule_drop_auto_expand(self: &Rc<Self>, target: String) {
-        if target.is_empty()
+    fn schedule_drop_auto_expand(self: &Rc<Self>, target: FileNodePath) {
+        if target.is_root()
             || !self.search_query.borrow().is_empty()
             || self.expanded_dirs.borrow().contains(&target)
             || !self.workspace_is_directory(&target)
@@ -135,7 +130,7 @@ impl FileBrowser {
 
             move || {
                 if browser.drop_hover_generation.get() != generation
-                    || browser.drop_target_folder.borrow().as_deref() != Some(target.as_str())
+                    || browser.drop_target_folder.borrow().as_ref() != Some(&target)
                     || !browser.search_query.borrow().is_empty()
                     || !browser.workspace_is_directory(&target)
                     || browser.expanded_dirs.borrow().contains(&target)
@@ -151,28 +146,28 @@ impl FileBrowser {
         });
     }
 
-    pub(super) fn current_drop_target_folder(&self) -> Option<String> {
+    pub(super) fn current_drop_target_folder(&self) -> Option<FileNodePath> {
         self.drop_target_folder.borrow().clone()
     }
 
-    fn workspace_is_directory(&self, relative: &str) -> bool {
+    fn workspace_is_directory(&self, path: &FileNodePath) -> bool {
         self.file_access
             .borrow()
-            .metadata(&self.workspace_path(relative))
-            .is_ok_and(|metadata| metadata.kind == FileKind::Directory)
+            .info(path)
+            .is_ok_and(|info| info.kind == FileKind::Directory)
     }
 
     fn transfer_workspace_paths_to_folder(
         self: &Rc<Self>,
-        sources: Vec<String>,
-        target_relative: String,
+        sources: Vec<FileNodePath>,
+        target_folder: FileNodePath,
         operation: TransferOperation,
         auto_focus: bool,
     ) {
         if sources.is_empty() {
             return;
         }
-        if !self.workspace_is_directory(&target_relative) {
+        if !self.workspace_is_directory(&target_folder) {
             self.show_error(operation.failure_heading(), "Drop target is not a folder.");
             return;
         }
@@ -204,9 +199,8 @@ impl FileBrowser {
             let progress_sender = sender.clone();
             let result = transfer_workspace_paths(
                 file_access,
-                &workspace,
                 sources,
-                &target_relative,
+                target_folder,
                 operation,
                 &cancel_requested,
                 move |progress| {
@@ -256,8 +250,8 @@ impl FileBrowser {
 
     fn set_transfer_progress(&self, transfer_id: u64, progress: TransferProgressUpdate) -> bool {
         if let Some(active) = self.active_transfers.borrow_mut().get_mut(&transfer_id) {
-            let current_path_changed = active.current_relative != progress.current_relative;
-            active.current_relative = progress.current_relative;
+            let current_path_changed = active.current_path != progress.current_path;
+            active.current_path = progress.current_path;
             active.copied_bytes = progress.copied_bytes;
             active.total_bytes = progress.total_bytes;
             active.copied_files = progress.copied_files;
@@ -271,7 +265,7 @@ impl FileBrowser {
         self: &Rc<Self>,
         transfer_id: u64,
         operation: TransferOperation,
-        result: Result<Vec<String>, String>,
+        result: Result<Vec<FileNodePath>, String>,
     ) {
         let auto_focus = self
             .active_transfers
@@ -323,14 +317,17 @@ impl FileBrowser {
         self.set_browser_rows(rows);
     }
 
-    fn auto_focus_transferred_items(self: &Rc<Self>, destinations: Vec<String>) {
-        let Some(selected) = destinations.into_iter().find(|path| !path.is_empty()) else {
+    fn auto_focus_transferred_items(self: &Rc<Self>, destinations: Vec<FileNodePath>) {
+        let Some(selected) = destinations.into_iter().find(|path| !path.is_root()) else {
             return;
         };
-        self.set_selected_path(selected.clone());
+        self.set_selected_node_path(Some(selected.clone()));
         self.scroll_selected_row_into_view();
         self.focus_selected_row();
-        log::info!("file transfer auto-focused item path={selected}");
+        log::info!(
+            "file transfer auto-focused item path={}",
+            selected.display()
+        );
     }
 
     pub(super) fn confirm_cancel_transfers(self: &Rc<Self>, transfer_ids: Vec<u64>) {
@@ -371,7 +368,10 @@ impl FileBrowser {
         }
     }
 
-    pub(super) fn transfer_progress_for_path(&self, path: &str) -> Option<TransferRowProgress> {
+    pub(super) fn transfer_progress_for_path(
+        &self,
+        path: &FileNodePath,
+    ) -> Option<TransferRowProgress> {
         let transfers = self.active_transfers.borrow();
         let mut count = 0usize;
         let mut copied_bytes = 0u64;
@@ -382,7 +382,7 @@ impl FileBrowser {
         let mut transfer_ids = Vec::new();
 
         for (transfer_id, transfer) in transfers.iter() {
-            if transfer.current_relative.as_deref() != Some(path) {
+            if transfer.current_path.as_ref() != Some(path) {
                 continue;
             }
 
@@ -424,24 +424,26 @@ impl FileBrowser {
         })
     }
 
-    pub(super) fn paste_target_folder(self: &Rc<Self>) -> String {
-        let selected = self.selected_path.borrow().clone();
-        if selected.is_empty() {
+    pub(super) fn paste_target_folder(self: &Rc<Self>) -> FileNodePath {
+        let Some(selected) = self.selected_node_path.borrow().clone() else {
             return self.active_folder.borrow().clone();
-        }
+        };
 
         if self.workspace_is_directory(&selected) {
             selected
         } else {
-            parent_folder(&selected)
+            selected.parent().unwrap_or_else(|| self.root_node_path())
         }
     }
 
-    pub(super) fn target_paste_folder(&self, target: &BrowserTarget) -> String {
+    pub(super) fn target_paste_folder(&self, target: &BrowserTarget) -> FileNodePath {
         if target.is_dir {
-            target.path.clone()
+            target.node_path.clone()
         } else {
-            parent_folder(&target.path)
+            target
+                .node_path
+                .parent()
+                .unwrap_or_else(|| self.root_node_path())
         }
     }
 
@@ -449,75 +451,54 @@ impl FileBrowser {
         self.paste_into_folder(self.paste_target_folder());
     }
 
-    pub(super) fn paste_into_folder(self: &Rc<Self>, target_relative: String) {
+    pub(super) fn paste_into_folder(self: &Rc<Self>, target_folder: FileNodePath) {
         let Some(clipboard) = self.file_clipboard.borrow().clone() else {
             return;
         };
         self.transfer_workspace_paths_to_folder(
             clipboard.paths,
-            target_relative,
+            target_folder,
             clipboard.operation,
             true,
         );
     }
 
     pub(super) fn open_target(self: &Rc<Self>, target: &BrowserTarget) {
-        if target.is_dir {
-            if !target.path.is_empty() {
-                self.toggle_dir(&target.path);
+        if target.is_dir || target.capabilities.listable {
+            if !target.node_path.is_root() {
+                self.toggle_dir(&target.node_path);
             } else {
                 self.open_external(target);
             }
         } else {
-            self.set_selected_path(target.path.clone());
+            self.set_selected_node_path(Some(target.node_path.clone()));
         }
     }
 
     pub(super) fn copy_target(&self, target: &BrowserTarget, operation: TransferOperation) {
         self.file_clipboard.replace(Some(FileClipboard {
-            paths: vec![target.path.clone()],
+            paths: vec![target.node_path.clone()],
             operation,
         }));
         set_clipboard_text(&target.path);
     }
 
     pub(super) fn copy_selected_target(&self, operation: TransferOperation) {
-        let path = self.selected_path.borrow().clone();
-        if path.is_empty() {
+        let Some(path) = self.selected_node_path.borrow().clone() else {
             return;
-        }
-
-        let workspace_path = self.workspace_path(&path);
-        let is_dir = match self.file_access.borrow().metadata(&workspace_path) {
-            Ok(metadata) => metadata.kind == FileKind::Directory,
-            Err(err) => {
-                let heading = match operation {
-                    TransferOperation::Copy => "Copy Failed",
-                    TransferOperation::Move => "Cut Failed",
-                };
-                self.show_error(heading, &format!("Unable to inspect {path}: {err}"));
-                return;
-            }
         };
-        self.copy_target(
-            &BrowserTarget {
-                path,
-                is_dir,
-                executable: false,
-            },
-            operation,
-        );
+        let target = self.target_for_node_path(path);
+        self.copy_target(&target, operation);
     }
 
     pub(super) fn copy_absolute_path(&self, target: &BrowserTarget) {
         self.file_clipboard.borrow_mut().take();
-        let path = self.workspace_path(&target.path);
         let text = self
             .opener
             .borrow()
             .as_ref()
-            .map(|opener| opener.copyable_path(&path))
-            .unwrap_or_else(|| path.absolute);
+            .map(|opener| opener.copyable_path(&target.node_path))
+            .unwrap_or_else(|| target.path.clone());
         set_clipboard_text(&text);
     }
 
@@ -536,7 +517,7 @@ impl FileBrowser {
         } else {
             OpenTargetKind::File
         };
-        match opener.open_path(&self.workspace_path(&target.path), kind) {
+        match opener.open_path(&target.node_path, kind) {
             Ok(message) => self.notify_open_message(&message),
             Err(err) => self.notify_open_message(&err),
         }
@@ -550,7 +531,7 @@ impl FileBrowser {
             );
             return;
         };
-        match opener.reveal_path(&self.workspace_path(&target.path)) {
+        match opener.reveal_path(&target.node_path) {
             Ok(message) => self.notify_open_message(&message),
             Err(err) => self.show_error("Open Failed", &err),
         }
@@ -607,7 +588,7 @@ impl FileBrowser {
 
 #[derive(Clone)]
 pub(super) struct FileClipboard {
-    paths: Vec<String>,
+    paths: Vec<FileNodePath>,
     operation: TransferOperation,
 }
 
@@ -655,7 +636,7 @@ pub(super) struct ActiveTransfer {
     operation: TransferOperation,
     auto_focus: bool,
     cancel_requested: Arc<AtomicBool>,
-    current_relative: Option<String>,
+    current_path: Option<FileNodePath>,
     copied_bytes: u64,
     total_bytes: u64,
     copied_files: u64,
@@ -673,7 +654,7 @@ impl ActiveTransfer {
             operation,
             auto_focus,
             cancel_requested,
-            current_relative: None,
+            current_path: None,
             copied_bytes: 0,
             total_bytes: 0,
             copied_files: 0,
@@ -684,7 +665,7 @@ impl ActiveTransfer {
 
 #[derive(Clone)]
 struct TransferProgressUpdate {
-    current_relative: Option<String>,
+    current_path: Option<FileNodePath>,
     copied_bytes: u64,
     total_bytes: u64,
     copied_files: u64,
@@ -693,50 +674,45 @@ struct TransferProgressUpdate {
 
 enum TransferEvent {
     Progress(TransferProgressUpdate),
-    Finished(Result<Vec<String>, String>),
+    Finished(Result<Vec<FileNodePath>, String>),
 }
 
 fn transfer_workspace_paths(
     file_access: Arc<dyn FileAccess>,
-    workspace: &crate::system::WorkspaceRef,
-    sources: Vec<String>,
-    target_relative: &str,
+    sources: Vec<FileNodePath>,
+    target_folder: FileNodePath,
     operation: TransferOperation,
     cancel_requested: &AtomicBool,
     mut progress: impl FnMut(TransferProgressUpdate),
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<FileNodePath>, String> {
     let mut destinations = Vec::new();
     let total_files = sources.len() as u64;
     let mut copied_files = 0u64;
     for source in sources {
         check_transfer_canceled(cancel_requested)?;
         let name = file_name_for_transfer(&source)?;
-        let destination = join_relative(
-            (!target_relative.is_empty()).then_some(target_relative),
-            &name,
-        );
+        let destination = target_folder.join_child(&name);
         if source == destination {
             continue;
         }
-        if file_access.metadata(&workspace.path(&destination)).is_ok() {
-            return Err(format!("{destination} already exists."));
+        if file_access.info(&destination).is_ok() {
+            return Err(format!("{} already exists.", destination.display()));
         }
         match operation {
             TransferOperation::Copy => copy_workspace_entry(
                 file_access.clone(),
-                workspace,
                 &source,
                 &destination,
                 cancel_requested,
                 &mut progress,
             )?,
             TransferOperation::Move => {
-                file_access.rename(&workspace.path(&source), &workspace.path(&destination))?;
+                file_access.rename(&source, &target_folder, &name)?;
             }
         }
         copied_files = copied_files.saturating_add(1);
         progress(TransferProgressUpdate {
-            current_relative: Some(destination.clone()),
+            current_path: Some(destination.clone()),
             copied_bytes: 0,
             total_bytes: 0,
             copied_files,
@@ -749,43 +725,45 @@ fn transfer_workspace_paths(
 
 fn copy_workspace_entry(
     file_access: Arc<dyn FileAccess>,
-    workspace: &crate::system::WorkspaceRef,
-    source_relative: &str,
-    destination_relative: &str,
+    source: &FileNodePath,
+    destination: &FileNodePath,
     cancel_requested: &AtomicBool,
     progress: &mut impl FnMut(TransferProgressUpdate),
 ) -> Result<(), String> {
     check_transfer_canceled(cancel_requested)?;
-    let source = workspace.path(source_relative);
-    let destination = workspace.path(destination_relative);
-    let metadata = file_access.metadata(&source)?;
-    match metadata.kind {
+    let info = file_access.info(source)?;
+    match info.kind {
         FileKind::Directory => {
-            file_access.create_dir(&destination)?;
+            let parent = destination
+                .parent()
+                .ok_or_else(|| "Cannot copy over workspace root.".to_string())?;
+            let name = destination
+                .file_name()
+                .ok_or_else(|| "Cannot copy over workspace root.".to_string())?;
+            file_access.create_dir(&parent, name)?;
             progress(TransferProgressUpdate {
-                current_relative: Some(destination_relative.to_string()),
+                current_path: Some(destination.clone()),
                 copied_bytes: 0,
                 total_bytes: 0,
                 copied_files: 0,
                 total_files: 0,
             });
             let entries = file_access
-                .list_dirs(std::slice::from_ref(&source))?
+                .list_dirs(std::slice::from_ref(source))?
                 .into_iter()
                 .next()
                 .map(|listing| listing.entries)
                 .unwrap_or_default();
-            for entry in entries {
-                let Some(child_source) = entry.path.path.relative.clone() else {
+            for child_source in entries {
+                let Some(name) = child_source.file_name().map(ToString::to_string) else {
                     continue;
                 };
-                if should_skip(&entry.name) {
+                if should_skip(&name) {
                     continue;
                 }
-                let child_destination = join_relative(Some(destination_relative), &entry.name);
+                let child_destination = destination.join_child(&name);
                 copy_workspace_entry(
                     file_access.clone(),
-                    workspace,
                     &child_source,
                     &child_destination,
                     cancel_requested,
@@ -793,12 +771,12 @@ fn copy_workspace_entry(
                 )?;
             }
         }
-        FileKind::File | FileKind::Symlink | FileKind::Other => {
-            let bytes = file_access.read_bytes(&source, None)?;
+        FileKind::File | FileKind::Symlink | FileKind::Other | FileKind::Archive { .. } => {
+            let bytes = file_access.read_bytes(source, None)?;
             let total_bytes = bytes.len() as u64;
-            file_access.write_bytes(&destination, &bytes)?;
+            file_access.write_bytes(destination, &bytes)?;
             progress(TransferProgressUpdate {
-                current_relative: Some(destination_relative.to_string()),
+                current_path: Some(destination.clone()),
                 copied_bytes: total_bytes,
                 total_bytes,
                 copied_files: 1,
@@ -809,10 +787,9 @@ fn copy_workspace_entry(
     Ok(())
 }
 
-fn file_name_for_transfer(relative: &str) -> Result<String, String> {
-    let name = relative
-        .rsplit('/')
-        .find(|segment| !segment.is_empty())
+fn file_name_for_transfer(path: &FileNodePath) -> Result<String, String> {
+    let name = path
+        .file_name()
         .ok_or_else(|| "Cannot transfer workspace root.".to_string())?;
     if should_skip(name) {
         return Err("That name is hidden by the file browser.".to_string());

@@ -4,7 +4,9 @@ use crate::system::capabilities::{
     docker::DockerAccess, files::FileAccess, git::GitAccess, open::OpenAccess, shell::ShellAccess,
     terminal_link::TerminalLinkAccess,
 };
-use crate::system::{SystemPath, SystemProviderRegistry, SystemRef, WorkspacePath, WorkspaceRef};
+use crate::system::{
+    FileNodePath, SystemPath, SystemProviderRegistry, SystemRef, WorkspacePath, WorkspaceRef,
+};
 use crate::terminal::CommandSpec;
 use crate::ui::dialogs::show_error_dialog;
 use adw::prelude::*;
@@ -75,7 +77,7 @@ impl PageBadge {
 #[derive(Clone)]
 pub(crate) enum PageCommand {
     OpenSearchMatch {
-        path: String,
+        path: FileNodePath,
         start: usize,
         end: usize,
     },
@@ -176,6 +178,14 @@ impl PageContext {
         let workspace = self.workspace_ref();
         let path = workspace.path(relative);
         SystemPath::new(self.system_ref(), workspace, path)
+    }
+
+    pub(super) fn workspace_node_path(&self, relative: &str) -> FileNodePath {
+        self.workspace_ref().node_path(&self.system_ref(), relative)
+    }
+
+    pub(super) fn workspace_root_node_path(&self) -> FileNodePath {
+        self.workspace_ref().root_node_path(&self.system_ref())
     }
 
     pub(super) fn files(&self) -> Option<Arc<dyn FileAccess>> {

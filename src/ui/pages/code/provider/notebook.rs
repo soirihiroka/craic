@@ -1,6 +1,6 @@
 use super::{PreviewMatchRequest, PreviewRequest};
 use crate::config;
-use crate::system::WorkspacePath;
+use crate::system::FileNodePath;
 use crate::system::capabilities::files::FileAccess;
 use crate::ui::content::code_editor;
 use adw::prelude::*;
@@ -875,7 +875,7 @@ pub(in crate::ui::pages::code) fn show_match(request: PreviewMatchRequest<'_>) {
 #[derive(Clone)]
 struct ReadonlyNotebookSource {
     files: Arc<dyn FileAccess>,
-    workspace_path: WorkspacePath,
+    node_path: FileNodePath,
     local_path: Option<PathBuf>,
     prefetched_bytes: Option<Vec<u8>>,
 }
@@ -891,7 +891,7 @@ impl ReadonlyNotebookSource {
             right,
             load_token,
             Arc::clone(&self.files),
-            self.workspace_path.clone(),
+            self.node_path.clone(),
             file_path,
             self.local_path.clone(),
             self.prefetched_bytes.clone(),
@@ -906,7 +906,7 @@ fn show_notebook(request: PreviewRequest<'_>) {
 
     let readonly_source = ReadonlyNotebookSource {
         files: request.files.clone(),
-        workspace_path: request.workspace_path.clone(),
+        node_path: request.node_path.clone(),
         local_path: request.local_path.map(Path::to_path_buf),
         prefetched_bytes: request.prefetched_bytes.map(|bytes| bytes.to_vec()),
     };
@@ -923,7 +923,18 @@ fn show_notebook(request: PreviewRequest<'_>) {
         return;
     }
 
-    let repo_path = PathBuf::from(&request.metadata.path.workspace.root.absolute);
+    let Some(repo_path) = request.ctx.local_workspace_path() else {
+        log::info!(
+            "jupyter notebook live preview unavailable without local workspace path; showing readonly file_path={}",
+            request.file_path
+        );
+        readonly_source.show(
+            Rc::clone(&request.right),
+            request.load_token,
+            request.file_path.to_string(),
+        );
+        return;
+    };
     let file_path = request.file_path.to_string();
     let right = Rc::clone(&request.right);
     let load_token = request.load_token;

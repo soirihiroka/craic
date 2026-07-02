@@ -347,13 +347,15 @@ fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
 
     let files = request.files.clone();
     let file_path = request.file_path.to_string();
-    let workspace_path = request.workspace_path.clone();
+    let read_node_path = request.node_path.clone();
+    let apply_node_path = request.node_path.clone();
     let git = (request.ctx.system_ref().provider_kind == crate::system::ProviderKind::Local)
         .then(|| request.ctx.git())
         .flatten();
     let prefetched_bytes = request.prefetched_bytes.map(|bytes| bytes.to_vec());
     let apply_file_path = file_path.clone();
-    let disk_signature = super::disk_signature(request.metadata);
+    let disk_signature = super::disk_signature(request.info);
+    let writable = request.info.capabilities.writable;
     let workspace = request.ctx.workspace_ref();
     let language = crate::ui::content::code_editor::language_hint_from_path(&file_path);
 
@@ -362,7 +364,7 @@ fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
         request.load_token,
         file_path.clone(),
         move || {
-            read_svg_source(prefetched_bytes, files.as_ref(), &workspace_path).map(
+            read_svg_source(prefetched_bytes, files.as_ref(), &read_node_path).map(
                 |(bytes, text, signature)| {
                     let comparison = git.as_ref().and_then(|git| git.comparison(&file_path).ok());
                     let allowlist =
@@ -386,9 +388,11 @@ fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
         move |right, result| match result {
             Ok(load) => {
                 right.show_editor(
+                    &apply_node_path,
                     &apply_file_path,
                     &load.text,
                     disk_signature,
+                    writable,
                     load.comparison.as_ref(),
                     load.spellcheck_issues,
                 );
@@ -408,13 +412,10 @@ fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
 fn read_svg_source(
     prefetched_bytes: Option<Vec<u8>>,
     files: &dyn crate::system::capabilities::files::FileAccess,
-    workspace_path: &crate::system::WorkspacePath,
+    node_path: &crate::system::FileNodePath,
 ) -> Result<(Vec<u8>, String, super::ContentSignature), String> {
-    let bytes = super::super::read_repository_file_bytes_from_prefetch(
-        prefetched_bytes,
-        files,
-        workspace_path,
-    )?;
+    let bytes =
+        super::super::read_repository_file_bytes_from_prefetch(prefetched_bytes, files, node_path)?;
     let signature = super::content_signature(&bytes);
     let text = String::from_utf8(bytes.clone())
         .map_err(|_| "Unable to load SVG source. File is not valid UTF-8 text.".to_string())?;

@@ -68,16 +68,17 @@ pub fn options_for_path(path: &str, kind: IgnoreTargetKind) -> Vec<IgnoreOption>
 
 pub fn add_pattern_to_workspace(
     files: &dyn FileAccess,
-    workspace: &WorkspaceRef,
+    _workspace: &WorkspaceRef,
     pattern: &str,
 ) -> Result<String, String> {
     if pattern.is_empty() {
         return Err("Ignore pattern cannot be empty.".to_string());
     }
 
-    let gitignore_path = workspace.path(".gitignore");
-    let existing = match files.read_with_metadata(&gitignore_path, None) {
-        Ok(read) if read.metadata.kind == FileKind::File => read.into_bytes()?,
+    let root = files.root();
+    let gitignore_path = root.join_child(".gitignore");
+    let existing = match files.read_with_info(&gitignore_path, None) {
+        Ok(read) if read.info.kind == FileKind::File => read.into_bytes()?,
         Ok(_) => return Err(".gitignore is not a file.".to_string()),
         Err(_) => Vec::new(),
     };
@@ -93,8 +94,8 @@ pub fn add_pattern_to_workspace(
     next.extend_from_slice(pattern.as_bytes());
     next.push(b'\n');
 
-    if files.metadata(&gitignore_path).is_err() {
-        files.create_file(&gitignore_path)?;
+    if files.info(&gitignore_path).is_err() {
+        files.create_file(&root, ".gitignore")?;
     }
     files.write_bytes(&gitignore_path, &next)?;
     Ok(format!("Added {pattern} to .gitignore."))

@@ -1,5 +1,4 @@
 use super::{DiskSignature, PreviewMatchRequest, PreviewRequest, disk_signature};
-use crate::system::capabilities::files::FileKind;
 use crate::system::materialize::MaterializedFile;
 use crate::ui::widgets;
 use gtk::{gio, prelude::*};
@@ -294,9 +293,9 @@ fn show_media(request: PreviewRequest<'_>, kind: MediaKind) {
     let file_path = request.file_path.to_string();
     let local_path = request.local_path.map(|path| path.to_path_buf());
     let files = request.files.clone();
-    let source = request.metadata.path.clone();
-    let is_file = request.metadata.kind == FileKind::File;
-    let disk_signature = disk_signature(request.metadata);
+    let source = request.info.clone();
+    let is_file = request.info.kind.is_file();
+    let disk_signature = disk_signature(request.info);
     let apply_file_path = file_path.clone();
 
     super::spawn_preview_load(

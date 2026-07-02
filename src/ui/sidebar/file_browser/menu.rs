@@ -17,7 +17,7 @@ pub(super) fn repository_row_menu(
 }
 
 fn repository_folder_menu(target: &BrowserTarget, terminal_available: bool) -> ContextMenuBuilder {
-    let is_root = target.path.is_empty();
+    let is_root = target.is_root();
     let mut menu = context_menu::builder("repo_file")
         .item("New File...", "new-file")
         .item("New Folder...", "new-folder")
@@ -39,7 +39,7 @@ fn repository_folder_menu(target: &BrowserTarget, terminal_available: bool) -> C
     }
     menu = menu.shortcut_item("Paste", "paste", "<Primary>v");
 
-    if !is_root {
+    if !is_root && target.capabilities.native {
         menu = append_ignore_section(menu.separator(), &target.path, IgnoreTargetKind::Folder);
     }
 
@@ -70,13 +70,15 @@ fn repository_file_menu(
         .shortcut_item("Copy", "copy", "<Primary>c")
         .shortcut_item("Paste", "paste", "<Primary>v");
 
-    menu = append_ignore_section(
-        menu.separator(),
-        target.path.as_str(),
-        IgnoreTargetKind::File,
-    );
+    if target.capabilities.native {
+        menu = append_ignore_section(
+            menu.separator(),
+            target.path.as_str(),
+            IgnoreTargetKind::File,
+        );
+    }
 
-    if container_actions_available {
+    if container_actions_available && target.capabilities.native {
         menu = append_container_section(menu.separator(), target);
     }
 

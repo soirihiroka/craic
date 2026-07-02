@@ -2,6 +2,7 @@ use super::provider;
 use crate::config;
 use crate::git::FileComparison;
 use crate::spellcheck::SpellcheckIssue;
+use crate::system::FileNodePath;
 use crate::ui::content::{binary_preview, code_editor, folder_view};
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -21,9 +22,10 @@ pub(super) struct RightPane {
     editor_loading: gtk::Box,
     pub(super) folder_view: folder_view::FolderView,
     pub(super) file_editor: code_editor::CodeEditor,
-    pub(in crate::ui::pages::code) file_editor_path: Rc<RefCell<Option<String>>>,
+    pub(in crate::ui::pages::code) file_editor_path: Rc<RefCell<Option<FileNodePath>>>,
     pub(in crate::ui::pages::code) file_editor_disk_signature:
         Rc<RefCell<Option<provider::DiskSignature>>>,
+    pub(in crate::ui::pages::code) file_editor_writable: Rc<Cell<bool>>,
     pub(in crate::ui::pages::code) file_view_split: gtk::Paned,
     pub(in crate::ui::pages::code) file_svg_preview: Rc<super::provider::svg::SvgPreview>,
     pub(in crate::ui::pages::code) file_markdown_preview:
@@ -62,7 +64,7 @@ impl RightPane {
 
         let file_editor = code_editor::CodeEditor::new("", "");
         file_editor.set_font_size(config::load().font_sizes.editor);
-        file_editor.set_editable(true);
+        file_editor.set_editable(false);
         file_editor.root.set_vexpand(true);
         let editor_loading = loading_screen("Loading file preview...");
 
@@ -154,6 +156,7 @@ impl RightPane {
             file_editor,
             file_editor_path: Rc::new(RefCell::new(None)),
             file_editor_disk_signature: Rc::new(RefCell::new(None)),
+            file_editor_writable: Rc::new(Cell::new(false)),
             file_view_split,
             file_svg_preview,
             file_markdown_preview,
@@ -273,9 +276,11 @@ impl RightPane {
 
     pub(in crate::ui::pages::code) fn show_editor(
         &self,
+        node_path: &FileNodePath,
         file_path: &str,
         text: &str,
         disk_signature: provider::DiskSignature,
+        writable: bool,
         comparison: Option<&FileComparison>,
         spellcheck_issues: Vec<SpellcheckIssue>,
     ) {
@@ -283,12 +288,14 @@ impl RightPane {
         self.stack.set_visible_child_name("editor");
         self.file_view_split
             .set_start_child(Some(&self.file_editor.root));
-        self.file_editor_path.replace(Some(file_path.to_string()));
+        self.file_editor_path.replace(Some(node_path.clone()));
         self.file_editor_disk_signature
             .replace(Some(disk_signature));
+        self.file_editor_writable.set(writable);
 
         let language = code_editor::language_hint_from_path(file_path);
         self.file_editor.set_document(&language, text);
+        self.file_editor.set_editable(writable);
         self.file_editor.set_file_diff(comparison);
         self.file_editor.set_spellcheck_issues(spellcheck_issues);
         self.clear_auxiliary_previews();
@@ -352,9 +359,12 @@ impl RightPane {
     fn clear_file_state(&self) {
         self.file_editor_path.borrow_mut().take();
         self.file_editor_disk_signature.borrow_mut().take();
+        self.file_editor_writable.set(false);
+        self.file_editor.set_editable(false);
         self.file_editor.set_language("");
         self.file_editor.set_text("");
         self.file_editor.clear_file_diff();
+        self.file_editor.set_spellcheck_issues(Vec::new());
     }
 
     fn clear_auxiliary_previews(&self) {

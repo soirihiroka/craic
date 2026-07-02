@@ -34,7 +34,7 @@ pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
         .right
         .show_provider_loading_message(request.file_path, "Materializing SQLite database...");
     let files = request.files.clone();
-    let source = request.metadata.path.clone();
+    let source = request.info.clone();
     let file_path = request.file_path.to_string();
     let apply_file_path = file_path.clone();
     super::spawn_preview_load(

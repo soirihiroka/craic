@@ -1,11 +1,11 @@
 use crate::git::ChangedFile;
 use crate::spellcheck::SpellcheckAllowlist;
-use crate::system::WorkspaceRef;
 use crate::system::capabilities::{
-    files::{FileAccess, FileWatchSubscription},
+    files::{FileAccess, FileNodeInfo, FileNodeKind, FileWatchSubscription},
     git::GitAccess,
     open::OpenAccess,
 };
+use crate::system::{FileNodePath, WorkspaceRef};
 use crate::ui::components::context_menu;
 use crate::ui::components::search::SearchPanel;
 use crate::ui::components::tree_view;
@@ -33,7 +33,7 @@ use self::search::SearchMatch;
 use self::search::{SearchOutput, SearchSelectionKey, SearchSignature};
 use self::transfer::TransferRowProgress;
 use self::transfer::{ActiveTransfer, FileClipboard, TransferOperation};
-use self::tree::BrowserRow;
+use self::tree::{BrowserRow, RowCapabilities};
 use self::tree_loader::{RowSignature, TreeRowsCache, insert_changed_path_status, rows_signature};
 use self::watch::FileBrowserWatchSignature;
 
@@ -49,8 +49,8 @@ const FILE_TRANSFER_MIME_TYPES: &[&str] = &[
     "text/plain",
 ];
 
-type SelectionCallback = Rc<dyn Fn(String)>;
-type SearchMatchCallback = Rc<dyn Fn(String, usize, usize)>;
+type SelectionCallback = Rc<dyn Fn(FileNodePath)>;
+type SearchMatchCallback = Rc<dyn Fn(FileNodePath, usize, usize)>;
 type PathCallback = Rc<dyn Fn(String, bool)>;
 type RunCallback = Rc<dyn Fn(String)>;
 type ChatCallback = Rc<dyn Fn(String)>;
@@ -75,11 +75,11 @@ pub(in crate::ui) struct FileBrowser {
     file_access: RefCell<Arc<dyn FileAccess>>,
     git_access: RefCell<Option<Arc<dyn GitAccess>>>,
     opener: RefCell<Option<Arc<dyn OpenAccess>>>,
-    expanded_dirs: RefCell<HashSet<String>>,
-    active_folder: RefCell<String>,
-    selected_path: Rc<RefCell<String>>,
+    expanded_dirs: RefCell<HashSet<FileNodePath>>,
+    active_folder: RefCell<FileNodePath>,
+    selected_node_path: Rc<RefCell<Option<FileNodePath>>>,
     selected_search_match: RefCell<Option<SearchSelectionKey>>,
-    search_collapsed_dirs: RefCell<HashSet<String>>,
+    search_collapsed_dirs: RefCell<HashSet<FileNodePath>>,
     search_query: Rc<RefCell<String>>,
     search_case_sensitive: Cell<bool>,
     search_whole_word: Cell<bool>,
@@ -99,7 +99,7 @@ pub(in crate::ui) struct FileBrowser {
     open_failed_callbacks: RefCell<Vec<OpenFailedCallback>>,
     changed_file_statuses: RefCell<HashMap<String, String>>,
     tree_rows_cache: RefCell<Option<TreeRowsCache>>,
-    tree_directory_cache: RefCell<HashMap<String, Vec<BrowserRow>>>,
+    tree_directory_cache: RefCell<HashMap<FileNodePath, Vec<BrowserRow>>>,
     file_watch_generation: Rc<Cell<u64>>,
     file_watch_signature: RefCell<Option<FileBrowserWatchSignature>>,
     file_watch_subscriptions: RefCell<Vec<FileWatchSubscription>>,
@@ -110,8 +110,8 @@ pub(in crate::ui) struct FileBrowser {
     file_clipboard: RefCell<Option<FileClipboard>>,
     next_transfer_id: Cell<u64>,
     active_transfers: RefCell<HashMap<u64, ActiveTransfer>>,
-    internal_drag_paths: RefCell<Option<Vec<String>>>,
-    drop_target_folder: RefCell<Option<String>>,
+    internal_drag_paths: RefCell<Option<Vec<FileNodePath>>>,
+    drop_target_folder: RefCell<Option<FileNodePath>>,
     drop_hover_generation: Rc<Cell<u64>>,
     active_context_menu: RefCell<Option<gtk::Popover>>,
     pending_new_entry: RefCell<Option<PendingNewEntry>>,
@@ -159,6 +159,7 @@ impl FileBrowser {
         root.append(&tree.root);
 
         let workspace = file_access.workspace();
+        let root_node_path = file_access.root();
         let browser = Rc::new(Self {
             root,
             search_panel,
@@ -168,8 +169,8 @@ impl FileBrowser {
             git_access: RefCell::new(git_access),
             opener: RefCell::new(None),
             expanded_dirs: RefCell::new(HashSet::new()),
-            active_folder: RefCell::new(String::new()),
-            selected_path: Rc::new(RefCell::new(String::new())),
+            active_folder: RefCell::new(root_node_path),
+            selected_node_path: Rc::new(RefCell::new(None)),
             selected_search_match: RefCell::new(None),
             search_collapsed_dirs: RefCell::new(HashSet::new()),
             search_query: Rc::new(RefCell::new(String::new())),
@@ -286,8 +287,8 @@ impl FileBrowser {
             self.clear_git_ignore_cache();
             self.git_ignore_rules_signature.borrow_mut().take();
             self.expanded_dirs.borrow_mut().clear();
-            self.active_folder.borrow_mut().clear();
-            self.selected_path.replace(String::new());
+            self.active_folder.replace(self.root_node_path());
+            self.selected_node_path.borrow_mut().take();
             self.selected_search_match.borrow_mut().take();
             self.pending_new_entry.borrow_mut().take();
             self.pending_rename_entry.borrow_mut().take();
@@ -306,8 +307,12 @@ impl FileBrowser {
         }
     }
 
-    pub(super) fn workspace_path(&self, relative: &str) -> crate::system::WorkspacePath {
-        self.workspace.borrow().path(relative)
+    pub(super) fn root_node_path(&self) -> FileNodePath {
+        self.file_access.borrow().root()
+    }
+
+    pub(super) fn node_path(&self, relative: &str) -> FileNodePath {
+        node_path_for_relative(&self.root_node_path(), relative)
     }
 
     pub(in crate::ui) fn set_opener(&self, opener: Option<Arc<dyn OpenAccess>>) {
@@ -322,8 +327,11 @@ impl FileBrowser {
         self.container_actions_available.set(available);
     }
 
-    pub(in crate::ui) fn selected_file_path(&self) -> String {
-        self.selected_path.borrow().clone()
+    pub(in crate::ui) fn selected_node_path(&self) -> FileNodePath {
+        self.selected_node_path
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| self.root_node_path())
     }
 
     pub(in crate::ui) fn reveal_workspace_path(self: &Rc<Self>, path: &str) {
@@ -331,10 +339,11 @@ impl FileBrowser {
             self.search_panel.close();
         }
 
-        let parent = parent_folder(path);
+        let node_path = self.node_path(path);
+        let parent = node_path.parent().unwrap_or_else(|| self.root_node_path());
         self.active_folder.replace(parent.clone());
         expand_parent_folders(&self.expanded_dirs, &parent);
-        self.selected_path.replace(path.to_string());
+        self.selected_node_path.replace(Some(node_path));
         self.selected_search_match.borrow_mut().take();
         let rows = self.visible_rows();
         let status_signatures = self.changed_file_statuses.borrow();
@@ -349,14 +358,14 @@ impl FileBrowser {
 
     pub(in crate::ui) fn connect_selected<F>(&self, callback: F)
     where
-        F: Fn(String) + 'static,
+        F: Fn(FileNodePath) + 'static,
     {
         self.callbacks.borrow_mut().push(Rc::new(callback));
     }
 
     pub(in crate::ui) fn connect_search_match_selected<F>(&self, callback: F)
     where
-        F: Fn(String, usize, usize) + 'static,
+        F: Fn(FileNodePath, usize, usize) + 'static,
     {
         self.search_match_callbacks
             .borrow_mut()
@@ -487,26 +496,26 @@ impl FileBrowser {
         self.root.add_controller(keys);
     }
 
-    pub(super) fn toggle_dir(self: &Rc<Self>, path: &str) {
+    pub(super) fn toggle_dir(self: &Rc<Self>, path: &FileNodePath) {
         if !self.search_query.borrow().is_empty() {
             {
                 let mut collapsed = self.search_collapsed_dirs.borrow_mut();
                 if collapsed.contains(path) {
                     collapsed.remove(path);
                 } else {
-                    collapsed.insert(path.to_string());
+                    collapsed.insert(path.clone());
                 }
             }
             self.rebuild_search_result_rows_from_cache();
             return;
         }
-        self.active_folder.replace(path.to_string());
+        self.active_folder.replace(path.clone());
         {
             let mut expanded = self.expanded_dirs.borrow_mut();
             if expanded.contains(path) {
                 expanded.remove(path);
-            } else {
-                expanded.insert(path.to_string());
+            } else if !path.is_root() {
+                expanded.insert(path.clone());
             }
         }
         self.rebuild();
@@ -518,11 +527,11 @@ impl FileBrowser {
             return;
         }
 
-        let selected = self.selected_path.borrow().clone();
+        let selected = self.selected_node_path.borrow().clone();
         let selected_search_match = self.selected_search_match.borrow().clone();
-        let current_index = rows
-            .iter()
-            .position(|row| row_matches_selection(row, &selected, selected_search_match.as_ref()));
+        let current_index = rows.iter().position(|row| {
+            row_matches_selection(row, selected.as_ref(), selected_search_match.as_ref())
+        });
 
         let mut index = match current_index {
             Some(index) => index as i32 + direction,
@@ -546,12 +555,15 @@ impl FileBrowser {
     fn select_browser_row(self: &Rc<Self>, row: &rows::BrowserListRow) {
         match row {
             rows::BrowserListRow::Tree(row) => {
-                self.active_folder.replace(if row.is_dir {
-                    row.path.clone()
-                } else {
-                    parent_folder(&row.path)
-                });
-                self.set_selected_path(row.path.clone());
+                self.active_folder
+                    .replace(if row.tree_role == tree::TreeRowRole::Branch {
+                        row.node_path.clone()
+                    } else {
+                        row.node_path
+                            .parent()
+                            .unwrap_or_else(|| self.root_node_path())
+                    });
+                self.set_selected_node_path(Some(row.node_path.clone()));
             }
             rows::BrowserListRow::NewEntry(_) | rows::BrowserListRow::RenameEntry(_) => {}
             rows::BrowserListRow::Search(search_match) => {
@@ -562,13 +574,15 @@ impl FileBrowser {
     }
 
     fn toggle_selected_folder(self: &Rc<Self>) -> bool {
-        let selected = self.selected_path.borrow().clone();
+        let selected = self.selected_node_path.borrow().clone();
         let selected_search_match = self.selected_search_match.borrow().clone();
         let selected_row = self
             .list_rows
             .borrow()
             .iter()
-            .find(|row| row_matches_selection(row, &selected, selected_search_match.as_ref()))
+            .find(|row| {
+                row_matches_selection(row, selected.as_ref(), selected_search_match.as_ref())
+            })
             .cloned();
 
         let Some(rows::BrowserListRow::Tree(row)) = selected_row else {
@@ -578,12 +592,8 @@ impl FileBrowser {
             return false;
         }
 
-        self.active_folder.replace(if row.is_dir {
-            row.path.clone()
-        } else {
-            parent_folder(&row.path)
-        });
-        self.toggle_dir(&row.path);
+        self.active_folder.replace(row.node_path.clone());
+        self.toggle_dir(&row.node_path);
         true
     }
 
@@ -635,13 +645,15 @@ impl FileBrowser {
     }
 
     fn selected_row_key(&self) -> Option<rows::BrowserListRowKey> {
-        let selected = self.selected_path.borrow().clone();
+        let selected = self.selected_node_path.borrow().clone();
         let selected_search_match = self.selected_search_match.borrow().clone();
         self.list_rows
             .borrow()
             .iter()
             .enumerate()
-            .find(|(_, row)| row_matches_selection(row, &selected, selected_search_match.as_ref()))
+            .find(|(_, row)| {
+                row_matches_selection(row, selected.as_ref(), selected_search_match.as_ref())
+            })
             .map(|(index, row)| rows::browser_list_row_key(row, index))
     }
 
@@ -680,18 +692,19 @@ impl FileBrowser {
         self.tree.has_edit_focus()
     }
 
-    pub(super) fn set_selected_path(self: &Rc<Self>, selected: String) {
-        if self.selected_path.borrow().as_str() == selected
+    pub(super) fn set_selected_node_path(self: &Rc<Self>, selected: Option<FileNodePath>) {
+        if *self.selected_node_path.borrow() == selected
             && self.selected_search_match.borrow().is_none()
         {
             return;
         }
-        self.selected_path.replace(selected.clone());
+        let callback_path = selected.clone().unwrap_or_else(|| self.root_node_path());
+        self.selected_node_path.replace(selected);
         self.selected_search_match.borrow_mut().take();
         self.refresh_browser_row_state();
         let callbacks = self.callbacks.borrow().clone();
         for callback in callbacks {
-            callback(selected.clone());
+            callback(callback_path.clone());
         }
         self.focus_selected_row();
     }
@@ -742,7 +755,7 @@ impl FileBrowser {
         });
     }
 
-    fn gap_context_folder(&self, list_y: f64) -> String {
+    fn gap_context_folder(&self, list_y: f64) -> FileNodePath {
         if let Some(folder) = self.folder_for_gap_at_y(list_y) {
             return folder;
         }
@@ -750,14 +763,10 @@ impl FileBrowser {
         self.tree
             .last_sticky_row()
             .and_then(|row| match row.state.to_row() {
-                rows::BrowserListRow::Tree(row) => Some(row.path),
+                rows::BrowserListRow::Tree(row) => Some(row.node_path),
                 _ => None,
             })
-            .or_else(|| {
-                let active = self.active_folder.borrow();
-                (!active.is_empty()).then(|| active.clone())
-            })
-            .unwrap_or_default()
+            .unwrap_or_else(|| self.active_folder.borrow().clone())
     }
 
     fn apply_tree_scroll(self: &Rc<Self>, target: TreeScrollTarget) {
@@ -800,18 +809,91 @@ impl FileBrowser {
             callback(message.to_string());
         }
     }
+
+    fn target_for_node_path(&self, node_path: FileNodePath) -> BrowserTarget {
+        match self.file_access.borrow().info(&node_path) {
+            Ok(info) => BrowserTarget::from_info(info),
+            Err(err) => {
+                log::debug!(
+                    "file browser target info unavailable path={} err={err}",
+                    node_path.display()
+                );
+                BrowserTarget::fallback(node_path)
+            }
+        }
+    }
+
+    fn can_paste_into_target(&self, target: &BrowserTarget) -> bool {
+        if self.file_clipboard.borrow().is_none() {
+            return false;
+        }
+        let folder = if target.is_dir {
+            target.node_path.clone()
+        } else {
+            target
+                .node_path
+                .parent()
+                .unwrap_or_else(|| self.root_node_path())
+        };
+        self.file_access
+            .borrow()
+            .info(&folder)
+            .is_ok_and(|info| info.capabilities.creatable)
+    }
 }
 
 #[derive(Clone)]
 struct BrowserTarget {
+    node_path: FileNodePath,
     path: String,
     is_dir: bool,
     executable: bool,
+    capabilities: RowCapabilities,
 }
 
 impl BrowserTarget {
+    fn from_row(row: &BrowserRow) -> Self {
+        Self {
+            node_path: row.node_path.clone(),
+            path: row.path.clone(),
+            is_dir: row.is_dir,
+            executable: row.executable,
+            capabilities: row.capabilities,
+        }
+    }
+
+    fn from_info(info: FileNodeInfo) -> Self {
+        let mut kind = info.kind;
+        if matches!(kind, FileNodeKind::File)
+            && let Some(format) = crate::system::ArchiveFormat::from_name(&info.display_name)
+        {
+            kind = FileNodeKind::Archive { format };
+        }
+        Self {
+            path: info.path.display(),
+            is_dir: kind == FileNodeKind::Directory,
+            executable: info.mode.is_some_and(|mode| mode & 0o111 != 0),
+            capabilities: RowCapabilities::from(&info.capabilities),
+            node_path: info.path,
+        }
+    }
+
+    fn fallback(node_path: FileNodePath) -> Self {
+        Self {
+            path: node_path.display(),
+            is_dir: node_path.is_root(),
+            executable: false,
+            capabilities: RowCapabilities::default(),
+            node_path,
+        }
+    }
+
+    fn is_root(&self) -> bool {
+        self.node_path.is_root()
+    }
+
     fn container_actions(&self) -> Vec<ContainerFileAction> {
-        if self.is_dir {
+        if self.is_dir || !self.capabilities.native {
             return Vec::new();
         }
 
@@ -876,42 +958,45 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
     let new_file = add_menu_action(&actions, "new-file", {
         let browser = browser.clone();
         let target = target.clone();
-        move || browser.create_file_in_folder(&target.path)
+        move || browser.create_file_in_folder(&target.node_path)
     });
-    new_file.set_enabled(target.is_dir);
+    new_file.set_enabled(target.is_dir && target.capabilities.creatable);
     let new_folder = add_menu_action(&actions, "new-folder", {
         let browser = browser.clone();
         let target = target.clone();
-        move || browser.create_folder_in_folder(&target.path)
+        move || browser.create_folder_in_folder(&target.node_path)
     });
-    new_folder.set_enabled(target.is_dir);
-    add_menu_action(&actions, "open-external", {
+    new_folder.set_enabled(target.is_dir && target.capabilities.creatable);
+    let open_external = add_menu_action(&actions, "open-external", {
         let browser = browser.clone();
         let target = target.clone();
         move || browser.open_external(&target)
     });
-    add_menu_action(&actions, "open-containing-folder", {
+    open_external.set_enabled(target.capabilities.open_external && target.capabilities.native);
+    let open_containing_folder = add_menu_action(&actions, "open-containing-folder", {
         let browser = browser.clone();
         let target = target.clone();
         move || browser.open_containing_folder(&target)
     });
-    add_menu_action(&actions, "open-terminal", {
+    open_containing_folder.set_enabled(target.capabilities.reveal && target.capabilities.native);
+    let open_terminal = add_menu_action(&actions, "open-terminal", {
         let browser = browser.clone();
         let target = target.clone();
         move || browser.open_terminal(&target)
     });
+    open_terminal.set_enabled(target.capabilities.native);
     let run_terminal = add_menu_action(&actions, "run-terminal", {
         let browser = browser.clone();
         let target = target.clone();
         move || browser.run_in_terminal(&target)
     });
-    run_terminal.set_enabled(!target.is_dir && target.executable);
+    run_terminal.set_enabled(!target.is_dir && target.executable && target.capabilities.native);
     let add_to_chat = add_menu_action(&actions, "add-to-chat", {
         let browser = browser.clone();
         let target = target.clone();
         move || browser.add_to_chat(&target)
     });
-    add_to_chat.set_enabled(!target.is_dir);
+    add_to_chat.set_enabled(!target.is_dir && target.capabilities.readable);
     let build_image = add_menu_action(&actions, "build-image", {
         let browser = browser.clone();
         let target = target.clone();
@@ -962,16 +1047,20 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
             .container_actions()
             .contains(&ContainerFileAction::ComposeDown),
     );
-    add_menu_action(&actions, "cut", {
+    let cut = add_menu_action(&actions, "cut", {
         let browser = browser.clone();
         let target = target.clone();
         move || browser.copy_target(&target, TransferOperation::Move)
     });
-    add_menu_action(&actions, "copy", {
+    cut.set_enabled(
+        !target.is_root() && target.capabilities.renameable && target.capabilities.native,
+    );
+    let copy = add_menu_action(&actions, "copy", {
         let browser = browser.clone();
         let target = target.clone();
         move || browser.copy_target(&target, TransferOperation::Copy)
     });
+    copy.set_enabled(!target.is_root() && target.capabilities.readable);
     let paste = add_menu_action(&actions, "paste", {
         let browser = browser.clone();
         let target = target.clone();
@@ -980,12 +1069,13 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
             browser.paste_into_folder(folder);
         }
     });
-    paste.set_enabled(true);
-    add_menu_action(&actions, "copy-path", {
+    paste.set_enabled(browser.can_paste_into_target(&target));
+    let copy_path = add_menu_action(&actions, "copy-path", {
         let browser = browser.clone();
         let target = target.clone();
         move || browser.copy_absolute_path(&target)
     });
+    copy_path.set_enabled(target.capabilities.native);
     add_menu_action(&actions, "copy-relative-path", {
         let browser = browser.clone();
         let target = target.clone();
@@ -995,20 +1085,24 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
         let browser = browser.clone();
         move |pattern| browser.add_to_ignore(pattern)
     });
-    ignore_pattern.set_enabled(!browser.ignore_callbacks.borrow().is_empty());
-    add_menu_action(&actions, "rename", {
+    ignore_pattern
+        .set_enabled(target.capabilities.native && !browser.ignore_callbacks.borrow().is_empty());
+    let rename = add_menu_action(&actions, "rename", {
         let browser = browser.clone();
         let target = target.clone();
         move || browser.rename_target(&target)
     });
-    add_menu_action(&actions, "delete", {
+    rename.set_enabled(!target.is_root() && target.capabilities.renameable);
+    let delete = add_menu_action(&actions, "delete", {
         let browser = browser.clone();
         let target = target.clone();
         move || browser.delete_target(target.clone())
     });
+    delete.set_enabled(!target.is_root() && target.capabilities.deletable);
 
-    let terminal_available = browser.terminal_actions_available.get();
-    let container_actions_available = browser.container_actions_available.get();
+    let terminal_available = browser.terminal_actions_available.get() && target.capabilities.native;
+    let container_actions_available =
+        browser.container_actions_available.get() && target.capabilities.native;
     menu::repository_row_menu(&target, terminal_available, container_actions_available).popup(
         parent,
         x,
@@ -1034,12 +1128,14 @@ pub(super) fn parent_folder(path: &str) -> String {
         .unwrap_or_default()
 }
 
-fn expand_parent_folders(expanded_dirs: &RefCell<HashSet<String>>, folder: &str) {
+fn expand_parent_folders(expanded_dirs: &RefCell<HashSet<FileNodePath>>, folder: &FileNodePath) {
     let mut parents = Vec::new();
-    let mut current = folder.to_string();
-    while !current.is_empty() {
-        parents.push(current.clone());
-        current = parent_folder(&current);
+    let mut current = Some(folder.clone());
+    while let Some(path) = current {
+        if !path.is_root() {
+            parents.push(path.clone());
+        }
+        current = path.parent();
     }
 
     let mut expanded_dirs = expanded_dirs.borrow_mut();
@@ -1048,20 +1144,15 @@ fn expand_parent_folders(expanded_dirs: &RefCell<HashSet<String>>, folder: &str)
     }
 }
 
-pub(super) fn join_relative(parent: Option<&str>, name: &str) -> String {
-    match parent {
-        Some(parent) if !parent.is_empty() => format!("{parent}/{name}"),
-        _ => name.to_string(),
-    }
-}
-
 fn row_matches_selection(
     row: &rows::BrowserListRow,
-    selected: &str,
+    selected: Option<&FileNodePath>,
     selected_search_match: Option<&SearchSelectionKey>,
 ) -> bool {
     match row {
-        rows::BrowserListRow::Tree(row) => selected_search_match.is_none() && selected == row.path,
+        rows::BrowserListRow::Tree(row) => {
+            selected_search_match.is_none() && selected == Some(&row.node_path)
+        }
         rows::BrowserListRow::NewEntry(_) | rows::BrowserListRow::RenameEntry(_) => false,
         rows::BrowserListRow::Search(search_match) => {
             selected_search_match == Some(&search_match.selection_key())
@@ -1086,6 +1177,14 @@ pub(super) fn set_scroll_value(adjustment: &gtk::Adjustment, value: f64) {
             .min(adjustment.upper() - adjustment.page_size())
             .max(adjustment.lower()),
     );
+}
+
+pub(super) fn node_path_for_relative(root: &FileNodePath, relative: &str) -> FileNodePath {
+    let mut path = root.clone();
+    for segment in relative.split('/').filter(|segment| !segment.is_empty()) {
+        path = path.join_child(segment);
+    }
+    path
 }
 
 pub(in crate::ui) fn file_name(path: &str) -> &str {

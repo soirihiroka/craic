@@ -6,5 +6,7 @@ pub(crate) mod path;
 pub(crate) mod provider;
 pub(crate) mod providers;
 
-pub(crate) use path::{ProviderKind, SystemPath, SystemRef, WorkspacePath, WorkspaceRef};
+pub(crate) use path::{
+    ArchiveFormat, FileNodePath, ProviderKind, SystemPath, SystemRef, WorkspacePath, WorkspaceRef,
+};
 pub(crate) use provider::SystemProviderRegistry;
