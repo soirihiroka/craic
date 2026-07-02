@@ -26,6 +26,7 @@ typos-dict = "0.13.31"
 unicase = "2.9.0"
 pulldown-cmark = "0.13"
 regex = "1"
+rumdl = { version = "0.2.27", default-features = false }
 unicode-segmentation = "1.13"
 walkdir = "2"
 tree-sitter = "0.26"

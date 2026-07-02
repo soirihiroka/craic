@@ -3,7 +3,9 @@ mod highlights;
 mod line_numbers;
 mod theme;
 
-use self::highlights::{draw_highlighted_slice, draw_spellcheck_issues, draw_syntax_issues};
+use self::highlights::{
+    draw_highlighted_slice, draw_markdown_lint_issues, draw_spellcheck_issues, draw_syntax_issues,
+};
 use self::line_numbers::{
     LineNumberStyle, draw_deleted_hint, draw_gutter, draw_line_number, gutter_width_for_state,
     gutter_x, text_bounds, viewport_width_for_state,
@@ -87,6 +89,7 @@ pub(super) fn draw_editor(
     };
     let highlights = state.highlight_cache.borrow();
     let syntax_issues = state.syntax_issues.borrow();
+    let markdown_lint_issues = state.markdown_lint_issues.borrow();
     let spellcheck_issues = state.spellcheck_issues.borrow();
     let visual_lines = &layout.visual_lines;
     let gutter = layout.gutter_width;
@@ -226,6 +229,18 @@ pub(super) fn draw_editor(
             state,
             &text,
             &spellcheck_issues,
+            line.start,
+            line.end,
+            text_x,
+            baseline,
+            theme,
+        );
+        draw_markdown_lint_issues(
+            area,
+            context,
+            state,
+            &text,
+            &markdown_lint_issues,
             line.start,
             line.end,
             text_x,

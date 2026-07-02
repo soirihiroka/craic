@@ -1278,6 +1278,19 @@ fn spellcheck_editor_document(
     let language = code_editor::language_hint_from_path(file_path);
     let issues = crate::spellcheck::check_document(&language, Some(file_path), text, &allowlist);
     file_editor.set_spellcheck_issues(issues);
+    file_editor.set_markdown_lint_issues(markdown_lint_issues(file_path, text));
+}
+
+pub(in crate::ui::pages::file) fn markdown_lint_issues(
+    file_path: &str,
+    text: &str,
+) -> Vec<crate::markdown_lint::MarkdownLintIssue> {
+    let language = code_editor::language_hint_from_path(file_path);
+    if matches!(language.as_str(), "md" | "markdown" | "mdown" | "mkd") {
+        crate::markdown_lint::check_document(Some(file_path), text)
+    } else {
+        Vec::new()
+    }
 }
 
 fn text_from_repository_bytes(bytes: Vec<u8>) -> Result<String, String> {

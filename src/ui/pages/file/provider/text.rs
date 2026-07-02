@@ -5,6 +5,7 @@ use std::rc::Rc;
 struct TextPreviewLoad {
     text: String,
     comparison: Option<FileComparison>,
+    markdown_lint_issues: Vec<crate::markdown_lint::MarkdownLintIssue>,
     spellcheck_issues: Vec<crate::spellcheck::SpellcheckIssue>,
 }
 
@@ -54,9 +55,11 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
                     &text,
                     &allowlist,
                 );
+                let markdown_lint_issues = super::super::markdown_lint_issues(&file_path, &text);
                 TextPreviewLoad {
                     text,
                     comparison,
+                    markdown_lint_issues,
                     spellcheck_issues,
                 }
             })
@@ -70,6 +73,7 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
                     disk_signature,
                     writable,
                     load.comparison.as_ref(),
+                    load.markdown_lint_issues,
                     load.spellcheck_issues,
                 );
                 right.file_view_split.set_end_child(None::<&gtk::Widget>);

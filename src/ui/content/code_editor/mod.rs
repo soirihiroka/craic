@@ -11,6 +11,7 @@ use crate::language_support::{
     CompletionItem, CompletionSet, HighlightRange, SyntaxHighlighter, SyntaxIssue,
     apply_edit_to_ranges,
 };
+use crate::markdown_lint::MarkdownLintIssue;
 use crate::spellcheck::SpellcheckIssue;
 use crate::ui::canvas_scroll;
 use crate::ui::components::search::SearchPanel;
@@ -100,6 +101,7 @@ struct EditorState {
     scroll_callbacks: RefCell<Vec<ScrollCallback>>,
     git_added_lines: RefCell<Vec<bool>>,
     git_deleted_hint_counts: RefCell<Vec<usize>>,
+    markdown_lint_issues: RefCell<Vec<MarkdownLintIssue>>,
     spellcheck_issues: RefCell<Vec<SpellcheckIssue>>,
 }
 
@@ -315,6 +317,7 @@ impl CodeEditor {
             scroll_callbacks: RefCell::new(Vec::new()),
             git_added_lines: RefCell::new(vec![false; line_count]),
             git_deleted_hint_counts: RefCell::new(vec![0; line_count]),
+            markdown_lint_issues: RefCell::new(Vec::new()),
             spellcheck_issues: RefCell::new(Vec::new()),
         });
         install_syntax_result_receiver(&area, &state, syntax_result_receiver);
@@ -427,6 +430,11 @@ impl CodeEditor {
         self.area.queue_draw();
     }
 
+    pub(in crate::ui) fn set_markdown_lint_issues(&self, issues: Vec<MarkdownLintIssue>) {
+        self.state.markdown_lint_issues.replace(issues);
+        self.area.queue_draw();
+    }
+
     pub(in crate::ui) fn set_language(&self, language: &str) {
         if self.state.language.borrow().as_str() == language {
             return;
@@ -524,6 +532,7 @@ impl CodeEditor {
             self.state.undo_stack.borrow_mut().clear();
             self.state.redo_stack.borrow_mut().clear();
             self.state.scrollbar_markers.borrow_mut().clear();
+            self.state.markdown_lint_issues.borrow_mut().clear();
             self.state.spellcheck_issues.borrow_mut().clear();
             reset_git_state(&self.state);
             clear_automatic_folds(&self.state, "document changed");

@@ -1,6 +1,7 @@
 use super::provider;
 use crate::config;
 use crate::git::FileComparison;
+use crate::markdown_lint::MarkdownLintIssue;
 use crate::spellcheck::SpellcheckIssue;
 use crate::system::FileNodePath;
 use crate::ui::content::{binary_preview, code_editor, folder_view};
@@ -302,6 +303,7 @@ impl RightPane {
         disk_signature: provider::DiskSignature,
         writable: bool,
         comparison: Option<&FileComparison>,
+        markdown_lint_issues: Vec<MarkdownLintIssue>,
         spellcheck_issues: Vec<SpellcheckIssue>,
     ) {
         self.set_title(file_path, file_path);
@@ -317,6 +319,8 @@ impl RightPane {
         self.file_editor.set_document(&language, text);
         self.file_editor.set_editable(writable);
         self.file_editor.set_file_diff(comparison);
+        self.file_editor
+            .set_markdown_lint_issues(markdown_lint_issues);
         self.file_editor.set_spellcheck_issues(spellcheck_issues);
         self.clear_auxiliary_previews();
     }
@@ -384,6 +388,7 @@ impl RightPane {
         self.file_editor.set_language("");
         self.file_editor.set_text("");
         self.file_editor.clear_file_diff();
+        self.file_editor.set_markdown_lint_issues(Vec::new());
         self.file_editor.set_spellcheck_issues(Vec::new());
     }
 
