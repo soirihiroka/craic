@@ -267,7 +267,7 @@ fn load(path: &Path) -> LocalWorkspaceConfig {
 
 fn load_from_file_access(files: &dyn FileAccess) -> LocalWorkspaceConfig {
     let config_path = config_node(files);
-    let contents = match read_text(files, &config_path, None) {
+    let contents = match read_text_via_callback(files, &config_path, None) {
         Ok(contents) => contents,
         Err(err) => {
             log::debug!(
@@ -291,7 +291,7 @@ fn load_from_file_access(files: &dyn FileAccess) -> LocalWorkspaceConfig {
 
 fn load_repo_config_from_file_access(files: &dyn FileAccess) -> Result<toml::Value, String> {
     let config_path = repo_config_node(files);
-    let contents = match read_text(files, &config_path, Some(MAX_REPO_CONFIG_BYTES)) {
+    let contents = match read_text_via_callback(files, &config_path, Some(MAX_REPO_CONFIG_BYTES)) {
         Ok(contents) => contents,
         Err(_) => return Ok(toml::Value::Table(toml::map::Map::new())),
     };
@@ -303,15 +303,15 @@ fn load_repo_config_from_file_access(files: &dyn FileAccess) -> Result<toml::Val
     })
 }
 
-fn read_text(
+fn read_text_via_callback(
     files: &dyn FileAccess,
     path: &FileNodePath,
     max_bytes: Option<u64>,
 ) -> Result<String, String> {
-    read_with_info(files, path, max_bytes)?.into_text()
+    read_with_info_via_callback(files, path, max_bytes)?.into_text()
 }
 
-fn read_with_info(
+fn read_with_info_via_callback(
     files: &dyn FileAccess,
     path: &FileNodePath,
     max_bytes: Option<u64>,
@@ -335,7 +335,11 @@ fn read_with_info(
         .map_err(|err| err.to_string())
 }
 
-fn write_text(files: &dyn FileAccess, path: &FileNodePath, contents: &str) -> Result<(), String> {
+fn write_text_via_callback(
+    files: &dyn FileAccess,
+    path: &FileNodePath,
+    contents: &str,
+) -> Result<(), String> {
     let (sender, receiver) = mpsc::channel();
     files.write_node(
         FileWriteRequest {
@@ -405,7 +409,7 @@ fn save_with_file_access(
 ) -> Result<(), String> {
     let local_dir = ensure_config_dir(files)?;
     let gitignore_path = ensure_file(files, &local_dir, LOCAL_GITIGNORE_FILE)?;
-    write_text(files, &gitignore_path, LOCAL_GITIGNORE_CONTENTS)?;
+    write_text_via_callback(files, &gitignore_path, LOCAL_GITIGNORE_CONTENTS)?;
     log::debug!(
         "initialized local workspace gitignore through file access workspace={} path={}",
         files.workspace().display_name,
@@ -415,7 +419,7 @@ fn save_with_file_access(
     let contents = toml::to_string_pretty(config)
         .map_err(|err| format!("Failed to serialize local workspace config: {err}"))?;
     let config_path = ensure_file(files, &local_dir, LOCAL_CONFIG_FILE)?;
-    write_text(files, &config_path, &contents)?;
+    write_text_via_callback(files, &config_path, &contents)?;
     log::info!(
         "saved local workspace config through file access workspace={} path={}",
         files.workspace().display_name,
@@ -432,7 +436,7 @@ fn save_repo_config_with_file_access(
     let config_path = ensure_file(files, &craic_dir, REPO_CONFIG_FILE)?;
     let contents = toml::to_string_pretty(config)
         .map_err(|err| format!("Failed to serialize repo config: {err}"))?;
-    write_text(files, &config_path, &contents)?;
+    write_text_via_callback(files, &config_path, &contents)?;
     log::info!(
         "saved repo config through file access workspace={} path={}",
         files.workspace().display_name,
@@ -495,7 +499,7 @@ fn ensure_file(
 }
 
 fn write_directory(files: &dyn FileAccess, path: &FileNodePath) -> Result<(), String> {
-    write_node(
+    write_node_via_callback(
         files,
         FileWriteRequest {
             path: path.clone(),
@@ -507,7 +511,7 @@ fn write_directory(files: &dyn FileAccess, path: &FileNodePath) -> Result<(), St
 }
 
 fn write_empty_file(files: &dyn FileAccess, path: &FileNodePath) -> Result<(), String> {
-    write_node(
+    write_node_via_callback(
         files,
         FileWriteRequest {
             path: path.clone(),
@@ -518,7 +522,10 @@ fn write_empty_file(files: &dyn FileAccess, path: &FileNodePath) -> Result<(), S
     )
 }
 
-fn write_node(files: &dyn FileAccess, request: FileWriteRequest) -> Result<(), String> {
+fn write_node_via_callback(
+    files: &dyn FileAccess,
+    request: FileWriteRequest,
+) -> Result<(), String> {
     let (sender, receiver) = mpsc::channel();
     files.write_node(
         request,

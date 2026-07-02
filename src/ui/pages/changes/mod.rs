@@ -1645,10 +1645,33 @@ fn ignore_pattern(ctx: &PageContext, pattern: &str) {
         );
         return;
     };
-    match gitignore::add_pattern_to_workspace(files.as_ref(), &ctx.workspace_ref(), pattern) {
-        Ok(message) => ctx.refresh(Some(message)),
-        Err(err) => ctx.show_error("Ignore Failed", &err),
-    }
+    let (sender, receiver) = mpsc::channel();
+    gitignore::add_pattern_to_workspace(
+        files,
+        pattern.to_string(),
+        Box::new(move |result| {
+            let _ = sender.send(result);
+        }),
+    );
+
+    let ctx = ctx.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(75), move || {
+        match receiver.try_recv() {
+            Ok(Ok(message)) => {
+                ctx.refresh(Some(message));
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(err)) => {
+                ctx.show_error("Ignore Failed", &err);
+                gtk::glib::ControlFlow::Break
+            }
+            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) => {
+                ctx.show_error("Ignore Failed", "Ignore operation did not return a result.");
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn open_repository_in_files(ctx: &PageContext) {

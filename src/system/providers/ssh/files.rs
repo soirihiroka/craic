@@ -243,7 +243,7 @@ impl SshFileAccess {
         callback(FileOperationEvent::Progress(progress));
     }
 
-    fn read_with_info_sync(
+    fn perform_read_with_info(
         &self,
         request: &FileReadRequest,
         callback: &FileOperationCallback<FileRead>,
@@ -293,7 +293,7 @@ impl SshFileAccess {
         Ok(read)
     }
 
-    fn write_node_sync(
+    fn perform_write_node(
         &self,
         request: &FileWriteRequest,
         callback: &FileOperationCallback<()>,
@@ -371,7 +371,7 @@ impl SshFileAccess {
         Ok(())
     }
 
-    fn copy_node_sync(
+    fn perform_copy_node(
         &self,
         request: &FileCopyRequest,
         callback: &FileOperationCallback<FileNodePath>,
@@ -446,7 +446,7 @@ cp -a -- "$src" "$dst""#,
         Ok(request.destination.clone())
     }
 
-    fn move_node_sync(
+    fn perform_move_node(
         &self,
         request: &FileMoveRequest,
         callback: &FileOperationCallback<FileNodePath>,
@@ -537,7 +537,7 @@ mv -- "$src" "$dst""#,
         Ok(destination_path)
     }
 
-    fn delete_sync(
+    fn perform_delete(
         &self,
         request: &FileDeleteRequest,
         callback: &FileOperationCallback<()>,
@@ -706,7 +706,7 @@ impl FileAccess for SshFileAccess {
                 request.path.display(),
                 request.max_bytes
             );
-            let result = access.read_with_info_sync(&request, &callback);
+            let result = access.perform_read_with_info(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
     }
@@ -723,7 +723,7 @@ impl FileAccess for SshFileAccess {
                 request.path.display(),
                 payload_label
             );
-            let result = access.write_node_sync(&request, &callback);
+            let result = access.perform_write_node(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
     }
@@ -736,7 +736,7 @@ impl FileAccess for SshFileAccess {
                 request.source.display(),
                 request.destination.display()
             );
-            let result = access.copy_node_sync(&request, &callback);
+            let result = access.perform_copy_node(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
     }
@@ -750,7 +750,7 @@ impl FileAccess for SshFileAccess {
                 request.destination_parent.display(),
                 request.new_name
             );
-            let result = access.move_node_sync(&request, &callback);
+            let result = access.perform_move_node(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
     }
@@ -762,7 +762,7 @@ impl FileAccess for SshFileAccess {
                 "ssh file delete worker start path={}",
                 request.path.display()
             );
-            let result = access.delete_sync(&request, &callback);
+            let result = access.perform_delete(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
     }

@@ -1,11 +1,11 @@
 use super::path::FileNodePath;
 use crate::system::capabilities::files::{
-    FileAccess, FileNodeInfo, FileOperationEvent, FileRead, FileReadRequest,
+    FileAccess, FileNodeInfo, FileOperationEvent, FileReadRequest,
 };
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -57,12 +57,45 @@ impl Drop for MaterializedFile {
     }
 }
 
-pub(crate) fn materialize_for_view(
-    files: &dyn FileAccess,
+pub(crate) fn materialize_for_view<F>(
+    files: Arc<dyn FileAccess>,
+    source: FileNodeInfo,
+    max_bytes: u64,
+    callback: F,
+) where
+    F: FnOnce(Result<MaterializedFile, String>) + Send + 'static,
+{
+    let path = source.path.clone();
+    let callback = Arc::new(Mutex::new(Some(callback)));
+    files.read_with_info(
+        FileReadRequest {
+            path,
+            max_bytes: Some(max_bytes),
+            cancel_requested: None,
+        },
+        Box::new(move |event| {
+            if let FileOperationEvent::Finished(result) = event {
+                let result = result
+                    .map_err(|err| err.to_string())
+                    .and_then(|read| read.into_bytes())
+                    .and_then(|bytes| materialize_bytes(&source, bytes, max_bytes));
+                let callback = callback
+                    .lock()
+                    .ok()
+                    .and_then(|mut callback| callback.take());
+                if let Some(callback) = callback {
+                    callback(result);
+                }
+            }
+        }),
+    );
+}
+
+fn materialize_bytes(
     source: &FileNodeInfo,
+    bytes: Vec<u8>,
     max_bytes: u64,
 ) -> Result<MaterializedFile, String> {
-    let bytes = read_with_info(files, &source.path, Some(max_bytes))?.into_bytes()?;
     if bytes.len() as u64 > max_bytes {
         return Err(format!(
             "{} is too large to materialize for preview.",
@@ -94,28 +127,4 @@ pub(crate) fn materialize_for_view(
         local_path,
         bytes.len() as u64,
     ))
-}
-
-fn read_with_info(
-    files: &dyn FileAccess,
-    path: &FileNodePath,
-    max_bytes: Option<u64>,
-) -> Result<FileRead, String> {
-    let (sender, receiver) = mpsc::channel();
-    files.read_with_info(
-        FileReadRequest {
-            path: path.clone(),
-            max_bytes,
-            cancel_requested: None,
-        },
-        Box::new(move |event| {
-            if let FileOperationEvent::Finished(result) = event {
-                let _ = sender.send(result);
-            }
-        }),
-    );
-    receiver
-        .recv()
-        .map_err(|_| "Read operation did not return a result.".to_string())?
-        .map_err(|err| err.to_string())
 }

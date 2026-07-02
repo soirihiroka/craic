@@ -305,13 +305,17 @@ fn directory_listing_rows(
         .filter(|info| !should_skip(&info.display_name))
         .map(|info| BrowserRow::from_info(info, depth))
         .collect::<Vec<_>>();
+    sort_browser_rows(&mut children);
+    Ok(children)
+}
+
+pub(super) fn sort_browser_rows(children: &mut [BrowserRow]) {
     children.sort_by(|left, right| {
         right
             .is_dir
             .cmp(&left.is_dir)
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
-    Ok(children)
 }
 
 #[derive(Clone, PartialEq, Eq)]

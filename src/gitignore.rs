@@ -1,14 +1,13 @@
 use crate::system::FileNodePath;
-use crate::system::WorkspaceRef;
 use crate::system::capabilities::files::{
-    FileAccess, FileKind, FileOperationEvent, FileRead, FileReadRequest, FileWriteMode,
-    FileWritePayload, FileWriteRequest,
+    FileAccess, FileKind, FileOperationEvent, FileReadRequest, FileWriteMode, FileWritePayload,
+    FileWriteRequest,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IgnoreTargetKind {
@@ -71,85 +70,109 @@ pub fn options_for_path(path: &str, kind: IgnoreTargetKind) -> Vec<IgnoreOption>
     options
 }
 
+type AddPatternCallback = Box<dyn Fn(Result<String, String>) + Send + 'static>;
+
 pub fn add_pattern_to_workspace(
-    files: &dyn FileAccess,
-    _workspace: &WorkspaceRef,
-    pattern: &str,
-) -> Result<String, String> {
+    files: Arc<dyn FileAccess>,
+    pattern: String,
+    callback: AddPatternCallback,
+) {
     if pattern.is_empty() {
-        return Err("Ignore pattern cannot be empty.".to_string());
+        callback(Err("Ignore pattern cannot be empty.".to_string()));
+        return;
     }
 
     let root = files.root();
     let gitignore_path = root.join_child(".gitignore");
-    let existing = match read_with_info(files, &gitignore_path, None) {
-        Ok(read) if read.info.kind == FileKind::File => read.into_bytes()?,
-        Ok(_) => return Err(".gitignore is not a file.".to_string()),
-        Err(_) => Vec::new(),
-    };
-
-    if contains_pattern(&existing, pattern) {
-        return Ok(format!("{pattern} is already in .gitignore."));
-    }
-
-    let mut next = existing;
-    if next.last().is_some_and(|byte| *byte != b'\n') {
-        next.push(b'\n');
-    }
-    next.extend_from_slice(pattern.as_bytes());
-    next.push(b'\n');
-
-    write_file_contents(files, &gitignore_path, next)?;
-    Ok(format!("Added {pattern} to .gitignore."))
-}
-
-fn read_with_info(
-    files: &dyn FileAccess,
-    path: &FileNodePath,
-    max_bytes: Option<u64>,
-) -> Result<FileRead, String> {
-    let (sender, receiver) = mpsc::channel();
+    let callback = Arc::new(Mutex::new(Some(callback)));
+    let write_files = Arc::clone(&files);
     files.read_with_info(
         FileReadRequest {
-            path: path.clone(),
-            max_bytes,
+            path: gitignore_path.clone(),
+            max_bytes: None,
             cancel_requested: None,
         },
         Box::new(move |event| {
             if let FileOperationEvent::Finished(result) = event {
-                let _ = sender.send(result);
+                let existing = match result {
+                    Ok(read) if read.info.kind == FileKind::File => match read.into_bytes() {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            finish_add_pattern(&callback, Err(err));
+                            return;
+                        }
+                    },
+                    Ok(_) => {
+                        finish_add_pattern(&callback, Err(".gitignore is not a file.".to_string()));
+                        return;
+                    }
+                    Err(_) => Vec::new(),
+                };
+
+                if contains_pattern(&existing, &pattern) {
+                    finish_add_pattern(
+                        &callback,
+                        Ok(format!("{pattern} is already in .gitignore.")),
+                    );
+                    return;
+                }
+
+                let mut next = existing;
+                if next.last().is_some_and(|byte| *byte != b'\n') {
+                    next.push(b'\n');
+                }
+                next.extend_from_slice(pattern.as_bytes());
+                next.push(b'\n');
+                write_file_contents(
+                    Arc::clone(&write_files),
+                    gitignore_path.clone(),
+                    next,
+                    pattern.clone(),
+                    Arc::clone(&callback),
+                );
             }
         }),
     );
-    receiver
-        .recv()
-        .map_err(|_| "Read operation did not return a result.".to_string())?
-        .map_err(|err| err.to_string())
 }
 
 fn write_file_contents(
-    files: &dyn FileAccess,
-    path: &FileNodePath,
+    files: Arc<dyn FileAccess>,
+    path: FileNodePath,
     contents: Vec<u8>,
-) -> Result<(), String> {
-    let (sender, receiver) = mpsc::channel();
+    pattern: String,
+    callback: Arc<Mutex<Option<AddPatternCallback>>>,
+) {
     files.write_node(
         FileWriteRequest {
-            path: path.clone(),
+            path,
             mode: FileWriteMode::Replace,
             payload: FileWritePayload::File(contents),
             cancel_requested: None,
         },
         Box::new(move |event| {
             if let FileOperationEvent::Finished(result) = event {
-                let _ = sender.send(result);
+                finish_add_pattern(
+                    &callback,
+                    result
+                        .map(|_| format!("Added {pattern} to .gitignore."))
+                        .map_err(|err| err.to_string()),
+                );
             }
         }),
     );
-    receiver
-        .recv()
-        .map_err(|_| "Write operation did not return a result.".to_string())?
-        .map_err(|err| err.to_string())
+}
+
+fn finish_add_pattern(
+    callback: &Arc<Mutex<Option<AddPatternCallback>>>,
+    result: Result<String, String>,
+) {
+    let callback = callback
+        .lock()
+        .ok()
+        .and_then(|mut callback| callback.take());
+    if let Some(callback) = callback {
+        callback(result);
+    }
 }
 
 pub fn check_ignored_paths(

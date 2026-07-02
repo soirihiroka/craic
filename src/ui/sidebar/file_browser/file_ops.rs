@@ -1,5 +1,6 @@
 use super::{
     BrowserTarget, FileBrowser, SEARCH_POLL_MS, file_name, rows, should_skip, tree::BrowserRow,
+    tree_loader::sort_browser_rows,
 };
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{
@@ -276,7 +277,7 @@ impl FileBrowser {
         if !folder.is_root() {
             self.expanded_dirs.borrow_mut().insert(folder.clone());
         }
-        self.invalidate_tree_rows_cache();
+        self.insert_created_target_into_browser_state(folder, &created);
         self.spellcheck_allowlist
             .replace(crate::spellcheck::SpellcheckAllowlist::default());
 
@@ -293,6 +294,35 @@ impl FileBrowser {
         }
 
         self.rebuild_if_changed();
+    }
+
+    fn insert_created_target_into_browser_state(
+        &self,
+        folder: &FileNodePath,
+        created: &FileNodePath,
+    ) {
+        let info = match self.file_access.borrow().info(created) {
+            Ok(info) => info,
+            Err(err) => {
+                log::debug!(
+                    "file browser create cache update skipped path={} err={err}",
+                    created.display()
+                );
+                self.tree_directory_cache.borrow_mut().remove(folder);
+                self.tree_rows_cache.borrow_mut().take();
+                self.rows_signature.borrow_mut().clear();
+                return;
+            }
+        };
+
+        if let Some(rows) = self.tree_directory_cache.borrow_mut().get_mut(folder) {
+            let row = BrowserRow::from_info(info, child_depth(folder));
+            rows.retain(|existing| existing.node_path != row.node_path);
+            rows.push(row);
+            sort_browser_rows(rows);
+        }
+        self.tree_rows_cache.borrow_mut().take();
+        self.rows_signature.borrow_mut().clear();
     }
 
     pub(super) fn rename_target(self: &Rc<Self>, target: &BrowserTarget) {

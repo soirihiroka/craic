@@ -1,7 +1,5 @@
 use super::{PreviewMatchRequest, PreviewRequest};
 use crate::config;
-use crate::system::FileNodePath;
-use crate::system::capabilities::files::FileAccess;
 use crate::ui::content::code_editor;
 use adw::prelude::*;
 use std::cell::RefCell;
@@ -10,7 +8,6 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -874,8 +871,6 @@ pub(in crate::ui::pages::file) fn show_match(request: PreviewMatchRequest<'_>) {
 
 #[derive(Clone)]
 struct ReadonlyNotebookSource {
-    files: Arc<dyn FileAccess>,
-    node_path: FileNodePath,
     local_path: Option<PathBuf>,
     prefetched_bytes: Option<Vec<u8>>,
 }
@@ -890,8 +885,6 @@ impl ReadonlyNotebookSource {
         super::notebook_readonly::show(
             right,
             load_token,
-            Arc::clone(&self.files),
-            self.node_path.clone(),
             file_path,
             self.local_path.clone(),
             self.prefetched_bytes.clone(),
@@ -905,8 +898,6 @@ fn show_notebook(request: PreviewRequest<'_>) {
         .show_provider_loading_message(request.file_path, "Checking notebook environment...");
 
     let readonly_source = ReadonlyNotebookSource {
-        files: request.files.clone(),
-        node_path: request.node_path.clone(),
         local_path: request.local_path.map(Path::to_path_buf),
         prefetched_bytes: request.prefetched_bytes.map(|bytes| bytes.to_vec()),
     };

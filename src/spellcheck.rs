@@ -62,7 +62,7 @@ pub(crate) fn check_filename(name: &str, allowlist: &SpellcheckAllowlist) -> Vec
     issues
 }
 
-pub(crate) fn load_manifest_allowlist(manifests: &[(&str, &str)]) -> SpellcheckAllowlist {
+pub(crate) fn manifest_allowlist_from_texts(manifests: &[(&str, &str)]) -> SpellcheckAllowlist {
     let mut allowlist = SpellcheckAllowlist::default();
     for (manifest, text) in manifests {
         if text.len() as u64 > MAX_MANIFEST_BYTES {

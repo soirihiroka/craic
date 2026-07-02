@@ -346,9 +346,7 @@ pub(in crate::ui::pages::file) fn show_match(request: PreviewMatchRequest<'_>) {
 fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
     request.right.show_editor_loading(request.file_path, "SVG");
 
-    let files = request.files.clone();
     let file_path = request.file_path.to_string();
-    let read_node_path = request.node_path.clone();
     let apply_node_path = request.node_path.clone();
     let git = (request.ctx.system_ref().provider_kind == crate::system::ProviderKind::Local)
         .then(|| request.ctx.git())
@@ -364,26 +362,24 @@ fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
         request.load_token,
         file_path.clone(),
         move || {
-            read_svg_source(prefetched_bytes, files.as_ref(), &read_node_path).map(
-                |(bytes, text, signature)| {
-                    let comparison = git.as_ref().and_then(|git| git.comparison(&file_path).ok());
-                    let allowlist = crate::spellcheck::SpellcheckAllowlist::default();
-                    let spellcheck_issues = crate::spellcheck::check_document(
-                        &language,
-                        Some(&file_path),
-                        &text,
-                        &allowlist,
-                    );
-                    SvgPreviewLoad {
-                        bytes,
-                        text,
-                        signature,
-                        comparison,
-                        markdown_lint_issues: Vec::new(),
-                        spellcheck_issues,
-                    }
-                },
-            )
+            read_svg_source(prefetched_bytes, &file_path).map(|(bytes, text, signature)| {
+                let comparison = git.as_ref().and_then(|git| git.comparison(&file_path).ok());
+                let allowlist = crate::spellcheck::SpellcheckAllowlist::default();
+                let spellcheck_issues = crate::spellcheck::check_document(
+                    &language,
+                    Some(&file_path),
+                    &text,
+                    &allowlist,
+                );
+                SvgPreviewLoad {
+                    bytes,
+                    text,
+                    signature,
+                    comparison,
+                    markdown_lint_issues: Vec::new(),
+                    spellcheck_issues,
+                }
+            })
         },
         move |right, result| match result {
             Ok(load) => {
@@ -412,11 +408,9 @@ fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
 
 fn read_svg_source(
     prefetched_bytes: Option<Vec<u8>>,
-    files: &dyn crate::system::capabilities::files::FileAccess,
-    node_path: &crate::system::FileNodePath,
+    file_path: &str,
 ) -> Result<(Vec<u8>, String, super::ContentSignature), String> {
-    let bytes =
-        super::super::read_repository_file_bytes_from_prefetch(prefetched_bytes, files, node_path)?;
+    let bytes = super::super::repository_bytes_from_prefetch(prefetched_bytes, file_path)?;
     let signature = super::content_signature(&bytes);
     let text = String::from_utf8(bytes.clone())
         .map_err(|_| "Unable to load SVG source. File is not valid UTF-8 text.".to_string())?;
