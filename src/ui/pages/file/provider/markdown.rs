@@ -358,8 +358,12 @@ fn show_markdown(request: PreviewRequest<'_>, selection: Option<(usize, usize)>)
                     &text,
                     &allowlist,
                 );
+                let ignored_rules =
+                    crate::workspace_config::markdown_lint_ignored_rules_from_file_access(
+                        files.as_ref(),
+                    );
                 let markdown_lint_issues =
-                    crate::markdown_lint::check_document(Some(&file_path), &text);
+                    crate::markdown_lint::check_document(Some(&file_path), &text, &ignored_rules);
                 MarkdownPreviewLoad {
                     text,
                     html,

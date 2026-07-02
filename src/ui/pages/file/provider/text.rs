@@ -55,7 +55,12 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
                     &text,
                     &allowlist,
                 );
-                let markdown_lint_issues = super::super::markdown_lint_issues(&file_path, &text);
+                let ignored_rules =
+                    crate::workspace_config::markdown_lint_ignored_rules_from_file_access(
+                        files.as_ref(),
+                    );
+                let markdown_lint_issues =
+                    super::super::markdown_lint_issues(&file_path, &text, &ignored_rules);
                 TextPreviewLoad {
                     text,
                     comparison,

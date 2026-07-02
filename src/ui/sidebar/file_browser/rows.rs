@@ -216,6 +216,7 @@ impl FileBrowser {
                     drop_target: previous_drop_target,
                     status: previous_status,
                     transfer_progress: previous_transfer_progress,
+                    deleting: previous_deleting,
                 },
                 BrowserListRowRenderState::Tree {
                     row,
@@ -224,8 +225,13 @@ impl FileBrowser {
                     drop_target,
                     status,
                     transfer_progress,
+                    deleting,
                 },
             ) => {
+                if previous_deleting != deleting {
+                    replace_row_widget(widget, self.row_widget(index, next));
+                    return;
+                }
                 self.update_tree_row_widget(
                     widget,
                     previous_row,
@@ -359,6 +365,7 @@ impl FileBrowser {
                 drop_target,
                 status,
                 transfer_progress,
+                deleting,
             } => self.tree_row_widget(
                 row,
                 *expanded,
@@ -366,6 +373,7 @@ impl FileBrowser {
                 *drop_target,
                 status.as_deref(),
                 transfer_progress.as_ref(),
+                *deleting,
                 render,
             ),
             BrowserListRowRenderState::NewEntry(row) => self.new_entry_row_widget(row),
@@ -392,6 +400,7 @@ impl FileBrowser {
         drop_target: bool,
         status: Option<&str>,
         transfer_progress: Option<&TransferRowProgress>,
+        deleting: bool,
         render: &tree_view::TreeRenderState<BrowserListRowKey, BrowserListRowRenderState>,
     ) -> gtk::Box {
         let mut builder = tree_view::IconRow::builder(&row.name);
@@ -403,16 +412,21 @@ impl FileBrowser {
             .selected(selected)
             .sticky(render.sticky)
             .bottom_sticky(render.bottom)
-            .end_padding(row_end_padding())
-            .on_primary_click(tree_primary_click_handler(self, row.clone(), render.sticky))
-            .on_secondary_click(tree_secondary_click_handler(self, row.clone()))
-            .drag_source(file_drag_source(self, row.node_path.clone()));
+            .end_padding(row_end_padding());
+        if deleting {
+            builder = builder.trailing(deleting_spinner());
+        } else {
+            builder = builder
+                .on_primary_click(tree_primary_click_handler(self, row.clone(), render.sticky))
+                .on_secondary_click(tree_secondary_click_handler(self, row.clone()))
+                .drag_source(file_drag_source(self, row.node_path.clone()));
+        }
         if row.tree_role == TreeRowRole::Branch {
             let handle = self.tree.disclosure_widget(tree_row_key(row), expanded);
             tree_view::sync_dimmed(&handle, row.ignore.is_ignored());
             builder = builder.disclosure(handle);
         }
-        if let Some(progress) = transfer_progress {
+        if !deleting && let Some(progress) = transfer_progress {
             let browser = self.clone();
             let row_path = row.node_path.clone();
             builder = builder.progress(icon_row_progress(progress), move || {
@@ -421,7 +435,7 @@ impl FileBrowser {
                 }
             });
         }
-        if !row.capabilities.writable {
+        if !deleting && !row.capabilities.writable {
             builder = builder.trailing(read_only_icon());
         }
 
@@ -429,7 +443,7 @@ impl FileBrowser {
         tree_view::sync_dimmed(&icon_row.title, row.ignore.is_ignored());
         tree_view::sync_icon_row_drop_target(&icon_row.root, drop_target);
         sync_status_icon(&icon_row.root.clone().upcast(), status);
-        if render.sticky && row.is_dir {
+        if render.sticky && row.is_dir && !deleting {
             self.install_folder_drop_targets(&icon_row.root, row.node_path.clone());
         }
         icon_row.root
@@ -779,6 +793,7 @@ impl FileBrowser {
                 drop_target: drop_target.as_ref() == Some(&row.node_path),
                 status: self.changed_file_statuses.borrow().get(&row.path).cloned(),
                 transfer_progress: self.transfer_progress_for_path(&row.node_path),
+                deleting: self.deleting_paths.borrow().contains(&row.node_path),
             },
             BrowserListRow::NewEntry(row) => BrowserListRowRenderState::NewEntry(row.clone()),
             BrowserListRow::RenameEntry(row) => BrowserListRowRenderState::RenameEntry {
@@ -868,6 +883,7 @@ pub(super) enum BrowserListRowRenderState {
         drop_target: bool,
         status: Option<String>,
         transfer_progress: Option<TransferRowProgress>,
+        deleting: bool,
     },
     NewEntry(NewEntryRow),
     RenameEntry {
@@ -956,6 +972,18 @@ fn loading_disclosure_spinner() -> adw::Spinner {
     spinner.set_can_target(false);
     spinner.set_sensitive(false);
     spinner.set_tooltip_text(Some("Loading"));
+    spinner
+}
+
+fn deleting_spinner() -> adw::Spinner {
+    let spinner = adw::Spinner::builder()
+        .width_request(tree_view::ICON_SIZE)
+        .height_request(tree_view::ICON_SIZE)
+        .valign(gtk::Align::Center)
+        .build();
+    spinner.set_can_target(false);
+    spinner.set_sensitive(false);
+    spinner.set_tooltip_text(Some("Deleting"));
     spinner
 }
 
@@ -1205,7 +1233,7 @@ fn sync_new_file_icon(icon: &gtk::Widget, name: &str) {
 
 fn row_file_icon(row: &BrowserRow) -> gtk::Image {
     let icon = if matches!(row.kind, FileNodeKind::Archive { .. }) {
-        file_type::icon_for_name("extract-symbolic")
+        file_type::icon_for_name("package-x-generic-symbolic")
     } else {
         let detected_type = file_type::detect(&row.name, false);
         file_type::icon(&detected_type)

@@ -7,6 +7,7 @@ use vte4::prelude::*;
 #[derive(Clone)]
 pub(crate) struct ActionMenuItem<A> {
     pub label: String,
+    pub icon_name: Option<String>,
     pub action: A,
     pub enabled: bool,
 }
@@ -24,6 +25,12 @@ pub(crate) struct MenuActionState {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum TextContextAction {
+    ApplyMarkdownFix {
+        edits: Vec<crate::markdown_lint::MarkdownLintEdit>,
+    },
+    AddMarkdownLintIgnore {
+        rule_name: String,
+    },
     CorrectSpelling {
         start: usize,
         end: usize,
@@ -64,6 +71,21 @@ impl<A> ActionMenuItem<A> {
     pub(crate) fn new(label: impl Into<String>, action: A, enabled: bool) -> Self {
         Self {
             label: label.into(),
+            icon_name: None,
+            action,
+            enabled,
+        }
+    }
+
+    pub(crate) fn with_icon(
+        label: impl Into<String>,
+        icon_name: impl Into<String>,
+        action: A,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            icon_name: Some(icon_name.into()),
             action,
             enabled,
         }
@@ -199,7 +221,11 @@ where
         for item in section.items {
             let name = format!("item-{index}");
             let detailed_action = format!("context.{name}");
-            section_menu.append(Some(&item.label), Some(&detailed_action));
+            let menu_item = gio::MenuItem::new(Some(&item.label), Some(&detailed_action));
+            if let Some(icon_name) = &item.icon_name {
+                menu_item.set_icon(&gio::ThemedIcon::new(icon_name));
+            }
+            section_menu.append_item(&menu_item);
 
             let action = gio::SimpleAction::new(&name, None);
             action.set_enabled(item.enabled);

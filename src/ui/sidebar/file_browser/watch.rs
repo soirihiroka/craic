@@ -117,6 +117,16 @@ impl FileBrowser {
             return;
         };
 
+        let changed_paths = self.delete_watch_filtered_paths(changed_paths);
+        if changed_paths.is_empty() {
+            log::trace!(
+                "file browser watch ignored delete-local changes workspace={} watched_dirs={}",
+                signature.workspace_id,
+                signature.directories.len()
+            );
+            return;
+        }
+
         let invalidated_dirs =
             watched_directories_for_changes(&signature.directories, &changed_paths);
         if invalidated_dirs.is_empty() {
@@ -147,6 +157,27 @@ impl FileBrowser {
         if self.search_query.borrow().is_empty() {
             self.rebuild_if_changed();
         }
+    }
+
+    fn delete_watch_filtered_paths(
+        &self,
+        changed_paths: HashSet<FileNodePath>,
+    ) -> HashSet<FileNodePath> {
+        let suppressed = self.delete_watch_suppression_paths.borrow();
+        if suppressed.is_empty() {
+            return changed_paths;
+        }
+
+        changed_paths
+            .into_iter()
+            .filter(|changed| {
+                !suppressed.iter().any(|deleted| {
+                    changed == deleted
+                        || changed.is_child_of(deleted)
+                        || deleted.is_child_of(changed)
+                })
+            })
+            .collect()
     }
 }
 

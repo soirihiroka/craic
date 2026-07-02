@@ -10,6 +10,8 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
+const DELETE_WATCH_SUPPRESSION_MS: u64 = 1_200;
+
 impl FileBrowser {
     pub(super) fn browser_list_rows_with_pending_new_entry(
         &self,
@@ -404,6 +406,10 @@ impl FileBrowser {
 
     fn delete_confirmed(self: &Rc<Self>, target: BrowserTarget) {
         let path = target.node_path.clone();
+        if !self.start_pending_delete(&path) {
+            return;
+        }
+
         let file_access = self.file_access.borrow().clone();
         let (sender, receiver) = mpsc::channel();
 
@@ -418,39 +424,120 @@ impl FileBrowser {
 
             move || match receiver.try_recv() {
                 Ok(Ok(())) => {
-                    let selection_affected = {
-                        let selected = browser.selected_node_path.borrow();
-                        target_affects_selection(selected.as_ref(), &target)
-                    };
-                    if selection_affected {
-                        browser.set_selected_node_path(None);
-                    }
-                    let parent = target
-                        .node_path
-                        .parent()
-                        .unwrap_or_else(|| browser.root_node_path());
-                    browser.active_folder.replace(parent);
-                    remove_expanded_dir(&mut browser.expanded_dirs.borrow_mut(), &target.node_path);
-                    browser.invalidate_tree_rows_cache();
-                    browser.rebuild();
+                    browser.finish_successful_delete(&target);
                     gtk::glib::ControlFlow::Break
                 }
                 Ok(Err(message)) => {
-                    browser.invalidate_tree_rows_cache();
-                    browser.rebuild_if_changed();
+                    browser.finish_failed_delete(&target.node_path);
                     browser.show_error("Delete Failed", &message);
                     gtk::glib::ControlFlow::Break
                 }
                 Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
                 Err(TryRecvError::Disconnected) => {
-                    browser.invalidate_tree_rows_cache();
-                    browser.rebuild_if_changed();
+                    browser.finish_failed_delete(&target.node_path);
                     browser
                         .show_error("Delete Failed", "Delete operation did not return a result.");
                     gtk::glib::ControlFlow::Break
                 }
             }
         });
+    }
+
+    fn start_pending_delete(self: &Rc<Self>, path: &FileNodePath) -> bool {
+        {
+            let mut deleting = self.deleting_paths.borrow_mut();
+            if !deleting.insert(path.clone()) {
+                log::debug!(
+                    "file browser delete ignored duplicate path={}",
+                    path.display()
+                );
+                return false;
+            }
+        }
+
+        self.pending_new_entry.borrow_mut().take();
+        self.pending_rename_entry.borrow_mut().take();
+        self.refresh_browser_row_state();
+        true
+    }
+
+    fn finish_successful_delete(self: &Rc<Self>, target: &BrowserTarget) {
+        self.deleting_paths.borrow_mut().remove(&target.node_path);
+        self.suppress_delete_watch_events(target.node_path.clone());
+        self.remove_deleted_target_from_browser_state(target);
+
+        if self.search_query.borrow().is_empty() {
+            self.rebuild_if_changed();
+        } else {
+            self.remove_deleted_target_from_search_cache(target);
+            self.rebuild_search_result_rows_from_cache();
+        }
+    }
+
+    fn finish_failed_delete(self: &Rc<Self>, path: &FileNodePath) {
+        self.deleting_paths.borrow_mut().remove(path);
+        self.delete_watch_suppression_paths
+            .borrow_mut()
+            .remove(path);
+        self.refresh_browser_row_state();
+    }
+
+    fn suppress_delete_watch_events(self: &Rc<Self>, path: FileNodePath) {
+        self.delete_watch_suppression_paths
+            .borrow_mut()
+            .insert(path.clone());
+        log::debug!(
+            "file browser delete watch suppression start path={}",
+            path.display()
+        );
+
+        let browser = self.clone();
+        gtk::glib::timeout_add_local_once(
+            Duration::from_millis(DELETE_WATCH_SUPPRESSION_MS),
+            move || {
+                let removed = browser
+                    .delete_watch_suppression_paths
+                    .borrow_mut()
+                    .remove(&path);
+                if removed {
+                    log::debug!(
+                        "file browser delete watch suppression end path={}",
+                        path.display()
+                    );
+                }
+            },
+        );
+    }
+
+    fn remove_deleted_target_from_browser_state(&self, target: &BrowserTarget) {
+        let parent = target
+            .node_path
+            .parent()
+            .unwrap_or_else(|| self.root_node_path());
+
+        {
+            let mut cache = self.tree_directory_cache.borrow_mut();
+            if let Some(rows) = cache.get_mut(&parent) {
+                rows.retain(|row| !target_affects_path(&row.node_path, target));
+            }
+            if target.is_dir {
+                cache.retain(|path, _| !target_affects_path(path, target));
+            }
+        }
+
+        if target.is_dir {
+            remove_expanded_dir(&mut self.expanded_dirs.borrow_mut(), &target.node_path);
+        }
+        if active_folder_affected(&self.active_folder.borrow(), target) {
+            self.active_folder.replace(parent);
+        }
+        if target_affects_selection(self.selected_node_path.borrow().as_ref(), target) {
+            self.selected_node_path.borrow_mut().take();
+            self.selected_search_match.borrow_mut().take();
+        }
+
+        self.tree_rows_cache.borrow_mut().take();
+        self.rows_signature.borrow_mut().clear();
     }
 }
 
@@ -489,6 +576,15 @@ fn target_affects_selection(selected: Option<&FileNodePath>, target: &BrowserTar
         .is_dir
         .then_some(())
         .is_some_and(|_| selected.is_some_and(|path| path.is_child_of(&target.node_path)))
+}
+
+fn target_affects_path(path: &FileNodePath, target: &BrowserTarget) -> bool {
+    path == &target.node_path || (target.is_dir && path.is_child_of(&target.node_path))
+}
+
+fn active_folder_affected(active_folder: &FileNodePath, target: &BrowserTarget) -> bool {
+    target.is_dir
+        && (active_folder == &target.node_path || active_folder.is_child_of(&target.node_path))
 }
 
 fn loading_row_after(

@@ -1,6 +1,6 @@
 use super::{
-    FileBrowser, MAX_SEARCH_FILE_BYTES, MAX_SEARCH_RESULTS, SEARCH_DEBOUNCE_MS, SEARCH_POLL_MS,
-    file_name, rows, skipped_names, tree::BrowserRow,
+    BrowserTarget, FileBrowser, MAX_SEARCH_FILE_BYTES, MAX_SEARCH_RESULTS, SEARCH_DEBOUNCE_MS,
+    SEARCH_POLL_MS, file_name, rows, skipped_names, tree::BrowserRow,
 };
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{FileSearchMatch, FileSearchOutput, FileSearchQuery};
@@ -271,6 +271,15 @@ impl FileBrowser {
             None => return,
         };
         self.replace_search_rows(rows);
+    }
+
+    pub(super) fn remove_deleted_target_from_search_cache(&self, target: &BrowserTarget) {
+        if let Some(output) = self.search_output.borrow_mut().as_mut() {
+            output.matches.retain(|search_match| {
+                search_match.node_path != target.node_path
+                    && !(target.is_dir && search_match.node_path.is_child_of(&target.node_path))
+            });
+        }
     }
 
     fn replace_search_rows(self: &Rc<Self>, rows: Vec<rows::BrowserListRow>) {
