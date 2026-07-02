@@ -2,7 +2,7 @@ mod left;
 mod right;
 
 use super::{Page, PageBadge, PageCommand, PageCommandResult, PageContext};
-use crate::git::{self, RepositorySnapshot};
+use crate::git::{self, BytesComparison, FileComparison, RepositorySnapshot};
 use crate::github::CommitEmailOption;
 use crate::gitignore::{self, IgnoreTargetKind};
 use crate::system::capabilities::open::OpenTargetKind;
@@ -18,12 +18,13 @@ use adw::prelude::*;
 use gtk::gio;
 use gtk::gio::prelude::AppInfoExt;
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use right::ChangesRight;
 
@@ -34,11 +35,16 @@ pub(super) struct ChangesPage {
     right: Rc<ChangesRight>,
     changed_count: Cell<usize>,
     active_preview_signature: Rc<RefCell<Option<WorktreePreviewSignature>>>,
+    preview_signatures: Rc<RefCell<HashMap<String, WorktreePreviewSignature>>>,
+    preview_cache: Rc<RefCell<BoundedPreviewCache<WorktreePreviewSignature, WorktreePreview>>>,
+    preview_workspace_key: Rc<RefCell<Option<String>>>,
     commit_message_generation_running: Rc<Cell<bool>>,
     active_context_menu: Rc<RefCell<Option<gtk::Popover>>>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+const WORKTREE_PREVIEW_CACHE_LIMIT: usize = 24;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct WorktreePreviewSignature {
     path: String,
     kind: PreviewKind,
@@ -47,13 +53,77 @@ struct WorktreePreviewSignature {
     disk: WorktreePreviewDiskSignature,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum WorktreePreviewDiskSignature {
     Missing,
     Present {
         len: u64,
         modified: Option<SystemTime>,
     },
+}
+
+#[derive(Clone, Debug)]
+enum WorktreePreview {
+    Diff(FileComparison),
+    Bytes(BytesComparison),
+    PreviewLimit(String),
+}
+
+struct WorktreePreviewWorkerResult {
+    signature: WorktreePreviewSignature,
+    result: Result<WorktreePreview, String>,
+    duration: Duration,
+}
+
+struct BoundedPreviewCache<K, V> {
+    limit: usize,
+    entries: VecDeque<(K, V)>,
+}
+
+impl<K: Eq + Clone, V: Clone> BoundedPreviewCache<K, V> {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<V> {
+        let index = self.entries.iter().position(|(entry, _)| entry == key)?;
+        let (key, value) = self.entries.remove(index)?;
+        let cloned = value.clone();
+        self.entries.push_front((key, value));
+        Some(cloned)
+    }
+
+    fn insert(&mut self, key: K, value: V) -> usize {
+        if let Some(index) = self.entries.iter().position(|(entry, _)| entry == &key) {
+            self.entries.remove(index);
+        }
+        self.entries.push_front((key, value));
+
+        let mut evicted = 0;
+        while self.entries.len() > self.limit {
+            self.entries.pop_back();
+            evicted += 1;
+        }
+        evicted
+    }
+
+    fn retain<F>(&mut self, mut keep: F) -> usize
+    where
+        F: FnMut(&K) -> bool,
+    {
+        let before = self.entries.len();
+        self.entries.retain(|(key, _)| keep(key));
+        before.saturating_sub(self.entries.len())
+    }
+
+    fn clear(&mut self) -> usize {
+        let count = self.entries.len();
+        self.entries.clear();
+        count
+    }
 }
 
 impl ChangesPage {
@@ -66,6 +136,11 @@ impl ChangesPage {
             right: Rc::new(ChangesRight::new()),
             changed_count: Cell::new(0),
             active_preview_signature: Rc::new(RefCell::new(None)),
+            preview_signatures: Rc::new(RefCell::new(HashMap::new())),
+            preview_cache: Rc::new(RefCell::new(BoundedPreviewCache::new(
+                WORKTREE_PREVIEW_CACHE_LIMIT,
+            ))),
+            preview_workspace_key: Rc::new(RefCell::new(None)),
             commit_message_generation_running: Rc::new(Cell::new(false)),
             active_context_menu: Rc::new(RefCell::new(None)),
         };
@@ -82,6 +157,8 @@ impl ChangesPage {
             let ctx = self.ctx.clone();
             let right = self.right.clone();
             let active_preview_signature = self.active_preview_signature.clone();
+            let preview_signatures = self.preview_signatures.clone();
+            let preview_cache = self.preview_cache.clone();
 
             move |_, row| {
                 let Some(file_path) = row
@@ -89,11 +166,30 @@ impl ChangesPage {
                     .filter(|path| !path.is_empty())
                 else {
                     active_preview_signature.borrow_mut().take();
+                    log::info!(
+                        "changes preview selection cleared workspace={}",
+                        ctx.workspace_key()
+                    );
                     right.show_home();
                     return;
                 };
-                active_preview_signature.borrow_mut().take();
-                show_worktree_preview(&ctx, &right, &file_path);
+                let Some(signature) = preview_signatures.borrow().get(&file_path).cloned() else {
+                    active_preview_signature.borrow_mut().take();
+                    log::warn!(
+                        "changes preview signature missing workspace={} path={}",
+                        ctx.workspace_key(),
+                        file_path
+                    );
+                    right.show_home();
+                    return;
+                };
+                show_worktree_preview(
+                    &ctx,
+                    &right,
+                    &active_preview_signature,
+                    &preview_cache,
+                    signature,
+                );
             }
         });
     }
@@ -364,6 +460,14 @@ impl Page for ChangesPage {
     }
 
     fn refresh(&self, snapshot: &RepositorySnapshot) {
+        sync_worktree_preview_workspace(
+            &self.preview_workspace_key,
+            &self.preview_signatures,
+            &self.preview_cache,
+            &self.active_preview_signature,
+            &self.ctx.workspace_key(),
+        );
+
         if workspace_can_initialize_git(&self.ctx) {
             if self.changed_count.replace(0) != 0 {
                 self.ctx.notify_badge_changed();
@@ -371,6 +475,12 @@ impl Page for ChangesPage {
             self.commit_form.clear();
             self.panel.show_initialize_repository();
             self.active_preview_signature.borrow_mut().take();
+            self.preview_signatures.borrow_mut().clear();
+            clear_worktree_preview_cache(
+                &self.preview_cache,
+                "initialize-repository",
+                &self.ctx.workspace_key(),
+            );
             log::info!(
                 "changes page showing git initialization prompt during refresh workspace={}",
                 self.ctx.workspace_key()
@@ -385,20 +495,23 @@ impl Page for ChangesPage {
         }
         self.commit_form.set_branch(&snapshot.branch);
         self.commit_form.update_avatar(snapshot);
+        replace_worktree_preview_signatures(&self.preview_signatures, snapshot);
         self.panel.update(snapshot);
         self.right.update(snapshot, self.ctx.git_action_running());
+        retain_worktree_preview_cache(&self.preview_cache, snapshot, &self.ctx.workspace_key());
 
         if let Some(file_path) = self.panel.selected_file_path() {
             let signature = worktree_preview_signature(snapshot, &file_path);
             if self.active_preview_signature.borrow().as_ref() == Some(&signature) {
                 return;
             }
-            if show_worktree_preview_result(&self.ctx, &self.right, &file_path).is_err() {
-                self.active_preview_signature.borrow_mut().take();
-                self.right.show_home();
-            } else {
-                self.active_preview_signature.replace(Some(signature));
-            }
+            show_worktree_preview(
+                &self.ctx,
+                &self.right,
+                &self.active_preview_signature,
+                &self.preview_cache,
+                signature,
+            );
         } else {
             self.active_preview_signature.borrow_mut().take();
             self.right.show_home();
@@ -412,6 +525,12 @@ impl Page for ChangesPage {
         self.commit_form.clear();
         self.panel.clear();
         self.active_preview_signature.borrow_mut().take();
+        self.preview_signatures.borrow_mut().clear();
+        clear_worktree_preview_cache(
+            &self.preview_cache,
+            "repository-error",
+            &self.ctx.workspace_key(),
+        );
         if workspace_can_initialize_git(&self.ctx) {
             log::info!(
                 "changes page showing git initialization status workspace={}",
@@ -439,6 +558,10 @@ impl Page for ChangesPage {
             PageCommand::ClearSelection => {
                 self.panel.files_list.unselect_all();
                 self.active_preview_signature.borrow_mut().take();
+                log::info!(
+                    "changes preview selection cleared workspace={}",
+                    self.ctx.workspace_key()
+                );
                 self.right.show_home();
                 PageCommandResult::Handled
             }
@@ -451,6 +574,80 @@ fn workspace_can_initialize_git(ctx: &PageContext) -> bool {
     ctx.local_workspace_path()
         .as_deref()
         .is_some_and(|path| git::root_for_path(path).is_none())
+}
+
+fn sync_worktree_preview_workspace(
+    preview_workspace_key: &Rc<RefCell<Option<String>>>,
+    preview_signatures: &Rc<RefCell<HashMap<String, WorktreePreviewSignature>>>,
+    preview_cache: &Rc<RefCell<BoundedPreviewCache<WorktreePreviewSignature, WorktreePreview>>>,
+    active_preview_signature: &Rc<RefCell<Option<WorktreePreviewSignature>>>,
+    workspace_key: &str,
+) {
+    if preview_workspace_key.borrow().as_deref() == Some(workspace_key) {
+        return;
+    }
+
+    let previous = preview_workspace_key.replace(Some(workspace_key.to_string()));
+    active_preview_signature.borrow_mut().take();
+    preview_signatures.borrow_mut().clear();
+    let invalidated = preview_cache.borrow_mut().clear();
+    log::info!(
+        "changes preview cache invalidation workspace={} previous_workspace={:?} reason=workspace-change count={}",
+        workspace_key,
+        previous,
+        invalidated
+    );
+}
+
+fn replace_worktree_preview_signatures(
+    preview_signatures: &Rc<RefCell<HashMap<String, WorktreePreviewSignature>>>,
+    snapshot: &RepositorySnapshot,
+) {
+    let mut signatures = HashMap::new();
+    for file in &snapshot.changed_files {
+        signatures.insert(
+            file.path.clone(),
+            worktree_preview_signature(snapshot, &file.path),
+        );
+    }
+    preview_signatures.replace(signatures);
+}
+
+fn retain_worktree_preview_cache(
+    preview_cache: &Rc<RefCell<BoundedPreviewCache<WorktreePreviewSignature, WorktreePreview>>>,
+    snapshot: &RepositorySnapshot,
+    workspace_key: &str,
+) {
+    let invalidated = preview_cache.borrow_mut().retain(|signature| {
+        snapshot
+            .changed_files
+            .iter()
+            .any(|file| file.path == signature.path)
+            && worktree_preview_signature(snapshot, &signature.path) == *signature
+    });
+    if invalidated > 0 {
+        log::info!(
+            "changes preview cache invalidation workspace={} reason=signature-change count={}",
+            workspace_key,
+            invalidated
+        );
+    }
+}
+
+fn clear_worktree_preview_cache(
+    preview_cache: &Rc<RefCell<BoundedPreviewCache<WorktreePreviewSignature, WorktreePreview>>>,
+    reason: &str,
+    workspace_key: &str,
+) {
+    let invalidated = preview_cache.borrow_mut().clear();
+    if invalidated > 0 {
+        log::info!(
+            "changes preview cache invalidation workspace={} reason={} count={}",
+            workspace_key,
+            reason,
+            invalidated
+        );
+    }
 }
 
 fn initialize_git_repository(ctx: &PageContext) {
@@ -478,38 +675,175 @@ fn initialize_git_repository(ctx: &PageContext) {
     }
 }
 
-fn show_worktree_preview(ctx: &PageContext, right: &ChangesRight, file_path: &str) {
-    match show_worktree_preview_result(ctx, right, file_path) {
-        Ok(()) => {}
-        Err(err) if is_preview_limit_message(&err) => {
-            right.show_preview_unavailable(file_path, &err);
-        }
-        Err(err) => {
-            ctx.show_error("Diff Failed", &err);
-            right.show_home();
-        }
+fn show_worktree_preview(
+    ctx: &PageContext,
+    right: &Rc<ChangesRight>,
+    active_preview_signature: &Rc<RefCell<Option<WorktreePreviewSignature>>>,
+    preview_cache: &Rc<RefCell<BoundedPreviewCache<WorktreePreviewSignature, WorktreePreview>>>,
+    signature: WorktreePreviewSignature,
+) {
+    let file_path = signature.path.clone();
+    active_preview_signature.replace(Some(signature.clone()));
+
+    if let Some(preview) = preview_cache.borrow_mut().get(&signature) {
+        log::info!(
+            "changes preview cache hit workspace={} path={} kind={:?} {}",
+            ctx.workspace_key(),
+            file_path,
+            signature.kind,
+            worktree_preview_summary(&preview)
+        );
+        show_worktree_preview_outcome(right, &file_path, &preview);
+        return;
     }
+
+    log::info!(
+        "changes preview cache miss workspace={} path={} kind={:?}",
+        ctx.workspace_key(),
+        file_path,
+        signature.kind
+    );
+
+    let Some(git_access) = ctx.git() else {
+        active_preview_signature.borrow_mut().take();
+        right.show_home();
+        ctx.show_error("Diff Failed", &ctx.git_unavailable_message());
+        return;
+    };
+    let (sender, receiver) = mpsc::channel();
+    let workspace_key = ctx.workspace_key();
+
+    thread::spawn({
+        let signature = signature.clone();
+
+        move || {
+            let start = Instant::now();
+            let result = worktree_preview_result(git_access.as_ref(), &signature);
+            let _ = sender.send(WorktreePreviewWorkerResult {
+                signature,
+                result,
+                duration: start.elapsed(),
+            });
+        }
+    });
+
+    gtk::glib::timeout_add_local(Duration::from_millis(75), {
+        let ctx = ctx.clone();
+        let right = right.clone();
+        let active_preview_signature = active_preview_signature.clone();
+        let preview_cache = preview_cache.clone();
+
+        move || match receiver.try_recv() {
+            Ok(result) => {
+                let is_current = ctx.workspace_is_current(&workspace_key)
+                    && active_preview_signature.borrow().as_ref() == Some(&result.signature);
+                if !is_current {
+                    log::info!(
+                        "changes preview stale result dropped workspace={} path={} kind={:?} duration_ms={}",
+                        workspace_key,
+                        result.signature.path,
+                        result.signature.kind,
+                        result.duration.as_millis()
+                    );
+                    return gtk::glib::ControlFlow::Break;
+                }
+
+                match result.result {
+                    Ok(preview) => {
+                        log::info!(
+                            "changes preview loaded workspace={} path={} kind={:?} duration_ms={} {}",
+                            workspace_key,
+                            result.signature.path,
+                            result.signature.kind,
+                            result.duration.as_millis(),
+                            worktree_preview_summary(&preview)
+                        );
+                        let evicted = preview_cache
+                            .borrow_mut()
+                            .insert(result.signature.clone(), preview.clone());
+                        if evicted > 0 {
+                            log::info!(
+                                "changes preview cache invalidation workspace={} reason=evict count={}",
+                                workspace_key,
+                                evicted
+                            );
+                        }
+                        show_worktree_preview_outcome(&right, &result.signature.path, &preview);
+                    }
+                    Err(err) => {
+                        active_preview_signature.borrow_mut().take();
+                        right.show_home();
+                        log::warn!(
+                            "changes preview load failed workspace={} path={} kind={:?} duration_ms={} err={}",
+                            workspace_key,
+                            result.signature.path,
+                            result.signature.kind,
+                            result.duration.as_millis(),
+                            err
+                        );
+                        ctx.show_error("Diff Failed", &err);
+                    }
+                }
+                gtk::glib::ControlFlow::Break
+            }
+            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) => {
+                if ctx.workspace_is_current(&workspace_key)
+                    && active_preview_signature.borrow().as_ref() == Some(&signature)
+                {
+                    active_preview_signature.borrow_mut().take();
+                    right.show_home();
+                    ctx.show_error("Diff Failed", "Diff loading did not return a result.");
+                }
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
-fn show_worktree_preview_result(
-    ctx: &PageContext,
-    right: &ChangesRight,
-    file_path: &str,
-) -> Result<(), String> {
-    let Some(git_access) = ctx.git() else {
-        return Err(ctx.git_unavailable_message());
-    };
-    match crate::ui::file_type::preview_kind_for_path(file_path, false) {
+fn worktree_preview_result(
+    git_access: &dyn crate::system::capabilities::git::GitAccess,
+    signature: &WorktreePreviewSignature,
+) -> Result<WorktreePreview, String> {
+    let result = match signature.kind {
         PreviewKind::Image
         | PreviewKind::Audio
         | PreviewKind::Video
         | PreviewKind::Font
         | PreviewKind::Pdf => git_access
-            .bytes_comparison(file_path)
-            .map(|comparison| right.show_binary_comparison(file_path, &comparison)),
+            .bytes_comparison(&signature.path)
+            .map(WorktreePreview::Bytes),
         _ => git_access
-            .comparison(file_path)
-            .map(|comparison| right.show_comparison(file_path, &comparison)),
+            .comparison(&signature.path)
+            .map(WorktreePreview::Diff),
+    };
+
+    match result {
+        Ok(preview) => Ok(preview),
+        Err(err) if is_preview_limit_message(&err) => Ok(WorktreePreview::PreviewLimit(err)),
+        Err(err) => Err(err),
+    }
+}
+
+fn show_worktree_preview_outcome(right: &ChangesRight, file_path: &str, preview: &WorktreePreview) {
+    match preview {
+        WorktreePreview::Diff(comparison) => right.show_comparison(file_path, comparison),
+        WorktreePreview::Bytes(comparison) => right.show_binary_comparison(file_path, comparison),
+        WorktreePreview::PreviewLimit(message) => {
+            right.show_preview_unavailable(file_path, message);
+        }
+    }
+}
+
+fn worktree_preview_summary(preview: &WorktreePreview) -> String {
+    match preview {
+        WorktreePreview::Diff(comparison) => format!("rows={}", comparison.rows.len()),
+        WorktreePreview::Bytes(comparison) => format!(
+            "before_bytes={} after_bytes={}",
+            comparison.before.as_ref().map(Vec::len).unwrap_or(0),
+            comparison.after.as_ref().map(Vec::len).unwrap_or(0)
+        ),
+        WorktreePreview::PreviewLimit(_) => "preview_limit=true".to_string(),
     }
 }
 

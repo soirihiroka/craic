@@ -1,14 +1,21 @@
 use super::super::canvas_overshoot;
-use super::{
-    canvas, CELL_PADDING, DIFF_PREFIX_WIDTH, EditorDiffKind, EditorState, FoldControlKey,
-    FoldIconState, FoldRange, GutterSide, LayoutCache, MIN_CONTENT_WIDTH, ScrollbarMarkerKind,
-    SearchMatch, VisualLine,
+mod highlights;
+mod line_numbers;
+mod theme;
+
+use self::highlights::{draw_highlighted_slice, draw_spellcheck_issues, draw_syntax_issues};
+use self::line_numbers::{
+    LineNumberStyle, diff_prefix, draw_deleted_hint, draw_gutter, draw_line_background,
+    draw_line_number, gutter_width_for_state, gutter_x, text_bounds, viewport_width_for_state,
 };
-use crate::language_support::{HighlightRange, SyntaxIssue};
+use self::theme::{Color, EditorTheme, editor_theme, lerp_color};
+use super::{
+    CELL_PADDING, EditorDiffKind, EditorState, FoldControlKey, FoldIconState, FoldRange,
+    LayoutCache, MIN_CONTENT_WIDTH, ScrollbarMarkerKind, SearchMatch, VisualLine, canvas,
+};
 use crate::ui::{canvas_scroll, canvas_scrollbar};
 use adw::prelude::*;
 use gtk::cairo;
-use gtk::gdk::RGBA;
 use gtk::gdk::prelude::GdkCairoContextExt;
 use gtk::gdk_pixbuf::Pixbuf;
 use std::cell::RefCell;
@@ -46,82 +53,6 @@ pub(super) enum FoldAction {
 struct FoldControlHit {
     key: FoldControlKey,
     action: FoldAction,
-}
-
-#[derive(Clone, Copy)]
-struct Color {
-    red: f64,
-    green: f64,
-    blue: f64,
-    alpha: f64,
-}
-
-impl Color {
-    const fn rgb(red: f64, green: f64, blue: f64) -> Self {
-        Self {
-            red,
-            green,
-            blue,
-            alpha: 1.0,
-        }
-    }
-
-    const fn rgb8(red: u8, green: u8, blue: u8) -> Self {
-        Self::rgb(
-            red as f64 / 255.0,
-            green as f64 / 255.0,
-            blue as f64 / 255.0,
-        )
-    }
-
-    fn from_rgba(rgba: RGBA) -> Self {
-        Self {
-            red: rgba.red() as f64,
-            green: rgba.green() as f64,
-            blue: rgba.blue() as f64,
-            alpha: rgba.alpha() as f64,
-        }
-    }
-
-    fn with_alpha(self, alpha: f64) -> Self {
-        Self {
-            alpha: alpha.clamp(0.0, 1.0),
-            ..self
-        }
-    }
-}
-
-impl From<(f64, f64, f64)> for Color {
-    fn from(value: (f64, f64, f64)) -> Self {
-        Self {
-            red: value.0,
-            green: value.1,
-            blue: value.2,
-            alpha: 1.0,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct EditorTheme {
-    background: Color,
-    foreground: Color,
-    gutter_background: Color,
-    line_number: Color,
-    line_number_emphasis: Color,
-    folded_text: Color,
-    selection: Color,
-    search_match: Color,
-    search_match_current: Color,
-    cursor: Color,
-    fold_control_background: Color,
-    added_background: Color,
-    added_gutter_background: Color,
-    deleted_background: Color,
-    deleted_gutter_background: Color,
-    deleted_hint: Color,
-    spellcheck_underline: Color,
-    syntax_error_underline: Color,
 }
 
 pub(super) fn draw_editor(
@@ -426,115 +357,6 @@ pub(super) fn draw_editor(
     let _ = context.restore();
 }
 
-fn draw_syntax_issues(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
-    state: &Rc<EditorState>,
-    source: &str,
-    issues: &[SyntaxIssue],
-    start: usize,
-    end: usize,
-    text_x: f64,
-    baseline: f64,
-    theme: EditorTheme,
-) {
-    if !state.editable.get() {
-        return;
-    }
-
-    let first_issue = issues.partition_point(|issue| issue.end <= start);
-    for issue in &issues[first_issue..] {
-        if issue.start >= end {
-            break;
-        }
-        if !valid_syntax_issue(source, issue) {
-            continue;
-        }
-        let issue_start = issue.start.max(start);
-        let issue_end = issue.end.min(end);
-        if issue_start >= issue_end {
-            continue;
-        }
-        let x = text_x + text_width(area, state, &source[start..issue_start]);
-        let width = text_width(area, state, &source[issue_start..issue_end]);
-        draw_wavy_underline(
-            context,
-            x,
-            baseline + 2.0,
-            width,
-            theme.syntax_error_underline,
-        );
-    }
-}
-
-fn valid_syntax_issue(source: &str, issue: &SyntaxIssue) -> bool {
-    issue.start < issue.end
-        && issue.end <= source.len()
-        && source.is_char_boundary(issue.start)
-        && source.is_char_boundary(issue.end)
-}
-
-fn draw_spellcheck_issues(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
-    state: &Rc<EditorState>,
-    source: &str,
-    issues: &[crate::spellcheck::SpellcheckIssue],
-    start: usize,
-    end: usize,
-    text_x: f64,
-    baseline: f64,
-    theme: EditorTheme,
-) {
-    let first_issue = issues.partition_point(|issue| issue.end <= start);
-    for issue in &issues[first_issue..] {
-        if issue.start >= end {
-            break;
-        }
-        if issue.start >= issue.end
-            || issue.end > source.len()
-            || !source.is_char_boundary(issue.start)
-            || !source.is_char_boundary(issue.end)
-        {
-            continue;
-        }
-        let issue_start = issue.start.max(start);
-        let issue_end = issue.end.min(end);
-        if issue_start >= issue_end {
-            continue;
-        }
-        let x = text_x + text_width(area, state, &source[start..issue_start]);
-        let width = text_width(area, state, &source[issue_start..issue_end]);
-        draw_wavy_underline(
-            context,
-            x,
-            baseline + 2.0,
-            width,
-            theme.spellcheck_underline,
-        );
-    }
-}
-
-fn draw_wavy_underline(context: &cairo::Context, x: f64, y: f64, width: f64, color: Color) {
-    if width <= 1.0 {
-        return;
-    }
-    context.set_source_rgba(color.red, color.green, color.blue, color.alpha);
-    context.set_line_width(1.2);
-    let step = 3.0;
-    let amplitude = 1.4;
-    context.move_to(x, y);
-    let mut current = 0.0;
-    let mut up = true;
-    while current < width {
-        current = (current + step).min(width);
-        let next_y = if up { y - amplitude } else { y + amplitude };
-        context.line_to(x + current, next_y);
-        up = !up;
-    }
-    let _ = context.stroke();
-}
-
 pub(super) fn invalidate_layout(state: &Rc<EditorState>) {
     state.layout_cache.borrow_mut().take();
     state.layout_dirty.set(true);
@@ -629,26 +451,6 @@ fn ensure_highlights(area: &gtk::DrawingArea, state: &Rc<EditorState>, text: &st
         return;
     }
     super::schedule_highlights(area, state, text);
-}
-
-fn draw_deleted_hint(
-    context: &cairo::Context,
-    gutter_x: f64,
-    gutter: f64,
-    line_y: f64,
-    _baseline: f64,
-    _count: usize,
-    theme: EditorTheme,
-) {
-    let hint_width = (gutter - CELL_PADDING * 2.0).max(20.0);
-    fill_rect(
-        context,
-        gutter_x + CELL_PADDING,
-        line_y + 2.0,
-        hint_width,
-        3.0,
-        theme.deleted_hint,
-    );
 }
 
 fn draw_cursor(
@@ -908,75 +710,6 @@ fn valid_search_match(source: &str, search_match: &SearchMatch) -> bool {
         && search_match.end <= source.len()
         && source.is_char_boundary(search_match.start)
         && source.is_char_boundary(search_match.end)
-}
-
-fn draw_highlighted_slice(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
-    state: &Rc<EditorState>,
-    source: &str,
-    highlights: &[HighlightRange],
-    start: usize,
-    end: usize,
-    mut x: f64,
-    baseline: f64,
-    max_x: f64,
-    min_x: f64,
-) {
-    let mut cursor = start;
-    let first_range = highlights.partition_point(|range| range.end <= start);
-    for range in &highlights[first_range..] {
-        if range.start >= end {
-            break;
-        }
-        if !valid_highlight_range(source, range) {
-            continue;
-        }
-        let range_start = range.start.max(start);
-        let range_end = range.end.min(end);
-        let range_start = range_start.max(cursor);
-        if range_start >= range_end {
-            continue;
-        }
-        if cursor < range_start {
-            let plain = &source[cursor..range_start];
-            draw_plain_text(area, context, state, plain, x, baseline, (0.86, 0.86, 0.86));
-            x += text_width(area, state, plain);
-        }
-        let segment = &source[range_start..range_end];
-        let segment_width = text_width(area, state, segment);
-        if x <= max_x && x + segment_width >= min_x {
-            draw_plain_text(
-                area,
-                context,
-                state,
-                segment,
-                x,
-                baseline,
-                range.style.color(),
-            );
-        }
-        x += segment_width;
-        cursor = range_end;
-    }
-    if cursor < end {
-        draw_plain_text(
-            area,
-            context,
-            state,
-            &source[cursor..end],
-            x,
-            baseline,
-            (0.86, 0.86, 0.86),
-        );
-    }
-}
-
-fn valid_highlight_range(source: &str, range: &HighlightRange) -> bool {
-    range.start < range.end
-        && range.end <= source.len()
-        && source.is_char_boundary(range.start)
-        && source.is_char_boundary(range.end)
 }
 
 fn build_visual_lines(
@@ -1526,10 +1259,6 @@ fn fold_control_hit_at_point(
     )
 }
 
-fn draw_gutter(context: &cairo::Context, x: f64, width: f64, height: f64, color: Color) {
-    fill_rect(context, x, 0.0, width, height, color);
-}
-
 fn draw_scrollbar(
     area: &gtk::DrawingArea,
     context: &cairo::Context,
@@ -1673,141 +1402,6 @@ fn scrollbar_marker_visual_span(
 }
 
 #[derive(Clone, Copy)]
-struct LineNumberStyle {
-    added: bool,
-    deleted: bool,
-    missing: bool,
-    prefix: Option<&'static str>,
-    fold_control: Option<(FoldControlKey, bool)>,
-    show_diff_fold_control: bool,
-}
-
-fn draw_line_number(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-    context: &cairo::Context,
-    gutter_x: f64,
-    gutter: f64,
-    number: usize,
-    show_number: bool,
-    y: f64,
-    baseline: f64,
-    style: LineNumberStyle,
-    theme: EditorTheme,
-) {
-    let background = if style.added {
-        theme.added_gutter_background
-    } else if style.deleted {
-        theme.deleted_gutter_background
-    } else if style.missing {
-        theme.background
-    } else {
-        theme.gutter_background
-    };
-    let line_height = line_height(state);
-    fill_rect(context, gutter_x, y, gutter, line_height, background);
-
-    if style.show_diff_fold_control {
-        if let Some((key, expanded)) = style.fold_control {
-            draw_fold_toggle_icon(
-                area,
-                state,
-                context,
-                fold_toggle_rect(gutter_x, gutter, y, line_height),
-                key,
-                expanded,
-                theme,
-            );
-        }
-        return;
-    }
-
-    if let Some((key, expanded)) = style.fold_control {
-        draw_fold_toggle_icon(
-            area,
-            state,
-            context,
-            fold_toggle_rect(gutter_x, gutter, y, line_height),
-            key,
-            expanded,
-            theme,
-        );
-    }
-
-    if !show_number {
-        return;
-    }
-
-    let number_text = number.to_string();
-    let color = if style.added || style.deleted {
-        theme.line_number_emphasis
-    } else {
-        theme.line_number
-    };
-    let number_area_width = if style.prefix.is_some() {
-        gutter - DIFF_PREFIX_WIDTH
-    } else {
-        gutter
-    };
-    let x = gutter_x + number_area_width - CELL_PADDING - text_width(area, state, &number_text);
-    draw_plain_text(area, context, state, &number_text, x, baseline, color);
-
-    if let Some(prefix) = style.prefix {
-        draw_plain_text(
-            area,
-            context,
-            state,
-            prefix,
-            gutter_x + gutter - DIFF_PREFIX_WIDTH + 7.0,
-            baseline,
-            theme.line_number_emphasis,
-        );
-    }
-}
-
-fn viewport_width_for_state(state: &Rc<EditorState>, width: i32) -> i32 {
-    if state.scrollbar_visible.get() || state.diff_rows.borrow().is_some() {
-        viewport_width(width)
-    } else {
-        width.max(MIN_CONTENT_WIDTH.min(width.max(1)))
-    }
-}
-
-fn gutter_x(side: GutterSide, width: i32, gutter: f64) -> f64 {
-    match side {
-        GutterSide::Left => 0.0,
-        GutterSide::Right => (width as f64 - gutter).max(0.0),
-    }
-}
-
-fn text_bounds(side: GutterSide, width: i32, gutter: f64) -> (f64, f64) {
-    match side {
-        GutterSide::Left => (gutter + CELL_PADDING, width as f64 - CELL_PADDING),
-        GutterSide::Right => (CELL_PADDING, width as f64 - gutter - CELL_PADDING),
-    }
-}
-
-fn gutter_width_for_state(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-    line_count: usize,
-) -> f64 {
-    let mut width = gutter_width_for_line_count(area, state, line_count);
-    if state.diff_rows.borrow().is_some() {
-        width += DIFF_PREFIX_WIDTH;
-    }
-    width
-}
-
-fn gutter_width_for_line_count(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-    line_count: usize,
-) -> f64 {
-    text_width(area, state, &line_count.max(1).to_string()) + 4.0 * char_width(state)
-}
-
-#[derive(Clone, Copy)]
 struct LineMeta {
     number: Option<usize>,
     kind: EditorDiffKind,
@@ -1888,40 +1482,6 @@ fn display_line_start_for_offset(display_text: &str, offset: usize) -> Option<us
         .rfind('\n')
         .map(|newline| newline + 1)
         .or(Some(0))
-}
-
-fn draw_line_background(
-    context: &cairo::Context,
-    side: GutterSide,
-    width: i32,
-    gutter: f64,
-    y: f64,
-    line_height: f64,
-    kind: EditorDiffKind,
-    theme: EditorTheme,
-) {
-    let color = match kind {
-        EditorDiffKind::Added => Some(theme.added_background),
-        EditorDiffKind::Deleted => Some(theme.deleted_background),
-        EditorDiffKind::Missing | EditorDiffKind::Fold => Some(theme.background),
-        EditorDiffKind::Context => None,
-    };
-    let Some(color) = color else {
-        return;
-    };
-    let (x, row_width) = match side {
-        GutterSide::Left => (0.0, width as f64),
-        GutterSide::Right => (0.0, width as f64),
-    };
-    fill_rect(context, x, y, row_width.max(gutter), line_height, color);
-}
-
-fn diff_prefix(kind: EditorDiffKind) -> Option<&'static str> {
-    match kind {
-        EditorDiffKind::Added => Some("+"),
-        EditorDiffKind::Deleted => Some("-"),
-        EditorDiffKind::Context | EditorDiffKind::Missing | EditorDiffKind::Fold => None,
-    }
 }
 
 fn fold_index_starting_at(state: &Rc<EditorState>, source_line: usize) -> Option<usize> {
@@ -2396,69 +1956,4 @@ fn rounded_rect(context: &cairo::Context, x: f64, y: f64, width: f64, height: f6
         std::f64::consts::PI * 1.5,
     );
     context.close_path();
-}
-
-fn editor_theme(area: &gtk::DrawingArea) -> EditorTheme {
-    let style_manager = adw::StyleManager::for_display(&area.display());
-    let dark = style_manager.is_dark();
-    let background = if dark {
-        Color::rgb8(0x1d, 0x1d, 0x20)
-    } else {
-        Color::rgb8(0xff, 0xff, 0xff)
-    };
-    let foreground = Color::from_rgba(area.color());
-    let gutter_background = if dark {
-        Color::rgb8(0x22, 0x22, 0x26)
-    } else {
-        Color::rgb8(0xfa, 0xfa, 0xfb)
-    };
-    let accent = Color::from_rgba(style_manager.accent_color_rgba());
-    let success = if dark {
-        Color::rgb8(0x26, 0xa2, 0x69)
-    } else {
-        Color::rgb8(0x2e, 0xc2, 0x7e)
-    };
-    let error = if dark {
-        Color::rgb8(0xc0, 0x1c, 0x28)
-    } else {
-        Color::rgb8(0xe0, 0x1b, 0x24)
-    };
-
-    EditorTheme {
-        background,
-        foreground,
-        gutter_background,
-        line_number: foreground.with_alpha(0.55),
-        line_number_emphasis: foreground.with_alpha(0.86),
-        folded_text: foreground.with_alpha(0.62),
-        selection: accent.with_alpha(0.45),
-        search_match: Color::rgb8(0xf6, 0xd3, 0x2d).with_alpha(if dark { 0.28 } else { 0.36 }),
-        search_match_current: Color::rgb8(0xff, 0xbe, 0x6f).with_alpha(if dark {
-            0.52
-        } else {
-            0.62
-        }),
-        cursor: accent,
-        fold_control_background: foreground,
-        added_background: success.with_alpha(0.18),
-        added_gutter_background: success.with_alpha(0.26),
-        deleted_background: error.with_alpha(0.20),
-        deleted_gutter_background: error.with_alpha(0.28),
-        deleted_hint: error.with_alpha(0.90),
-        spellcheck_underline: Color::rgb8(0xf6, 0xd3, 0x2d).with_alpha(0.95),
-        syntax_error_underline: error.with_alpha(0.95),
-    }
-}
-
-fn lerp(start: f64, end: f64, amount: f64) -> f64 {
-    start + (end - start) * amount.clamp(0.0, 1.0)
-}
-
-fn lerp_color(start: Color, end: Color, amount: f64) -> Color {
-    Color {
-        red: lerp(start.red, end.red, amount),
-        green: lerp(start.green, end.green, amount),
-        blue: lerp(start.blue, end.blue, amount),
-        alpha: lerp(start.alpha, end.alpha, amount),
-    }
 }

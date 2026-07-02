@@ -7,14 +7,14 @@ pub(in crate::ui) enum EditorDiffKind {
     Fold,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(in crate::ui) struct DiffEditorDocument {
     pub(in crate::ui) rows: Vec<DiffEditorRow>,
     pub(in crate::ui) language: String,
     pub(in crate::ui) source: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(in crate::ui) struct DiffEditorRow {
     pub(in crate::ui) number: Option<usize>,
     pub(in crate::ui) text: String,

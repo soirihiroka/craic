@@ -1,3 +1,6 @@
+use super::super::preview_reconcile::{
+    RightPreviewReconciler, binary_state, diff_state, should_update_preview, unavailable_state,
+};
 use crate::git::{BytesComparison, ChangedFile, Commit, FileComparison};
 use crate::ui::content::binary_preview::{
     BinaryPreviewWidgets, set_audio_preview, set_font_preview, set_image_preview, set_pdf_preview,
@@ -31,6 +34,7 @@ pub(super) struct HistoryRight {
     preview_stack: gtk::Stack,
     file_preview: BinaryPreviewWidgets,
     avatar_source: Rc<RefCell<Option<String>>>,
+    preview_reconciler: RefCell<RightPreviewReconciler>,
 }
 
 impl HistoryRight {
@@ -226,6 +230,7 @@ impl HistoryRight {
             preview_stack,
             file_preview,
             avatar_source: Rc::new(RefCell::new(None)),
+            preview_reconciler: RefCell::new(RightPreviewReconciler::new()),
         }
     }
 
@@ -303,11 +308,25 @@ impl HistoryRight {
     }
 
     pub(super) fn show_comparison(&self, file_path: &str, comparison: &FileComparison) {
+        if !should_update_preview(
+            &self.preview_reconciler,
+            diff_state(file_path, comparison),
+            "history",
+        ) {
+            return;
+        }
         self.preview_stack.set_visible_child_name("diff");
         self.diff.set_diff(file_path, comparison);
     }
 
     pub(super) fn show_binary_comparison(&self, file_path: &str, comparison: &BytesComparison) {
+        if !should_update_preview(
+            &self.preview_reconciler,
+            binary_state(file_path, comparison),
+            "history",
+        ) {
+            return;
+        }
         match crate::ui::file_type::preview_kind_for_path(file_path, false) {
             PreviewKind::Image => {
                 set_image_preview(&self.file_preview, file_path, comparison);
@@ -332,6 +351,13 @@ impl HistoryRight {
     }
 
     pub(super) fn show_preview_unavailable(&self, file_path: &str, message: &str) {
+        if !should_update_preview(
+            &self.preview_reconciler,
+            unavailable_state(file_path, message),
+            "history",
+        ) {
+            return;
+        }
         set_unavailable_preview(&self.file_preview, file_path, message);
         self.preview_stack.set_visible_child_name("preview");
     }

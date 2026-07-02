@@ -2,6 +2,8 @@ pub(in crate::ui) mod canvas;
 mod diff_document;
 mod input;
 mod render;
+pub(in crate::ui) mod selection;
+mod text_buffer;
 
 use super::canvas_overshoot;
 use crate::config;
@@ -15,20 +17,21 @@ use crate::ui::canvas_scroll;
 use crate::ui::components::search::SearchPanel;
 use adw::prelude::*;
 use gtk::gdk;
+use selection::Selection;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
-use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
+use text_buffer::{TextBuffer, TextWidthCache, clamp_to_char_boundary, next_char_boundary};
 
 pub(in crate::ui) use crate::language_support::language_hint_from_path;
 pub(in crate::ui) use diff_document::{
     DiffEditorDocument, DiffEditorRow, EditorDiffKind, ScrollbarMarker, ScrollbarMarkerKind,
 };
+pub(in crate::ui) use text_buffer::byte_offset_for_line_column;
 
 const CELL_PADDING: f64 = 8.0;
 const DIFF_PREFIX_WIDTH: f64 = 22.0;
@@ -183,14 +186,6 @@ struct HistorySnapshot {
     after_selection: Option<Selection>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Selection {
-    anchor: usize,
-    focus: usize,
-    visual_anchor: usize,
-    visual_focus: usize,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectionMode {
     Character,
@@ -266,119 +261,6 @@ struct LayoutCache {
     content_width: f64,
     content_height: f64,
     visual_lines: Vec<VisualLine>,
-}
-
-struct TextBuffer {
-    before_gap: String,
-    after_gap_reversed: String,
-    text: String,
-}
-
-impl TextBuffer {
-    fn new(text: &str) -> Self {
-        Self {
-            before_gap: text.to_string(),
-            after_gap_reversed: String::new(),
-            text: text.to_string(),
-        }
-    }
-
-    fn set_text(&mut self, text: &str) {
-        self.before_gap.clear();
-        self.before_gap.push_str(text);
-        self.after_gap_reversed.clear();
-        self.text.clear();
-        self.text.push_str(text);
-    }
-
-    fn as_str(&self) -> &str {
-        &self.text
-    }
-
-    fn replace_range(&mut self, start: usize, old_end: usize, replacement: &str) {
-        let start = previous_char_boundary(&self.text, start.min(self.text.len()));
-        let old_end = previous_char_boundary(&self.text, old_end.min(self.text.len()).max(start));
-        self.move_gap_to(start);
-        self.delete_after_gap(old_end - start);
-        self.before_gap.push_str(replacement);
-        self.text.replace_range(start..old_end, replacement);
-    }
-
-    fn move_gap_to(&mut self, offset: usize) {
-        if offset < self.before_gap.len() {
-            let moved = self.before_gap.split_off(offset);
-            self.after_gap_reversed.reserve(moved.len());
-            for ch in moved.chars().rev() {
-                self.after_gap_reversed.push(ch);
-            }
-            return;
-        }
-
-        while self.before_gap.len() < offset {
-            let Some(ch) = self.after_gap_reversed.pop() else {
-                break;
-            };
-            self.before_gap.push(ch);
-        }
-    }
-
-    fn delete_after_gap(&mut self, byte_len: usize) {
-        let mut removed = 0usize;
-        while removed < byte_len {
-            let Some(ch) = self.after_gap_reversed.pop() else {
-                break;
-            };
-            removed += ch.len_utf8();
-        }
-    }
-}
-
-impl Deref for TextBuffer {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
-}
-
-fn previous_char_boundary(text: &str, mut offset: usize) -> usize {
-    offset = offset.min(text.len());
-    while offset > 0 && !text.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
-}
-
-struct TextWidthCache {
-    font_size: i32,
-    total_bytes: usize,
-    widths: HashMap<String, f64>,
-    insertion_order: VecDeque<String>,
-}
-
-impl TextWidthCache {
-    fn new(font_size: f64) -> Self {
-        Self {
-            font_size: font_size.round() as i32,
-            total_bytes: 0,
-            widths: HashMap::new(),
-            insertion_order: VecDeque::new(),
-        }
-    }
-
-    fn clear_for_font_size(&mut self, font_size: i32) {
-        if self.font_size == font_size {
-            return;
-        }
-        self.font_size = font_size;
-        self.clear();
-    }
-
-    fn clear(&mut self) {
-        self.total_bytes = 0;
-        self.widths.clear();
-        self.insertion_order.clear();
-    }
 }
 
 impl CodeEditor {
@@ -507,7 +389,7 @@ impl CodeEditor {
     }
 
     pub(in crate::ui) fn set_text(&self, text: &str) {
-        self.set_document_with_language(None, text, true);
+        self.set_document_with_language(None, text, false);
     }
 
     pub(in crate::ui) fn set_document(&self, language: &str, text: &str) {
@@ -557,6 +439,31 @@ impl CodeEditor {
     }
 
     pub(in crate::ui) fn set_diff_document(&self, document: DiffEditorDocument) {
+        let unchanged = {
+            let rows_match = self
+                .state
+                .diff_rows
+                .borrow()
+                .as_ref()
+                .is_some_and(|rows| rows == &document.rows);
+            let source_match = self
+                .state
+                .syntax_source
+                .borrow()
+                .as_ref()
+                .is_some_and(|source| source == &document.source);
+            let language_match =
+                self.state.language.borrow().as_str() == document.language.as_str();
+            rows_match && source_match && language_match
+        };
+        if unchanged {
+            log::debug!(
+                "code_editor diff document unchanged rows={} source_bytes={}",
+                document.rows.len(),
+                document.source.len()
+            );
+            return;
+        }
         input::dismiss_completion(&self.state);
         let text = document
             .rows
@@ -702,6 +609,9 @@ impl CodeEditor {
     }
 
     pub(in crate::ui) fn set_auto_folding_enabled(&self, enabled: bool) {
+        if self.state.auto_folding_enabled.get() == enabled {
+            return;
+        }
         self.state.auto_folding_enabled.set(enabled);
         rebuild_auto_folds(&self.area, &self.state);
         render::invalidate_layout(&self.state);
@@ -773,37 +683,6 @@ impl CodeEditor {
         rebuild_auto_folds(&self.area, &self.state);
         self.refresh();
     }
-}
-
-pub(in crate::ui) fn byte_offset_for_line_column(text: &str, line: usize, column: usize) -> usize {
-    let target_line = line.max(1);
-    let target_column = column.max(1);
-    let mut current_line = 1usize;
-    let mut line_start = 0usize;
-
-    for (offset, ch) in text.char_indices() {
-        if current_line == target_line {
-            break;
-        }
-        if ch == '\n' {
-            current_line += 1;
-            line_start = offset + ch.len_utf8();
-        }
-    }
-
-    if current_line != target_line {
-        return text.len();
-    }
-
-    let mut current_column = 1usize;
-    for (offset, ch) in text[line_start..].char_indices() {
-        if current_column >= target_column || ch == '\n' {
-            return line_start + offset;
-        }
-        current_column += 1;
-    }
-
-    text.len()
 }
 
 fn build_search_panel(area: &gtk::DrawingArea, state: &Rc<EditorState>) -> SearchPanel {
@@ -955,14 +834,6 @@ fn next_search_cursor(text: &str, start: usize, end: usize) -> usize {
     } else {
         end
     }
-}
-
-fn next_char_boundary(text: &str, mut offset: usize) -> usize {
-    offset = offset.min(text.len());
-    while offset < text.len() && !text.is_char_boundary(offset) {
-        offset += 1;
-    }
-    offset
 }
 
 fn search_next(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
@@ -1190,14 +1061,6 @@ fn normalize_folds_for_current_text(state: &Rc<EditorState>, reason: &str) -> bo
     );
     mark_fold_state_changed(state);
     true
-}
-
-fn clamp_to_char_boundary(text: &str, offset: usize) -> usize {
-    let mut offset = offset.min(text.len());
-    while offset > 0 && !text.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
 }
 
 fn notify_scroll(state: &Rc<EditorState>, scroll_y: f64) {
@@ -1671,18 +1534,28 @@ fn send_syntax_command(state: &Rc<EditorState>, command: SyntaxWorkerCommand) {
 fn reset_syntax_worker(state: &Rc<EditorState>) {
     let generation = next_syntax_generation(state);
     state.highlight_request_generation.set(generation);
+    let source = state
+        .syntax_source
+        .borrow()
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| state.text.borrow().as_str().to_string());
+    let diff_document = state.diff_rows.borrow().is_some();
+    let auto_folds = state.auto_folding_enabled.get() && !diff_document;
+    log::debug!(
+        "code_editor syntax reset generation={} source_bytes={} diff_document={} auto_folds={}",
+        generation,
+        source.len(),
+        diff_document,
+        auto_folds
+    );
     send_syntax_command(
         state,
         SyntaxWorkerCommand::Reset {
             generation,
             language: state.language.borrow().clone(),
-            source: state
-                .syntax_source
-                .borrow()
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| state.text.borrow().as_str().to_string()),
-            auto_folds: state.auto_folding_enabled.get() && state.diff_rows.borrow().is_none(),
+            source,
+            auto_folds,
         },
     );
 }
@@ -1792,15 +1665,7 @@ fn append_auto_folds_preserving_state(
 
 fn selection_bounds(state: &Rc<EditorState>) -> Option<(usize, usize)> {
     let selection = *state.selection.borrow();
-    let selection = selection?;
-    if selection.visual_anchor == selection.visual_focus {
-        return None;
-    }
-    Some(if selection.visual_anchor < selection.visual_focus {
-        (selection.visual_anchor, selection.visual_focus)
-    } else {
-        (selection.visual_focus, selection.visual_anchor)
-    })
+    selection.and_then(Selection::visual_bounds)
 }
 
 fn notify_edit(state: &Rc<EditorState>) {
