@@ -2,7 +2,10 @@ use super::{
     canvas_overshoot,
     code_editor::{
         canvas::{self, TextColor},
-        selection::{AnchoredSelection, clipped_bounds, word_bounds_at as text_word_bounds_at},
+        selection::{
+            AnchoredSelection, DragSelection, SelectionMode, clipped_bounds, drag_for_mode,
+            selection_for_drag, selection_for_mode, word_bounds_at as text_word_bounds_at,
+        },
     },
     diff_layout,
 };
@@ -58,7 +61,7 @@ struct DiffCanvasState {
     syntax: RefCell<Option<DiffSyntaxState>>,
     syntax_signature: RefCell<Option<DiffSyntaxSignature>>,
     selection: RefCell<Option<DiffSelection>>,
-    selection_drag: Cell<Option<DiffSelectionDrag>>,
+    selection_drag: Cell<Option<DragSelection<DiffSelectionPoint>>>,
     active_side: Cell<DiffCanvasSide>,
     last_layout_log: RefCell<Option<LayoutLogSnapshot>>,
 }
@@ -101,42 +104,10 @@ struct DiffSelectionPoint {
     byte: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DiffSelectionMode {
-    Character,
-    Word,
-    Line,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DiffSelectionDrag {
-    Character {
-        anchor: DiffSelectionPoint,
-    },
-    Word {
-        start: DiffSelectionPoint,
-        end: DiffSelectionPoint,
-    },
-    Line {
-        start: DiffSelectionPoint,
-        end: DiffSelectionPoint,
-    },
-}
-
 #[derive(Clone, Copy)]
 enum DiffContextAction {
     Copy,
     SelectAll,
-}
-
-impl DiffSelectionMode {
-    fn for_press_count(press_count: i32) -> Self {
-        match press_count {
-            count if count >= 3 => Self::Line,
-            2 => Self::Word,
-            _ => Self::Character,
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1234,27 +1205,16 @@ fn stop_diff_middle_autoscroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasSta
 }
 
 fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner: &adw::Spinner) {
-    let click_selection_mode = Rc::new(Cell::new(DiffSelectionMode::Character));
+    let click_selection_mode = Rc::new(Cell::new(SelectionMode::Character));
     let click = gtk::GestureClick::new();
-    click.set_button(0);
+    click.set_button(1);
     click.connect_pressed({
         let area = area.clone();
         let state = state.clone();
         let click_selection_mode = click_selection_mode.clone();
         move |gesture, n_press, x, y| {
-            let button = gesture.current_button();
-            if button == 2 {
-                return;
-            }
             area.grab_focus();
             if state.middle_autoscroll.is_active() {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                return;
-            }
-            if button == 3 {
-                state.scrollbar_drag.set(None);
-                state.selection_drag.set(None);
-                show_context_menu(&area, &state, x, y);
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 return;
             }
@@ -1285,9 +1245,6 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
                 }
             }
 
-            if button != 1 {
-                return;
-            }
             if let Some(fold_index) = fold_index_at(&area, &state, y) {
                 if let Some(callback) = state.fold_callback.borrow().as_ref().cloned() {
                     callback(fold_index);
@@ -1296,7 +1253,7 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
                 }
             }
 
-            let mode = DiffSelectionMode::for_press_count(n_press);
+            let mode = SelectionMode::for_press_count(n_press);
             click_selection_mode.set(mode);
             if let Some(point) = selection_point_at(&area, &state, x, y) {
                 apply_click_selection(&area, &state, point, mode);
@@ -1375,12 +1332,13 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
             state.active_side.set(point.side);
             state
                 .selection_drag
-                .set(selection_drag_for_point(&area, &state, point, mode));
+                .set(Some(selection_drag_for_point(&area, &state, point, mode)));
         }
     });
     drag.connect_drag_update({
         let area = area.clone();
         let state = state.clone();
+        let click_selection_mode = click_selection_mode.clone();
         move |gesture, offset_x, offset_y| {
             if state.middle_autoscroll.is_active() {
                 return;
@@ -1408,15 +1366,23 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
             let Some((start_x, start_y)) = gesture.start_point() else {
                 return;
             };
-            if let Some(drag) = state.selection_drag.get() {
-                let pointer_x = start_x + offset_x;
-                let pointer_y = start_y + offset_y;
-                if let Some(focus) =
-                    selection_point_at_side(&area, &state, pointer_x, pointer_y, drag.side())
-                {
-                    apply_drag_selection(&area, &state, drag, focus);
-                }
+            let Some(drag) = state.selection_drag.get().or_else(|| {
+                let point = selection_point_at(&area, &state, start_x, start_y)?;
+                let mode = click_selection_mode.get();
+                state.active_side.set(point.side);
+                let drag = selection_drag_for_point(&area, &state, point, mode);
+                state.selection_drag.set(Some(drag));
+                Some(drag)
+            }) else {
                 return;
+            };
+
+            let pointer_x = start_x + offset_x;
+            let pointer_y = start_y + offset_y;
+            if let Some(focus) =
+                selection_point_at_side(&area, &state, pointer_x, pointer_y, drag.anchor().side)
+            {
+                apply_drag_selection(&area, &state, drag, focus);
             }
         }
     });
@@ -1439,6 +1405,25 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
     click.group_with(&drag);
     area.add_controller(click);
     area.add_controller(drag);
+
+    let secondary_click = gtk::GestureClick::new();
+    secondary_click.set_button(3);
+    secondary_click.connect_pressed({
+        let area = area.clone();
+        let state = state.clone();
+        move |gesture, _, x, y| {
+            area.grab_focus();
+            if state.middle_autoscroll.is_active() {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                return;
+            }
+            state.scrollbar_drag.set(None);
+            state.selection_drag.set(None);
+            show_context_menu(&area, &state, x, y);
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        }
+    });
+    area.add_controller(secondary_click);
 }
 
 fn install_motion(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
@@ -1559,7 +1544,7 @@ fn apply_click_selection(
     area: &gtk::DrawingArea,
     state: &Rc<DiffCanvasState>,
     point: DiffSelectionPoint,
-    mode: DiffSelectionMode,
+    mode: SelectionMode,
 ) {
     log::debug!(
         "diff_canvas click_selection mode={mode:?} side={:?} row={} byte={}",
@@ -1569,40 +1554,13 @@ fn apply_click_selection(
     );
     state.active_side.set(point.side);
     state.selection_drag.set(None);
-    match mode {
-        DiffSelectionMode::Character => {
-            state.selection.replace(Some(DiffSelection {
-                anchor: point,
-                focus: point,
-            }));
-        }
-        DiffSelectionMode::Word => {
-            if let Some((start, end)) = word_bounds_at_point(state, point) {
-                state.selection.replace(Some(DiffSelection {
-                    anchor: start,
-                    focus: end,
-                }));
-            } else {
-                state.selection.replace(Some(DiffSelection {
-                    anchor: point,
-                    focus: point,
-                }));
-            }
-        }
-        DiffSelectionMode::Line => {
-            if let Some((start, end)) = line_bounds_at_point(state, point) {
-                state.selection.replace(Some(DiffSelection {
-                    anchor: start,
-                    focus: end,
-                }));
-            } else {
-                state.selection.replace(Some(DiffSelection {
-                    anchor: point,
-                    focus: point,
-                }));
-            }
-        }
-    }
+    let selection = selection_for_mode(
+        point,
+        mode,
+        |point| word_bounds_at_point(state, point),
+        |point| line_bounds_at_point(state, point),
+    );
+    state.selection.replace(Some(selection));
     area.queue_draw();
 }
 
@@ -1610,125 +1568,58 @@ fn selection_drag_for_point(
     area: &gtk::DrawingArea,
     state: &Rc<DiffCanvasState>,
     point: DiffSelectionPoint,
-    mode: DiffSelectionMode,
-) -> Option<DiffSelectionDrag> {
+    mode: SelectionMode,
+) -> DragSelection<DiffSelectionPoint> {
     log::debug!(
         "diff_canvas selection_drag_begin mode={mode:?} side={:?} row={} byte={}",
         point.side,
         point.row,
         point.byte
     );
-    match mode {
-        DiffSelectionMode::Character => {
-            state.selection.replace(Some(DiffSelection {
-                anchor: point,
-                focus: point,
-            }));
-            area.queue_draw();
-            Some(DiffSelectionDrag::Character { anchor: point })
-        }
-        DiffSelectionMode::Word => {
-            if let Some((start, end)) = word_bounds_at_point(state, point) {
-                state.selection.replace(Some(DiffSelection {
-                    anchor: start,
-                    focus: end,
-                }));
-                area.queue_draw();
-                Some(DiffSelectionDrag::Word { start, end })
-            } else {
-                state.selection.replace(Some(DiffSelection {
-                    anchor: point,
-                    focus: point,
-                }));
-                area.queue_draw();
-                Some(DiffSelectionDrag::Character { anchor: point })
-            }
-        }
-        DiffSelectionMode::Line => {
-            if let Some((start, end)) = line_bounds_at_point(state, point) {
-                state.selection.replace(Some(DiffSelection {
-                    anchor: start,
-                    focus: end,
-                }));
-                area.queue_draw();
-                Some(DiffSelectionDrag::Line { start, end })
-            } else {
-                state.selection.replace(Some(DiffSelection {
-                    anchor: point,
-                    focus: point,
-                }));
-                area.queue_draw();
-                Some(DiffSelectionDrag::Character { anchor: point })
-            }
-        }
-    }
+    let (drag, selection) = drag_for_mode(
+        point,
+        mode,
+        |point| word_bounds_at_point(state, point),
+        |point| line_bounds_at_point(state, point),
+    );
+    state.selection.replace(Some(selection));
+    area.queue_draw();
+    drag
 }
 
 fn apply_drag_selection(
     area: &gtk::DrawingArea,
     state: &Rc<DiffCanvasState>,
-    drag: DiffSelectionDrag,
+    drag: DragSelection<DiffSelectionPoint>,
     focus: DiffSelectionPoint,
 ) {
-    let selection = match drag {
-        DiffSelectionDrag::Character { anchor } => DiffSelection { anchor, focus },
-        DiffSelectionDrag::Word { start, end } => {
-            let (focus_start, focus_end) =
-                word_bounds_at_point(state, focus).unwrap_or((focus, focus));
-            if focus < start {
-                DiffSelection {
-                    anchor: end,
-                    focus: focus_start,
-                }
-            } else {
-                DiffSelection {
-                    anchor: start,
-                    focus: focus_end,
-                }
-            }
-        }
-        DiffSelectionDrag::Line { start, end } => {
-            let (focus_start, focus_end) =
-                line_bounds_at_point(state, focus).unwrap_or((focus, focus));
-            if focus < start {
-                DiffSelection {
-                    anchor: end,
-                    focus: focus_start,
-                }
-            } else {
-                DiffSelection {
-                    anchor: start,
-                    focus: focus_end,
-                }
-            }
-        }
-    };
+    let selection = selection_for_drag(
+        drag,
+        focus,
+        |focus| word_bounds_at_point(state, focus),
+        |focus| line_bounds_at_point(state, focus),
+    );
     state.selection.replace(Some(selection));
     area.queue_draw();
 }
 
-impl DiffSelectionDrag {
-    fn side(self) -> DiffCanvasSide {
-        match self {
-            Self::Character { anchor } => anchor.side,
-            Self::Word { start, .. } | Self::Line { start, .. } => start.side,
-        }
-    }
-}
-
 fn show_context_menu(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, x: f64, y: f64) {
-    if let Some(point) = selection_point_at(area, state, x, y) {
+    let hit_point = selection_point_at(area, state, x, y);
+    if let Some(point) = hit_point {
         state.active_side.set(point.side);
-        if !point_inside_selection(state, point) {
-            state.selection.replace(Some(DiffSelection {
-                anchor: point,
-                focus: point,
-            }));
-            area.queue_draw();
-        }
+    } else if x
+        < (canvas_scrollbar::content_width(area.allocated_width())
+            .max(MIN_CONTENT_WIDTH.min(area.allocated_width().max(1))) as f64
+            / 2.0)
+            .floor()
+    {
+        state.active_side.set(DiffCanvasSide::Left);
+    } else {
+        state.active_side.set(DiffCanvasSide::Right);
     }
 
-    let copy_enabled = selected_text(state).is_some_and(|text| !text.is_empty());
+    let copy_enabled = hit_point.is_some_and(|point| point_inside_selection(state, point))
+        && selected_text(state).is_some_and(|text| !text.is_empty());
     let select_all_enabled = has_selectable_text(state, state.active_side.get());
     log::debug!(
         "diff_canvas context_menu x={x:.1} y={y:.1} active_side={:?} has_selection={}",

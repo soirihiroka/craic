@@ -1,5 +1,8 @@
 use super::super::canvas_overshoot;
-use super::selection::word_bounds_at;
+use super::selection::{
+    AnchoredSelection, DragSelection, drag_for_mode, selection_for_drag, selection_for_mode,
+    word_bounds_at,
+};
 use super::{
     CompletionUi, EditorState, FoldControlKey, FoldRange, HistorySnapshot, MAX_HISTORY_SNAPSHOTS,
     Selection, SelectionMode, notify_diff_fold, notify_edit, render, selection_bounds,
@@ -31,7 +34,7 @@ pub(super) fn install_interactions(
     state: &Rc<EditorState>,
 ) {
     let scroll_drag = Rc::new(Cell::new(None::<canvas_scrollbar::Drag>));
-    let selection_drag = Rc::new(Cell::new(None::<DragSelection>));
+    let selection_drag = Rc::new(Cell::new(None::<DragSelection<usize>>));
     let selected_text_drag = Rc::new(Cell::new(None::<SelectedTextDrag>));
     let pending_selection_click = Rc::new(Cell::new(None::<usize>));
     let click_press_state = Rc::new(Cell::new(ClickPressState::default()));
@@ -300,13 +303,10 @@ pub(super) fn install_interactions(
                 SelectionMode::Character => {
                     move_cursor_to(&area, &state, offset, false);
                 }
-                SelectionMode::Word => {
-                    if !select_word_at(&area, &state, offset) {
+                SelectionMode::Word | SelectionMode::Line => {
+                    if !select_at_mode(&area, &state, offset, mode) {
                         move_cursor_to(&area, &state, offset, false);
                     }
-                }
-                SelectionMode::Line => {
-                    select_line_at(&area, &state, offset);
                 }
             }
         }
@@ -427,32 +427,14 @@ pub(super) fn install_interactions(
             }
             pending_selection_click.set(None);
             selected_text_drag.set(None);
-            match mode {
-                SelectionMode::Line => {
-                    if let Some((start, end)) = line_drag_bounds(&state, offset) {
-                        select_line_at(&area, &state, offset);
-                        selection_drag.set(Some(DragSelection::Line { start, end }));
-                        reset_cursor_blink(&area, &state);
-                    } else {
-                        selection_drag.set(Some(DragSelection::Character { anchor: offset }));
-                        set_drag_selection(&area, &state, offset, offset);
-                    }
-                }
-                SelectionMode::Word => {
-                    if let Some((start, end)) = word_drag_bounds(&state, offset) {
-                        select_word_at(&area, &state, offset);
-                        selection_drag.set(Some(DragSelection::Word { start, end }));
-                        reset_cursor_blink(&area, &state);
-                    } else {
-                        selection_drag.set(Some(DragSelection::Character { anchor: offset }));
-                        set_drag_selection(&area, &state, offset, offset);
-                    }
-                }
-                SelectionMode::Character => {
-                    selection_drag.set(Some(DragSelection::Character { anchor: offset }));
-                    set_drag_selection(&area, &state, offset, offset);
-                }
-            }
+            let (drag, selection) = drag_for_mode(
+                offset,
+                mode,
+                |offset| word_drag_bounds(&state, offset),
+                |offset| line_drag_bounds(&state, offset),
+            );
+            selection_drag.set(Some(drag));
+            set_initial_drag_selection(&area, &state, offset, selection);
         }
     });
     drag.connect_drag_update({
@@ -555,9 +537,9 @@ pub(super) fn install_interactions(
                     return;
                 }
             }
-            let drag = selection_drag.get().unwrap_or_else(|| {
-                DragSelection::Character { anchor }
-            });
+            let drag = selection_drag
+                .get()
+                .unwrap_or(DragSelection::Character { anchor });
             let focus = render::hit_test(&area, &state, pointer_x, pointer_y);
             selection_drag.set(Some(drag));
             log::debug!(
@@ -806,21 +788,56 @@ fn set_drag_selection(
     reset_cursor_blink(area, state);
 }
 
+fn set_initial_drag_selection(
+    area: &gtk::DrawingArea,
+    state: &Rc<EditorState>,
+    offset: usize,
+    selection: AnchoredSelection<usize>,
+) {
+    state.selection.replace(Some(Selection {
+        anchor: offset,
+        focus: offset,
+        visual_anchor: selection.anchor,
+        visual_focus: selection.focus,
+    }));
+    state.cursor.set(selection.focus);
+    render::ensure_offset_visible(area, state, selection.focus);
+    reset_cursor_blink(area, state);
+}
+
 fn apply_drag_selection(
     area: &gtk::DrawingArea,
     state: &Rc<EditorState>,
-    drag: DragSelection,
+    drag: DragSelection<usize>,
     focus: usize,
 ) {
-    match drag {
-        DragSelection::Character { anchor } => set_drag_selection(area, state, anchor, focus),
-        DragSelection::Word { start, end } => {
-            set_word_drag_selection(area, state, start, end, focus)
-        }
-        DragSelection::Line { start, end } => {
-            set_line_drag_selection(area, state, start, end, focus)
-        }
+    if let DragSelection::Character { anchor } = drag {
+        set_drag_selection(area, state, anchor, focus);
+        return;
     }
+
+    let selection = state.selection.borrow();
+    let (raw_anchor, raw_focus) = match *selection {
+        Some(selection) => (selection.anchor, focus),
+        None => (focus, focus),
+    };
+    drop(selection);
+
+    let visual = selection_for_drag(
+        drag,
+        focus,
+        |focus| word_drag_bounds(state, focus),
+        |focus| line_drag_bounds(state, focus),
+    );
+    state.selection.replace(Some(Selection {
+        anchor: raw_anchor,
+        focus: raw_focus,
+        visual_anchor: visual.anchor,
+        visual_focus: visual.focus,
+    }));
+    state.cursor.set(visual.focus);
+    render::ensure_offset_visible(area, state, visual.focus);
+    reset_cursor_blink(area, state);
 }
 
 fn scroll_for_drag_selection(
@@ -867,7 +884,7 @@ fn schedule_drag_autoscroll(
     state: &Rc<EditorState>,
     drag_autoscroll_id: &Rc<Cell<u64>>,
     drag_autoscroll_pointer: &Rc<Cell<Option<(f64, f64)>>>,
-    selection_drag: &Rc<Cell<Option<DragSelection>>>,
+    selection_drag: &Rc<Cell<Option<DragSelection<usize>>>>,
     selected_text_drag: &Rc<Cell<Option<SelectedTextDrag>>>,
     pointer_x: f64,
     pointer_y: f64,
@@ -927,7 +944,7 @@ fn schedule_drag_autoscroll(
 fn begin_selected_text_drag(
     area: &gtk::DrawingArea,
     state: &Rc<EditorState>,
-    selection_drag: &Rc<Cell<Option<DragSelection>>>,
+    selection_drag: &Rc<Cell<Option<DragSelection<usize>>>>,
     selected_text_drag: &Rc<Cell<Option<SelectedTextDrag>>>,
     start: usize,
     end: usize,
@@ -1167,13 +1184,6 @@ fn install_cursor_blink(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
 fn reset_cursor_blink(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     state.cursor_visible.set(true);
     area.queue_draw();
-}
-
-#[derive(Clone, Copy, Debug)]
-enum DragSelection {
-    Character { anchor: usize },
-    Word { start: usize, end: usize },
-    Line { start: usize, end: usize },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2499,42 +2509,32 @@ fn page_line_delta(area: &gtk::DrawingArea, state: &Rc<EditorState>, direction: 
     lines * direction
 }
 
-fn select_word_at(area: &gtk::DrawingArea, state: &Rc<EditorState>, offset: usize) -> bool {
-    let bounds = {
-        let text = state.text.borrow();
-        word_bounds_at(&text, offset)
-    };
-    let Some((start, end)) = bounds else {
+fn select_at_mode(
+    area: &gtk::DrawingArea,
+    state: &Rc<EditorState>,
+    offset: usize,
+    mode: SelectionMode,
+) -> bool {
+    let selection = selection_for_mode(
+        offset,
+        mode,
+        |offset| word_drag_bounds(state, offset),
+        |offset| line_drag_bounds(state, offset),
+    );
+    if selection.anchor == selection.focus {
         return false;
-    };
-
+    }
     let raw_anchor = offset.min(state.text.borrow().len());
     state.selection.replace(Some(Selection {
         anchor: raw_anchor,
         focus: raw_anchor,
-        visual_anchor: start,
-        visual_focus: end,
+        visual_anchor: selection.anchor,
+        visual_focus: selection.focus,
     }));
-    state.cursor.set(end);
-    render::ensure_offset_visible(area, state, end);
+    state.cursor.set(selection.focus);
+    render::ensure_offset_visible(area, state, selection.focus);
     reset_cursor_blink(area, state);
     true
-}
-
-fn select_line_at(area: &gtk::DrawingArea, state: &Rc<EditorState>, offset: usize) {
-    let text = state.text.borrow();
-    let (start, end) = logical_line_bounds_at(&text, offset);
-    drop(text);
-
-    state.selection.replace(Some(Selection {
-        anchor: offset.min(state.text.borrow().len()),
-        focus: offset.min(state.text.borrow().len()),
-        visual_anchor: start,
-        visual_focus: end,
-    }));
-    state.cursor.set(end);
-    render::ensure_offset_visible(area, state, end);
-    reset_cursor_blink(area, state);
 }
 
 fn selection_spans_lines(state: &Rc<EditorState>) -> bool {
