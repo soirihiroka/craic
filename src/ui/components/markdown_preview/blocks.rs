@@ -15,7 +15,10 @@ pub(super) enum MarkdownPreviewBlockKind {
         level: u8,
         text: RenderedText,
     },
-    Paragraph(RenderedText),
+    Paragraph {
+        text: RenderedText,
+        alignment: BlockAlignment,
+    },
     CodeBlock {
         code: String,
         language: Option<String>,
@@ -28,7 +31,17 @@ pub(super) enum MarkdownPreviewBlockKind {
         rows: Vec<Vec<RenderedText>>,
         alignments: Vec<Alignment>,
     },
-    ImageGroup(Vec<RenderedImageItem>),
+    ImageGroup {
+        images: Vec<RenderedImageItem>,
+        alignment: BlockAlignment,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BlockAlignment {
+    Start,
+    Center,
+    End,
 }
 
 #[derive(Clone, Debug)]
@@ -62,7 +75,7 @@ pub(super) fn blocks_from_nodes(nodes: &[MarkdownNode]) -> Vec<MarkdownPreviewBl
         blocks.len(),
         blocks
             .iter()
-            .filter(|block| matches!(block.kind, MarkdownPreviewBlockKind::ImageGroup(_)))
+            .filter(|block| matches!(block.kind, MarkdownPreviewBlockKind::ImageGroup { .. }))
             .count(),
         blocks
             .iter()
@@ -106,7 +119,10 @@ fn append_blocks_from_nodes(
                     continue;
                 }
                 blocks.push(MarkdownPreviewBlock {
-                    kind: MarkdownPreviewBlockKind::Paragraph(RenderedText::plain(text)),
+                    kind: MarkdownPreviewBlockKind::Paragraph {
+                        text: RenderedText::plain(text),
+                        alignment: BlockAlignment::Start,
+                    },
                     source: source.clone(),
                 });
             }
@@ -183,7 +199,10 @@ fn append_block_from_element(
         }
         "img" => {
             blocks.push(MarkdownPreviewBlock {
-                kind: MarkdownPreviewBlockKind::ImageGroup(vec![image_item(element, None)]),
+                kind: MarkdownPreviewBlockKind::ImageGroup {
+                    images: vec![image_item(element, None)],
+                    alignment: BlockAlignment::Start,
+                },
                 source: element.source.clone(),
             });
         }
@@ -197,9 +216,10 @@ fn append_block_from_element(
 }
 
 fn append_paragraph_block(blocks: &mut Vec<MarkdownPreviewBlock>, element: &MarkdownElement) {
+    let alignment = block_alignment(element);
     if let Some(images) = standalone_image_group(&element.children) {
         blocks.push(MarkdownPreviewBlock {
-            kind: MarkdownPreviewBlockKind::ImageGroup(images),
+            kind: MarkdownPreviewBlockKind::ImageGroup { images, alignment },
             source: element.source.clone(),
         });
         return;
@@ -211,9 +231,35 @@ fn append_paragraph_block(blocks: &mut Vec<MarkdownPreviewBlock>, element: &Mark
     }
 
     blocks.push(MarkdownPreviewBlock {
-        kind: MarkdownPreviewBlockKind::Paragraph(text),
+        kind: MarkdownPreviewBlockKind::Paragraph { text, alignment },
         source: element.source.clone(),
     });
+}
+
+fn block_alignment(element: &MarkdownElement) -> BlockAlignment {
+    let align = attr_value(&element.attrs, "align")
+        .or_else(|| {
+            attr_value(&element.attrs, "style")
+                .and_then(|style| css_text_align(&style).map(str::to_string))
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match align.trim() {
+        "center" | "middle" => BlockAlignment::Center,
+        "right" | "end" => BlockAlignment::End,
+        _ => BlockAlignment::Start,
+    }
+}
+
+fn css_text_align(style: &str) -> Option<&str> {
+    style.split(';').find_map(|part| {
+        let (name, value) = part.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("text-align")
+            .then(|| value.trim())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn list_items(element: &MarkdownElement, depth: usize) -> Vec<RenderedListItem> {
@@ -443,26 +489,46 @@ fn parse_image_dimension(value: &str) -> Option<i32> {
 }
 
 fn inline_text(nodes: &[MarkdownNode]) -> RenderedText {
+    inline_text_with_linkify(nodes, true)
+}
+
+fn inline_text_with_linkify(nodes: &[MarkdownNode], linkify: bool) -> RenderedText {
     let mut markup = String::new();
     let mut plain_text = String::new();
-    append_inline_text(nodes, &mut markup, &mut plain_text);
+    append_inline_text(nodes, &mut markup, &mut plain_text, linkify);
     RenderedText { markup, plain_text }
 }
 
-fn append_inline_text(nodes: &[MarkdownNode], markup: &mut String, plain_text: &mut String) {
+fn append_inline_text(
+    nodes: &[MarkdownNode],
+    markup: &mut String,
+    plain_text: &mut String,
+    linkify: bool,
+) {
     for node in nodes {
         match node {
             MarkdownNode::Text { text, .. } => {
-                markup.push_str(&pango_escape(text));
+                if linkify {
+                    append_linkified_text(text, markup);
+                } else {
+                    markup.push_str(&pango_escape(text));
+                }
                 plain_text.push_str(text);
             }
-            MarkdownNode::Element(element) => append_inline_element(element, markup, plain_text),
+            MarkdownNode::Element(element) => {
+                append_inline_element(element, markup, plain_text, linkify)
+            }
         }
     }
 }
 
-fn append_inline_element(element: &MarkdownElement, markup: &mut String, plain_text: &mut String) {
-    let child = inline_text(&element.children);
+fn append_inline_element(
+    element: &MarkdownElement,
+    markup: &mut String,
+    plain_text: &mut String,
+    linkify: bool,
+) {
+    let child = inline_text_with_linkify(&element.children, linkify && element.tag != "a");
     match element.tag.as_str() {
         "strong" | "b" => {
             markup.push_str("<b>");
@@ -535,13 +601,66 @@ fn append_inline_element(element: &MarkdownElement, markup: &mut String, plain_t
     }
 }
 
+fn append_linkified_text(text: &str, markup: &mut String) {
+    let mut cursor = 0;
+    while let Some((start, end)) = next_autolink(text, cursor) {
+        if cursor < start {
+            markup.push_str(&pango_escape(&text[cursor..start]));
+        }
+
+        let url = &text[start..end];
+        markup.push_str("<a href=\"");
+        markup.push_str(&pango_escape_attribute(url));
+        markup.push_str("\">");
+        markup.push_str(&pango_escape(url));
+        markup.push_str("</a>");
+        cursor = end;
+    }
+
+    if cursor < text.len() {
+        markup.push_str(&pango_escape(&text[cursor..]));
+    }
+}
+
+fn next_autolink(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    let rest = text.get(cursor..)?;
+    let http = rest.find("http://").map(|index| cursor + index);
+    let https = rest.find("https://").map(|index| cursor + index);
+    let start = match (http, https) {
+        (Some(http), Some(https)) => http.min(https),
+        (Some(http), None) => http,
+        (None, Some(https)) => https,
+        (None, None) => return None,
+    };
+
+    let mut end = text[start..]
+        .char_indices()
+        .find_map(|(index, ch)| {
+            (index > 0 && (ch.is_whitespace() || ch == '<')).then_some(start + index)
+        })
+        .unwrap_or(text.len());
+
+    while end > start {
+        let Some(ch) = text[..end].chars().next_back() else {
+            break;
+        };
+        if matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}') {
+            end -= ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    (end > start).then_some((start, end))
+}
+
 pub(super) fn block_text(blocks: &[MarkdownPreviewBlock]) -> RenderedText {
     let mut markup = Vec::new();
     let mut plain_text = Vec::new();
     for block in blocks {
         let text = match &block.kind {
             MarkdownPreviewBlockKind::Heading { text, .. }
-            | MarkdownPreviewBlockKind::Paragraph(text)
+            | MarkdownPreviewBlockKind::Paragraph { text, .. }
             | MarkdownPreviewBlockKind::Blockquote(text) => text.clone(),
             MarkdownPreviewBlockKind::List(items) => RenderedText {
                 markup: items
@@ -569,7 +688,7 @@ pub(super) fn block_text(blocks: &[MarkdownPreviewBlock]) -> RenderedText {
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
-            MarkdownPreviewBlockKind::ImageGroup(images) => RenderedText::plain(
+            MarkdownPreviewBlockKind::ImageGroup { images, .. } => RenderedText::plain(
                 &images
                     .iter()
                     .map(|image| image_description(image))
