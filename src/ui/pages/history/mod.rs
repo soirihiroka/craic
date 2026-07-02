@@ -1,5 +1,6 @@
 use super::{Page, PageCommand, PageCommandResult, PageContext};
 use crate::git::{self, BytesComparison, FileComparison, RepositorySnapshot};
+use crate::system::capabilities::open::DesktopOpenActivation;
 use crate::system::capabilities::git::GitAccess;
 use crate::ui::components::context_menu;
 use crate::ui::file_type::PreviewKind;
@@ -971,14 +972,14 @@ fn open_remote_commit(ctx: &PageContext, hash: &str) {
             };
 
             let url = git::remote_commit_web_url(&remote_url, &hash);
-            let Some(opener) = ctx.opener() else {
+            let Some(desktop_opener) = ctx.desktop_opener() else {
                 ctx.show_error(
                     "Open Remote Commit Failed",
-                    &ctx.opener_unavailable_message(),
+                    &ctx.desktop_opener_unavailable_message(),
                 );
                 return;
             };
-            if let Err(err) = opener.open_url(&url) {
+            if let Err(err) = desktop_opener.open_url(&url, DesktopOpenActivation::default()) {
                 ctx.show_error("Open Remote Commit Failed", &err);
                 return;
             }

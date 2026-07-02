@@ -1,8 +1,8 @@
 use crate::git::RepositorySnapshot;
 use crate::system::capabilities::shell::ShellCommandSpec;
 use crate::system::capabilities::{
-    docker::DockerAccess, files::FileAccess, git::GitAccess, open::OpenAccess, shell::ShellAccess,
-    terminal_link::TerminalLinkAccess,
+    docker::DockerAccess, files::FileAccess, git::GitAccess, open::DesktopOpenAccess,
+    shell::ShellAccess, terminal_link::TerminalLinkAccess,
 };
 use crate::system::{
     FileNodePath, SystemPath, SystemProviderRegistry, SystemRef, WorkspacePath, WorkspaceRef,
@@ -216,9 +216,9 @@ impl PageContext {
             .docker(&self.system_ref.borrow().id, &self.workspace_ref())
     }
 
-    pub(super) fn opener(&self) -> Option<Arc<dyn OpenAccess>> {
+    pub(super) fn desktop_opener(&self) -> Option<Arc<dyn DesktopOpenAccess>> {
         self.providers
-            .opener(&self.system_ref.borrow().id, &self.workspace_ref())
+            .desktop_opener(&self.system_ref.borrow().id, &self.workspace_ref())
     }
 
     pub(super) fn terminal_links(&self) -> Option<Arc<dyn TerminalLinkAccess>> {
@@ -226,7 +226,7 @@ impl PageContext {
             .terminal_links(&self.system_ref.borrow().id, &self.workspace_ref())
     }
 
-    pub(super) fn opener_unavailable_message(&self) -> String {
+    pub(super) fn desktop_opener_unavailable_message(&self) -> String {
         format!(
             "Opening paths is unavailable for workspace {}.",
             self.workspace_ref.borrow().display_name

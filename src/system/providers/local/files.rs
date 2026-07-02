@@ -895,7 +895,8 @@ impl FileAccess for LocalFileAccess {
         let root = self.local_path_for_node(&query.root)?;
         let matcher = build_search_regex(&query)?;
         let excluded_names = query.excluded_names.clone();
-        let mut matches = Vec::new();
+        let mut text_matches = Vec::new();
+        let mut file_name_matches = Vec::new();
         let mut limited = false;
 
         log::info!(
@@ -923,6 +924,22 @@ impl FileAccess for LocalFileAccess {
             if !entry.file_type().is_file() {
                 continue;
             }
+            let path = self.node_path_for_local(entry.path());
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| matcher.find_iter(name).any(|found| !found.is_empty()))
+            {
+                if text_matches.len() + file_name_matches.len() >= query.max_results {
+                    limited = true;
+                    break;
+                }
+                file_name_matches.push(path.clone());
+                if text_matches.len() + file_name_matches.len() >= query.max_results {
+                    limited = true;
+                    break;
+                }
+            }
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
@@ -938,26 +955,39 @@ impl FileAccess for LocalFileAccess {
             let Ok(text) = String::from_utf8(bytes) else {
                 continue;
             };
-            let path = self.node_path_for_local(entry.path());
-            collect_file_matches(&path, &text, &matcher, &query, &mut matches, &mut limited);
+            collect_file_matches(
+                &path,
+                &text,
+                &matcher,
+                &query,
+                file_name_matches.len(),
+                &mut text_matches,
+                &mut limited,
+            );
             if limited {
                 break;
             }
         }
 
-        matches.sort_by(|left, right| {
+        text_matches.sort_by(|left, right| {
             left.path
                 .display()
                 .cmp(&right.path.display())
                 .then_with(|| left.start.cmp(&right.start))
         });
+        file_name_matches.sort_by_key(FileNodePath::display);
         log::info!(
-            "file search complete provider=local workspace={} matches={} limited={}",
+            "file search complete provider=local workspace={} text_matches={} file_name_matches={} limited={}",
             self.workspace.display_name,
-            matches.len(),
+            text_matches.len(),
+            file_name_matches.len(),
             limited
         );
-        Ok(FileSearchOutput { matches, limited })
+        Ok(FileSearchOutput {
+            text_matches,
+            file_name_matches,
+            limited,
+        })
     }
 }
 
@@ -1296,12 +1326,17 @@ fn collect_file_matches(
     text: &str,
     matcher: &Regex,
     query: &FileSearchQuery,
+    file_name_match_count: usize,
     matches: &mut Vec<FileSearchMatch>,
     limited: &mut bool,
 ) {
     for found in matcher.find_iter(text) {
         if found.is_empty() {
             continue;
+        }
+        if matches.len() + file_name_match_count >= query.max_results {
+            *limited = true;
+            return;
         }
         matches.push(FileSearchMatch {
             path: path.clone(),
@@ -1310,7 +1345,7 @@ fn collect_file_matches(
             end: found.end(),
             line_text: search_match_preview(text, found.start(), found.end()),
         });
-        if matches.len() >= query.max_results {
+        if matches.len() + file_name_match_count >= query.max_results {
             *limited = true;
             return;
         }

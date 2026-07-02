@@ -356,13 +356,19 @@ pub(crate) struct FileSearchMatch {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileSearchOutput {
-    pub(crate) matches: Vec<FileSearchMatch>,
+    pub(crate) text_matches: Vec<FileSearchMatch>,
+    pub(crate) file_name_matches: Vec<FileNodePath>,
     pub(crate) limited: bool,
 }
 
 pub(crate) trait FileAccess: Send + Sync {
     fn workspace(&self) -> WorkspaceRef;
     fn root(&self) -> FileNodePath;
+    fn copy_path(&self, path: &FileNodePath) -> String {
+        path.to_workspace_path(&self.workspace())
+            .map(|path| path.absolute)
+            .unwrap_or_else(|| path.display())
+    }
 
     fn list_dirs(&self, paths: &[FileNodePath]) -> Result<Vec<DirectoryListing>, String>;
     fn info(&self, path: &FileNodePath) -> Result<FileNodeInfo, String>;

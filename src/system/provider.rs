@@ -1,7 +1,7 @@
 use super::capabilities::github::GitHubAccess;
 use super::capabilities::{
-    docker::DockerAccess, files::FileAccess, git::GitAccess, open::OpenAccess, shell::ShellAccess,
-    terminal_link::TerminalLinkAccess,
+    docker::DockerAccess, files::FileAccess, git::GitAccess, open::DesktopOpenAccess,
+    shell::ShellAccess, terminal_link::TerminalLinkAccess,
 };
 use super::path::{ProviderKind, SystemId, WorkspaceRef};
 use std::collections::HashMap;
@@ -57,7 +57,7 @@ pub(crate) trait SystemProvider: Send + Sync {
     fn github(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn GitHubAccess>>;
     fn shell(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn ShellAccess>>;
     fn docker(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn DockerAccess>>;
-    fn opener(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn OpenAccess>>;
+    fn desktop_opener(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn DesktopOpenAccess>>;
     fn terminal_links(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn TerminalLinkAccess>>;
 }
 
@@ -69,7 +69,7 @@ pub(crate) struct SystemProviderRegistry {
     github: Arc<RwLock<HashMap<String, Arc<dyn GitHubAccess>>>>,
     shell: Arc<RwLock<HashMap<String, Arc<dyn ShellAccess>>>>,
     docker: Arc<RwLock<HashMap<String, Arc<dyn DockerAccess>>>>,
-    opener: Arc<RwLock<HashMap<String, Arc<dyn OpenAccess>>>>,
+    desktop_opener: Arc<RwLock<HashMap<String, Arc<dyn DesktopOpenAccess>>>>,
     terminal_links: Arc<RwLock<HashMap<String, Arc<dyn TerminalLinkAccess>>>>,
 }
 
@@ -206,22 +206,27 @@ impl SystemProviderRegistry {
         access
     }
 
-    pub(crate) fn opener(
+    pub(crate) fn desktop_opener(
         &self,
         system_id: &SystemId,
         workspace: &WorkspaceRef,
-    ) -> Option<Arc<dyn OpenAccess>> {
+    ) -> Option<Arc<dyn DesktopOpenAccess>> {
         let key = capability_key(system_id, workspace);
-        if let Some(access) = self.cached_open_access(&key) {
+        if let Some(access) = self.cached_desktop_open_access(&key) {
             return Some(access);
         }
         let provider = self.provider(system_id)?;
-        let access = provider.opener(workspace);
-        log_capability_absence(access.is_some(), &provider.label(), workspace, "open");
+        let access = provider.desktop_opener(workspace);
+        log_capability_absence(
+            access.is_some(),
+            &provider.label(),
+            workspace,
+            "desktop-open",
+        );
         if let Some(access) = &access {
-            self.opener
+            self.desktop_opener
                 .write()
-                .expect("system open cache poisoned")
+                .expect("system desktop open cache poisoned")
                 .insert(key, access.clone());
         }
         access
@@ -293,10 +298,10 @@ impl SystemProviderRegistry {
             .cloned()
     }
 
-    fn cached_open_access(&self, key: &str) -> Option<Arc<dyn OpenAccess>> {
-        self.opener
+    fn cached_desktop_open_access(&self, key: &str) -> Option<Arc<dyn DesktopOpenAccess>> {
+        self.desktop_opener
             .read()
-            .expect("system open cache poisoned")
+            .expect("system desktop open cache poisoned")
             .get(key)
             .cloned()
     }
@@ -331,9 +336,9 @@ impl SystemProviderRegistry {
             .write()
             .expect("system docker cache poisoned")
             .retain(|key, _| !key.starts_with(&prefix));
-        self.opener
+        self.desktop_opener
             .write()
-            .expect("system open cache poisoned")
+            .expect("system desktop open cache poisoned")
             .retain(|key, _| !key.starts_with(&prefix));
         self.terminal_links
             .write()

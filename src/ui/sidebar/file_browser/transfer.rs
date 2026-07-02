@@ -1,7 +1,7 @@
 use super::{BrowserTarget, FileBrowser, should_skip};
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{FileAccess, FileKind};
-use crate::system::capabilities::open::OpenTargetKind;
+use crate::system::capabilities::open::{DesktopOpenActivation, DesktopOpenTargetKind};
 use adw::prelude::*;
 use gtk::gdk;
 use std::rc::Rc;
@@ -468,7 +468,7 @@ impl FileBrowser {
             if !target.node_path.is_root() {
                 self.toggle_dir(&target.node_path);
             } else {
-                self.open_external(target);
+                self.open_external(target, DesktopOpenActivation::default());
             }
         } else {
             self.set_selected_node_path(Some(target.node_path.clone()));
@@ -493,12 +493,7 @@ impl FileBrowser {
 
     pub(super) fn copy_absolute_path(&self, target: &BrowserTarget) {
         self.file_clipboard.borrow_mut().take();
-        let text = self
-            .opener
-            .borrow()
-            .as_ref()
-            .map(|opener| opener.copyable_path(&target.node_path))
-            .unwrap_or_else(|| target.path.clone());
+        let text = self.file_access.borrow().copy_path(&target.node_path);
         set_clipboard_text(&text);
     }
 
@@ -507,31 +502,39 @@ impl FileBrowser {
         set_clipboard_text(&target.path);
     }
 
-    pub(super) fn open_external(self: &Rc<Self>, target: &BrowserTarget) {
-        let Some(opener) = self.opener.borrow().clone() else {
+    pub(super) fn open_external(
+        self: &Rc<Self>,
+        target: &BrowserTarget,
+        activation: DesktopOpenActivation,
+    ) {
+        let Some(desktop_opener) = self.desktop_opener.borrow().clone() else {
             self.notify_open_message("Opening files externally is unavailable for this workspace.");
             return;
         };
         let kind = if target.is_dir {
-            OpenTargetKind::Folder
+            DesktopOpenTargetKind::Folder
         } else {
-            OpenTargetKind::File
+            DesktopOpenTargetKind::File
         };
-        match opener.open_path(&target.node_path, kind) {
+        match desktop_opener.open_path(&target.node_path, kind, activation) {
             Ok(message) => self.notify_open_message(&message),
             Err(err) => self.notify_open_message(&err),
         }
     }
 
-    pub(super) fn open_containing_folder(self: &Rc<Self>, target: &BrowserTarget) {
-        let Some(opener) = self.opener.borrow().clone() else {
+    pub(super) fn open_containing_folder(
+        self: &Rc<Self>,
+        target: &BrowserTarget,
+        activation: DesktopOpenActivation,
+    ) {
+        let Some(desktop_opener) = self.desktop_opener.borrow().clone() else {
             self.show_error(
                 "Open Failed",
                 "Opening containing folders is unavailable for this workspace.",
             );
             return;
         };
-        match opener.reveal_path(&target.node_path) {
+        match desktop_opener.reveal_path(&target.node_path, activation) {
             Ok(message) => self.notify_open_message(&message),
             Err(err) => self.show_error("Open Failed", &err),
         }

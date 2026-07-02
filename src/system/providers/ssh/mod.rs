@@ -2,7 +2,6 @@ mod docker;
 mod files;
 mod git;
 mod github;
-mod open;
 mod shell;
 mod terminal_link;
 
@@ -10,13 +9,12 @@ use self::docker::SshDockerAccess;
 use self::files::SshFileAccess;
 use self::git::SshGitAccess;
 use self::github::SshGitHubAccess;
-use self::open::SshOpenAccess;
 use self::shell::SshShellAccess;
 use self::terminal_link::SshTerminalLinkAccess;
 use crate::system::capabilities::github::GitHubAccess;
 use crate::system::capabilities::{
-    docker::DockerAccess, files::FileAccess, git::GitAccess, open::OpenAccess, shell::ShellAccess,
-    terminal_link::TerminalLinkAccess,
+    docker::DockerAccess, files::FileAccess, git::GitAccess, open::DesktopOpenAccess,
+    shell::ShellAccess, terminal_link::TerminalLinkAccess,
 };
 use crate::system::path::{
     HostRef, ProviderKind, SystemId, SystemRef, WorkspaceId, WorkspacePath, WorkspaceRef,
@@ -300,11 +298,8 @@ impl SystemProvider for SshProvider {
         )))
     }
 
-    fn opener(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn OpenAccess>> {
-        Some(Arc::new(SshOpenAccess::new(
-            workspace.clone(),
-            self.label(),
-        )))
+    fn desktop_opener(&self, _workspace: &WorkspaceRef) -> Option<Arc<dyn DesktopOpenAccess>> {
+        None
     }
 
     fn terminal_links(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn TerminalLinkAccess>> {

@@ -1,0 +1,1 @@
+You should make sure that your API actually works on Wayland. Avoid simple solutions like `xdg-open` as it doesn't fully work under Wayland.

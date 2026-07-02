@@ -5,7 +5,7 @@ use super::{Page, PageBadge, PageCommand, PageCommandResult, PageContext};
 use crate::git::{self, BytesComparison, FileComparison, RepositorySnapshot};
 use crate::github::CommitEmailOption;
 use crate::gitignore::{self, IgnoreTargetKind};
-use crate::system::capabilities::open::OpenTargetKind;
+use crate::system::capabilities::open::{DesktopOpenActivation, DesktopOpenTargetKind};
 use crate::system::path::ProviderKind;
 use crate::ui::components::context_menu;
 use crate::ui::file_manager;
@@ -331,6 +331,11 @@ impl ChangesPage {
 
     fn connect_repository_suggestions(&self) {
         let actions = &self.right.suggestions_actions;
+        let local_workspace = self.ctx.local_workspace_path().is_some();
+        let desktop_open_available = local_workspace && self.ctx.desktop_opener().is_some();
+        actions.open_editor.set_sensitive(local_workspace);
+        actions.open_terminal.set_sensitive(local_workspace);
+        actions.show_files.set_sensitive(desktop_open_available);
         let terminal_event_time = track_button_event_time(&actions.open_terminal);
         let files_event_time = track_button_event_time(&actions.show_files);
 
@@ -1459,21 +1464,28 @@ fn changed_file_action_group(
     local_workspace: bool,
 ) -> gio::SimpleActionGroup {
     let actions = gio::SimpleActionGroup::new();
+    let desktop_open_available = local_workspace && ctx.desktop_opener().is_some();
 
-    context_menu::add_string_menu_action(&actions, "open-default", {
+    let open_default = context_menu::add_string_menu_action(&actions, "open-default", {
         let ctx = ctx.clone();
+        let event_time = event_time.clone();
         move |file_path| {
-            let Some(opener) = ctx.opener() else {
-                ctx.show_error("Open Failed", &ctx.opener_unavailable_message());
+            let Some(desktop_opener) = ctx.desktop_opener() else {
+                ctx.show_error("Open Failed", &ctx.desktop_opener_unavailable_message());
                 return;
             };
             let path = ctx.workspace_node_path(file_path);
-            match opener.open_path(&path, OpenTargetKind::File) {
+            match desktop_opener.open_path(
+                &path,
+                DesktopOpenTargetKind::File,
+                DesktopOpenActivation::from_event_time(event_time.get()),
+            ) {
                 Ok(_) => ctx.refresh(Some("Opened file.".to_string())),
                 Err(err) => ctx.show_error("Open Failed", &err),
             }
         }
     });
+    open_default.set_enabled(desktop_open_available);
     let open_code = context_menu::add_string_menu_action(&actions, "open-code", {
         let ctx = ctx.clone();
         move |file_path| {
@@ -1489,29 +1501,33 @@ fn changed_file_action_group(
         }
     });
     open_code.set_enabled(local_workspace);
-    context_menu::add_string_menu_action(&actions, "show-folder", {
+    let show_folder = context_menu::add_string_menu_action(&actions, "show-folder", {
         let ctx = ctx.clone();
-        let _event_time = event_time.clone();
+        let event_time = event_time.clone();
         move |file_path| {
-            let Some(opener) = ctx.opener() else {
-                ctx.show_error("Open Failed", &ctx.opener_unavailable_message());
+            let Some(desktop_opener) = ctx.desktop_opener() else {
+                ctx.show_error("Open Failed", &ctx.desktop_opener_unavailable_message());
                 return;
             };
             let path = ctx.workspace_node_path(file_path);
-            match opener.reveal_path(&path) {
+            match desktop_opener.reveal_path(
+                &path,
+                DesktopOpenActivation::from_event_time(event_time.get()),
+            ) {
                 Ok(_) => ctx.refresh(Some("Opened file manager.".to_string())),
                 Err(err) => ctx.show_error("Open Failed", &err),
             }
         }
     });
+    show_folder.set_enabled(desktop_open_available);
     context_menu::add_string_menu_action(&actions, "copy-path", {
         let ctx = ctx.clone();
         move |file_path| {
             let workspace = ctx.workspace_ref();
             let path = ctx.workspace_node_path(file_path);
             let text = ctx
-                .opener()
-                .map(|opener| opener.copyable_path(&path))
+                .files()
+                .map(|files| files.copy_path(&path))
                 .unwrap_or_else(|| workspace.path(file_path).absolute);
             copy_to_clipboard(&ctx, &text);
         }
@@ -1644,14 +1660,17 @@ fn ignore_pattern(ctx: &PageContext, pattern: &str) {
 }
 
 fn open_repository_in_files(ctx: &PageContext, event_time: u32) {
-    let _ = event_time;
-    let Some(opener) = ctx.opener() else {
-        ctx.show_error("Open Failed", &ctx.opener_unavailable_message());
+    let Some(desktop_opener) = ctx.desktop_opener() else {
+        ctx.show_error("Open Failed", &ctx.desktop_opener_unavailable_message());
         return;
     };
     let path = ctx.workspace_root_node_path();
 
-    match opener.open_path(&path, OpenTargetKind::Folder) {
+    match desktop_opener.open_path(
+        &path,
+        DesktopOpenTargetKind::Folder,
+        DesktopOpenActivation::from_event_time(event_time),
+    ) {
         Ok(_) => ctx.refresh(Some("Opened in Files.".to_string())),
         Err(err) => ctx.show_error("Open Failed", &err),
     }
@@ -1780,11 +1799,11 @@ fn open_remote_repository(ctx: &PageContext) {
             };
 
             let url = git::remote_web_url(&remote_url);
-            let Some(opener) = ctx.opener() else {
-                ctx.show_error("Open Failed", &ctx.opener_unavailable_message());
+            let Some(desktop_opener) = ctx.desktop_opener() else {
+                ctx.show_error("Open Failed", &ctx.desktop_opener_unavailable_message());
                 return;
             };
-            match opener.open_url(&url) {
+            match desktop_opener.open_url(&url, DesktopOpenActivation::default()) {
                 Ok(_) => ctx.refresh(Some(format!("Opened {url}."))),
                 Err(err) => ctx.show_error("Open Failed", &err),
             }
