@@ -72,7 +72,7 @@ impl LocalDesktopOpenAccess {
         file: &gio::File,
     ) -> String {
         let files = [file.clone()];
-        let app = gio::AppInfo::default_for_uri_scheme("file");
+        let app = gio::AppInfo::default_for_type("inode/directory", true);
         match app.as_ref() {
             Some(app) => context.startup_notify_id(Some(app), &files),
             None => context.startup_notify_id(None::<&gio::AppInfo>, &files),
