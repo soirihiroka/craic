@@ -45,3 +45,57 @@ pub(in crate::ui) fn clipped_bounds(
     let end = end.min(upper).max(lower);
     (start < end).then_some((start, end))
 }
+
+pub(in crate::ui) fn word_bounds_at(text: &str, offset: usize) -> Option<(usize, usize)> {
+    let offset = offset.min(text.len());
+    let (_, ch) = next_char(text, offset)?;
+    let group = selectable_group(ch)?;
+
+    let mut start = offset;
+    while let Some((previous, ch)) = previous_char(text, start) {
+        if selectable_group(ch) != Some(group) {
+            break;
+        }
+        start = previous;
+    }
+
+    let mut end = offset;
+    while let Some((current, ch)) = next_char(text, end) {
+        if selectable_group(ch) != Some(group) {
+            break;
+        }
+        end = current + ch.len_utf8();
+    }
+
+    Some((start, end))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextGroup {
+    Word,
+    Punctuation,
+}
+
+fn selectable_group(ch: char) -> Option<TextGroup> {
+    (!ch.is_whitespace()).then(|| text_group(ch))
+}
+
+fn text_group(ch: char) -> TextGroup {
+    if ch == '_' || ch.is_alphanumeric() {
+        TextGroup::Word
+    } else {
+        TextGroup::Punctuation
+    }
+}
+
+fn previous_char(text: &str, cursor: usize) -> Option<(usize, char)> {
+    text[..cursor.min(text.len())].char_indices().last()
+}
+
+fn next_char(text: &str, cursor: usize) -> Option<(usize, char)> {
+    let cursor = cursor.min(text.len());
+    text[cursor..]
+        .char_indices()
+        .next()
+        .map(|(offset, ch)| (cursor + offset, ch))
+}

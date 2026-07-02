@@ -1,4 +1,5 @@
 use super::super::canvas_overshoot;
+use super::selection::word_bounds_at;
 use super::{
     CompletionUi, EditorState, FoldControlKey, FoldRange, HistorySnapshot, MAX_HISTORY_SNAPSHOTS,
     Selection, SelectionMode, notify_diff_fold, notify_edit, render, selection_bounds,
@@ -2544,30 +2545,6 @@ fn selection_spans_lines(state: &Rc<EditorState>) -> bool {
     render::line_for_offset(&text, start) < render::line_for_offset(&text, end)
 }
 
-fn word_bounds_at(text: &str, offset: usize) -> Option<(usize, usize)> {
-    let offset = offset.min(text.len());
-    let (_, ch) = next_char(text, offset)?;
-    let group = selectable_group(ch)?;
-
-    let mut start = offset;
-    while let Some((previous, ch)) = previous_char(text, start) {
-        if selectable_group(ch) != Some(group) {
-            break;
-        }
-        start = previous;
-    }
-
-    let mut end = offset;
-    while let Some((current, ch)) = next_char(text, end) {
-        if selectable_group(ch) != Some(group) {
-            break;
-        }
-        end = current + ch.len_utf8();
-    }
-
-    Some((start, end))
-}
-
 fn previous_word_start(text: &str, cursor: usize) -> usize {
     let mut offset = cursor.min(text.len());
     while let Some((previous, ch)) = previous_char(text, offset) {
@@ -2642,10 +2619,6 @@ fn next_word_end(text: &str, cursor: usize) -> usize {
 enum TextGroup {
     Word,
     Punctuation,
-}
-
-fn selectable_group(ch: char) -> Option<TextGroup> {
-    (!ch.is_whitespace()).then(|| text_group(ch))
 }
 
 fn text_group(ch: char) -> TextGroup {

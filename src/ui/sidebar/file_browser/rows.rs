@@ -212,6 +212,7 @@ impl FileBrowser {
                 BrowserListRowRenderState::Tree {
                     row: previous_row,
                     expanded: previous_expanded,
+                    loading: previous_loading,
                     selected: previous_selected,
                     drop_target: previous_drop_target,
                     status: previous_status,
@@ -220,22 +221,29 @@ impl FileBrowser {
                 BrowserListRowRenderState::Tree {
                     row,
                     expanded,
+                    loading,
                     selected,
                     drop_target,
                     status,
                     transfer_progress,
                 },
             ) => {
+                if previous_loading != loading {
+                    replace_row_widget(widget, self.row_widget(index, next));
+                    return;
+                }
                 self.update_tree_row_widget(
                     widget,
                     previous_row,
                     *previous_expanded,
+                    *previous_loading,
                     *previous_selected,
                     *previous_drop_target,
                     previous_status.as_deref(),
                     previous_transfer_progress.as_ref(),
                     row,
                     *expanded,
+                    *loading,
                     *selected,
                     *drop_target,
                     status.as_deref(),
@@ -295,12 +303,14 @@ impl FileBrowser {
         widget: &gtk::Widget,
         previous_row: &BrowserRow,
         previous_expanded: bool,
+        previous_loading: bool,
         previous_selected: bool,
         previous_drop_target: bool,
         previous_status: Option<&str>,
         previous_transfer_progress: Option<&TransferRowProgress>,
         row: &BrowserRow,
         expanded: bool,
+        loading: bool,
         selected: bool,
         drop_target: bool,
         status: Option<&str>,
@@ -327,6 +337,8 @@ impl FileBrowser {
             }
         }
         if previous_expanded != expanded
+            && !previous_loading
+            && !loading
             && row.tree_role == TreeRowRole::Branch
             && let Some(handle) = tree_view::icon_row_disclosure(widget)
         {
@@ -355,6 +367,7 @@ impl FileBrowser {
             BrowserListRowRenderState::Tree {
                 row,
                 expanded,
+                loading,
                 selected,
                 drop_target,
                 status,
@@ -362,6 +375,7 @@ impl FileBrowser {
             } => self.tree_row_widget(
                 row,
                 *expanded,
+                *loading,
                 *selected,
                 *drop_target,
                 status.as_deref(),
@@ -388,6 +402,7 @@ impl FileBrowser {
         self: &Rc<Self>,
         row: &BrowserRow,
         expanded: bool,
+        loading: bool,
         selected: bool,
         drop_target: bool,
         status: Option<&str>,
@@ -408,9 +423,13 @@ impl FileBrowser {
             .on_secondary_click(tree_secondary_click_handler(self, row.clone()))
             .drag_source(file_drag_source(self, row.node_path.clone()));
         if row.tree_role == TreeRowRole::Branch {
-            let handle = self.tree.disclosure_widget(tree_row_key(row), expanded);
-            tree_view::sync_dimmed(&handle, row.ignore.is_ignored());
-            builder = builder.disclosure(handle);
+            if loading {
+                builder = builder.disclosure(loading_disclosure_spinner());
+            } else {
+                let handle = self.tree.disclosure_widget(tree_row_key(row), expanded);
+                tree_view::sync_dimmed(&handle, row.ignore.is_ignored());
+                builder = builder.disclosure(handle);
+            }
         }
         if let Some(progress) = transfer_progress {
             let browser = self.clone();
@@ -509,18 +528,11 @@ impl FileBrowser {
     }
 
     fn loading_row_widget(self: &Rc<Self>, row: &LoadingRow) -> gtk::Box {
-        let spinner = adw::Spinner::builder()
-            .width_request(16)
-            .height_request(16)
-            .valign(gtk::Align::Center)
-            .build();
         let icon_row = tree_view::IconRow::builder("Loading...")
-            .set_icon(spinner)
+            .set_icon(loading_disclosure_spinner())
             .depth(row.depth)
             .end_padding(row_end_padding())
             .build();
-        icon_row.title.add_css_class("dim-label");
-        icon_row.title.add_css_class("caption");
         icon_row.root
     }
 
@@ -778,15 +790,23 @@ impl FileBrowser {
         let drop_target = self.current_drop_target_folder();
 
         match row {
-            BrowserListRow::Tree(row) => BrowserListRowRenderState::Tree {
-                row: row.clone(),
-                expanded: self.tree_row_expanded(row),
-                selected: selected_search_match.is_none()
-                    && selected.as_ref() == Some(&row.node_path),
-                drop_target: drop_target.as_ref() == Some(&row.node_path),
-                status: self.changed_file_statuses.borrow().get(&row.path).cloned(),
-                transfer_progress: self.transfer_progress_for_path(&row.node_path),
-            },
+            BrowserListRow::Tree(row) => {
+                let expanded = self.tree_row_expanded(row);
+                BrowserListRowRenderState::Tree {
+                    row: row.clone(),
+                    expanded,
+                    loading: expanded
+                        && self
+                            .tree_directory_loading
+                            .borrow()
+                            .contains(&row.node_path),
+                    selected: selected_search_match.is_none()
+                        && selected.as_ref() == Some(&row.node_path),
+                    drop_target: drop_target.as_ref() == Some(&row.node_path),
+                    status: self.changed_file_statuses.borrow().get(&row.path).cloned(),
+                    transfer_progress: self.transfer_progress_for_path(&row.node_path),
+                }
+            }
             BrowserListRow::NewEntry(row) => BrowserListRowRenderState::NewEntry(row.clone()),
             BrowserListRow::RenameEntry(row) => BrowserListRowRenderState::RenameEntry {
                 row: row.clone(),
@@ -871,6 +891,7 @@ pub(super) enum BrowserListRowRenderState {
     Tree {
         row: BrowserRow,
         expanded: bool,
+        loading: bool,
         selected: bool,
         drop_target: bool,
         status: Option<String>,
@@ -952,6 +973,18 @@ fn root_gap_row_widget() -> gtk::Box {
 
 fn row_end_padding() -> i32 {
     canvas_scrollbar::WIDTH.ceil() as i32 + 4
+}
+
+fn loading_disclosure_spinner() -> adw::Spinner {
+    let spinner = adw::Spinner::builder()
+        .width_request(tree_view::ICON_SIZE)
+        .height_request(tree_view::ICON_SIZE)
+        .valign(gtk::Align::Center)
+        .build();
+    spinner.set_can_target(false);
+    spinner.set_sensitive(false);
+    spinner.set_tooltip_text(Some("Loading"));
+    spinner
 }
 
 fn tree_primary_click_handler(
