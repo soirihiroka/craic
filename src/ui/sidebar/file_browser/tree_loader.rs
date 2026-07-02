@@ -7,7 +7,9 @@ use crate::system::capabilities::files::{DirectoryListing, FileAccess, FileNodeK
 use crate::system::path::FileNodeRef;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::Duration;
 
 impl FileBrowser {
     pub(super) fn visible_rows(self: &Rc<Self>) -> Vec<BrowserRow> {
@@ -23,7 +25,11 @@ impl FileBrowser {
         {
             cache.rows.clone()
         } else {
-            self.load_open_directory_rows(&workspace, &file_access, &self.expanded_dirs.borrow());
+            self.schedule_open_directory_rows(
+                &workspace,
+                &file_access,
+                &self.expanded_dirs.borrow(),
+            );
             let mut rows = Vec::new();
             self.collect_rows(
                 &self.root_node_path(),
@@ -43,8 +49,15 @@ impl FileBrowser {
     }
 
     pub(super) fn invalidate_tree_rows_cache(&self) {
+        self.tree_directory_load_generation.set(
+            self.tree_directory_load_generation
+                .get()
+                .wrapping_add(1)
+                .max(1),
+        );
         self.tree_rows_cache.borrow_mut().take();
         self.tree_directory_cache.borrow_mut().clear();
+        self.tree_directory_loading.borrow_mut().clear();
         self.rows_signature.borrow_mut().clear();
     }
 
@@ -56,6 +69,13 @@ impl FileBrowser {
             return;
         }
 
+        self.tree_directory_load_generation.set(
+            self.tree_directory_load_generation
+                .get()
+                .wrapping_add(1)
+                .max(1),
+        );
+        self.tree_directory_loading.borrow_mut().clear();
         let mut cache = self.tree_directory_cache.borrow_mut();
         for changed in changed_files {
             let parent = parent_folder(&changed.path);
@@ -65,8 +85,8 @@ impl FileBrowser {
         self.rows_signature.borrow_mut().clear();
     }
 
-    fn load_open_directory_rows(
-        &self,
+    fn schedule_open_directory_rows(
+        self: &Rc<Self>,
         workspace: &crate::system::WorkspaceRef,
         file_access: &Arc<dyn FileAccess>,
         expanded_dirs: &HashSet<FileNodePath>,
@@ -74,70 +94,104 @@ impl FileBrowser {
         let open_dirs = open_directory_paths(expanded_dirs, &self.root_node_path());
         let missing_dirs = {
             let cache = self.tree_directory_cache.borrow();
+            let loading = self.tree_directory_loading.borrow();
             open_dirs
                 .into_iter()
-                .filter(|path| !cache.contains_key(path))
+                .filter(|path| !cache.contains_key(path) && !loading.contains(path))
                 .collect::<Vec<_>>()
         };
         if missing_dirs.is_empty() {
             return;
         }
 
+        self.tree_directory_loading
+            .borrow_mut()
+            .extend(missing_dirs.iter().cloned());
+        self.rows_signature.borrow_mut().clear();
+
         log::trace!(
-            "file browser list node directories count={} workspace={}",
+            "file browser queue node directory load count={} workspace={}",
             missing_dirs.len(),
             workspace.display_name
         );
-        let listings = match file_access.list_dirs(&missing_dirs) {
-            Ok(listings) => listings,
-            Err(err) => {
-                log::debug!(
-                    "file browser list node directories failed workspace={} dir_count={} err={err}",
-                    workspace.display_name,
-                    missing_dirs.len()
-                );
-                Vec::new()
+        let generation = self.tree_directory_load_generation.get();
+        let file_access = Arc::clone(file_access);
+        let workspace_name = workspace.display_name.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            log::debug!(
+                "file browser directory load start workspace={} count={}",
+                workspace_name,
+                missing_dirs.len()
+            );
+            let result = load_directory_rows(file_access, missing_dirs);
+            let _ = sender.send(result);
+        });
+
+        gtk::glib::timeout_add_local(Duration::from_millis(super::SEARCH_POLL_MS), {
+            let browser = self.clone();
+
+            move || match receiver.try_recv() {
+                Ok(result) => {
+                    browser.finish_directory_load(generation, result);
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    browser.finish_directory_load(
+                        generation,
+                        vec![TreeDirectoryLoadResult::batch_error(
+                            "Directory listing did not return a result.".to_string(),
+                        )],
+                    );
+                    gtk::glib::ControlFlow::Break
+                }
             }
-        };
-        self.cache_directory_listings(file_access, listings);
+        });
     }
 
-    fn cache_directory_listings(
-        &self,
-        file_access: &Arc<dyn FileAccess>,
-        listings: Vec<DirectoryListing>,
+    fn finish_directory_load(
+        self: &Rc<Self>,
+        generation: u64,
+        results: Vec<TreeDirectoryLoadResult>,
     ) {
-        let mut cache = self.tree_directory_cache.borrow_mut();
-        for listing in listings {
-            let depth = directory_child_depth(&listing.path);
-            let entry_paths = listing
-                .entries
-                .into_iter()
-                .filter(|path| path.file_name().is_some_and(|name| !should_skip(name)))
-                .collect::<Vec<_>>();
-            let infos = match file_access.info_many(&entry_paths) {
-                Ok(infos) => infos,
-                Err(err) => {
-                    log::debug!(
-                        "file browser node info failed path={} entries={} err={err}",
-                        listing.path.display(),
-                        entry_paths.len()
-                    );
-                    Vec::new()
+        if self.tree_directory_load_generation.get() != generation {
+            return;
+        }
+
+        let mut changed = false;
+        {
+            let mut loading = self.tree_directory_loading.borrow_mut();
+            let mut cache = self.tree_directory_cache.borrow_mut();
+            for result in results {
+                let Some(path) = result.path else {
+                    log::debug!("file browser directory load failed err={}", result.message);
+                    loading.clear();
+                    changed = true;
+                    continue;
+                };
+                loading.remove(&path);
+                match result.rows {
+                    Ok(rows) => {
+                        cache.insert(path, rows);
+                    }
+                    Err(err) => {
+                        log::debug!(
+                            "file browser directory load failed path={} err={err}",
+                            path.display()
+                        );
+                    }
                 }
-            };
-            let mut children = infos
-                .into_iter()
-                .filter(|info| !should_skip(&info.display_name))
-                .map(|info| BrowserRow::from_info(info, depth))
-                .collect::<Vec<_>>();
-            children.sort_by(|left, right| {
-                right
-                    .is_dir
-                    .cmp(&left.is_dir)
-                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-            });
-            cache.insert(listing.path, children);
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.tree_rows_cache.borrow_mut().take();
+            self.rows_signature.borrow_mut().clear();
+            if self.search_query.borrow().is_empty() {
+                self.rebuild_if_changed();
+            }
         }
     }
 
@@ -170,6 +224,93 @@ impl FileBrowser {
             }
         }
     }
+}
+
+struct TreeDirectoryLoadResult {
+    path: Option<FileNodePath>,
+    rows: Result<Vec<BrowserRow>, String>,
+    message: String,
+}
+
+impl TreeDirectoryLoadResult {
+    fn ok(path: FileNodePath, rows: Vec<BrowserRow>) -> Self {
+        Self {
+            path: Some(path),
+            rows: Ok(rows),
+            message: String::new(),
+        }
+    }
+
+    fn err(path: FileNodePath, message: String) -> Self {
+        Self {
+            path: Some(path),
+            rows: Err(message.clone()),
+            message,
+        }
+    }
+
+    fn batch_error(message: String) -> Self {
+        Self {
+            path: None,
+            rows: Err(message.clone()),
+            message,
+        }
+    }
+}
+
+fn load_directory_rows(
+    file_access: Arc<dyn FileAccess>,
+    paths: Vec<FileNodePath>,
+) -> Vec<TreeDirectoryLoadResult> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let listing =
+                file_access
+                    .list_dirs(std::slice::from_ref(&path))
+                    .and_then(|mut listings| {
+                        listings
+                            .pop()
+                            .ok_or_else(|| "Directory listing was empty.".to_string())
+                    });
+            match listing.and_then(|listing| directory_listing_rows(&file_access, listing)) {
+                Ok(rows) => TreeDirectoryLoadResult::ok(path, rows),
+                Err(err) => TreeDirectoryLoadResult::err(path, err),
+            }
+        })
+        .collect()
+}
+
+fn directory_listing_rows(
+    file_access: &Arc<dyn FileAccess>,
+    listing: DirectoryListing,
+) -> Result<Vec<BrowserRow>, String> {
+    let depth = directory_child_depth(&listing.path);
+    let entry_paths = listing
+        .entries
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| !should_skip(name)))
+        .collect::<Vec<_>>();
+    let infos = file_access.info_many(&entry_paths).map_err(|err| {
+        log::debug!(
+            "file browser node info failed path={} entries={} err={err}",
+            listing.path.display(),
+            entry_paths.len()
+        );
+        err
+    })?;
+    let mut children = infos
+        .into_iter()
+        .filter(|info| !should_skip(&info.display_name))
+        .map(|info| BrowserRow::from_info(info, depth))
+        .collect::<Vec<_>>();
+    children.sort_by(|left, right| {
+        right
+            .is_dir
+            .cmp(&left.is_dir)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    Ok(children)
 }
 
 #[derive(Clone, PartialEq, Eq)]

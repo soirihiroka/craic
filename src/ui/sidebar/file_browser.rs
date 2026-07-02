@@ -100,6 +100,8 @@ pub(in crate::ui) struct FileBrowser {
     changed_file_statuses: RefCell<HashMap<String, String>>,
     tree_rows_cache: RefCell<Option<TreeRowsCache>>,
     tree_directory_cache: RefCell<HashMap<FileNodePath, Vec<BrowserRow>>>,
+    tree_directory_loading: RefCell<HashSet<FileNodePath>>,
+    tree_directory_load_generation: Rc<Cell<u64>>,
     file_watch_generation: Rc<Cell<u64>>,
     file_watch_signature: RefCell<Option<FileBrowserWatchSignature>>,
     file_watch_subscriptions: RefCell<Vec<FileWatchSubscription>>,
@@ -193,6 +195,8 @@ impl FileBrowser {
             changed_file_statuses: RefCell::new(HashMap::new()),
             tree_rows_cache: RefCell::new(None),
             tree_directory_cache: RefCell::new(HashMap::new()),
+            tree_directory_loading: RefCell::new(HashSet::new()),
+            tree_directory_load_generation: Rc::new(Cell::new(0)),
             file_watch_generation: Rc::new(Cell::new(0)),
             file_watch_signature: RefCell::new(None),
             file_watch_subscriptions: RefCell::new(Vec::new()),
@@ -565,7 +569,9 @@ impl FileBrowser {
                     });
                 self.set_selected_node_path(Some(row.node_path.clone()));
             }
-            rows::BrowserListRow::NewEntry(_) | rows::BrowserListRow::RenameEntry(_) => {}
+            rows::BrowserListRow::NewEntry(_)
+            | rows::BrowserListRow::RenameEntry(_)
+            | rows::BrowserListRow::Loading(_) => {}
             rows::BrowserListRow::Search(search_match) => {
                 self.set_selected_search_match(search_match.clone());
             }
@@ -1153,7 +1159,9 @@ fn row_matches_selection(
         rows::BrowserListRow::Tree(row) => {
             selected_search_match.is_none() && selected == Some(&row.node_path)
         }
-        rows::BrowserListRow::NewEntry(_) | rows::BrowserListRow::RenameEntry(_) => false,
+        rows::BrowserListRow::NewEntry(_)
+        | rows::BrowserListRow::RenameEntry(_)
+        | rows::BrowserListRow::Loading(_) => false,
         rows::BrowserListRow::Search(search_match) => {
             selected_search_match == Some(&search_match.selection_key())
         }
@@ -1166,6 +1174,7 @@ fn row_is_selectable(row: &rows::BrowserListRow) -> bool {
         row,
         rows::BrowserListRow::NewEntry(_)
             | rows::BrowserListRow::RenameEntry(_)
+            | rows::BrowserListRow::Loading(_)
             | rows::BrowserListRow::Status(_)
             | rows::BrowserListRow::RootGap
     )

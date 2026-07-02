@@ -18,6 +18,7 @@ pub(super) enum BrowserListRow {
     Tree(BrowserRow),
     NewEntry(NewEntryRow),
     RenameEntry(RenameEntryRow),
+    Loading(LoadingRow),
     Search(SearchMatch),
     Status(String),
     RootGap,
@@ -26,9 +27,11 @@ pub(super) enum BrowserListRow {
 impl BrowserListRow {
     pub(super) fn height(&self) -> f64 {
         match self {
-            Self::Tree(_) | Self::NewEntry(_) | Self::RenameEntry(_) | Self::Search(_) => {
-                tree_view::ICON_ROW_HEIGHT_F64
-            }
+            Self::Tree(_)
+            | Self::NewEntry(_)
+            | Self::RenameEntry(_)
+            | Self::Loading(_)
+            | Self::Search(_) => tree_view::ICON_ROW_HEIGHT_F64,
             Self::Status(_) => tree_view::ICON_ROW_HEIGHT_F64,
             Self::RootGap => ROOT_GAP_HEIGHT,
         }
@@ -47,6 +50,12 @@ pub(super) struct NewEntryRow {
 pub(super) struct RenameEntryRow {
     pub(super) row: BrowserRow,
     pub(super) original_name: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct LoadingRow {
+    pub(super) folder: FileNodePath,
+    pub(super) depth: usize,
 }
 
 impl FileBrowser {
@@ -275,6 +284,7 @@ impl FileBrowser {
             ) => {
                 update_status_row_widget(widget, previous, next);
             }
+            (BrowserListRowRenderState::Loading(_), BrowserListRowRenderState::Loading(_)) => {}
             (BrowserListRowRenderState::RootGap, BrowserListRowRenderState::RootGap) => {}
             _ => replace_row_widget(widget, self.row_widget(index, next)),
         }
@@ -362,6 +372,7 @@ impl FileBrowser {
             BrowserListRowRenderState::RenameEntry { row, expanded } => {
                 self.rename_entry_row_widget(row, *expanded)
             }
+            BrowserListRowRenderState::Loading(row) => self.loading_row_widget(row),
             BrowserListRowRenderState::Search {
                 search_match,
                 selected,
@@ -495,6 +506,22 @@ impl FileBrowser {
             })
             .build()
             .root
+    }
+
+    fn loading_row_widget(self: &Rc<Self>, row: &LoadingRow) -> gtk::Box {
+        let spinner = adw::Spinner::builder()
+            .width_request(16)
+            .height_request(16)
+            .valign(gtk::Align::Center)
+            .build();
+        let icon_row = tree_view::IconRow::builder("Loading...")
+            .set_icon(spinner)
+            .depth(row.depth)
+            .end_padding(row_end_padding())
+            .build();
+        icon_row.title.add_css_class("dim-label");
+        icon_row.title.add_css_class("caption");
+        icon_row.root
     }
 
     fn search_row_widget(self: &Rc<Self>, search_match: &SearchMatch, selected: bool) -> gtk::Box {
@@ -667,6 +694,7 @@ impl FileBrowser {
                 .node_path
                 .parent()
                 .unwrap_or_else(|| self.root_node_path()),
+            BrowserListRow::Loading(row) => row.folder,
             BrowserListRow::Search(search_match) => search_match
                 .node_path
                 .parent()
@@ -724,6 +752,7 @@ impl FileBrowser {
             BrowserListRowRenderState::RenameEntry { row, .. } => {
                 (row.row.depth, false, false, false)
             }
+            BrowserListRowRenderState::Loading(row) => (row.depth, false, false, false),
             BrowserListRowRenderState::Search { search_match, .. } => {
                 (search_match.depth, false, false, false)
             }
@@ -763,6 +792,7 @@ impl FileBrowser {
                 row: row.clone(),
                 expanded: self.tree_row_expanded(&row.row),
             },
+            BrowserListRow::Loading(row) => BrowserListRowRenderState::Loading(row.clone()),
             BrowserListRow::Search(search_match) => BrowserListRowRenderState::Search {
                 search_match: search_match.clone(),
                 selected: selected_search_match.as_ref() == Some(&search_match.selection_key()),
@@ -820,6 +850,9 @@ pub(super) enum BrowserListRowKey {
     RenameEntry {
         path: FileNodePath,
     },
+    Loading {
+        folder: FileNodePath,
+    },
     Search {
         path: FileNodePath,
         line_number: u64,
@@ -848,6 +881,7 @@ pub(super) enum BrowserListRowRenderState {
         row: RenameEntryRow,
         expanded: bool,
     },
+    Loading(LoadingRow),
     Search {
         search_match: SearchMatch,
         selected: bool,
@@ -862,6 +896,7 @@ impl BrowserListRowRenderState {
             Self::Tree { row, .. } => BrowserListRow::Tree(row.clone()),
             Self::NewEntry(row) => BrowserListRow::NewEntry(row.clone()),
             Self::RenameEntry { row, .. } => BrowserListRow::RenameEntry(row.clone()),
+            Self::Loading(row) => BrowserListRow::Loading(row.clone()),
             Self::Search { search_match, .. } => BrowserListRow::Search(search_match.clone()),
             Self::Status(message) => BrowserListRow::Status(message.clone()),
             Self::RootGap => BrowserListRow::RootGap,
@@ -877,6 +912,9 @@ pub(super) fn browser_list_row_key(row: &BrowserListRow, index: usize) -> Browse
             kind: row.kind,
         },
         BrowserListRow::RenameEntry(row) => rename_row_key(&row.row.node_path),
+        BrowserListRow::Loading(row) => BrowserListRowKey::Loading {
+            folder: row.folder.clone(),
+        },
         BrowserListRow::Search(search_match) => BrowserListRowKey::Search {
             path: search_match.node_path.clone(),
             line_number: search_match.line_number,

@@ -33,6 +33,7 @@ impl FileBrowser {
                 }
             })
             .collect::<Vec<_>>();
+        self.insert_directory_loading_rows(&mut list_rows);
 
         let Some(pending) = pending else {
             return list_rows;
@@ -47,6 +48,37 @@ impl FileBrowser {
         let insert_at = pending_new_entry_insert_index(&list_rows, &pending);
         list_rows.insert(insert_at, rows::BrowserListRow::NewEntry(new_entry_row));
         list_rows
+    }
+
+    fn insert_directory_loading_rows(&self, list_rows: &mut Vec<rows::BrowserListRow>) {
+        let loading = self.tree_directory_loading.borrow().clone();
+        if loading.is_empty() {
+            return;
+        }
+
+        let root = self.root_node_path();
+        if loading.contains(&root) {
+            list_rows.insert(
+                0,
+                rows::BrowserListRow::Loading(rows::LoadingRow {
+                    folder: root,
+                    depth: 0,
+                }),
+            );
+        }
+
+        let mut index = 0usize;
+        while index < list_rows.len() {
+            let Some((folder, depth)) = loading_row_after(&list_rows[index], &loading) else {
+                index += 1;
+                continue;
+            };
+            list_rows.insert(
+                index + 1,
+                rows::BrowserListRow::Loading(rows::LoadingRow { folder, depth }),
+            );
+            index += 2;
+        }
     }
 
     pub(super) fn create_file_in_folder(self: &Rc<Self>, folder: &FileNodePath) {
@@ -457,6 +489,21 @@ fn target_affects_selection(selected: Option<&FileNodePath>, target: &BrowserTar
         .is_dir
         .then_some(())
         .is_some_and(|_| selected.is_some_and(|path| path.is_child_of(&target.node_path)))
+}
+
+fn loading_row_after(
+    row: &rows::BrowserListRow,
+    loading: &HashSet<FileNodePath>,
+) -> Option<(FileNodePath, usize)> {
+    match row {
+        rows::BrowserListRow::Tree(row)
+            if row.tree_role == super::tree::TreeRowRole::Branch
+                && loading.contains(&row.node_path) =>
+        {
+            Some((row.node_path.clone(), row.depth + 1))
+        }
+        _ => None,
+    }
 }
 
 fn rename_expanded_dirs(
