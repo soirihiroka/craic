@@ -13,9 +13,9 @@ use crate::github::PullRequestInfo;
 use crate::quick_action::{self, RunItem, RunTargetsSignature};
 use crate::system::WorkspacePath;
 use crate::system::capabilities::{
-    open::{DesktopOpenAccess, DesktopOpenActivation},
     shell::ShellAccess,
     terminal_link::{TerminalLinkAccess, TerminalLinkTarget},
+    url::{UrlOpenAccess, UrlOpenActivation},
 };
 use crate::terminal;
 use crate::ui::components::tabbed_picker::{
@@ -76,7 +76,7 @@ pub struct ContentPane {
 pub trait RepositoryActionContext: Clone {
     fn local_workspace_path(&self) -> Option<PathBuf>;
     fn workspace_root(&self) -> WorkspacePath;
-    fn desktop_opener(&self) -> Option<Arc<dyn DesktopOpenAccess>>;
+    fn url_opener(&self) -> Option<Arc<dyn UrlOpenAccess>>;
     fn terminal_links(&self) -> Option<Arc<dyn TerminalLinkAccess>>;
     fn shell(&self) -> Option<Arc<dyn ShellAccess>>;
     fn window(&self) -> adw::ApplicationWindow;
@@ -631,13 +631,13 @@ fn handle_terminal_activation<C: RepositoryActionContext + 'static>(
 }
 
 fn confirm_open_terminal_url<C: RepositoryActionContext + 'static>(context: C, url: String) {
-    let Some(desktop_opener) = context.desktop_opener() else {
+    let Some(url_opener) = context.url_opener() else {
         show_error_dialog(
             &context.window(),
             "Open Link Failed",
             "Opening links is unavailable for this workspace.",
         );
-        log::warn!("terminal url activation failed reason=no-desktop-opener url={url}");
+        log::warn!("terminal url activation failed reason=no-url-opener url={url}");
         return;
     };
 
@@ -657,7 +657,7 @@ fn confirm_open_terminal_url<C: RepositoryActionContext + 'static>(context: C, u
             return;
         }
 
-        match desktop_opener.open_url(&url, DesktopOpenActivation::default()) {
+        match url_opener.open_url(&url, UrlOpenActivation::default()) {
             Ok(message) => {
                 log::info!("terminal url opened url={url} message={message}");
                 context.show_toast(&message);

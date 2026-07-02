@@ -29,5 +29,4 @@ pub(crate) trait DesktopOpenAccess: Send + Sync {
         path: &FileNodePath,
         activation: DesktopOpenActivation,
     ) -> Result<String, String>;
-    fn open_url(&self, url: &str, activation: DesktopOpenActivation) -> Result<String, String>;
 }

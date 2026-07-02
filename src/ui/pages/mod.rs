@@ -2,7 +2,7 @@ use crate::git::RepositorySnapshot;
 use crate::system::capabilities::shell::ShellCommandSpec;
 use crate::system::capabilities::{
     docker::DockerAccess, files::FileAccess, git::GitAccess, open::DesktopOpenAccess,
-    shell::ShellAccess, terminal_link::TerminalLinkAccess,
+    shell::ShellAccess, terminal_link::TerminalLinkAccess, url::UrlOpenAccess,
 };
 use crate::system::{
     FileNodePath, SystemPath, SystemProviderRegistry, SystemRef, WorkspacePath, WorkspaceRef,
@@ -221,6 +221,11 @@ impl PageContext {
             .desktop_opener(&self.system_ref.borrow().id, &self.workspace_ref())
     }
 
+    pub(super) fn url_opener(&self) -> Option<Arc<dyn UrlOpenAccess>> {
+        self.providers
+            .url_opener(&self.system_ref.borrow().id, &self.workspace_ref())
+    }
+
     pub(super) fn terminal_links(&self) -> Option<Arc<dyn TerminalLinkAccess>> {
         self.providers
             .terminal_links(&self.system_ref.borrow().id, &self.workspace_ref())
@@ -229,6 +234,13 @@ impl PageContext {
     pub(super) fn desktop_opener_unavailable_message(&self) -> String {
         format!(
             "Opening paths is unavailable for workspace {}.",
+            self.workspace_ref.borrow().display_name
+        )
+    }
+
+    pub(super) fn url_opener_unavailable_message(&self) -> String {
+        format!(
+            "Opening links is unavailable for workspace {}.",
             self.workspace_ref.borrow().display_name
         )
     }

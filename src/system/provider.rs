@@ -1,7 +1,7 @@
 use super::capabilities::github::GitHubAccess;
 use super::capabilities::{
     docker::DockerAccess, files::FileAccess, git::GitAccess, open::DesktopOpenAccess,
-    shell::ShellAccess, terminal_link::TerminalLinkAccess,
+    shell::ShellAccess, terminal_link::TerminalLinkAccess, url::UrlOpenAccess,
 };
 use super::path::{ProviderKind, SystemId, WorkspaceRef};
 use std::collections::HashMap;
@@ -58,6 +58,7 @@ pub(crate) trait SystemProvider: Send + Sync {
     fn shell(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn ShellAccess>>;
     fn docker(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn DockerAccess>>;
     fn desktop_opener(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn DesktopOpenAccess>>;
+    fn url_opener(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn UrlOpenAccess>>;
     fn terminal_links(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn TerminalLinkAccess>>;
 }
 
@@ -70,6 +71,7 @@ pub(crate) struct SystemProviderRegistry {
     shell: Arc<RwLock<HashMap<String, Arc<dyn ShellAccess>>>>,
     docker: Arc<RwLock<HashMap<String, Arc<dyn DockerAccess>>>>,
     desktop_opener: Arc<RwLock<HashMap<String, Arc<dyn DesktopOpenAccess>>>>,
+    url_opener: Arc<RwLock<HashMap<String, Arc<dyn UrlOpenAccess>>>>,
     terminal_links: Arc<RwLock<HashMap<String, Arc<dyn TerminalLinkAccess>>>>,
 }
 
@@ -232,6 +234,27 @@ impl SystemProviderRegistry {
         access
     }
 
+    pub(crate) fn url_opener(
+        &self,
+        system_id: &SystemId,
+        workspace: &WorkspaceRef,
+    ) -> Option<Arc<dyn UrlOpenAccess>> {
+        let key = capability_key(system_id, workspace);
+        if let Some(access) = self.cached_url_open_access(&key) {
+            return Some(access);
+        }
+        let provider = self.provider(system_id)?;
+        let access = provider.url_opener(workspace);
+        log_capability_absence(access.is_some(), &provider.label(), workspace, "url-open");
+        if let Some(access) = &access {
+            self.url_opener
+                .write()
+                .expect("system url open cache poisoned")
+                .insert(key, access.clone());
+        }
+        access
+    }
+
     pub(crate) fn terminal_links(
         &self,
         system_id: &SystemId,
@@ -306,6 +329,14 @@ impl SystemProviderRegistry {
             .cloned()
     }
 
+    fn cached_url_open_access(&self, key: &str) -> Option<Arc<dyn UrlOpenAccess>> {
+        self.url_opener
+            .read()
+            .expect("system url open cache poisoned")
+            .get(key)
+            .cloned()
+    }
+
     fn cached_terminal_link_access(&self, key: &str) -> Option<Arc<dyn TerminalLinkAccess>> {
         self.terminal_links
             .read()
@@ -339,6 +370,10 @@ impl SystemProviderRegistry {
         self.desktop_opener
             .write()
             .expect("system desktop open cache poisoned")
+            .retain(|key, _| !key.starts_with(&prefix));
+        self.url_opener
+            .write()
+            .expect("system url open cache poisoned")
             .retain(|key, _| !key.starts_with(&prefix));
         self.terminal_links
             .write()

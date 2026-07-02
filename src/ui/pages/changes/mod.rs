@@ -6,6 +6,7 @@ use crate::git::{self, BytesComparison, FileComparison, RepositorySnapshot};
 use crate::github::CommitEmailOption;
 use crate::gitignore::{self, IgnoreTargetKind};
 use crate::system::capabilities::open::{DesktopOpenActivation, DesktopOpenTargetKind};
+use crate::system::capabilities::url::UrlOpenActivation;
 use crate::system::path::ProviderKind;
 use crate::ui::components::context_menu;
 use crate::ui::file_manager;
@@ -1799,11 +1800,11 @@ fn open_remote_repository(ctx: &PageContext) {
             };
 
             let url = git::remote_web_url(&remote_url);
-            let Some(desktop_opener) = ctx.desktop_opener() else {
-                ctx.show_error("Open Failed", &ctx.desktop_opener_unavailable_message());
+            let Some(url_opener) = ctx.url_opener() else {
+                ctx.show_error("Open Failed", &ctx.url_opener_unavailable_message());
                 return;
             };
-            match desktop_opener.open_url(&url, DesktopOpenActivation::default()) {
+            match url_opener.open_url(&url, UrlOpenActivation::default()) {
                 Ok(_) => ctx.refresh(Some(format!("Opened {url}."))),
                 Err(err) => ctx.show_error("Open Failed", &err),
             }

@@ -1132,13 +1132,12 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
     let terminal_available = browser.terminal_actions_available.get() && target.capabilities.native;
     let container_actions_available =
         browser.container_actions_available.get() && target.capabilities.native;
-    let popover = menu::repository_row_menu(&target, terminal_available, container_actions_available).popup(
-        parent,
-        x,
-        y,
-        &actions,
-        &browser.active_context_menu,
-    );
+    let popover = menu::repository_row_menu(
+        &target,
+        terminal_available,
+        container_actions_available,
+    )
+    .popup(parent, x, y, &actions, &browser.active_context_menu);
     context_menu::track_context_menu_event_time(&popover, action_event_time);
 }
 
