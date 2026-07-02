@@ -183,6 +183,15 @@ impl ChangesPage {
                     right.show_home();
                     return;
                 };
+                if active_preview_signature.borrow().as_ref() == Some(&signature) {
+                    log::debug!(
+                        "changes preview selection unchanged workspace={} path={} kind={:?}",
+                        ctx.workspace_key(),
+                        signature.path,
+                        signature.kind
+                    );
+                    return;
+                }
                 show_worktree_preview(
                     &ctx,
                     &right,
@@ -386,7 +395,6 @@ impl ChangesPage {
                     return;
                 }
 
-                files_list.select_row(Some(&row));
                 let event_time = gesture.current_event_time();
                 let parent = files_list.clone();
                 let ctx = ctx.clone();

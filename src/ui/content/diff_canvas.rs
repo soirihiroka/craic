@@ -28,6 +28,11 @@ const MIN_CONTENT_WIDTH: i32 = 360;
 const CELL_PADDING: f64 = 8.0;
 const PREFIX_WIDTH: f64 = 18.0;
 const DIVIDER_WIDTH: f64 = 1.0;
+const DRAG_AUTOSCROLL_ZONE_LINES: f64 = 2.0;
+const DRAG_AUTOSCROLL_MIN_LINES_PER_FRAME: f64 = 0.5;
+const DRAG_AUTOSCROLL_BASE_EXTRA_LINES_PER_FRAME: f64 = 1.5;
+const DRAG_AUTOSCROLL_AGGRESSIVE_EXTRA_LINES_PER_FRAME: f64 = 2.0;
+const DRAG_AUTOSCROLL_OUTSIDE_EXTRA_LINES_PER_FRAME: f64 = 2.0;
 
 #[derive(Clone)]
 pub(in crate::ui) struct DiffCanvas {
@@ -208,8 +213,7 @@ impl DiffCanvas {
 
         area.set_draw_func({
             let state = state.clone();
-            let spinner = spinner.clone();
-            move |area, context, width, height| draw(area, context, width, height, &state, &spinner)
+            move |area, context, width, height| draw(area, context, width, height, &state)
         });
         area.connect_resize({
             let state = state.clone();
@@ -239,7 +243,6 @@ impl DiffCanvas {
     }
 
     pub(in crate::ui) fn set_rows(&self, rows: Vec<FileDiffRow>) {
-        stop_diff_middle_autoscroll(&self.area, &self.state);
         let fold_rows = rows.iter().filter(|row| is_fold_row(row)).count();
         let max_line_number = rows
             .iter()
@@ -247,6 +250,18 @@ impl DiffCanvas {
             .flatten()
             .max()
             .unwrap_or(1);
+        if diff_rows_equal(&self.state.rows.borrow(), &rows) {
+            log::debug!(
+                "diff_canvas set_rows unchanged rows={} fold_rows={} keeping_layout_cache=true",
+                rows.len(),
+                fold_rows
+            );
+            self.state.fold_row_count.set(fold_rows);
+            self.state.max_line_number.set(max_line_number);
+            return;
+        }
+
+        stop_diff_middle_autoscroll(&self.area, &self.state);
         log::debug!(
             "diff_canvas set_rows rows={} fold_rows={}",
             rows.len(),
@@ -428,7 +443,6 @@ fn draw(
     width: i32,
     height: i32,
     state: &Rc<DiffCanvasState>,
-    spinner: &adw::Spinner,
 ) {
     let theme = theme_for(area);
     fill_rect(
@@ -440,7 +454,6 @@ fn draw(
         theme.background,
     );
 
-    request_layout(area, state, spinner);
     let content_width =
         canvas_scrollbar::content_width(width).max(MIN_CONTENT_WIDTH.min(width.max(1)));
     let metrics = canvas::measure_font_metrics(area, state.font_size.get(), |font_size| {
@@ -1206,6 +1219,8 @@ fn stop_diff_middle_autoscroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasSta
 
 fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner: &adw::Spinner) {
     let click_selection_mode = Rc::new(Cell::new(SelectionMode::Character));
+    let drag_autoscroll_id = Rc::new(Cell::new(0_u64));
+    let drag_autoscroll_pointer = Rc::new(Cell::new(None::<(f64, f64)>));
     let click = gtk::GestureClick::new();
     click.set_button(1);
     click.connect_pressed({
@@ -1267,9 +1282,12 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
     click.connect_released({
         let area = area.clone();
         let state = state.clone();
+        let drag_autoscroll_id = drag_autoscroll_id.clone();
+        let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
         move |_, _, _, _| {
             state.scrollbar_drag.set(None);
             state.selection_drag.set(None);
+            stop_diff_drag_autoscroll(&drag_autoscroll_id, &drag_autoscroll_pointer);
             canvas_scrollbar::set_active(
                 &area,
                 &state.scrollbar_hover,
@@ -1287,6 +1305,8 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
         let state = state.clone();
         let spinner = spinner.clone();
         let click_selection_mode = click_selection_mode.clone();
+        let drag_autoscroll_id = drag_autoscroll_id.clone();
+        let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
         move |_, x, y| {
             if state.middle_autoscroll.is_active() {
                 return;
@@ -1312,6 +1332,7 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
                     .scrollbar_drag
                     .set(Some(canvas_scrollbar::Drag::new(state.scroll_y.get())));
                 state.selection_drag.set(None);
+                stop_diff_drag_autoscroll(&drag_autoscroll_id, &drag_autoscroll_pointer);
                 canvas_scrollbar::set_active(
                     &area,
                     &state.scrollbar_hover,
@@ -1326,6 +1347,7 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
             state.scrollbar_drag.set(None);
             let Some(point) = selection_point_at(&area, &state, x, y) else {
                 state.selection_drag.set(None);
+                stop_diff_drag_autoscroll(&drag_autoscroll_id, &drag_autoscroll_pointer);
                 return;
             };
             let mode = click_selection_mode.get();
@@ -1339,6 +1361,8 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
         let area = area.clone();
         let state = state.clone();
         let click_selection_mode = click_selection_mode.clone();
+        let drag_autoscroll_id = drag_autoscroll_id.clone();
+        let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
         move |gesture, offset_x, offset_y| {
             if state.middle_autoscroll.is_active() {
                 return;
@@ -1384,14 +1408,26 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
             {
                 apply_drag_selection(&area, &state, drag, focus);
             }
+            schedule_diff_drag_autoscroll(
+                &area,
+                &state,
+                &drag_autoscroll_id,
+                &drag_autoscroll_pointer,
+                pointer_x,
+                pointer_y,
+                scroll_for_diff_drag_selection(&area, &state, pointer_y),
+            );
         }
     });
     drag.connect_drag_end({
         let area = area.clone();
         let state = state.clone();
+        let drag_autoscroll_id = drag_autoscroll_id.clone();
+        let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
         move |_, _, _| {
             state.scrollbar_drag.set(None);
             state.selection_drag.set(None);
+            stop_diff_drag_autoscroll(&drag_autoscroll_id, &drag_autoscroll_pointer);
             canvas_scrollbar::set_active(
                 &area,
                 &state.scrollbar_hover,
@@ -1412,13 +1448,10 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
         let area = area.clone();
         let state = state.clone();
         move |gesture, _, x, y| {
-            area.grab_focus();
             if state.middle_autoscroll.is_active() {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 return;
             }
-            state.scrollbar_drag.set(None);
-            state.selection_drag.set(None);
             show_context_menu(&area, &state, x, y);
             gesture.set_state(gtk::EventSequenceState::Claimed);
         }
@@ -1491,7 +1524,7 @@ fn install_key_shortcuts(
                 && !modifiers.contains(gtk::gdk::ModifierType::ALT_MASK)
                 && key == gtk::gdk::Key::a
             {
-                select_all_active_side(&area, &state);
+                select_all_side(&area, &state, state.active_side.get());
                 return gtk::glib::Propagation::Stop;
             }
 
@@ -1536,7 +1569,11 @@ fn set_scroll_y(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, scroll_y: 
         .map_or(f64::INFINITY, |cache| {
             canvas_scrollbar::max_scroll(cache.content_height, area.allocated_height() as f64)
         });
-    state.scroll_y.set(scroll_y.max(0.0).min(max_scroll));
+    let next_scroll_y = scroll_y.max(0.0).min(max_scroll);
+    if (state.scroll_y.get() - next_scroll_y).abs() <= f64::EPSILON {
+        return;
+    }
+    state.scroll_y.set(next_scroll_y);
     area.queue_draw();
 }
 
@@ -1603,27 +1640,130 @@ fn apply_drag_selection(
     area.queue_draw();
 }
 
+fn scroll_for_diff_drag_selection(
+    area: &gtk::DrawingArea,
+    state: &Rc<DiffCanvasState>,
+    pointer_y: f64,
+) -> bool {
+    let viewport_height = area.allocated_height().max(1) as f64;
+    let line_height = canvas::measure_font_metrics(area, state.font_size.get(), |font_size| {
+        (font_size + 9.0).ceil()
+    })
+    .line_height;
+    let zone = line_height * DRAG_AUTOSCROLL_ZONE_LINES;
+    if zone <= f64::EPSILON || viewport_height <= f64::EPSILON {
+        return false;
+    }
+    let before = state.scroll_y.get();
+
+    if pointer_y < 0.0 {
+        let overflow = -pointer_y;
+        let delta = -(line_height * drag_autoscroll_lines_per_frame(overflow / zone));
+        set_scroll_y(area, state, state.scroll_y.get() + delta);
+        return (state.scroll_y.get() - before).abs() > f64::EPSILON;
+    }
+    if pointer_y > viewport_height {
+        let overflow = pointer_y - viewport_height;
+        let delta = line_height * drag_autoscroll_lines_per_frame(overflow / zone);
+        set_scroll_y(area, state, state.scroll_y.get() + delta);
+        return (state.scroll_y.get() - before).abs() > f64::EPSILON;
+    }
+    false
+}
+
+fn drag_autoscroll_lines_per_frame(ratio: f64) -> f64 {
+    let ramp_ratio = ratio.clamp(0.0, 1.0);
+    let outside_ratio = (ratio - 1.0).max(0.0);
+    DRAG_AUTOSCROLL_MIN_LINES_PER_FRAME
+        + ramp_ratio * DRAG_AUTOSCROLL_BASE_EXTRA_LINES_PER_FRAME
+        + ramp_ratio.powi(3) * DRAG_AUTOSCROLL_AGGRESSIVE_EXTRA_LINES_PER_FRAME
+        + outside_ratio * DRAG_AUTOSCROLL_OUTSIDE_EXTRA_LINES_PER_FRAME
+}
+
+fn schedule_diff_drag_autoscroll(
+    area: &gtk::DrawingArea,
+    state: &Rc<DiffCanvasState>,
+    drag_autoscroll_id: &Rc<Cell<u64>>,
+    drag_autoscroll_pointer: &Rc<Cell<Option<(f64, f64)>>>,
+    pointer_x: f64,
+    pointer_y: f64,
+    should_scroll: bool,
+) {
+    if !should_scroll {
+        stop_diff_drag_autoscroll(drag_autoscroll_id, drag_autoscroll_pointer);
+        return;
+    }
+
+    drag_autoscroll_pointer.set(Some((pointer_x, pointer_y)));
+    if drag_autoscroll_id.get() != 0 {
+        return;
+    }
+
+    let next_id = drag_autoscroll_id.get().wrapping_add(1).max(1);
+    drag_autoscroll_id.set(next_id);
+    log::debug!("diff_canvas drag_autoscroll start id={next_id}");
+
+    let area = area.clone();
+    let state = state.clone();
+    let drag_autoscroll_id = drag_autoscroll_id.clone();
+    let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(16), move || {
+        if drag_autoscroll_id.get() != next_id {
+            return gtk::glib::ControlFlow::Break;
+        }
+
+        let Some((x, y)) = drag_autoscroll_pointer.get() else {
+            drag_autoscroll_id.set(0);
+            return gtk::glib::ControlFlow::Break;
+        };
+
+        if !scroll_for_diff_drag_selection(&area, &state, y) {
+            drag_autoscroll_id.set(0);
+            return gtk::glib::ControlFlow::Break;
+        }
+
+        if let Some(drag) = state.selection_drag.get() {
+            if let Some(focus) = selection_point_at_side(&area, &state, x, y, drag.anchor().side) {
+                apply_drag_selection(&area, &state, drag, focus);
+                return gtk::glib::ControlFlow::Continue;
+            }
+        }
+
+        drag_autoscroll_id.set(0);
+        gtk::glib::ControlFlow::Break
+    });
+}
+
+fn stop_diff_drag_autoscroll(
+    drag_autoscroll_id: &Rc<Cell<u64>>,
+    drag_autoscroll_pointer: &Rc<Cell<Option<(f64, f64)>>>,
+) {
+    if drag_autoscroll_id.get() != 0 {
+        log::debug!(
+            "diff_canvas drag_autoscroll stop id={}",
+            drag_autoscroll_id.get()
+        );
+    }
+    drag_autoscroll_id.set(0);
+    drag_autoscroll_pointer.set(None);
+}
+
 fn show_context_menu(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, x: f64, y: f64) {
-    let hit_point = selection_point_at(area, state, x, y);
-    if let Some(point) = hit_point {
-        state.active_side.set(point.side);
-    } else if x
+    let side = if x
         < (canvas_scrollbar::content_width(area.allocated_width())
             .max(MIN_CONTENT_WIDTH.min(area.allocated_width().max(1))) as f64
             / 2.0)
             .floor()
     {
-        state.active_side.set(DiffCanvasSide::Left);
+        DiffCanvasSide::Left
     } else {
-        state.active_side.set(DiffCanvasSide::Right);
-    }
+        DiffCanvasSide::Right
+    };
 
-    let copy_enabled = hit_point.is_some_and(|point| point_inside_selection(state, point))
-        && selected_text(state).is_some_and(|text| !text.is_empty());
-    let select_all_enabled = has_selectable_text(state, state.active_side.get());
+    let copy_enabled = selected_text(state).is_some_and(|text| !text.is_empty());
+    let select_all_enabled = has_selectable_text(state, side);
     log::debug!(
-        "diff_canvas context_menu x={x:.1} y={y:.1} active_side={:?} has_selection={}",
-        state.active_side.get(),
+        "diff_canvas context_menu x={x:.1} y={y:.1} side={side:?} has_selection={}",
         copy_enabled
     );
     context_menu::popup_action_menu(
@@ -1642,28 +1782,12 @@ fn show_context_menu(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, x: f6
             let area = area.clone();
             let state = state.clone();
 
-            move |action| {
-                match action {
-                    DiffContextAction::Copy => copy_selection(&area, &state),
-                    DiffContextAction::SelectAll => select_all_active_side(&area, &state),
-                }
-                area.grab_focus();
+            move |action| match action {
+                DiffContextAction::Copy => copy_selection(&area, &state),
+                DiffContextAction::SelectAll => select_all_side(&area, &state, side),
             }
         },
     );
-}
-
-fn point_inside_selection(state: &Rc<DiffCanvasState>, point: DiffSelectionPoint) -> bool {
-    let Some(selection) = *state.selection.borrow() else {
-        return false;
-    };
-    if selection.anchor.side != point.side || selection.focus.side != point.side {
-        return false;
-    }
-    let Some((start, end)) = selection.ordered() else {
-        return false;
-    };
-    start <= point && point < end
 }
 
 fn has_selectable_text(state: &Rc<DiffCanvasState>, side: DiffCanvasSide) -> bool {
@@ -1728,8 +1852,8 @@ fn selected_text(state: &Rc<DiffCanvasState>) -> Option<String> {
     Some(output)
 }
 
-fn select_all_active_side(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
-    let side = state.active_side.get();
+fn select_all_side(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, side: DiffCanvasSide) {
+    state.active_side.set(side);
     let rows = state.rows.borrow();
     let start = rows
         .iter()
@@ -1974,6 +2098,18 @@ fn diff_prefix(kind: DiffKind) -> Option<&'static str> {
 
 fn is_fold_row(row: &FileDiffRow) -> bool {
     row.left_kind == DiffKind::Fold || row.right_kind == DiffKind::Fold
+}
+
+fn diff_rows_equal(left: &[FileDiffRow], right: &[FileDiffRow]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right.iter()).all(|(left, right)| {
+            left.left_number == right.left_number
+                && left.right_number == right.right_number
+                && left.left_text == right.left_text
+                && left.right_text == right.right_text
+                && left.left_kind == right.left_kind
+                && left.right_kind == right.right_kind
+        })
 }
 
 fn font_size_delta_for_key(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> Option<f64> {
