@@ -199,6 +199,40 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
     let name_row = adw::EntryRow::builder().title("Repository Name").build();
     name_row.set_text(&default_publish_repository_name(state, &snapshot));
     name_row.set_sensitive(false);
+    let name_check_icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
+    name_check_icon.add_css_class("warning");
+    name_check_icon.set_pixel_size(16);
+    let name_check_label = gtk::Label::builder()
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(28)
+        .visible(false)
+        .build();
+    name_check_label.add_css_class("warning");
+    let name_check_message = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    name_check_message.append(&name_check_icon);
+    name_check_message.append(&name_check_label);
+    name_row.add_suffix(&name_check_message);
+    name_row.connect_changed({
+        let name_check_message = name_check_message.clone();
+        let name_check_label = name_check_label.clone();
+
+        move |_| {
+            set_publish_name_check_message(&name_check_message, &name_check_label, None);
+        }
+    });
+    owner_row.connect_selected_notify({
+        let name_check_message = name_check_message.clone();
+        let name_check_label = name_check_label.clone();
+
+        move |_| {
+            set_publish_name_check_message(&name_check_message, &name_check_label, None);
+        }
+    });
 
     let private_row = adw::ActionRow::builder()
         .title("Private Repository")
@@ -275,6 +309,8 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
         let owner_choices = owner_choices.clone();
         let owner_row = owner_row.clone();
         let name_row = name_row.clone();
+        let name_check_message = name_check_message.clone();
+        let name_check_label = name_check_label.clone();
         let private_switch = private_switch.clone();
         let status_row = status_row.clone();
         let publish_button = publish_button.clone();
@@ -284,10 +320,14 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
         move |_| {
             let name = name_row.text().trim().to_string();
             if name.is_empty() {
-                status_row.set_title("Repository name required");
-                status_row.set_subtitle("");
+                set_publish_name_check_message(
+                    &name_check_message,
+                    &name_check_label,
+                    Some("Repository name required."),
+                );
                 return;
             }
+            set_publish_name_check_message(&name_check_message, &name_check_label, None);
 
             let Some(owner) = owner_choices
                 .borrow()
@@ -314,8 +354,6 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
                 true,
                 "Checking availability...",
             );
-            status_row.set_title("Checking availability");
-            status_row.set_subtitle("");
             let (sender, receiver) = mpsc::channel();
             let github_access_for_check = github_access.clone();
             let request_for_check = request.clone();
@@ -331,18 +369,22 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
                 let snapshot = snapshot.clone();
                 let github_access = github_access.clone();
                 let dialog = dialog.clone();
-                let status_row = status_row.clone();
                 let publish_button = publish_button.clone();
                 let publish_spinner = publish_spinner.clone();
                 let publish_label = publish_label.clone();
+                let name_check_message = name_check_message.clone();
+                let name_check_label = name_check_label.clone();
 
                 move || match receiver.try_recv() {
                     Ok(Ok((true, request))) => {
-                        status_row.set_title("Name unavailable");
-                        status_row.set_subtitle(&format!(
-                            "Repository {}/{} already exists.",
-                            request.owner, request.name
-                        ));
+                        set_publish_name_check_message(
+                            &name_check_message,
+                            &name_check_label,
+                            Some(&format!(
+                                "Repository {}/{} already exists.",
+                                request.owner, request.name
+                            )),
+                        );
                         set_publish_button_loading(
                             &publish_button,
                             &publish_spinner,
@@ -363,8 +405,11 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
                         gtk::glib::ControlFlow::Break
                     }
                     Ok(Err(err)) => {
-                        status_row.set_title("Availability check failed");
-                        status_row.set_subtitle(&err);
+                        set_publish_name_check_message(
+                            &name_check_message,
+                            &name_check_label,
+                            Some(&err),
+                        );
                         set_publish_button_loading(
                             &publish_button,
                             &publish_spinner,
@@ -376,8 +421,11 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
                     }
                     Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
                     Err(TryRecvError::Disconnected) => {
-                        status_row.set_title("Availability check failed");
-                        status_row.set_subtitle("Check stopped unexpectedly.");
+                        set_publish_name_check_message(
+                            &name_check_message,
+                            &name_check_label,
+                            Some("Check stopped unexpectedly."),
+                        );
                         set_publish_button_loading(
                             &publish_button,
                             &publish_spinner,
@@ -487,6 +535,20 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
             }
         }
     });
+}
+
+fn set_publish_name_check_message(message: &gtk::Box, label: &gtk::Label, text: Option<&str>) {
+    let Some(text) = text else {
+        message.set_visible(false);
+        label.set_label("");
+        label.set_tooltip_text(None);
+        return;
+    };
+
+    message.set_visible(true);
+    label.set_visible(true);
+    label.set_label(text);
+    label.set_tooltip_text(Some(text));
 }
 
 fn load_publish_repository_options(
