@@ -475,8 +475,12 @@ fn image_item(element: &MarkdownElement, link_destination: Option<String>) -> Re
 }
 
 fn parse_image_dimension(value: &str) -> Option<i32> {
+    let value = value.trim();
+    if value.contains('%') {
+        return None;
+    }
+
     let numeric = value
-        .trim()
         .trim_end_matches("px")
         .chars()
         .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
