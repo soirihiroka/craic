@@ -16,6 +16,7 @@ use crate::spellcheck::SpellcheckIssue;
 use crate::ui::canvas_scroll;
 use crate::ui::components::search::SearchPanel;
 use adw::prelude::*;
+use canvas::TextWidthCache;
 use gtk::gdk;
 use selection::Selection;
 use std::any::Any;
@@ -25,7 +26,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
-use text_buffer::{TextBuffer, TextWidthCache, clamp_to_char_boundary, next_char_boundary};
+use text_buffer::{TextBuffer, clamp_to_char_boundary, next_char_boundary};
 
 pub(in crate::ui) use crate::language_support::language_hint_from_path;
 pub(in crate::ui) use diff_document::{

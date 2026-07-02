@@ -2,6 +2,7 @@ pub(super) mod binary_preview;
 mod canvas_overshoot;
 pub(super) mod code_editor;
 pub(super) mod diff_canvas;
+mod diff_layout;
 pub(super) mod diff_view;
 pub(super) mod folder_view;
 pub(super) mod pdf_preview;
