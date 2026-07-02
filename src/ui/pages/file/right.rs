@@ -30,6 +30,7 @@ pub(super) struct RightPane {
     pub(in crate::ui::pages::file) file_svg_preview: Rc<super::provider::svg::SvgPreview>,
     pub(in crate::ui::pages::file) file_markdown_preview:
         Rc<super::provider::markdown::MarkdownPreview>,
+    pub(in crate::ui::pages::file) file_markdown_status: gtk::Box,
     pub(in crate::ui::pages::file) file_media_preview: Rc<super::provider::media::MediaPreview>,
     pub(in crate::ui::pages::file) file_notebook_preview:
         Rc<super::provider::notebook::NotebookPreview>,
@@ -70,6 +71,24 @@ impl RightPane {
 
         let file_svg_preview = super::provider::svg::SvgPreview::new();
         let file_markdown_preview = super::provider::markdown::MarkdownPreview::new();
+        let markdown_status_label = gtk::Label::builder()
+            .label("No markdown preview.")
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .css_classes(["dim-label"])
+            .build();
+        let file_markdown_status = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .hexpand(true)
+            .vexpand(true)
+            .margin_top(24)
+            .margin_bottom(24)
+            .margin_start(24)
+            .margin_end(24)
+            .build();
+        file_markdown_status.append(&markdown_status_label);
         let file_media_preview = super::provider::media::MediaPreview::new();
         let file_notebook_preview = super::provider::notebook::NotebookPreview::new();
         let file_font_preview = binary_preview::BinaryPreviewWidgets::new("Font");
@@ -160,6 +179,7 @@ impl RightPane {
             file_view_split,
             file_svg_preview,
             file_markdown_preview,
+            file_markdown_status,
             file_media_preview,
             file_notebook_preview,
             file_font_preview,
