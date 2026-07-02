@@ -1,8 +1,8 @@
 use super::super::canvas_overshoot;
 use super::{
-    CELL_PADDING, DIFF_PREFIX_WIDTH, EditorDiffKind, EditorState, FoldControlKey, FoldIconState,
-    FoldRange, GutterSide, LayoutCache, MIN_CONTENT_WIDTH, ScrollbarMarkerKind, SearchMatch,
-    VisualLine,
+    canvas, CELL_PADDING, DIFF_PREFIX_WIDTH, EditorDiffKind, EditorState, FoldControlKey,
+    FoldIconState, FoldRange, GutterSide, LayoutCache, MIN_CONTENT_WIDTH, ScrollbarMarkerKind,
+    SearchMatch, VisualLine,
 };
 use crate::language_support::{HighlightRange, SyntaxIssue};
 use crate::ui::{canvas_scroll, canvas_scrollbar};
@@ -11,9 +11,7 @@ use gtk::cairo;
 use gtk::gdk::RGBA;
 use gtk::gdk::prelude::GdkCairoContextExt;
 use gtk::gdk_pixbuf::Pixbuf;
-use gtk::pango::{FontDescription, SCALE};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io::Cursor;
 use std::rc::Rc;
 use std::time::Duration;
@@ -24,24 +22,15 @@ const FOLD_ICON: &[u8] = include_bytes!("../../../assets/pan-down-symbolic.svg")
 const FOLD_ICON_COLLAPSED_ANGLE: f64 = -std::f64::consts::FRAC_PI_2;
 const FOLD_ICON_EXPANDED_ANGLE: f64 = 0.0;
 const FOLD_ICON_STATE_LIMIT: usize = 512;
-const EDITOR_FONT_FAMILIES: &str = "JetBrainsMono Nerd Font Mono, JetBrainsMono NFM, JetBrains Mono, monospace, Noto Sans Mono CJK SC, Noto Sans Mono CJK TC, Noto Sans Mono CJK JP, Noto Sans Mono CJK KR, Noto Color Emoji, Noto Emoji, emoji";
 const TEXT_WIDTH_CACHE_ENTRY_LIMIT: usize = 8192;
 const TEXT_WIDTH_CACHE_BYTE_LIMIT: usize = 1024 * 1024;
 const TEXT_WIDTH_CACHE_MAX_TEXT_BYTES: usize = 1024;
 
 thread_local! {
     static FOLD_ICON_BASE_PIXBUF: RefCell<Option<Pixbuf>> = RefCell::new(None);
-    static FONT_DESCRIPTION_CACHE: RefCell<HashMap<i32, FontDescription>> = RefCell::new(HashMap::new());
-    static FONT_METRIC_CACHE: RefCell<HashMap<i32, FontMetrics>> = RefCell::new(HashMap::new());
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct FontMetrics {
-    pub(super) char_width: f64,
-    pub(super) char_spacing: f64,
-    pub(super) line_height: f64,
-    pub(super) baseline_offset: f64,
-}
+pub(super) type FontMetrics = canvas::FontMetrics;
 
 #[derive(Clone, Copy)]
 pub(super) enum FoldAction {
@@ -571,68 +560,11 @@ pub(super) fn refresh_font_metrics(area: &gtk::DrawingArea, state: &Rc<EditorSta
 }
 
 pub(super) fn measure_font_metrics(area: &gtk::DrawingArea, font_size: f64) -> FontMetrics {
-    let font_size = font_size_key(font_size);
-    if let Some(metrics) = FONT_METRIC_CACHE.with(|cache| cache.borrow().get(&font_size).copied()) {
-        return metrics;
-    }
-
-    let font = font_description_for_size(font_size);
-    let char_width = measure_text_width(area, &font, "0");
-    let pair_width = measure_text_width(area, &font, "00");
-    let layout = text_layout(area, &font, "Hg日🙂");
-    let (_, height) = layout.size();
-    let natural_height = (height as f64 / SCALE as f64).ceil();
-    let line_height = natural_height
-        .max(super::line_height_for_font_size(font_size as f64))
-        .ceil();
-    let baseline_offset =
-        ((line_height - natural_height) / 2.0) + layout.baseline() as f64 / SCALE as f64;
-    let metrics = FontMetrics {
-        char_width,
-        char_spacing: pair_width - (char_width * 2.0),
-        line_height,
-        baseline_offset,
-    };
-    FONT_METRIC_CACHE.with(|cache| {
-        cache.borrow_mut().insert(font_size, metrics);
-    });
-    metrics
-}
-
-fn measure_text_width(area: &gtk::DrawingArea, font: &FontDescription, text: &str) -> f64 {
-    let layout = text_layout(area, font, text);
-    let (width, _) = layout.size();
-    width as f64 / SCALE as f64
-}
-
-fn text_layout(area: &gtk::DrawingArea, font: &FontDescription, text: &str) -> gtk::pango::Layout {
-    let layout = area.create_pango_layout(Some(text));
-    layout.set_font_description(Some(font));
-    layout.set_single_paragraph_mode(true);
-    layout
-}
-
-fn font_description(font_size: f64) -> FontDescription {
-    font_description_for_size(font_size_key(font_size))
-}
-
-fn font_description_for_size(font_size: i32) -> FontDescription {
-    FONT_DESCRIPTION_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(font) = cache.get(&font_size) {
-            return font.clone();
-        }
-
-        let mut font = FontDescription::new();
-        font.set_family(EDITOR_FONT_FAMILIES);
-        font.set_size(font_size * SCALE);
-        cache.insert(font_size, font.clone());
-        font
-    })
+    canvas::measure_font_metrics(area, font_size, super::line_height_for_font_size)
 }
 
 fn font_size_key(font_size: f64) -> i32 {
-    font_size.round() as i32
+    canvas::font_size_key(font_size)
 }
 
 fn ensure_layout(
@@ -2232,9 +2164,6 @@ fn wrap_width(state: &Rc<EditorState>, width: i32, gutter_width: f64) -> f64 {
     if !state.wrap.get() {
         return f64::MAX / 2.0;
     }
-    let width = state
-        .diff_layout
-        .wrap_viewport_width(width, state.diff_rows.borrow().is_some());
     (width as f64 - gutter_width - (CELL_PADDING * 2.0)).max(char_width(state))
 }
 
@@ -2304,8 +2233,7 @@ pub(super) fn text_width(area: &gtk::DrawingArea, state: &Rc<EditorState>, text:
         }
     }
 
-    let font = font_description_for_size(font_size);
-    let width = measure_text_width(area, &font, text);
+    let width = canvas::text_width_for_size(area, state.font_size.get(), text);
     if cacheable {
         cache_text_width(state, font_size, text, width);
     }
@@ -2381,11 +2309,30 @@ fn draw_plain_text(
         return;
     }
     let color = color.into();
-    context.set_source_rgba(color.red, color.green, color.blue, color.alpha);
-    let font = font_description(state.font_size.get());
-    let layout = text_layout(area, &font, text);
-    context.move_to(x, baseline - layout.baseline() as f64 / SCALE as f64);
-    pangocairo::functions::show_layout(context, &layout);
+    if color.alpha < 1.0 {
+        context.push_group();
+        canvas::draw_plain_text(
+            area,
+            context,
+            state.font_size.get(),
+            text,
+            x,
+            baseline,
+            canvas::TextColor::rgb(color.red, color.green, color.blue),
+        );
+        let _ = context.pop_group_to_source();
+        let _ = context.paint_with_alpha(color.alpha);
+    } else {
+        canvas::draw_plain_text(
+            area,
+            context,
+            state.font_size.get(),
+            text,
+            x,
+            baseline,
+            canvas::TextColor::rgb(color.red, color.green, color.blue),
+        );
+    }
 }
 
 fn fill_rect(

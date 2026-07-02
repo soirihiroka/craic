@@ -1,3 +1,4 @@
+pub(in crate::ui) mod canvas;
 mod diff_document;
 mod input;
 mod render;
@@ -25,7 +26,6 @@ use std::thread;
 use std::time::Duration;
 
 pub(in crate::ui) use crate::language_support::language_hint_from_path;
-use diff_document::DiffLayoutState;
 pub(in crate::ui) use diff_document::{
     DiffEditorDocument, DiffEditorRow, EditorDiffKind, ScrollbarMarker, ScrollbarMarkerKind,
 };
@@ -68,7 +68,6 @@ struct EditorState {
     folds: RefCell<Vec<FoldRange>>,
     fold_generation: Cell<u64>,
     diff_rows: RefCell<Option<Vec<DiffEditorRow>>>,
-    diff_layout: DiffLayoutState,
     scrollbar_markers: RefCell<Vec<ScrollbarMarker>>,
     scroll_x: Cell<f64>,
     scroll_y: Cell<f64>,
@@ -421,7 +420,6 @@ impl CodeEditor {
             folds: RefCell::new(Vec::new()),
             fold_generation: Cell::new(1),
             diff_rows: RefCell::new(None),
-            diff_layout: DiffLayoutState::default(),
             scrollbar_markers: RefCell::new(Vec::new()),
             scroll_x: Cell::new(0.0),
             scroll_y: Cell::new(0.0),
@@ -675,27 +673,6 @@ impl CodeEditor {
     pub(in crate::ui) fn set_scrollbar_markers(&self, markers: Vec<ScrollbarMarker>) {
         self.state.scrollbar_markers.replace(markers);
         self.area.queue_draw();
-    }
-
-    pub(in crate::ui) fn viewport_width(&self) -> i32 {
-        render::viewport_width(self.area.allocated_width())
-    }
-
-    pub(in crate::ui) fn connect_viewport_width_changed<F>(&self, callback: F)
-    where
-        F: Fn(i32) + 'static,
-    {
-        self.area.connect_resize(move |_, width, _| {
-            callback(render::viewport_width(width));
-        });
-    }
-
-    pub(in crate::ui) fn set_diff_peer_viewport_width(&self, width: Option<i32>) {
-        if !self.state.diff_layout.set_peer_viewport_width(width) {
-            return;
-        }
-        render::invalidate_layout(&self.state);
-        self.refresh();
     }
 
     pub(in crate::ui) fn connect_scroll_changed<F>(&self, callback: F)
