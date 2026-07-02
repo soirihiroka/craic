@@ -1430,10 +1430,9 @@ fn show_changed_file_context_menu(
 ) {
     let local_workspace = ctx.system_ref().provider_kind == ProviderKind::Local;
     let menu = changed_file_menu(file_path, local_workspace);
-    let action_event_time = Rc::new(Cell::new(event_time));
-    let actions = changed_file_action_group(ctx, action_event_time.clone(), local_workspace);
-    let popover = menu.popup(parent, x, y, &actions, active_context_menu);
-    context_menu::track_context_menu_event_time(&popover, action_event_time);
+    let _ = event_time;
+    let actions = changed_file_action_group(ctx, local_workspace);
+    menu.popup(parent, x, y, &actions, active_context_menu);
 }
 
 fn changed_file_menu(
@@ -1461,15 +1460,15 @@ fn changed_file_menu(
 
 fn changed_file_action_group(
     ctx: &PageContext,
-    event_time: Rc<Cell<u32>>,
     local_workspace: bool,
 ) -> gio::SimpleActionGroup {
     let actions = gio::SimpleActionGroup::new();
     let desktop_open_available = local_workspace && ctx.desktop_opener().is_some();
+    let parent_window = ctx.window().map(|window| window.upcast::<gtk::Window>());
 
     let open_default = context_menu::add_string_menu_action(&actions, "open-default", {
         let ctx = ctx.clone();
-        let event_time = event_time.clone();
+        let parent_window = parent_window.clone();
         move |file_path| {
             let Some(desktop_opener) = ctx.desktop_opener() else {
                 ctx.show_error("Open Failed", &ctx.desktop_opener_unavailable_message());
@@ -1479,7 +1478,7 @@ fn changed_file_action_group(
             match desktop_opener.open_path(
                 &path,
                 DesktopOpenTargetKind::File,
-                DesktopOpenActivation::from_event_time(event_time.get()),
+                DesktopOpenActivation::from_parent(parent_window.as_ref()),
             ) {
                 Ok(_) => ctx.refresh(Some("Opened file.".to_string())),
                 Err(err) => ctx.show_error("Open Failed", &err),
@@ -1504,7 +1503,7 @@ fn changed_file_action_group(
     open_code.set_enabled(local_workspace);
     let show_folder = context_menu::add_string_menu_action(&actions, "show-folder", {
         let ctx = ctx.clone();
-        let event_time = event_time.clone();
+        let parent_window = parent_window.clone();
         move |file_path| {
             let Some(desktop_opener) = ctx.desktop_opener() else {
                 ctx.show_error("Open Failed", &ctx.desktop_opener_unavailable_message());
@@ -1513,7 +1512,7 @@ fn changed_file_action_group(
             let path = ctx.workspace_node_path(file_path);
             match desktop_opener.reveal_path(
                 &path,
-                DesktopOpenActivation::from_event_time(event_time.get()),
+                DesktopOpenActivation::from_parent(parent_window.as_ref()),
             ) {
                 Ok(_) => ctx.refresh(Some("Opened file manager.".to_string())),
                 Err(err) => ctx.show_error("Open Failed", &err),
@@ -1661,16 +1660,18 @@ fn ignore_pattern(ctx: &PageContext, pattern: &str) {
 }
 
 fn open_repository_in_files(ctx: &PageContext, event_time: u32) {
+    let _ = event_time;
     let Some(desktop_opener) = ctx.desktop_opener() else {
         ctx.show_error("Open Failed", &ctx.desktop_opener_unavailable_message());
         return;
     };
     let path = ctx.workspace_root_node_path();
+    let parent_window = ctx.window().map(|window| window.upcast::<gtk::Window>());
 
     match desktop_opener.open_path(
         &path,
         DesktopOpenTargetKind::Folder,
-        DesktopOpenActivation::from_event_time(event_time),
+        DesktopOpenActivation::from_parent(parent_window.as_ref()),
     ) {
         Ok(_) => ctx.refresh(Some("Opened in Files.".to_string())),
         Err(err) => ctx.show_error("Open Failed", &err),
