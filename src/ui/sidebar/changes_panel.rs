@@ -101,6 +101,13 @@ impl ChangesPanel {
             .vexpand(true)
             .child(&initialize_button)
             .build();
+        let clean_status_page = adw::StatusPage::builder()
+            .icon_name("builder-check-symbolic")
+            .title("No local changes")
+            .description("Working tree is clean.")
+            .hexpand(true)
+            .vexpand(true)
+            .build();
 
         let files_content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -129,6 +136,7 @@ impl ChangesPanel {
         let root = gtk::Stack::builder().hexpand(true).vexpand(true).build();
         root.add_named(&content, Some("content"));
         root.add_named(&status_page, Some("status"));
+        root.add_named(&clean_status_page, Some("clean"));
         root.set_visible_child_name("content");
 
         let panel = Self {
@@ -158,6 +166,11 @@ impl ChangesPanel {
     }
 
     pub(in crate::ui) fn update(&self, snapshot: &RepositorySnapshot) {
+        if snapshot.changed_files.is_empty() {
+            self.show_clean_repository(snapshot);
+            return;
+        }
+
         self.root.set_visible_child_name("content");
         let signature = file_signature(snapshot);
         if *self.file_signature.borrow() != signature {
@@ -176,6 +189,23 @@ impl ChangesPanel {
         } else {
             self.latest_snapshot.replace(Some(snapshot.clone()));
         }
+        self.refresh_controls();
+    }
+
+    fn show_clean_repository(&self, snapshot: &RepositorySnapshot) {
+        let mut reconciler = self.file_reconciler.borrow_mut();
+        clear_changed_files(&self.files_list, &mut reconciler);
+        self.file_signature.borrow_mut().clear();
+        self.latest_snapshot.replace(Some(snapshot.clone()));
+        self.search_query.borrow_mut().clear();
+        self.checked_paths.borrow_mut().clear();
+        self.search_panel.set_query("", false);
+        self.root.set_visible_child_name("clean");
+        log::debug!(
+            "changes panel showing clean status workspace={} branch={}",
+            snapshot.name,
+            snapshot.branch
+        );
         self.refresh_controls();
     }
 
