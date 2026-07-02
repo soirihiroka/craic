@@ -9,9 +9,14 @@ A development environment made by me for me :D
 ## Features
 
 - Git integration with auto generated commit messages.
-- Docker integration
-- SSH Remote connection
+- Docker integration.
+- SSH Remote connection.
 - Vibe coding integration with Codex, AGY, OpenCode, and Ollama.
+- Document preview for Markdown, SVG, PDF, images, audio, and video.
+- Syntax highlighting, spellchecking, and Markdown linting.
+- Color-coding for workspaces and hosts.
+
+---
 
 ## Requirements
 
@@ -29,32 +34,6 @@ sudo apt install rustc cargo libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev 
 
 ---
 
-## Configuration
-
-Settings are stored in `~/.craic/config.toml`:
-
-* **`workspace_roots`**: Directories whose immediate children are workspaces. Entries may be strings for local paths or tables with `path` and optional `provider` such as `ssh:remote.host`.
-* **`workspaces`**: Explicit individual workspaces. Entries support the same optional `provider` field.
-* **`commit_message_provider`**: Agent to use for commit messages (`codex`, `agy`, `opencode`, `ollama`).
-* **`ollama.base_url`**: Endpoint for local Ollama server.
-* **`font_size`**: Editor, terminal, and diff view sizes:
-
-Example SSH workspace:
-```toml
-[[workspaces]]
-path = "~/workspaces/project"
-provider = "ssh:remote.host"
-```
-
-Example SSH workspace root:
-```toml
-[[workspace_roots]]
-path = "~/workspaces"
-provider = "ssh:remote.host"
-```
-
----
-
 ## Usage
 
 ### Run
@@ -67,3 +46,63 @@ Installs build artifacts, desktop launcher, and icons under `~/.local`:
 ```sh
 make install
 ```
+
+### Uninstall
+```sh
+make uninstall
+```
+
+---
+
+## Configuration
+
+Settings are stored in `~/.craic/config.toml`:
+
+```toml
+# AI Assist Providers
+commit_message_provider = "opencode"
+commit_message_model = "deepseek-coder"
+
+# Local Ollama URL (optional)
+ollama.base_url = "http://localhost:11434"
+
+# Custom Smart Feature Configurations
+[smart_feature.codex]
+provider = "opencode"
+model = "deepseek-coder"
+
+# Font Sizes
+[font_size]
+editor = 14.0
+shell = 13.0
+diff = 13.0
+
+# Explicit individual workspaces
+[[workspaces]]
+path = "~/workspaces/project-alpha"
+name = "Alpha Project"
+color = "purple"
+
+[[workspaces]]
+path = "~/workspaces/project-beta"
+provider = "ssh:remote-server"
+color = "blue-4"
+
+# Workspace root directories
+[[workspace_roots]]
+path = "~/Repos"
+provider = "local"
+
+# Custom background colors for SSH hosts
+[[hosts]]
+host = "remote-server"
+color = "orange-5"
+```
+
+---
+
+## License
+
+Craic is distributed under the terms of the GNU General Public License Version 3. See [LICENSE](LICENSE) for details.
+
+
