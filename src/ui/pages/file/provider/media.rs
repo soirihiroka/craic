@@ -32,8 +32,8 @@ struct MediaPreviewState {
     disk_signature: DiskSignature,
 }
 
-pub(in crate::ui::pages::code) struct MediaPreview {
-    pub(in crate::ui::pages::code) root: gtk::Box,
+pub(in crate::ui::pages::file) struct MediaPreview {
+    pub(in crate::ui::pages::file) root: gtk::Box,
     stack: gtk::Stack,
     picture: gtk::Picture,
     video: gtk::Video,
@@ -61,7 +61,7 @@ impl MediaPreviewLoad {
 }
 
 impl MediaPreview {
-    pub(in crate::ui::pages::code) fn new() -> Rc<Self> {
+    pub(in crate::ui::pages::file) fn new() -> Rc<Self> {
         let picture = gtk::Picture::builder()
             .hexpand(true)
             .vexpand(true)
@@ -175,7 +175,7 @@ impl MediaPreview {
         })
     }
 
-    pub(in crate::ui::pages::code) fn clear(&self) {
+    pub(in crate::ui::pages::file) fn clear(&self) {
         self.state.borrow_mut().take();
         if let Some(stream) = self.audio_stream.borrow().as_ref() {
             stream.pause();
@@ -262,27 +262,27 @@ impl MediaPreview {
     }
 }
 
-pub(in crate::ui::pages::code) fn show_image(request: PreviewRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_image(request: PreviewRequest<'_>) {
     show_media(request, MediaKind::Image);
 }
 
-pub(in crate::ui::pages::code) fn show_audio(request: PreviewRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_audio(request: PreviewRequest<'_>) {
     show_media(request, MediaKind::Audio);
 }
 
-pub(in crate::ui::pages::code) fn show_video(request: PreviewRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_video(request: PreviewRequest<'_>) {
     show_media(request, MediaKind::Video);
 }
 
-pub(in crate::ui::pages::code) fn show_image_match(request: PreviewMatchRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_image_match(request: PreviewMatchRequest<'_>) {
     show_image(preview_request_from_match(request));
 }
 
-pub(in crate::ui::pages::code) fn show_audio_match(request: PreviewMatchRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_audio_match(request: PreviewMatchRequest<'_>) {
     show_audio(preview_request_from_match(request));
 }
 
-pub(in crate::ui::pages::code) fn show_video_match(request: PreviewMatchRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_video_match(request: PreviewMatchRequest<'_>) {
     show_video(preview_request_from_match(request));
 }
 

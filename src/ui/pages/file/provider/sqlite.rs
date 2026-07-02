@@ -20,7 +20,7 @@ const SQLITE_PAGE_SIZE: usize = 100;
 const SQLITE_FILTER_DEBOUNCE_MS: u64 = 180;
 const SQLITE_POLL_MS: u64 = 30;
 
-pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
+pub(in crate::ui::pages::file) fn show(request: PreviewRequest<'_>) {
     if let Some(local_path) = request.local_path {
         request.right.show_sqlite_preview(request.file_path);
         request
@@ -63,11 +63,11 @@ pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
     );
 }
 
-pub(in crate::ui::pages::code) fn show_match(request: PreviewMatchRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_match(request: PreviewMatchRequest<'_>) {
     show(request.into_preview_request());
 }
 
-pub(in crate::ui::pages::code) fn has_sqlite_magic_bytes(bytes: &[u8]) -> bool {
+pub(in crate::ui::pages::file) fn has_sqlite_magic_bytes(bytes: &[u8]) -> bool {
     bytes.starts_with(SQLITE_MAGIC)
 }
 
@@ -79,8 +79,8 @@ fn local_has_sqlite_magic(path: &Path) -> bool {
 }
 
 #[derive(Clone)]
-pub(in crate::ui::pages::code) struct SqlitePreview {
-    pub(in crate::ui::pages::code) root: gtk::Box,
+pub(in crate::ui::pages::file) struct SqlitePreview {
+    pub(in crate::ui::pages::file) root: gtk::Box,
     table_filter_entry: gtk::Entry,
     table_list: gtk::ListBox,
     table_status_label: gtk::Label,
@@ -160,7 +160,7 @@ struct SqliteDisplayRow {
 }
 
 impl SqlitePreview {
-    pub(in crate::ui::pages::code) fn new() -> Rc<Self> {
+    pub(in crate::ui::pages::file) fn new() -> Rc<Self> {
         let table_filter_entry = gtk::Entry::builder()
             .placeholder_text("Search tables")
             .margin_top(8)
@@ -307,7 +307,7 @@ impl SqlitePreview {
         preview
     }
 
-    pub(in crate::ui::pages::code) fn clear(&self) {
+    pub(in crate::ui::pages::file) fn clear(&self) {
         self.cancel_filter_debounce();
         self.disconnect_sorter_signals();
         self.next_generation();
@@ -332,11 +332,11 @@ impl SqlitePreview {
         self.update_controls();
     }
 
-    pub(in crate::ui::pages::code) fn load_file(&self, file_path: &str, db_path: &Path) {
+    pub(in crate::ui::pages::file) fn load_file(&self, file_path: &str, db_path: &Path) {
         self.load_file_with_materialized(file_path, db_path, None);
     }
 
-    pub(in crate::ui::pages::code) fn load_file_with_materialized(
+    pub(in crate::ui::pages::file) fn load_file_with_materialized(
         &self,
         file_path: &str,
         db_path: &Path,

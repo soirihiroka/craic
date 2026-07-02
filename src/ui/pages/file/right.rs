@@ -10,7 +10,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::ui::pages::code) struct PreviewLoadToken(u64);
+pub(in crate::ui::pages::file) struct PreviewLoadToken(u64);
 
 pub(super) struct RightPane {
     pub(super) root: gtk::Box,
@@ -22,20 +22,20 @@ pub(super) struct RightPane {
     editor_loading: gtk::Box,
     pub(super) folder_view: folder_view::FolderView,
     pub(super) file_editor: code_editor::CodeEditor,
-    pub(in crate::ui::pages::code) file_editor_path: Rc<RefCell<Option<FileNodePath>>>,
-    pub(in crate::ui::pages::code) file_editor_disk_signature:
+    pub(in crate::ui::pages::file) file_editor_path: Rc<RefCell<Option<FileNodePath>>>,
+    pub(in crate::ui::pages::file) file_editor_disk_signature:
         Rc<RefCell<Option<provider::DiskSignature>>>,
-    pub(in crate::ui::pages::code) file_editor_writable: Rc<Cell<bool>>,
-    pub(in crate::ui::pages::code) file_view_split: gtk::Paned,
-    pub(in crate::ui::pages::code) file_svg_preview: Rc<super::provider::svg::SvgPreview>,
-    pub(in crate::ui::pages::code) file_markdown_preview:
+    pub(in crate::ui::pages::file) file_editor_writable: Rc<Cell<bool>>,
+    pub(in crate::ui::pages::file) file_view_split: gtk::Paned,
+    pub(in crate::ui::pages::file) file_svg_preview: Rc<super::provider::svg::SvgPreview>,
+    pub(in crate::ui::pages::file) file_markdown_preview:
         Rc<super::provider::markdown::MarkdownPreview>,
-    pub(in crate::ui::pages::code) file_media_preview: Rc<super::provider::media::MediaPreview>,
-    pub(in crate::ui::pages::code) file_notebook_preview:
+    pub(in crate::ui::pages::file) file_media_preview: Rc<super::provider::media::MediaPreview>,
+    pub(in crate::ui::pages::file) file_notebook_preview:
         Rc<super::provider::notebook::NotebookPreview>,
-    pub(in crate::ui::pages::code) file_font_preview: binary_preview::BinaryPreviewWidgets,
-    pub(in crate::ui::pages::code) file_pdf_preview: binary_preview::BinaryPreviewWidgets,
-    pub(in crate::ui::pages::code) file_sqlite_preview: Rc<super::provider::sqlite::SqlitePreview>,
+    pub(in crate::ui::pages::file) file_font_preview: binary_preview::BinaryPreviewWidgets,
+    pub(in crate::ui::pages::file) file_pdf_preview: binary_preview::BinaryPreviewWidgets,
+    pub(in crate::ui::pages::file) file_sqlite_preview: Rc<super::provider::sqlite::SqlitePreview>,
     status_label: gtk::Label,
 }
 
@@ -169,7 +169,7 @@ impl RightPane {
         }
     }
 
-    pub(in crate::ui::pages::code) fn begin_preview_load(
+    pub(in crate::ui::pages::file) fn begin_preview_load(
         &self,
         file_path: &str,
     ) -> PreviewLoadToken {
@@ -186,11 +186,11 @@ impl RightPane {
         PreviewLoadToken(generation)
     }
 
-    pub(in crate::ui::pages::code) fn is_current_load(&self, token: PreviewLoadToken) -> bool {
+    pub(in crate::ui::pages::file) fn is_current_load(&self, token: PreviewLoadToken) -> bool {
         self.preview_generation.get() == token.0
     }
 
-    pub(in crate::ui::pages::code) fn show_provider_loading(
+    pub(in crate::ui::pages::file) fn show_provider_loading(
         &self,
         file_path: &str,
         preview_kind: &str,
@@ -199,7 +199,7 @@ impl RightPane {
         self.show_provider_loading_message(file_path, &message);
     }
 
-    pub(in crate::ui::pages::code) fn show_provider_loading_message(
+    pub(in crate::ui::pages::file) fn show_provider_loading_message(
         &self,
         file_path: &str,
         message: &str,
@@ -215,7 +215,7 @@ impl RightPane {
         self.clear_auxiliary_previews();
     }
 
-    pub(in crate::ui::pages::code) fn show_editor_loading(
+    pub(in crate::ui::pages::file) fn show_editor_loading(
         &self,
         file_path: &str,
         preview_kind: &str,
@@ -274,7 +274,7 @@ impl RightPane {
         self.clear_auxiliary_previews();
     }
 
-    pub(in crate::ui::pages::code) fn show_editor(
+    pub(in crate::ui::pages::file) fn show_editor(
         &self,
         node_path: &FileNodePath,
         file_path: &str,
@@ -301,7 +301,7 @@ impl RightPane {
         self.clear_auxiliary_previews();
     }
 
-    pub(in crate::ui::pages::code) fn show_media_preview(&self, file_path: &str, _subtitle: &str) {
+    pub(in crate::ui::pages::file) fn show_media_preview(&self, file_path: &str, _subtitle: &str) {
         self.set_title(file_path, file_path);
         self.stack.set_visible_child_name("media");
         self.clear_file_state();
@@ -311,7 +311,7 @@ impl RightPane {
         self.file_sqlite_preview.clear();
     }
 
-    pub(in crate::ui::pages::code) fn show_font_preview(&self, file_path: &str) {
+    pub(in crate::ui::pages::file) fn show_font_preview(&self, file_path: &str) {
         self.set_title(file_path, file_path);
         self.stack.set_visible_child_name("font");
         self.clear_file_state();
@@ -321,7 +321,7 @@ impl RightPane {
         self.clear_auxiliary_previews();
     }
 
-    pub(in crate::ui::pages::code) fn show_sqlite_preview(&self, file_path: &str) {
+    pub(in crate::ui::pages::file) fn show_sqlite_preview(&self, file_path: &str) {
         self.set_title(file_path, file_path);
         self.stack.set_visible_child_name("sqlite");
         self.clear_file_state();
@@ -331,7 +331,7 @@ impl RightPane {
         self.clear_auxiliary_previews();
     }
 
-    pub(in crate::ui::pages::code) fn show_notebook_preview(&self, file_path: &str) {
+    pub(in crate::ui::pages::file) fn show_notebook_preview(&self, file_path: &str) {
         self.set_title(file_path, file_path);
         self.stack.set_visible_child_name("notebook");
         self.clear_file_state();
@@ -341,7 +341,7 @@ impl RightPane {
         self.clear_auxiliary_previews();
     }
 
-    pub(in crate::ui::pages::code) fn show_pdf_preview(&self, file_path: &str) {
+    pub(in crate::ui::pages::file) fn show_pdf_preview(&self, file_path: &str) {
         self.set_title(file_path, file_path);
         self.stack.set_visible_child_name("pdf");
         self.clear_file_state();
@@ -401,7 +401,7 @@ fn loading_screen(message: &str) -> gtk::Box {
     loading_screen_with_label(&label)
 }
 
-pub(in crate::ui::pages::code) fn loading_screen_with_label(label: &gtk::Label) -> gtk::Box {
+pub(in crate::ui::pages::file) fn loading_screen_with_label(label: &gtk::Label) -> gtk::Box {
     let spinner = adw::Spinner::builder()
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)

@@ -24,11 +24,11 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 const MAX_EDITOR_FILE_BYTES: u64 = 1024 * 1024;
-const CODE_FILE_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(75);
-const CODE_FILE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(120);
+const FILE_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(75);
+const FILE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(120);
 const LIVE_PREVIEW_REFRESH_DEBOUNCE: Duration = Duration::from_millis(60);
 
-pub(super) struct CodePage {
+pub(super) struct FilePage {
     ctx: PageContext,
     left: left::LeftPane,
     right: Rc<right::RightPane>,
@@ -177,7 +177,7 @@ impl OpenedFileMonitor {
         let right = Rc::clone(right);
         let pending_save = pending_save.clone();
         let watched_path = node_path.clone();
-        let source_id = glib::timeout_add_local(CODE_FILE_EVENT_POLL_INTERVAL, move || {
+        let source_id = glib::timeout_add_local(FILE_EVENT_POLL_INTERVAL, move || {
             if monitor_state.generation.get() != generation {
                 return glib::ControlFlow::Break;
             }
@@ -259,7 +259,7 @@ impl OpenedFileMonitor {
         let ctx = ctx.clone();
         let right = Rc::clone(right);
         let pending_save = pending_save.clone();
-        let source_id = glib::timeout_add_local(CODE_FILE_REFRESH_DEBOUNCE, move || {
+        let source_id = glib::timeout_add_local(FILE_REFRESH_DEBOUNCE, move || {
             monitor_state.debounce_source.borrow_mut().take();
             monitor_state.reload_if_changed(&ctx, &right, &pending_save, generation);
             glib::ControlFlow::Break
@@ -315,7 +315,7 @@ impl OpenedFileMonitor {
     }
 }
 
-impl CodePage {
+impl FilePage {
     pub(super) fn new(ctx: PageContext) -> Self {
         let left = left::LeftPane::new(ctx.files(), ctx.git());
         if let Some(file_browser) = &left.file_browser {
@@ -574,7 +574,7 @@ fn skip_next_active_selection_once(skip_next_active_selection: &Rc<Cell<bool>>) 
     });
 }
 
-impl Page for CodePage {
+impl Page for FilePage {
     fn label(&self) -> &'static str {
         "Files"
     }
@@ -1192,7 +1192,7 @@ fn disk_signature_for_path(
     Ok(Some(provider::disk_signature(&info)))
 }
 
-pub(in crate::ui::pages::code) fn folder_entry_counts(
+pub(in crate::ui::pages::file) fn folder_entry_counts(
     files: &dyn FileAccess,
     path: &FileNodePath,
 ) -> Result<(usize, usize), String> {
@@ -1216,7 +1216,7 @@ pub(in crate::ui::pages::code) fn folder_entry_counts(
     Ok((file_count, folder_count))
 }
 
-pub(in crate::ui::pages::code) fn read_repository_file(
+pub(in crate::ui::pages::file) fn read_repository_file(
     files: &dyn FileAccess,
     path: &FileNodePath,
 ) -> Result<String, String> {
@@ -1225,7 +1225,7 @@ pub(in crate::ui::pages::code) fn read_repository_file(
         .into_text()
 }
 
-pub(in crate::ui::pages::code) fn read_repository_file_bytes(
+pub(in crate::ui::pages::file) fn read_repository_file_bytes(
     files: &dyn FileAccess,
     path: &FileNodePath,
 ) -> Result<Vec<u8>, String> {
@@ -1234,7 +1234,7 @@ pub(in crate::ui::pages::code) fn read_repository_file_bytes(
         .into_bytes()
 }
 
-pub(in crate::ui::pages::code) fn read_repository_file_from_prefetch(
+pub(in crate::ui::pages::file) fn read_repository_file_from_prefetch(
     prefetched_bytes: Option<Vec<u8>>,
     files: &dyn FileAccess,
     path: &FileNodePath,
@@ -1245,7 +1245,7 @@ pub(in crate::ui::pages::code) fn read_repository_file_from_prefetch(
     }
 }
 
-pub(in crate::ui::pages::code) fn read_repository_file_bytes_from_prefetch(
+pub(in crate::ui::pages::file) fn read_repository_file_bytes_from_prefetch(
     prefetched_bytes: Option<Vec<u8>>,
     files: &dyn FileAccess,
     path: &FileNodePath,

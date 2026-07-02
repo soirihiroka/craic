@@ -89,6 +89,7 @@ impl DiffView {
         let syncing = Rc::new(Cell::new(false));
 
         connect_shared_scroll(&left_editor, &right_editor, &syncing);
+        connect_diff_viewport_widths(&left_editor, &right_editor);
         connect_diff_folds(&left_editor, &right_editor, &full_rows, &folds, &language);
 
         Self {
@@ -226,6 +227,35 @@ fn connect_shared_scroll(
     });
 }
 
+fn connect_diff_viewport_widths(
+    left_editor: &code_editor::CodeEditor,
+    right_editor: &code_editor::CodeEditor,
+) {
+    left_editor.connect_viewport_width_changed({
+        let right_editor = right_editor.clone();
+        move |width| {
+            right_editor.set_diff_peer_viewport_width((width > 1).then_some(width));
+        }
+    });
+    right_editor.connect_viewport_width_changed({
+        let left_editor = left_editor.clone();
+        move |width| {
+            left_editor.set_diff_peer_viewport_width((width > 1).then_some(width));
+        }
+    });
+    sync_diff_viewport_widths(left_editor, right_editor);
+}
+
+fn sync_diff_viewport_widths(
+    left_editor: &code_editor::CodeEditor,
+    right_editor: &code_editor::CodeEditor,
+) {
+    let left_width = left_editor.viewport_width();
+    let right_width = right_editor.viewport_width();
+    left_editor.set_diff_peer_viewport_width((right_width > 1).then_some(right_width));
+    right_editor.set_diff_peer_viewport_width((left_width > 1).then_some(left_width));
+}
+
 fn connect_diff_folds(
     left_editor: &code_editor::CodeEditor,
     right_editor: &code_editor::CodeEditor,
@@ -322,6 +352,7 @@ fn refresh_editors(
     let (left_document, right_document) = editor_documents(&full_rows, &display_rows, &language);
     let markers = scrollbar_markers(&display_rows);
 
+    sync_diff_viewport_widths(left_editor, right_editor);
     left_editor.set_diff_document(left_document);
     right_editor.set_diff_document(right_document);
     left_editor.set_scrollbar_markers(Vec::new());
@@ -370,7 +401,7 @@ fn editor_documents(
             kind: editor_kind(row.left_number, row.left_text.as_ref(), row.left_kind),
             fold_index: fold_index(row),
             fold_expanded: fold_expanded(row),
-            show_fold_control: false,
+            show_fold_control: is_fold_row(row),
         });
         right_rows.push(code_editor::DiffEditorRow {
             number: row.right_number.filter(|_| !is_fold_row(row)),

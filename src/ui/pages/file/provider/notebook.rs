@@ -517,8 +517,8 @@ const NOTEBOOK_INJECTED_CSS: &str = r#"
 })();
 "#;
 
-pub(in crate::ui::pages::code) struct NotebookPreview {
-    pub(in crate::ui::pages::code) root: gtk::Stack,
+pub(in crate::ui::pages::file) struct NotebookPreview {
+    pub(in crate::ui::pages::file) root: gtk::Stack,
     web_view: webkit6::WebView,
     readonly_list: gtk::Box,
     server: RefCell<Option<NotebookServer>>,
@@ -547,7 +547,7 @@ impl Drop for NotebookServer {
 }
 
 impl NotebookPreview {
-    pub(in crate::ui::pages::code) fn new() -> Rc<Self> {
+    pub(in crate::ui::pages::file) fn new() -> Rc<Self> {
         let user_content_manager = webkit6::UserContentManager::new();
         user_content_manager.add_script(&webkit6::UserScript::new(
             NOTEBOOK_INJECTED_CSS,
@@ -600,7 +600,7 @@ impl NotebookPreview {
         })
     }
 
-    pub(in crate::ui::pages::code) fn clear(&self) {
+    pub(in crate::ui::pages::file) fn clear(&self) {
         self.clear_readonly_cells();
     }
 
@@ -864,11 +864,11 @@ fn code_height_guess(source: &str) -> i32 {
     (lines * 22 + 28).clamp(96, 900)
 }
 
-pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
+pub(in crate::ui::pages::file) fn show(request: PreviewRequest<'_>) {
     show_notebook(request);
 }
 
-pub(in crate::ui::pages::code) fn show_match(request: PreviewMatchRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_match(request: PreviewMatchRequest<'_>) {
     show_notebook(request.into_preview_request());
 }
 

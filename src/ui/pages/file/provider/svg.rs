@@ -19,8 +19,8 @@ struct SvgPreviewLoad {
     spellcheck_issues: Vec<crate::spellcheck::SpellcheckIssue>,
 }
 
-pub(in crate::ui::pages::code) struct SvgPreview {
-    pub(in crate::ui::pages::code) root: gtk::Box,
+pub(in crate::ui::pages::file) struct SvgPreview {
+    pub(in crate::ui::pages::file) root: gtk::Box,
     scroller: gtk::ScrolledWindow,
     picture: gtk::Picture,
     empty: gtk::Label,
@@ -33,7 +33,7 @@ pub(in crate::ui::pages::code) struct SvgPreview {
 }
 
 impl SvgPreview {
-    pub(in crate::ui::pages::code) fn new() -> Rc<Self> {
+    pub(in crate::ui::pages::file) fn new() -> Rc<Self> {
         let checkerboard = gtk::DrawingArea::builder()
             .hexpand(true)
             .vexpand(true)
@@ -188,7 +188,7 @@ impl SvgPreview {
         preview
     }
 
-    pub(in crate::ui::pages::code) fn set_svg(
+    pub(in crate::ui::pages::file) fn set_svg(
         &self,
         bytes: &[u8],
         signature: super::ContentSignature,
@@ -333,11 +333,11 @@ impl SvgPreview {
     }
 }
 
-pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
+pub(in crate::ui::pages::file) fn show(request: PreviewRequest<'_>) {
     show_svg(request, None);
 }
 
-pub(in crate::ui::pages::code) fn show_match(request: PreviewMatchRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_match(request: PreviewMatchRequest<'_>) {
     let selection = Some((request.start, request.end));
     show_svg(request.into_preview_request(), selection);
 }

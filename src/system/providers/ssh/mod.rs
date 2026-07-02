@@ -264,9 +264,15 @@ impl SystemProvider for SshProvider {
             workspace.display_name,
             workspace.root.absolute
         );
+        let files: Arc<dyn FileAccess> = Arc::new(SshFileAccess::new(
+            self.system.clone(),
+            workspace.clone(),
+            self.runner(),
+        ));
         Some(Arc::new(SshGitAccess::new(
             workspace.clone(),
             self.runner(),
+            files,
         )))
     }
 

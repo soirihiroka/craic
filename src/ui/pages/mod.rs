@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 mod agent;
 mod changes;
-mod code;
 mod containers;
+mod file;
 mod history;
 
 pub(crate) trait Page {
@@ -295,7 +295,7 @@ pub(crate) fn build_pages(ctx: PageContext) -> Vec<PageRef> {
     vec![
         Rc::new(changes::ChangesPage::new(ctx.clone())),
         Rc::new(history::HistoryPage::new(ctx.clone())),
-        Rc::new(code::CodePage::new(ctx.clone())),
+        Rc::new(file::FilePage::new(ctx.clone())),
         Rc::new(containers::ContainersPage::new(ctx.clone())),
         Rc::new(agent::AgentPage::new(ctx)),
     ]

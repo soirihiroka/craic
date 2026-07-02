@@ -6,7 +6,7 @@ struct FolderPreviewLoad {
     folder_count: usize,
 }
 
-pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
+pub(in crate::ui::pages::file) fn show(request: PreviewRequest<'_>) {
     request
         .right
         .show_provider_loading_message(request.file_path, "Loading folder contents...");
@@ -43,6 +43,6 @@ pub(in crate::ui::pages::code) fn show(request: PreviewRequest<'_>) {
     );
 }
 
-pub(in crate::ui::pages::code) fn show_match(request: PreviewMatchRequest<'_>) {
+pub(in crate::ui::pages::file) fn show_match(request: PreviewMatchRequest<'_>) {
     show(request.into_preview_request());
 }

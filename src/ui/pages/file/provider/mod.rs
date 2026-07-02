@@ -1,12 +1,12 @@
 mod folder;
 mod font;
-pub(in crate::ui::pages::code) mod markdown;
-pub(in crate::ui::pages::code) mod media;
-pub(in crate::ui::pages::code) mod notebook;
+pub(in crate::ui::pages::file) mod markdown;
+pub(in crate::ui::pages::file) mod media;
+pub(in crate::ui::pages::file) mod notebook;
 mod notebook_readonly;
 mod pdf;
-pub(in crate::ui::pages::code) mod sqlite;
-pub(in crate::ui::pages::code) mod svg;
+pub(in crate::ui::pages::file) mod sqlite;
+pub(in crate::ui::pages::file) mod svg;
 mod text;
 
 use super::{PageContext, right};
@@ -25,42 +25,42 @@ use std::time::SystemTime;
 
 const PREVIEW_POLL_MS: u64 = 30;
 
-pub(in crate::ui::pages::code) type PreviewFn = for<'a> fn(PreviewRequest<'a>);
-pub(in crate::ui::pages::code) type MatchPreviewFn = for<'a> fn(PreviewMatchRequest<'a>);
+pub(in crate::ui::pages::file) type PreviewFn = for<'a> fn(PreviewRequest<'a>);
+pub(in crate::ui::pages::file) type MatchPreviewFn = for<'a> fn(PreviewMatchRequest<'a>);
 
-pub(in crate::ui::pages::code) struct Provider {
-    pub(in crate::ui::pages::code) show: PreviewFn,
-    pub(in crate::ui::pages::code) show_match: MatchPreviewFn,
+pub(in crate::ui::pages::file) struct Provider {
+    pub(in crate::ui::pages::file) show: PreviewFn,
+    pub(in crate::ui::pages::file) show_match: MatchPreviewFn,
 }
 
-pub(in crate::ui::pages::code) struct PreviewRequest<'a> {
-    pub(in crate::ui::pages::code) ctx: PageContext,
-    pub(in crate::ui::pages::code) right: Rc<right::RightPane>,
-    pub(in crate::ui::pages::code) load_token: right::PreviewLoadToken,
-    pub(in crate::ui::pages::code) files: Arc<dyn FileAccess>,
-    pub(in crate::ui::pages::code) file_path: &'a str,
-    pub(in crate::ui::pages::code) node_path: &'a FileNodePath,
-    pub(in crate::ui::pages::code) local_path: Option<&'a Path>,
-    pub(in crate::ui::pages::code) info: &'a FileNodeInfo,
-    pub(in crate::ui::pages::code) prefetched_bytes: Option<&'a [u8]>,
+pub(in crate::ui::pages::file) struct PreviewRequest<'a> {
+    pub(in crate::ui::pages::file) ctx: PageContext,
+    pub(in crate::ui::pages::file) right: Rc<right::RightPane>,
+    pub(in crate::ui::pages::file) load_token: right::PreviewLoadToken,
+    pub(in crate::ui::pages::file) files: Arc<dyn FileAccess>,
+    pub(in crate::ui::pages::file) file_path: &'a str,
+    pub(in crate::ui::pages::file) node_path: &'a FileNodePath,
+    pub(in crate::ui::pages::file) local_path: Option<&'a Path>,
+    pub(in crate::ui::pages::file) info: &'a FileNodeInfo,
+    pub(in crate::ui::pages::file) prefetched_bytes: Option<&'a [u8]>,
 }
 
-pub(in crate::ui::pages::code) struct PreviewMatchRequest<'a> {
-    pub(in crate::ui::pages::code) ctx: PageContext,
-    pub(in crate::ui::pages::code) right: Rc<right::RightPane>,
-    pub(in crate::ui::pages::code) load_token: right::PreviewLoadToken,
-    pub(in crate::ui::pages::code) files: Arc<dyn FileAccess>,
-    pub(in crate::ui::pages::code) file_path: &'a str,
-    pub(in crate::ui::pages::code) node_path: &'a FileNodePath,
-    pub(in crate::ui::pages::code) local_path: Option<&'a Path>,
-    pub(in crate::ui::pages::code) info: &'a FileNodeInfo,
-    pub(in crate::ui::pages::code) prefetched_bytes: Option<&'a [u8]>,
-    pub(in crate::ui::pages::code) start: usize,
-    pub(in crate::ui::pages::code) end: usize,
+pub(in crate::ui::pages::file) struct PreviewMatchRequest<'a> {
+    pub(in crate::ui::pages::file) ctx: PageContext,
+    pub(in crate::ui::pages::file) right: Rc<right::RightPane>,
+    pub(in crate::ui::pages::file) load_token: right::PreviewLoadToken,
+    pub(in crate::ui::pages::file) files: Arc<dyn FileAccess>,
+    pub(in crate::ui::pages::file) file_path: &'a str,
+    pub(in crate::ui::pages::file) node_path: &'a FileNodePath,
+    pub(in crate::ui::pages::file) local_path: Option<&'a Path>,
+    pub(in crate::ui::pages::file) info: &'a FileNodeInfo,
+    pub(in crate::ui::pages::file) prefetched_bytes: Option<&'a [u8]>,
+    pub(in crate::ui::pages::file) start: usize,
+    pub(in crate::ui::pages::file) end: usize,
 }
 
 impl<'a> PreviewMatchRequest<'a> {
-    pub(in crate::ui::pages::code) fn into_preview_request(self) -> PreviewRequest<'a> {
+    pub(in crate::ui::pages::file) fn into_preview_request(self) -> PreviewRequest<'a> {
         PreviewRequest {
             ctx: self.ctx,
             right: self.right,
@@ -75,7 +75,7 @@ impl<'a> PreviewMatchRequest<'a> {
     }
 }
 
-pub(in crate::ui::pages::code) fn for_file(
+pub(in crate::ui::pages::file) fn for_file(
     file_path: &str,
     info: &FileNodeInfo,
     prefetched_bytes: Option<&[u8]>,
@@ -145,7 +145,7 @@ pub(in crate::ui::pages::code) fn for_file(
     }
 }
 
-pub(in crate::ui::pages::code) fn spawn_preview_load<T, Work, Apply>(
+pub(in crate::ui::pages::file) fn spawn_preview_load<T, Work, Apply>(
     right: Rc<right::RightPane>,
     load_token: right::PreviewLoadToken,
     file_path: String,
@@ -200,18 +200,18 @@ fn receive_preview_load<T, Apply>(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::ui::pages::code) struct ContentSignature {
+pub(in crate::ui::pages::file) struct ContentSignature {
     len: usize,
     hash: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::ui::pages::code) struct DiskSignature {
+pub(in crate::ui::pages::file) struct DiskSignature {
     len: u64,
     modified: Option<SystemTime>,
 }
 
-pub(in crate::ui::pages::code) fn content_signature(bytes: &[u8]) -> ContentSignature {
+pub(in crate::ui::pages::file) fn content_signature(bytes: &[u8]) -> ContentSignature {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     ContentSignature {
@@ -220,7 +220,7 @@ pub(in crate::ui::pages::code) fn content_signature(bytes: &[u8]) -> ContentSign
     }
 }
 
-pub(in crate::ui::pages::code) fn disk_signature(info: &FileNodeInfo) -> DiskSignature {
+pub(in crate::ui::pages::file) fn disk_signature(info: &FileNodeInfo) -> DiskSignature {
     DiskSignature {
         len: info.len_or_zero(),
         modified: info.modified,
