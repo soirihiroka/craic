@@ -1131,12 +1131,13 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
     let terminal_available = browser.terminal_actions_available.get() && target.capabilities.native;
     let container_actions_available =
         browser.container_actions_available.get() && target.capabilities.native;
-    menu::repository_row_menu(
-        &target,
-        terminal_available,
-        container_actions_available,
-    )
-    .popup(parent, x, y, &actions, &browser.active_context_menu);
+    menu::repository_row_menu(&target, terminal_available, container_actions_available).popup(
+        parent,
+        x,
+        y,
+        &actions,
+        &browser.active_context_menu,
+    );
 }
 
 fn add_menu_action<F>(group: &gio::SimpleActionGroup, name: &str, activate: F) -> gio::SimpleAction
