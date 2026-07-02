@@ -6,7 +6,7 @@ pub(super) mod folder_view;
 pub(super) mod pdf_preview;
 
 use super::{file_type, widgets};
-use crate::git::RepositorySnapshot;
+use crate::git::{self, QuickActionConfig, RepositorySnapshot};
 use crate::github::PullRequestInfo;
 use crate::quick_action::{self, RunItem, RunTargetsSignature};
 use crate::system::WorkspacePath;
@@ -54,6 +54,9 @@ pub struct ContentPane {
     quick_action_add_button: gtk::Button,
     quick_actions: Rc<RefCell<Vec<Rc<QuickActionButton>>>>,
     quick_action_next_id: Rc<Cell<u64>>,
+    quick_action_config_repo: Rc<RefCell<Option<PathBuf>>>,
+    quick_action_runner: Rc<RefCell<Option<Rc<dyn Fn(RunItem)>>>>,
+    quick_action_state_changed: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     run_targets: Rc<RefCell<Vec<RunItem>>>,
     run_targets_signature: RefCell<Option<RunTargetsSignature>>,
     terminal: terminal::TerminalPanel,
@@ -127,6 +130,9 @@ pub fn build(_menu: &gio::Menu, snapshot: Option<&RepositorySnapshot>) -> Conten
     let run_targets = Rc::new(RefCell::new(Vec::new()));
     let quick_actions = Rc::new(RefCell::new(Vec::new()));
     let quick_action_next_id = Rc::new(Cell::new(1));
+    let quick_action_config_repo = Rc::new(RefCell::new(None));
+    let quick_action_runner = Rc::new(RefCell::new(None));
+    let quick_action_state_changed = Rc::new(RefCell::new(None));
     let quick_action_add_button = gtk::Button::builder()
         .icon_name("list-add-symbolic")
         .tooltip_text("Add quick action")
@@ -143,6 +149,9 @@ pub fn build(_menu: &gio::Menu, snapshot: Option<&RepositorySnapshot>) -> Conten
         &quick_actions,
         &run_targets,
         &quick_action_next_id,
+        &quick_action_runner,
+        &quick_action_state_changed,
+        None,
     );
 
     let terminal_toggle_button = gtk::ToggleButton::builder()
@@ -187,6 +196,9 @@ pub fn build(_menu: &gio::Menu, snapshot: Option<&RepositorySnapshot>) -> Conten
         quick_action_add_button,
         quick_actions,
         quick_action_next_id,
+        quick_action_config_repo,
+        quick_action_runner,
+        quick_action_state_changed,
         run_targets,
         run_targets_signature: RefCell::new(None),
         terminal,
@@ -288,6 +300,8 @@ impl ContentPane {
     }
 
     pub fn refresh_run_targets(&self, repo_path: &Path) {
+        self.load_quick_action_config(repo_path);
+
         let signature = quick_action::targets_signature(repo_path);
         let previous_signature = self.run_targets_signature.borrow().clone();
         if previous_signature.as_ref() == Some(&signature) {
@@ -315,6 +329,7 @@ impl ContentPane {
     }
 
     pub fn clear_run_targets(&self) {
+        self.quick_action_config_repo.borrow_mut().take();
         if self.run_targets.borrow().is_empty() && self.run_targets_signature.borrow().is_none() {
             return;
         }
@@ -324,6 +339,50 @@ impl ContentPane {
         for quick_action in self.quick_actions.borrow().iter() {
             quick_action.refresh();
         }
+    }
+
+    fn load_quick_action_config(&self, repo_path: &Path) {
+        if self
+            .quick_action_config_repo
+            .borrow()
+            .as_deref()
+            .is_some_and(|path| path == repo_path)
+        {
+            return;
+        }
+
+        let configs = git::quick_action_config(repo_path).unwrap_or_else(|| {
+            vec![QuickActionConfig {
+                selected_target_id: None,
+            }]
+        });
+        log::debug!(
+            "loaded quick action config repo={} actions={}",
+            repo_path.display(),
+            configs.len()
+        );
+
+        {
+            let mut quick_actions = self.quick_actions.borrow_mut();
+            for quick_action in quick_actions.iter() {
+                self.quick_actions_box.remove(&quick_action.button);
+            }
+            quick_actions.clear();
+        }
+        self.quick_action_next_id.set(1);
+
+        for config in configs {
+            append_quick_action_button(
+                &self.quick_actions_box,
+                &self.quick_actions,
+                &self.run_targets,
+                &self.quick_action_next_id,
+                &self.quick_action_runner,
+                &self.quick_action_state_changed,
+                config.selected_target_id,
+            );
+        }
+        *self.quick_action_config_repo.borrow_mut() = Some(repo_path.to_path_buf());
     }
 
     pub fn connect_repository_actions<C: RepositoryActionContext + 'static>(&self, context: C) {
@@ -414,43 +473,52 @@ impl ContentPane {
             }
         });
 
-        for quick_action in self.quick_actions.borrow().iter() {
-            install_quick_action_run_handler(
-                quick_action,
-                context.clone(),
-                self.terminal.clone(),
-                self.terminal_toggle_button.clone(),
-                suppress_terminal_auto_open.clone(),
-            );
-        }
-
-        self.quick_action_add_button.connect_clicked({
+        *self.quick_action_runner.borrow_mut() = Some(Rc::new({
             let context = context.clone();
             let terminal = self.terminal.clone();
             let terminal_toggle_button = self.terminal_toggle_button.clone();
             let suppress_terminal_auto_open = suppress_terminal_auto_open.clone();
+
+            move |target| {
+                run_target(
+                    &context,
+                    &target,
+                    &terminal,
+                    &terminal_toggle_button,
+                    &suppress_terminal_auto_open,
+                );
+            }
+        }));
+        *self.quick_action_state_changed.borrow_mut() = Some(Rc::new({
+            let quick_actions = self.quick_actions.clone();
+            let context = context.clone();
+
+            move || save_quick_action_state(&context, &quick_actions)
+        }));
+
+        self.quick_action_add_button.connect_clicked({
+            let context = context.clone();
             let quick_actions_box = self.quick_actions_box.downgrade();
             let quick_actions = self.quick_actions.clone();
             let run_targets = self.run_targets.clone();
             let quick_action_next_id = self.quick_action_next_id.clone();
+            let quick_action_runner = self.quick_action_runner.clone();
+            let quick_action_state_changed = self.quick_action_state_changed.clone();
 
             move |_| {
                 let Some(quick_actions_box) = quick_actions_box.upgrade() else {
                     return;
                 };
-                let quick_action = append_quick_action_button(
+                append_quick_action_button(
                     &quick_actions_box,
                     &quick_actions,
                     &run_targets,
                     &quick_action_next_id,
+                    &quick_action_runner,
+                    &quick_action_state_changed,
+                    None,
                 );
-                install_quick_action_run_handler(
-                    &quick_action,
-                    context.clone(),
-                    terminal.clone(),
-                    terminal_toggle_button.clone(),
-                    suppress_terminal_auto_open.clone(),
-                );
+                save_quick_action_state(&context, &quick_actions);
             }
         });
     }
@@ -867,6 +935,9 @@ struct QuickActionButton {
     delete_button: gtk::Button,
     targets: Rc<RefCell<Vec<RunItem>>>,
     selected_target: Rc<RefCell<Option<RunItem>>>,
+    saved_selected_target_id: Rc<RefCell<Option<String>>>,
+    runner: Rc<RefCell<Option<Rc<dyn Fn(RunItem)>>>>,
+    state_changed: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     target_reconciler: Rc<RefCell<QuickActionTargetReconciler>>,
 }
 
@@ -913,7 +984,13 @@ fn install_quick_action_css() {
 }
 
 impl QuickActionButton {
-    fn new(id: u64, targets: Rc<RefCell<Vec<RunItem>>>) -> Rc<Self> {
+    fn new(
+        id: u64,
+        targets: Rc<RefCell<Vec<RunItem>>>,
+        runner: Rc<RefCell<Option<Rc<dyn Fn(RunItem)>>>>,
+        state_changed: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+        saved_selected_target_id: Option<String>,
+    ) -> Rc<Self> {
         install_quick_action_css();
 
         let search_entry = gtk::SearchEntry::builder()
@@ -1010,12 +1087,16 @@ impl QuickActionButton {
             delete_button,
             targets,
             selected_target: Rc::new(RefCell::new(None)),
+            saved_selected_target_id: Rc::new(RefCell::new(saved_selected_target_id)),
+            runner,
+            state_changed,
             target_reconciler: Rc::new(RefCell::new(QuickActionTargetReconciler::new())),
         });
         quick_action.refresh();
         quick_action.connect_search();
         quick_action.connect_target_activation();
         quick_action.connect_popover();
+        quick_action.connect_run();
         quick_action
     }
 
@@ -1024,7 +1105,8 @@ impl QuickActionButton {
             .selected_target
             .borrow()
             .as_ref()
-            .map(|target| target.id.clone());
+            .map(|target| target.id.clone())
+            .or_else(|| self.saved_selected_target_id.borrow().clone());
         let targets = self.targets.borrow();
         let selected = selected_id
             .and_then(|id| targets.iter().find(|target| target.id == id).cloned())
@@ -1037,6 +1119,7 @@ impl QuickActionButton {
                 &self.run_icon,
                 &self.label,
                 &self.selected_target,
+                &self.saved_selected_target_id,
                 selected,
             );
         } else {
@@ -1092,7 +1175,9 @@ impl QuickActionButton {
             let label = self.label.downgrade();
             let targets = self.targets.clone();
             let selected_target = self.selected_target.clone();
+            let saved_selected_target_id = self.saved_selected_target_id.clone();
             let popover = self.button.popover().map(|popover| popover.downgrade());
+            let state_changed = self.state_changed.clone();
 
             move |_, row| {
                 let target_id = row.widget_name().to_string();
@@ -1123,8 +1208,12 @@ impl QuickActionButton {
                     &run_icon,
                     &label,
                     &selected_target,
+                    &saved_selected_target_id,
                     target,
                 );
+                if let Some(state_changed) = state_changed.borrow().as_ref() {
+                    state_changed();
+                }
                 if let Some(popover) = popover.as_ref().and_then(|popover| popover.upgrade()) {
                     popover.popdown();
                 }
@@ -1163,6 +1252,31 @@ impl QuickActionButton {
             });
         }
     }
+
+    fn connect_run(&self) {
+        self.button.connect_clicked({
+            let selected_target = self.selected_target.clone();
+            let runner = self.runner.clone();
+
+            move |_| {
+                let target = selected_target.borrow().clone();
+                let Some(target) = target else {
+                    return;
+                };
+                if let Some(runner) = runner.borrow().as_ref() {
+                    runner(target);
+                }
+            }
+        });
+    }
+
+    fn selected_target_id(&self) -> Option<String> {
+        self.selected_target
+            .borrow()
+            .as_ref()
+            .map(|target| target.id.clone())
+            .or_else(|| self.saved_selected_target_id.borrow().clone())
+    }
 }
 
 fn append_quick_action_button(
@@ -1170,11 +1284,20 @@ fn append_quick_action_button(
     quick_actions: &Rc<RefCell<Vec<Rc<QuickActionButton>>>>,
     targets: &Rc<RefCell<Vec<RunItem>>>,
     next_id: &Rc<Cell<u64>>,
+    runner: &Rc<RefCell<Option<Rc<dyn Fn(RunItem)>>>>,
+    state_changed: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    selected_target_id: Option<String>,
 ) -> Rc<QuickActionButton> {
     let id = next_id.get();
     next_id.set(id.saturating_add(1));
 
-    let quick_action = QuickActionButton::new(id, targets.clone());
+    let quick_action = QuickActionButton::new(
+        id,
+        targets.clone(),
+        runner.clone(),
+        state_changed.clone(),
+        selected_target_id,
+    );
     quick_actions_box.append(&quick_action.button);
     connect_quick_action_delete(&quick_action, quick_actions_box, quick_actions);
     quick_actions.borrow_mut().push(quick_action.clone());
@@ -1190,6 +1313,7 @@ fn connect_quick_action_delete(
     let button = quick_action.button.downgrade();
     let quick_actions_box = quick_actions_box.downgrade();
     let quick_actions = Rc::downgrade(quick_actions);
+    let state_changed = quick_action.state_changed.clone();
 
     quick_action.delete_button.connect_clicked(move |_| {
         if let Some(button) = button.upgrade() {
@@ -1206,30 +1330,8 @@ fn connect_quick_action_delete(
                 .borrow_mut()
                 .retain(|quick_action| quick_action.id != id);
         }
-    });
-}
-
-fn install_quick_action_run_handler<C: RepositoryActionContext + 'static>(
-    quick_action: &Rc<QuickActionButton>,
-    context: C,
-    terminal: terminal::TerminalPanel,
-    terminal_toggle_button: gtk::ToggleButton,
-    suppress_terminal_auto_open: Rc<Cell<bool>>,
-) {
-    quick_action.button.connect_clicked({
-        let selected_target = quick_action.selected_target.clone();
-
-        move |_| {
-            let target = selected_target.borrow().clone();
-            if let Some(target) = target {
-                run_target(
-                    &context,
-                    &target,
-                    &terminal,
-                    &terminal_toggle_button,
-                    &suppress_terminal_auto_open,
-                );
-            }
+        if let Some(state_changed) = state_changed.borrow().as_ref() {
+            state_changed();
         }
     });
 }
@@ -1240,6 +1342,7 @@ fn select_quick_action_target(
     run_icon: &gtk::Image,
     label: &gtk::Label,
     selected_target: &Rc<RefCell<Option<RunItem>>>,
+    saved_selected_target_id: &Rc<RefCell<Option<String>>>,
     target: RunItem,
 ) {
     label.set_label(&target.label);
@@ -1247,7 +1350,44 @@ fn select_quick_action_target(
     run_icon.set_visible(true);
     run_content.set_sensitive(true);
     button.set_tooltip_text(Some(&format!("Run quick action: {}", target.label)));
+    *saved_selected_target_id.borrow_mut() = Some(target.id.clone());
     *selected_target.borrow_mut() = Some(target);
+}
+
+fn quick_action_configs(
+    quick_actions: &Rc<RefCell<Vec<Rc<QuickActionButton>>>>,
+) -> Vec<QuickActionConfig> {
+    quick_actions
+        .borrow()
+        .iter()
+        .map(|quick_action| QuickActionConfig {
+            selected_target_id: quick_action.selected_target_id(),
+        })
+        .collect()
+}
+
+fn save_quick_action_state<C: RepositoryActionContext>(
+    context: &C,
+    quick_actions: &Rc<RefCell<Vec<Rc<QuickActionButton>>>>,
+) {
+    let Some(repo_path) = context.local_workspace_path() else {
+        log::debug!("quick action state save skipped for non-local workspace");
+        return;
+    };
+    let configs = quick_action_configs(quick_actions);
+    let action_count = configs.len();
+    match git::save_quick_action_config(&repo_path, configs) {
+        Ok(()) => log::info!(
+            "saved quick action state repo={} actions={}",
+            repo_path.display(),
+            action_count
+        ),
+        Err(err) => log::warn!(
+            "failed to save quick action state repo={} err={}",
+            repo_path.display(),
+            err
+        ),
+    }
 }
 
 fn fill_quick_action_targets(
