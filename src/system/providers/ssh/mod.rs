@@ -11,10 +11,11 @@ use self::git::SshGitAccess;
 use self::github::SshGitHubAccess;
 use self::shell::SshShellAccess;
 use self::terminal_link::SshTerminalLinkAccess;
+use super::url::GioUrlOpenAccess;
 use crate::system::capabilities::github::GitHubAccess;
 use crate::system::capabilities::{
     docker::DockerAccess, files::FileAccess, git::GitAccess, open::DesktopOpenAccess,
-    shell::ShellAccess, terminal_link::TerminalLinkAccess,
+    shell::ShellAccess, terminal_link::TerminalLinkAccess, url::UrlOpenAccess,
 };
 use crate::system::path::{
     HostRef, ProviderKind, SystemId, SystemRef, WorkspaceId, WorkspacePath, WorkspaceRef,
@@ -300,6 +301,19 @@ impl SystemProvider for SshProvider {
 
     fn desktop_opener(&self, _workspace: &WorkspaceRef) -> Option<Arc<dyn DesktopOpenAccess>> {
         None
+    }
+
+    fn url_opener(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn UrlOpenAccess>> {
+        log::debug!(
+            "creating ssh url-open capability provider={} workspace={} root={}",
+            self.label(),
+            workspace.display_name,
+            workspace.root.absolute
+        );
+        Some(Arc::new(GioUrlOpenAccess::new(
+            self.label(),
+            workspace.clone(),
+        )))
     }
 
     fn terminal_links(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn TerminalLinkAccess>> {

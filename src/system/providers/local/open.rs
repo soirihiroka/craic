@@ -169,14 +169,4 @@ impl DesktopOpenAccess for LocalDesktopOpenAccess {
         self.show_with_file_manager("ShowItems", &local_path, activation)?;
         Ok("Opened containing folder.".to_string())
     }
-
-    fn open_url(&self, url: &str, activation: DesktopOpenActivation) -> Result<String, String> {
-        log::info!(
-            "local open url start workspace={} url_len={}",
-            self.workspace.display_name,
-            url.len()
-        );
-        self.launch_uri(url, activation, |err| format!("Failed to open URL: {err}"))?;
-        Ok("Opened URL.".to_string())
-    }
 }

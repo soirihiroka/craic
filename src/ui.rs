@@ -24,7 +24,7 @@ mod widgets;
 
 use crate::git;
 use crate::system::capabilities::{
-    open::DesktopOpenAccess, shell::ShellAccess, terminal_link::TerminalLinkAccess,
+    shell::ShellAccess, terminal_link::TerminalLinkAccess, url::UrlOpenAccess,
 };
 use crate::system::provider::SystemProvider;
 use crate::system::providers::local::LocalProvider;
@@ -1028,10 +1028,10 @@ impl content::RepositoryActionContext for Rc<AppState> {
         self.workspace_ref.borrow().root.clone()
     }
 
-    fn desktop_opener(&self) -> Option<Arc<dyn DesktopOpenAccess>> {
+    fn url_opener(&self) -> Option<Arc<dyn UrlOpenAccess>> {
         let system = self.system_ref.borrow().clone();
         let workspace = self.workspace_ref.borrow().clone();
-        self.providers.desktop_opener(&system.id, &workspace)
+        self.providers.url_opener(&system.id, &workspace)
     }
 
     fn terminal_links(&self) -> Option<Arc<dyn TerminalLinkAccess>> {

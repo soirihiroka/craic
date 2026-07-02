@@ -13,10 +13,11 @@ use self::github::LocalGitHubAccess;
 use self::open::LocalDesktopOpenAccess;
 use self::shell::LocalShellAccess;
 use self::terminal_link::LocalTerminalLinkAccess;
+use super::url::GioUrlOpenAccess;
 use crate::system::capabilities::github::GitHubAccess;
 use crate::system::capabilities::{
     docker::DockerAccess, files::FileAccess, git::GitAccess, open::DesktopOpenAccess,
-    shell::ShellAccess, terminal_link::TerminalLinkAccess,
+    shell::ShellAccess, terminal_link::TerminalLinkAccess, url::UrlOpenAccess,
 };
 use crate::system::path::{
     ProviderKind, SystemId, SystemRef, WorkspacePath, WorkspaceRef, path_display_name,
@@ -220,6 +221,18 @@ impl SystemProvider for LocalProvider {
             workspace.root.absolute
         );
         Some(Arc::new(LocalDesktopOpenAccess::new(workspace.clone())))
+    }
+
+    fn url_opener(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn UrlOpenAccess>> {
+        log::debug!(
+            "creating local url-open capability workspace={} root={}",
+            workspace.display_name,
+            workspace.root.absolute
+        );
+        Some(Arc::new(GioUrlOpenAccess::new(
+            self.label(),
+            workspace.clone(),
+        )))
     }
 
     fn terminal_links(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn TerminalLinkAccess>> {
