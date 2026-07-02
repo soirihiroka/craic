@@ -1,6 +1,6 @@
 # Craic
 
-A development enviroment made by me for me :D
+A development environment made by me for me :D
 
 <img width="1207" height="764" alt="image" src="https://github.com/user-attachments/assets/511380e1-a28e-42b3-b03c-7896885072ce" />
 
