@@ -1101,16 +1101,18 @@ impl QuickActionButton {
     }
 
     fn refresh(&self) {
+        let saved_id = self.saved_selected_target_id.borrow().clone();
         let selected_id = self
             .selected_target
             .borrow()
             .as_ref()
             .map(|target| target.id.clone())
-            .or_else(|| self.saved_selected_target_id.borrow().clone());
+            .or_else(|| saved_id.clone());
         let targets = self.targets.borrow();
-        let selected = selected_id
-            .and_then(|id| targets.iter().find(|target| target.id == id).cloned())
-            .or_else(|| targets.first().cloned());
+        let selected = match selected_id {
+            Some(id) => targets.iter().find(|target| target.id == id).cloned(),
+            None => targets.first().cloned(),
+        };
 
         if let Some(selected) = selected {
             select_quick_action_target(
@@ -1127,7 +1129,11 @@ impl QuickActionButton {
             self.label.set_label("(empty)");
             self.run_icon.set_visible(false);
             self.run_content.set_sensitive(false);
-            self.button.set_tooltip_text(Some("No quick actions found"));
+            self.button.set_tooltip_text(Some(if targets.is_empty() {
+                "No quick actions found"
+            } else {
+                "Saved quick action not found"
+            }));
         }
 
         let selected_id = self
