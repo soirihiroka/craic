@@ -14,3 +14,5 @@ Remember to log thing.
 When writing docs avoid leaking personal information (ip, specific repo names etc).
 
 Remember to ask for permission.
+
+Avoid trivial functions. If it can be done in a few lines, then just write that few lines instead of trying to abstract it.
