@@ -2,7 +2,6 @@ use crate::git;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use toml::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,29 +131,11 @@ fn untracked_file_details(repo_path: &Path, files: &[String]) -> Result<String, 
 }
 
 fn tracked(repo_path: &Path, file: &str) -> Result<bool, String> {
-    let output = Command::new("git")
-        .args(["ls-files", "--error-unmatch", "--", file])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|err| format!("Failed to run git: {err}"))?;
-
-    Ok(output.status.success())
+    git::run_git_success(repo_path, &["ls-files", "--error-unmatch", "--", file])
 }
 
 fn run_git(repo_path: &Path, args: &[String]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
-        .output()
-        .map_err(|err| format!("Failed to run git: {err}"))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Err(if stderr.is_empty() { stdout } else { stderr })
-    }
+    git::run_git_owned_untrimmed(repo_path, args)
 }
 
 fn commit_prompt(

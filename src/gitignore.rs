@@ -4,9 +4,7 @@ use crate::system::capabilities::files::{
     FileWriteRequest,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,33 +181,18 @@ pub fn check_ignored_paths(
         return Ok(HashSet::new());
     }
 
-    let mut child = Command::new("git")
-        .args(["check-ignore", "--stdin", "-z"])
-        .current_dir(repo_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| format!("Failed to start git check-ignore: {err}"))?;
+    let stdout = crate::git::run_git_bytes_owned_with_stdin_and_success_codes(
+        repo_path,
+        &[
+            "check-ignore".to_string(),
+            "--stdin".to_string(),
+            "-z".to_string(),
+        ],
+        &check_ignore_stdin(checks),
+        &[0, 1],
+    )?;
 
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "git check-ignore did not expose stdin.".to_string())?;
-        stdin
-            .write_all(&check_ignore_stdin(checks))
-            .map_err(|err| format!("Failed to write git check-ignore input: {err}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("Failed to read git check-ignore output: {err}"))?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Err("git check-ignore failed.".to_string());
-    }
-
-    Ok(parse_check_ignore_output(checks, &output.stdout))
+    Ok(parse_check_ignore_output(checks, &stdout))
 }
 
 pub fn check_ignore_stdin(checks: &[IgnoreCheck]) -> Vec<u8> {

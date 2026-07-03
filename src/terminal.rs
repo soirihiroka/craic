@@ -107,19 +107,6 @@ impl TerminalSearchOptions {
 }
 
 impl CommandSpec {
-    pub fn new(program: impl Into<OsString>, working_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            program: program.into(),
-            args: Vec::new(),
-            working_dir: working_dir.into(),
-        }
-    }
-
-    pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
-        self.args.push(arg.into());
-        self
-    }
-
     fn display(&self) -> String {
         self.argv()
             .iter()

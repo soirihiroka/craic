@@ -1,18 +1,25 @@
 use super::shell_quote;
 use crate::system::capabilities::shell::{ShellAccess, ShellCommandSpec};
 use crate::system::path::{WorkspacePath, WorkspaceRef};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
 pub(crate) struct SshShellAccess {
     workspace: WorkspaceRef,
     host: String,
+    command_lookup: Arc<Mutex<HashMap<String, Option<String>>>>,
 }
 
 impl SshShellAccess {
     pub(crate) fn new(workspace: WorkspaceRef, host: String) -> Self {
-        Self { workspace, host }
+        Self {
+            workspace,
+            host,
+            command_lookup: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -38,11 +45,42 @@ impl ShellAccess for SshShellAccess {
         program: &str,
         args: &[String],
     ) -> Result<ShellCommandSpec, String> {
-        let program = self.resolved_or_original(program);
+        if command_name_can_use_path(program) {
+            if let Err(err) = self.which(program) {
+                log::warn!(
+                    "ssh shell command lookup failed host={} workspace={} program={} error={}",
+                    self.host,
+                    self.workspace.display_name,
+                    program,
+                    err
+                );
+            }
+            let mut script = format!("exec {}", shell_quote(program));
+            for arg in args {
+                script.push(' ');
+                script.push_str(&shell_quote(arg));
+            }
+            let remote = format!(
+                "cd {} && exec \"${{SHELL:-/bin/sh}}\" -i -c {}",
+                shell_quote(&working_dir.absolute),
+                shell_quote(&script)
+            );
+            log::debug!(
+                "ssh shell command created workspace={} working_dir={} program={} via_default_shell=true",
+                self.workspace.display_name,
+                working_dir.display(),
+                program
+            );
+            return Ok(ShellCommandSpec::new("ssh", self.workspace.root.clone())
+                .arg(self.host.clone())
+                .arg("-t")
+                .arg(remote));
+        }
+
         let mut remote = format!(
             "cd {} && exec {}",
             shell_quote(&working_dir.absolute),
-            shell_quote(&program)
+            shell_quote(program)
         );
         for arg in args {
             remote.push(' ');
@@ -73,6 +111,23 @@ impl ShellAccess for SshShellAccess {
             return Ok(None);
         }
 
+        if let Some(cached) = self
+            .command_lookup
+            .lock()
+            .map_err(|_| "Shell command lookup cache is unavailable.".to_string())?
+            .get(program)
+            .cloned()
+        {
+            log::debug!(
+                "ssh shell which cache hit host={} workspace={} program={} resolved={:?}",
+                self.host,
+                self.workspace.display_name,
+                program,
+                cached
+            );
+            return Ok(cached);
+        }
+
         let lookup = format!("command -v {}", shell_quote(program));
         let remote = format!(
             "exec \"${{SHELL:-/bin/sh}}\" -i -c {}",
@@ -85,7 +140,7 @@ impl ShellAccess for SshShellAccess {
             .map_err(|err| format!("Failed to start ssh command lookup: {err}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.success() {
+        let resolved = if output.status.success() {
             let resolved = shell_which_output(&stdout);
             log::debug!(
                 "ssh shell which host={} workspace={} program={} resolved={:?}",
@@ -94,7 +149,7 @@ impl ShellAccess for SshShellAccess {
                 program,
                 resolved
             );
-            Ok(resolved)
+            resolved
         } else {
             log::debug!(
                 "ssh shell which missing host={} workspace={} program={} status={} stderr={}",
@@ -104,27 +159,14 @@ impl ShellAccess for SshShellAccess {
                 output.status,
                 stderr.trim()
             );
-            Ok(None)
-        }
-    }
-}
+            None
+        };
 
-impl SshShellAccess {
-    fn resolved_or_original(&self, program: &str) -> String {
-        match self.which(program) {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => program.to_string(),
-            Err(err) => {
-                log::warn!(
-                    "ssh shell command lookup failed host={} workspace={} program={} error={}",
-                    self.host,
-                    self.workspace.display_name,
-                    program,
-                    err
-                );
-                program.to_string()
-            }
-        }
+        self.command_lookup
+            .lock()
+            .map_err(|_| "Shell command lookup cache is unavailable.".to_string())?
+            .insert(program.to_string(), resolved.clone());
+        Ok(resolved)
     }
 }
 

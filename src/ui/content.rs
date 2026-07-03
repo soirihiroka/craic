@@ -8,9 +8,9 @@ pub(super) mod folder_view;
 pub(super) mod pdf_preview;
 
 use super::{file_type, widgets};
-use crate::git::{self, QuickActionConfig, RepositorySnapshot};
+use crate::git::RepositorySnapshot;
 use crate::github::PullRequestInfo;
-use crate::quick_action::{self, RunItem, RunTargetsSignature};
+use crate::quick_action::{self, RunCommand, RunItem, RunTargetsSignature};
 use crate::system::WorkspacePath;
 use crate::system::capabilities::{
     shell::ShellAccess,
@@ -22,6 +22,7 @@ use crate::ui::components::tabbed_picker::{
     TabbedPicker, TabbedPickerGroup, TabbedPickerItem, TabbedPickerStatus, TabbedPickerTab,
 };
 use crate::ui::pages::{PageCommand, PageCommandResult};
+use crate::workspace_config::QuickActionConfig;
 use adw::prelude::*;
 use craic_diff_ui::{Element, PartialEqRenderState};
 use gtk::{gio, pango};
@@ -353,11 +354,12 @@ impl ContentPane {
             return;
         }
 
-        let configs = git::quick_action_config(repo_path).unwrap_or_else(|| {
-            vec![QuickActionConfig {
-                selected_target_id: None,
-            }]
-        });
+        let configs =
+            crate::workspace_config::quick_action_config(repo_path).unwrap_or_else(|| {
+                vec![QuickActionConfig {
+                    selected_target_id: None,
+                }]
+            });
         log::debug!(
             "loaded quick action config repo={} actions={}",
             repo_path.display(),
@@ -1384,7 +1386,7 @@ fn save_quick_action_state<C: RepositoryActionContext>(
     };
     let configs = quick_action_configs(quick_actions);
     let action_count = configs.len();
-    match git::save_quick_action_config(&repo_path, configs) {
+    match crate::workspace_config::save_quick_action_config(&repo_path, configs) {
         Ok(()) => log::info!(
             "saved quick action state repo={} actions={}",
             repo_path.display(),
@@ -1591,22 +1593,40 @@ fn run_target<C: RepositoryActionContext>(
     terminal_toggle_button: &gtk::ToggleButton,
     suppress_terminal_auto_open: &Rc<Cell<bool>>,
 ) {
-    let Some(repo_path) = context.local_workspace_path() else {
+    if context.local_workspace_path().is_none() {
         show_error_dialog(
             &context.window(),
             "Run Failed",
             "Quick actions are unavailable for remote workspaces.",
         );
         return;
+    }
+    let Some(shell) = context.shell() else {
+        show_error_dialog(
+            &context.window(),
+            "Run Failed",
+            "Terminal is unavailable for this workspace.",
+        );
+        return;
     };
-    let command = quick_action::command_for(&repo_path, target);
+    let (program, args) = match &target.command {
+        RunCommand::MakeTarget { target } => ("make", vec![target.clone()]),
+        RunCommand::BunScript { script } => ("bun", vec!["run".to_string(), script.clone()]),
+    };
+    let command = match shell.command(&context.workspace_root(), program, &args) {
+        Ok(command) => command,
+        Err(err) => {
+            show_error_dialog(&context.window(), "Run Failed", &err);
+            return;
+        }
+    };
 
     show_terminal(
         terminal,
         terminal_toggle_button,
         suppress_terminal_auto_open,
     );
-    match terminal.run(&command, &target.label) {
+    match terminal.run_shell_command(&command, &target.label) {
         Ok(()) => context.refresh(Some(format!("Started {} in terminal.", target.label))),
         Err(err) => show_error_dialog(&context.window(), "Run Failed", &err),
     }

@@ -5,7 +5,7 @@ pub(in crate::ui::pages::agent) mod opencode;
 use std::ffi::OsString;
 
 use super::agent_shell_integration::AgentShellIntegration;
-use crate::system::capabilities::shell::ShellAccess;
+use crate::system::capabilities::shell::{ShellAccess, default_shell};
 use crate::system::{ProviderKind, SystemRef, WorkspacePath, WorkspaceRef};
 use crate::ui::agent_status::AgentActiveState;
 
@@ -77,6 +77,31 @@ impl CommandSpec {
             };
         }
 
+        if system.provider_kind == ProviderKind::Local
+            && let Some(program) = program.to_str()
+            && command_name_can_use_path(program)
+        {
+            let mut script = format!("exec {}", shell_quote(program));
+            for arg in &args {
+                script.push(' ');
+                script.push_str(&shell_quote(&arg.to_string_lossy()));
+            }
+            log::debug!(
+                "agent command adapted for local default shell workspace={}",
+                workspace.display_name
+            );
+            return Self {
+                program: default_shell(),
+                args: vec![
+                    OsString::from("-i"),
+                    OsString::from("-c"),
+                    OsString::from(script),
+                ],
+                target_working_dir: workspace.root.clone(),
+                spawn_working_dir: workspace.root.absolute.clone(),
+            };
+        }
+
         Self {
             program,
             args,
@@ -132,13 +157,20 @@ pub(in crate::ui::pages::agent) fn normalize_title_text(text: &str) -> String {
 fn command_binary(name: &str, shell: Option<&dyn ShellAccess>) -> OsString {
     if let Some(shell) = shell {
         match shell.which(name) {
-            Ok(Some(path)) => return OsString::from(path),
-            Ok(None) => {}
+            Ok(Some(_)) | Ok(None) => {}
             Err(err) => log::warn!("agent command lookup failed program={} error={}", name, err),
         }
     }
 
     OsString::from(name)
+}
+
+fn command_name_can_use_path(program: &str) -> bool {
+    !program.is_empty()
+        && !program.contains('/')
+        && program
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
 }
 
 fn remote_command_start(program: &OsString) -> String {

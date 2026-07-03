@@ -70,13 +70,33 @@ fn active_app_window(app: &adw::Application) -> Option<adw::ApplicationWindow> {
 }
 
 fn launch_new_instance() -> Result<(), String> {
-    let executable = resolve_new_instance_executable()?;
-    log::info!(
-        "launching new Craic window executable={}",
-        executable.display()
-    );
+    launch_new_instance_with_workspace(None)
+}
 
-    let mut child = Command::new(&executable)
+pub(in crate::ui) fn launch_workspace_in_new_instance(workspace_path: &Path) -> Result<(), String> {
+    launch_new_instance_with_workspace(Some(workspace_path))
+}
+
+fn launch_new_instance_with_workspace(workspace_path: Option<&Path>) -> Result<(), String> {
+    let executable = resolve_new_instance_executable()?;
+    if let Some(workspace_path) = workspace_path {
+        log::info!(
+            "launching new Craic window executable={} workspace={}",
+            executable.display(),
+            workspace_path.display()
+        );
+    } else {
+        log::info!(
+            "launching new Craic window executable={}",
+            executable.display()
+        );
+    }
+
+    let mut command = Command::new(&executable);
+    if let Some(workspace_path) = workspace_path {
+        command.arg(workspace_path);
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

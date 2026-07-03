@@ -81,7 +81,12 @@ impl StartupTimer {
     }
 }
 
-pub fn build_ui(app: &adw::Application, launch_start: Instant) {
+pub fn build_ui(
+    app: &adw::Application,
+    launch_start: Instant,
+    startup_workspace: Option<crate::config::ConfiguredWorkspace>,
+    startup_error: Option<String>,
+) {
     let mut startup = StartupTimer::new(launch_start);
     startup.mark("activate");
 
@@ -207,7 +212,7 @@ pub fn build_ui(app: &adw::Application, launch_start: Instant) {
     let provider_registry = SystemProviderRegistry::new();
     startup.mark("create-provider-registry");
 
-    let active_workspace = initial_workspace(&provider_registry);
+    let active_workspace = initial_workspace(&provider_registry, startup_workspace.as_ref());
     startup.mark("resolve-initial-workspace");
 
     let repo_path = active_workspace.repo_path.clone();
@@ -422,6 +427,9 @@ pub fn build_ui(app: &adw::Application, launch_start: Instant) {
         );
         show_startup_crash_dialog(&window, &notice);
     }
+    if let Some(error) = startup_error.as_deref() {
+        show_error_dialog(&window, "Open Workspace Failed", error);
+    }
 }
 
 enum GitWorkerCommand {
@@ -536,8 +544,22 @@ struct ActiveWorkspace {
     workspace_ref: WorkspaceRef,
 }
 
-fn initial_workspace(registry: &SystemProviderRegistry) -> ActiveWorkspace {
+fn initial_workspace(
+    registry: &SystemProviderRegistry,
+    startup_workspace: Option<&crate::config::ConfiguredWorkspace>,
+) -> ActiveWorkspace {
     let step_start = Instant::now();
+    if let Some(workspace) = startup_workspace {
+        let active_workspace = active_workspace_from_config(registry, workspace);
+        log::info!(
+            "startup initial workspace source=cli provider={} path={} elapsed_ms={}",
+            workspace.provider_id(),
+            workspace.path,
+            step_start.elapsed().as_millis()
+        );
+        return active_workspace;
+    }
+
     if let Some(workspace) = crate::config::last_workspace() {
         let active_workspace = active_workspace_from_config(registry, &workspace);
         log::info!(

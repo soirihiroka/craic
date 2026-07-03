@@ -28,7 +28,6 @@ use crate::system::provider::{
     ProviderWorkspaceRemote, ProviderWorkspaceSource, SystemProvider,
 };
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -303,27 +302,11 @@ fn local_remote_name(path: &Path) -> Option<String> {
 }
 
 fn git_success(path: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    crate::git::run_git_success(path, args).unwrap_or(false)
 }
 
 fn git_output(path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .output()
-        .map_err(|err| format!("Failed to run git: {err}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
+    crate::git::run_git(path, args)
 }
 
 fn remote_slug(remote_url: &str) -> Option<String> {
