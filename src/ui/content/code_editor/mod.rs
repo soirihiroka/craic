@@ -13,8 +13,8 @@ use crate::language_support::{
 };
 use crate::markdown_lint::MarkdownLintIssue;
 use crate::spellcheck::SpellcheckIssue;
-use crate::ui::canvas_scroll;
 use crate::ui::components::search::SearchPanel;
+use crate::ui::{canvas_scroll, canvas_scrollbar};
 use adw::prelude::*;
 use canvas::TextWidthCache;
 use gtk::gdk;
@@ -72,6 +72,7 @@ struct EditorState {
     scrollbar_active: Rc<Cell<bool>>,
     scrollbar_hover_progress: Rc<Cell<f64>>,
     scrollbar_animating: Rc<Cell<bool>>,
+    scrollbar_smooth_scroll: canvas_scrollbar::SmoothScroll,
     middle_autoscroll: Rc<canvas_scroll::MiddleAutoscroll>,
     fold_hovered: Cell<Option<FoldControlKey>>,
     fold_pressed: Cell<Option<FoldControlKey>>,
@@ -289,6 +290,7 @@ impl CodeEditor {
             scrollbar_active: Rc::new(Cell::new(false)),
             scrollbar_hover_progress: Rc::new(Cell::new(0.0)),
             scrollbar_animating: Rc::new(Cell::new(false)),
+            scrollbar_smooth_scroll: canvas_scrollbar::SmoothScroll::new(),
             middle_autoscroll: Rc::new(canvas_scroll::MiddleAutoscroll::new()),
             fold_hovered: Cell::new(None),
             fold_pressed: Cell::new(None),

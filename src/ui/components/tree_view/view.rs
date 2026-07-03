@@ -228,6 +228,7 @@ impl TreeViewBuilder {
                 active: Rc::new(Cell::new(false)),
                 hover_progress: Rc::new(Cell::new(0.0)),
                 animating: Rc::new(Cell::new(false)),
+                smooth_scroll: canvas_scrollbar::SmoothScroll::new(),
             }
         });
 
@@ -256,6 +257,7 @@ struct TreeCanvasScrollbar {
     active: Rc<Cell<bool>>,
     hover_progress: Rc<Cell<f64>>,
     animating: Rc<Cell<bool>>,
+    smooth_scroll: canvas_scrollbar::SmoothScroll,
 }
 
 impl<K, S> TreeView<K, S>
@@ -631,6 +633,9 @@ where
 
                 let adjustment = tree.scroller.vadjustment();
                 let step = adjustment.step_increment().max(1.0);
+                if let Some(scrollbar) = tree.scrollbar.as_ref() {
+                    scrollbar.smooth_scroll.pause();
+                }
                 adjustment.set_value((adjustment.value() + dy * step).clamp(
                     adjustment.lower(),
                     (adjustment.upper() - adjustment.page_size()).max(adjustment.lower()),
@@ -725,6 +730,44 @@ where
             }
         });
         scrollbar.area.add_controller(motion);
+
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        scroll.connect_scroll({
+            let tree = self.clone();
+
+            move |controller, _, dy| {
+                if dy.abs() <= f64::EPSILON {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(scrollbar) = tree.scrollbar.as_ref() else {
+                    return glib::Propagation::Proceed;
+                };
+                let height = scrollbar.area.allocated_height();
+                let page_size = tree.external_scroll_page_size_for_height(height);
+                let adjustment = tree.scroller.vadjustment();
+                let lower = adjustment.lower();
+                let upper = external_scroll_max(&adjustment, page_size);
+                let current = tree.external_scroll_value_for_real(&adjustment, page_size);
+                if canvas_scrollbar::is_mouse_scroll(controller) {
+                    let delta = canvas_scrollbar::mouse_wheel_delta(page_size, dy);
+                    let tree_for_scroll = tree.clone();
+                    scrollbar.smooth_scroll.scroll_relative(
+                        &scrollbar.area,
+                        current,
+                        delta,
+                        lower,
+                        upper,
+                        move |value| tree_for_scroll.set_external_scroll_value(value),
+                    );
+                } else {
+                    scrollbar.smooth_scroll.pause();
+                    let step = adjustment.step_increment().max(1.0);
+                    tree.set_external_scroll_value(current + dy * step);
+                }
+                glib::Propagation::Stop
+            }
+        });
+        scrollbar.area.add_controller(scroll);
 
         let click = gtk::GestureClick::builder().button(1).build();
         click.connect_pressed({
@@ -865,6 +908,7 @@ where
         let scroll_y = self.external_scroll_value();
         let next_scroll_y =
             canvas_scrollbar::scroll_for_lane_press(width, height, total_height, scroll_y, x, y)?;
+        scrollbar.smooth_scroll.pause();
         self.set_external_scroll_value(next_scroll_y);
         Some(next_scroll_y)
     }
