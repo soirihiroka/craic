@@ -28,6 +28,7 @@ pub(crate) trait ShellAccess: Send + Sync {
         &self,
         working_dir: Option<&WorkspacePath>,
     ) -> Result<ShellCommandSpec, String>;
+    fn which(&self, program: &str) -> Result<Option<String>, String>;
     fn command(
         &self,
         working_dir: &WorkspacePath,

@@ -263,7 +263,8 @@ impl AgentChat {
         }
         let system = self.ctx.system_ref();
         let workspace = self.ctx.workspace_ref();
-        let command = provider.command(&system, &workspace);
+        let shell = self.ctx.shell();
+        let command = provider.command(shell.as_deref(), &system, &workspace);
         provider.shell_integration().log_session_create(
             session_id,
             provider,
@@ -303,7 +304,9 @@ impl AgentChat {
             .copied()
             .find(|provider| provider.provider_id() == row.provider_id)
             .ok_or_else(|| format!("Unknown agent provider {}.", row.provider_id))?;
+        let shell = self.ctx.shell();
         let command = provider.restore_command(
+            shell.as_deref(),
             &self.ctx.system_ref(),
             &self.ctx.workspace_ref(),
             cli_session_id,

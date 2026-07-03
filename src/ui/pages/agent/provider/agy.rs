@@ -5,6 +5,7 @@ use super::{
     AgentProvider, CommandSpec, command_binary, is_spinner_frame, normalize_title_text,
     title_candidate, window_title_active_state,
 };
+use crate::system::capabilities::shell::ShellAccess;
 use crate::system::{SystemRef, WorkspaceRef};
 
 pub(in crate::ui::pages::agent) static PROVIDER: Provider = Provider;
@@ -26,12 +27,18 @@ impl AgentProvider for Provider {
         "craic-antigravity-symbolic"
     }
 
-    fn command(&self, system: &SystemRef, workspace: &WorkspaceRef) -> CommandSpec {
-        CommandSpec::target(system, workspace, command_binary("agy", system), Vec::new())
+    fn command(
+        &self,
+        shell: Option<&dyn ShellAccess>,
+        system: &SystemRef,
+        workspace: &WorkspaceRef,
+    ) -> CommandSpec {
+        CommandSpec::target(system, workspace, command_binary("agy", shell), Vec::new())
     }
 
     fn restore_command(
         &self,
+        _shell: Option<&dyn ShellAccess>,
         _system: &SystemRef,
         _workspace: &WorkspaceRef,
         _cli_session_id: &str,

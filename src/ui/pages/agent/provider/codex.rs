@@ -7,6 +7,7 @@ use super::{
     AgentProvider, CommandSpec, command_binary, normalize_title_text, title_candidate,
     window_title_active_state,
 };
+use crate::system::capabilities::shell::ShellAccess;
 use crate::system::{SystemRef, WorkspaceRef};
 
 pub(in crate::ui::pages::agent) static PROVIDER: Provider = Provider;
@@ -28,17 +29,23 @@ impl AgentProvider for Provider {
         "craic-codex-symbolic"
     }
 
-    fn command(&self, system: &SystemRef, workspace: &WorkspaceRef) -> CommandSpec {
+    fn command(
+        &self,
+        shell: Option<&dyn ShellAccess>,
+        system: &SystemRef,
+        workspace: &WorkspaceRef,
+    ) -> CommandSpec {
         CommandSpec::target(
             system,
             workspace,
-            command_binary("codex", system),
+            command_binary("codex", shell),
             vec!["--cd".into(), workspace.root.absolute.clone().into()],
         )
     }
 
     fn restore_command(
         &self,
+        shell: Option<&dyn ShellAccess>,
         system: &SystemRef,
         workspace: &WorkspaceRef,
         cli_session_id: &str,
@@ -46,7 +53,7 @@ impl AgentProvider for Provider {
         Ok(CommandSpec::target(
             system,
             workspace,
-            command_binary("codex", system),
+            command_binary("codex", shell),
             vec![
                 "--cd".into(),
                 workspace.root.absolute.clone().into(),
