@@ -6,6 +6,7 @@ pub(in crate::ui) const MIME_MARKDOWN: &str = "text/markdown";
 pub(in crate::ui) const MIME_PDF: &str = "application/pdf";
 pub(in crate::ui) const MIME_SQLITE: &str = "application/vnd.sqlite3";
 pub(in crate::ui) const MIME_SVG: &str = "image/svg+xml";
+pub(in crate::ui) const MIME_SAFETENSORS: &str = "application/vnd.safetensors";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreviewKind {
@@ -14,6 +15,7 @@ pub(crate) enum PreviewKind {
     Notebook,
     Markdown,
     Svg,
+    Safetensors,
     Image,
     Audio,
     Video,
@@ -101,6 +103,9 @@ fn preview_kind(file_type: &FileType) -> PreviewKind {
     if file_type.mime == MIME_SQLITE {
         return PreviewKind::Sqlite;
     }
+    if file_type.mime == MIME_SAFETENSORS {
+        return PreviewKind::Safetensors;
+    }
     if file_type.mime == "application/vnd.ms-fontobject" || file_type.mime.starts_with("font/") {
         return PreviewKind::Font;
     }
@@ -158,6 +163,7 @@ fn mime_from_name_extension(file_name: &str, extension: &str) -> &'static str {
     match extension {
         "md" | "mdown" | "mdx" | "mkd" | "markdown" => MIME_MARKDOWN,
         "db" | "sqlite" | "sqlite3" => MIME_SQLITE,
+        "safetensors" => MIME_SAFETENSORS,
         "svg" | "svgz" => MIME_SVG,
         "apng" => "image/apng",
         "avif" => "image/avif",
@@ -263,6 +269,7 @@ fn display_kind_for_mime(mime: &str) -> &'static str {
         MIME_PDF => "PDF",
         MIME_SQLITE => "SQLite database",
         MIME_SVG => "SVG image",
+        MIME_SAFETENSORS => "Safetensors metadata",
         "application/x-ipynb+json" => "Jupyter notebook",
         "application/json" => "JSON",
         "application/xml" => "XML",
