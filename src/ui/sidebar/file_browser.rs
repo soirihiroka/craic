@@ -1,8 +1,7 @@
-use crate::git::ChangedFile;
+use crate::git::{ChangedFile, GitRepoHandle};
 use crate::spellcheck::SpellcheckAllowlist;
 use crate::system::capabilities::{
     files::{FileAccess, FileNodeInfo, FileNodeKind, FileWatchSubscription},
-    git::GitAccess,
     open::{DesktopOpenAccess, DesktopOpenActivation},
 };
 use crate::system::{FileNodePath, WorkspaceRef};
@@ -73,7 +72,7 @@ pub(in crate::ui) struct FileBrowser {
     tree: Rc<tree_view::TreeView<rows::BrowserListRowKey, rows::BrowserListRowRenderState>>,
     workspace: RefCell<WorkspaceRef>,
     file_access: RefCell<Arc<dyn FileAccess>>,
-    git_access: RefCell<Option<Arc<dyn GitAccess>>>,
+    git_handle: RefCell<Option<Arc<GitRepoHandle>>>,
     desktop_opener: RefCell<Option<Arc<dyn DesktopOpenAccess>>>,
     expanded_dirs: RefCell<HashSet<FileNodePath>>,
     active_folder: RefCell<FileNodePath>,
@@ -132,7 +131,7 @@ pub(in crate::ui) struct FileBrowser {
 impl FileBrowser {
     pub(in crate::ui) fn new(
         file_access: Arc<dyn FileAccess>,
-        git_access: Option<Arc<dyn GitAccess>>,
+        git_handle: Option<Arc<GitRepoHandle>>,
     ) -> Rc<Self> {
         let header = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -170,7 +169,7 @@ impl FileBrowser {
             tree,
             workspace: RefCell::new(workspace),
             file_access: RefCell::new(file_access),
-            git_access: RefCell::new(git_access),
+            git_handle: RefCell::new(git_handle),
             desktop_opener: RefCell::new(None),
             expanded_dirs: RefCell::new(HashSet::new()),
             active_folder: RefCell::new(root_node_path),
@@ -232,8 +231,8 @@ impl FileBrowser {
         browser.connect_paste();
         browser.connect_browser_rows();
         let initial_file_access = { browser.file_access.borrow().clone() };
-        let initial_git_access = { browser.git_access.borrow().clone() };
-        browser.refresh(None, initial_file_access, initial_git_access);
+        let initial_git_handle = { browser.git_handle.borrow().clone() };
+        browser.refresh(None, initial_file_access, initial_git_handle);
         browser
     }
 
@@ -241,7 +240,7 @@ impl FileBrowser {
         self: &Rc<Self>,
         changed_files: Option<&[ChangedFile]>,
         file_access: Arc<dyn FileAccess>,
-        git_access: Option<Arc<dyn GitAccess>>,
+        git_handle: Option<Arc<GitRepoHandle>>,
     ) {
         let workspace = file_access.workspace();
         let workspace_changed = *self.workspace.borrow() != workspace;
@@ -255,8 +254,8 @@ impl FileBrowser {
         self.file_access.replace(file_access);
         self.spellcheck_allowlist
             .replace(crate::spellcheck::SpellcheckAllowlist::default());
-        let git_availability_changed = self.git_access.borrow().is_some() != git_access.is_some();
-        self.git_access.replace(git_access);
+        let git_availability_changed = self.git_handle.borrow().is_some() != git_handle.is_some();
+        self.git_handle.replace(git_handle);
         if git_availability_changed {
             self.clear_git_ignore_cache();
             self.git_ignore_rules_signature.borrow_mut().take();

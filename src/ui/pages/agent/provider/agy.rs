@@ -32,8 +32,13 @@ impl AgentProvider for Provider {
         shell: Option<&dyn ShellAccess>,
         system: &SystemRef,
         workspace: &WorkspaceRef,
-    ) -> CommandSpec {
-        CommandSpec::target(system, workspace, command_binary("agy", shell), Vec::new())
+    ) -> Result<CommandSpec, String> {
+        Ok(CommandSpec::target(
+            system,
+            workspace,
+            command_binary("agy", shell)?,
+            Vec::new(),
+        ))
     }
 
     fn restore_command(

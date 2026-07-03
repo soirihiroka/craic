@@ -1,6 +1,6 @@
 use super::{Page, PageCommand, PageCommandResult, PageContext};
+use crate::git::GitRepoHandle;
 use crate::git::{self, BytesComparison, FileComparison, RepositorySnapshot};
-use crate::system::capabilities::git::GitAccess;
 use crate::system::capabilities::url::UrlOpenActivation;
 use crate::ui::components::context_menu;
 use crate::ui::file_type::PreviewKind;
@@ -13,7 +13,6 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
-use std::thread;
 use std::time::{Duration, Instant};
 
 mod right;
@@ -262,7 +261,7 @@ fn show_history_commit(
     selected_commit: &Rc<RefCell<Option<String>>>,
     hash: String,
 ) {
-    let Some(git_access) = ctx.git() else {
+    let Some(git_handle) = ctx.git() else {
         ctx.show_error("Commit Failed", &ctx.git_unavailable_message());
         return;
     };
@@ -270,18 +269,24 @@ fn show_history_commit(
 
     *selected_commit.borrow_mut() = Some(hash.clone());
 
-    thread::spawn({
-        let hash = hash.clone();
-
-        move || {
-            let result = git_access.commit_details(&hash).and_then(|commit| {
-                git_access
-                    .commit_changed_files(&hash)
-                    .map(|files| (commit, files))
-            });
-            let _ = sender.send(result);
-        }
-    });
+    let files_handle = git_handle.clone();
+    let files_hash = hash.clone();
+    git_handle.commit_details(
+        &hash,
+        Box::new(move |result| match result {
+            Ok(commit) => {
+                files_handle.commit_changed_files(
+                    &files_hash,
+                    Box::new(move |files_result| {
+                        let _ = sender.send(files_result.map(|files| (commit, files)));
+                    }),
+                );
+            }
+            Err(err) => {
+                let _ = sender.send(Err(err));
+            }
+        }),
+    );
 
     gtk::glib::timeout_add_local(Duration::from_millis(75), {
         let ctx = ctx.clone();
@@ -352,26 +357,14 @@ fn show_history_file_preview(
         key.kind
     );
 
-    let Some(git_access) = ctx.git() else {
+    let Some(git_handle) = ctx.git() else {
         ctx.show_error("Diff Failed", &ctx.git_unavailable_message());
         return;
     };
     let (sender, receiver) = mpsc::channel();
     let workspace_key = ctx.workspace_key();
 
-    thread::spawn({
-        let key = key.clone();
-
-        move || {
-            let start = Instant::now();
-            let result = commit_file_preview(git_access.as_ref(), &key);
-            let _ = sender.send(HistoryPreviewWorkerResult {
-                key,
-                result,
-                duration: start.elapsed(),
-            });
-        }
-    });
+    start_commit_file_preview_load(git_handle, key.clone(), sender);
 
     gtk::glib::timeout_add_local(Duration::from_millis(75), {
         let ctx = ctx.clone();
@@ -456,27 +449,55 @@ fn show_history_file_preview(
     });
 }
 
-fn commit_file_preview(
-    git_access: &dyn GitAccess,
-    key: &HistoryPreviewKey,
-) -> Result<HistoryFilePreview, String> {
-    let result = match key.kind {
+fn start_commit_file_preview_load(
+    git_handle: Arc<GitRepoHandle>,
+    key: HistoryPreviewKey,
+    sender: mpsc::Sender<HistoryPreviewWorkerResult>,
+) {
+    let start = Instant::now();
+    let hash = key.hash.clone();
+    let path = key.path.clone();
+    match key.kind {
         PreviewKind::Image
         | PreviewKind::Audio
         | PreviewKind::Video
         | PreviewKind::Font
-        | PreviewKind::Pdf => git_access
-            .commit_bytes_comparison(&key.hash, &key.path)
-            .map(HistoryFilePreview::Bytes),
-        _ => git_access
-            .commit_comparison(&key.hash, &key.path)
-            .map(HistoryFilePreview::Diff),
-    };
-
-    match result {
-        Ok(preview) => Ok(preview),
-        Err(err) if is_preview_limit_message(&err) => Ok(HistoryFilePreview::PreviewLimit(err)),
-        Err(err) => Err(err),
+        | PreviewKind::Pdf => git_handle.commit_bytes_comparison(
+            &hash,
+            &path,
+            Box::new(move |result| {
+                let result = match result.map(HistoryFilePreview::Bytes) {
+                    Ok(preview) => Ok(preview),
+                    Err(err) if is_preview_limit_message(&err) => {
+                        Ok(HistoryFilePreview::PreviewLimit(err))
+                    }
+                    Err(err) => Err(err),
+                };
+                let _ = sender.send(HistoryPreviewWorkerResult {
+                    key,
+                    result,
+                    duration: start.elapsed(),
+                });
+            }),
+        ),
+        _ => git_handle.commit_comparison(
+            &hash,
+            &path,
+            Box::new(move |result| {
+                let result = match result.map(HistoryFilePreview::Diff) {
+                    Ok(preview) => Ok(preview),
+                    Err(err) if is_preview_limit_message(&err) => {
+                        Ok(HistoryFilePreview::PreviewLimit(err))
+                    }
+                    Err(err) => Err(err),
+                };
+                let _ = sender.send(HistoryPreviewWorkerResult {
+                    key,
+                    result,
+                    duration: start.elapsed(),
+                });
+            }),
+        ),
     }
 }
 
@@ -566,7 +587,7 @@ fn show_history_commit_context_menu(
     y: f64,
     _event_time: u32,
 ) {
-    let Some(git_access) = ctx.git() else {
+    let Some(git_handle) = ctx.git() else {
         ctx.show_error("History Action Failed", &ctx.git_unavailable_message());
         return;
     };
@@ -576,15 +597,16 @@ fn show_history_commit_context_menu(
     let active_context_menu = active_context_menu.clone();
     let (sender, receiver) = mpsc::channel();
 
-    thread::spawn({
-        let git_access = git_access.clone();
-        let hash = hash.clone();
-        move || {
-            let parent_hash = git_access.commit_parent_hash(&hash).ok().flatten();
-            let snapshot = git_access.snapshot();
-            let _ = sender.send((parent_hash, snapshot));
-        }
-    });
+    let snapshot_handle = git_handle.clone();
+    git_handle.commit_parent_hash(
+        &hash,
+        Box::new(move |parent_result| {
+            let parent_hash = parent_result.ok().flatten();
+            snapshot_handle.snapshot(Box::new(move |snapshot| {
+                let _ = sender.send((parent_hash, snapshot));
+            }));
+        }),
+    );
 
     gtk::glib::timeout_add_local(Duration::from_millis(75), move || {
         match receiver.try_recv() {
@@ -632,9 +654,12 @@ fn history_commit_action_group(
         let hash = hash.clone();
         move |_, _| {
             let hash = hash.clone();
-            run_history_git_action(&ctx, "Checkout Failed", "Checked out commit.", move |git| {
-                git.checkout_commit(&hash)
-            });
+            run_history_git_action(
+                &ctx,
+                "Checkout Failed",
+                "Checked out commit.",
+                move |git, callback| git.checkout_commit(&hash, callback),
+            );
         }
     });
 
@@ -647,7 +672,7 @@ fn history_commit_action_group(
                     &ctx,
                     "Checkout Failed",
                     "Checked out parent commit.",
-                    move |git| git.checkout_commit(&parent_hash),
+                    move |git, callback| git.checkout_commit(&parent_hash, callback),
                 );
             }
             None => ctx.show_error("Checkout Failed", "This commit has no parent."),
@@ -676,7 +701,7 @@ fn history_commit_action_group(
                 &ctx,
                 "Cherry-Pick Failed",
                 "Cherry-picked commit.",
-                move |git| git.cherry_pick_commit(&hash),
+                move |git, callback| git.cherry_pick_commit(&hash, callback),
             );
         }
     });
@@ -768,9 +793,12 @@ fn prompt_create_branch_at_commit(ctx: &PageContext, hash: String) {
 
             let fallback = format!("Created and checked out {branch}.");
             let hash = hash.clone();
-            run_history_git_action(&ctx, "Create Branch Failed", &fallback, move |git| {
-                git.create_branch_at_commit(&branch, &hash)
-            });
+            run_history_git_action(
+                &ctx,
+                "Create Branch Failed",
+                &fallback,
+                move |git, callback| git.create_branch_at_commit(&branch, &hash, callback),
+            );
         }
     });
 }
@@ -810,9 +838,12 @@ fn prompt_create_tag_at_commit(ctx: &PageContext, hash: String) {
 
             let fallback = format!("Created tag {tag}.");
             let hash = hash.clone();
-            run_history_git_action(&ctx, "Create Tag Failed", &fallback, move |git| {
-                git.create_tag(&tag, &hash)
-            });
+            run_history_git_action(
+                &ctx,
+                "Create Tag Failed",
+                &fallback,
+                move |git, callback| git.create_tag(&tag, &hash, callback),
+            );
         }
     });
 }
@@ -831,9 +862,12 @@ fn confirm_revert_commit(ctx: &PageContext, hash: String) {
             let hash = hash.clone();
             move || {
                 let hash = hash.clone();
-                run_history_git_action(&ctx, "Revert Failed", "Reverted commit.", move |git| {
-                    git.revert_commit(&hash)
-                });
+                run_history_git_action(
+                    &ctx,
+                    "Revert Failed",
+                    "Reverted commit.",
+                    move |git, callback| git.revert_commit(&hash, callback),
+                );
             }
         },
     );
@@ -867,8 +901,8 @@ fn confirm_reset_to_commit(ctx: &PageContext, hash: String, mode: git::ResetMode
             let hash = hash.clone();
             move || {
                 let hash = hash.clone();
-                run_history_git_action(&ctx, "Reset Failed", fallback, move |git| {
-                    git.reset_to_commit(&hash, mode)
+                run_history_git_action(&ctx, "Reset Failed", fallback, move |git, callback| {
+                    git.reset_to_commit(&hash, mode, callback)
                 });
             }
         },
@@ -879,18 +913,54 @@ fn prompt_amend_head_from_commit(ctx: &PageContext, hash: String) {
     let Some(window) = ctx.window() else {
         return;
     };
-    let Some(git_access) = ctx.git() else {
+    let Some(git_handle) = ctx.git() else {
         ctx.show_error("Load Commit Message Failed", &ctx.git_unavailable_message());
         return;
     };
-    let message = match git_access.commit_message(&hash) {
-        Ok(message) => message,
-        Err(err) => {
-            ctx.show_error("Load Commit Message Failed", &err);
-            return;
-        }
-    };
+    let loading_dialog = adw::AlertDialog::builder()
+        .heading("Loading Commit Message")
+        .body("Loading the selected commit message.")
+        .build();
+    loading_dialog.present(Some(&window));
+    let (sender, receiver) = mpsc::channel();
+    git_handle.commit_message(
+        &hash,
+        Box::new(move |result| {
+            let _ = sender.send(result);
+        }),
+    );
 
+    gtk::glib::timeout_add_local(Duration::from_millis(75), {
+        let ctx = ctx.clone();
+        move || match receiver.try_recv() {
+            Ok(Ok(message)) => {
+                loading_dialog.close();
+                show_amend_head_dialog(&ctx, &window, message);
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(err)) => {
+                loading_dialog.close();
+                ctx.show_error("Load Commit Message Failed", &err);
+                gtk::glib::ControlFlow::Break
+            }
+            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) => {
+                loading_dialog.close();
+                ctx.show_error(
+                    "Load Commit Message Failed",
+                    "Commit message loading did not return a result.",
+                );
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn show_amend_head_dialog(
+    ctx: &PageContext,
+    window: &adw::ApplicationWindow,
+    message: git::CommitMessage,
+) {
     let dialog = adw::AlertDialog::builder()
         .heading("Amend HEAD")
         .body(
@@ -921,7 +991,7 @@ fn prompt_amend_head_from_commit(ctx: &PageContext, hash: String) {
     dialog.set_default_response(Some("amend"));
     dialog.set_close_response("cancel");
 
-    dialog.choose(Some(&window), None::<&gio::Cancellable>, {
+    dialog.choose(Some(window), None::<&gio::Cancellable>, {
         let ctx = ctx.clone();
         let summary_entry = summary_entry.clone();
         let description_view = description_view.clone();
@@ -932,9 +1002,12 @@ fn prompt_amend_head_from_commit(ctx: &PageContext, hash: String) {
 
             let summary = summary_entry.text().trim().to_string();
             let description = text_view_text(&description_view);
-            run_history_git_action(&ctx, "Amend Failed", "Amended HEAD.", move |git| {
-                git.amend_head(&summary, &description)
-            });
+            run_history_git_action(
+                &ctx,
+                "Amend Failed",
+                "Amended HEAD.",
+                move |git, callback| git.amend_head(&summary, &description, callback),
+            );
         }
     });
 }
@@ -943,13 +1016,13 @@ fn open_remote_commit(ctx: &PageContext, hash: &str) {
     let ctx = ctx.clone();
     let hash = hash.to_string();
     let workspace_key = ctx.workspace_key();
-    let Some(git_access) = ctx.git() else {
+    let Some(git_handle) = ctx.git() else {
         ctx.show_error("Open Remote Commit Failed", &ctx.git_unavailable_message());
         return;
     };
     request_provider_git_snapshot(
         workspace_key.clone(),
-        git_access,
+        git_handle,
         move |response_key, result| {
             if response_key != workspace_key || !ctx.workspace_is_current(&workspace_key) {
                 return;
@@ -1051,9 +1124,9 @@ fn run_history_git_action<F>(
     fallback_message: &str,
     action: F,
 ) where
-    F: FnOnce(Arc<dyn GitAccess>) -> Result<String, String> + Send + 'static,
+    F: FnOnce(Arc<GitRepoHandle>, crate::git::OperationCallback<String>) + 'static,
 {
-    let Some(git_access) = ctx.git() else {
+    let Some(git_handle) = ctx.git() else {
         ctx.show_error(error_heading, &ctx.git_unavailable_message());
         return;
     };
@@ -1061,10 +1134,12 @@ fn run_history_git_action<F>(
     let error_heading = error_heading.to_string();
     let fallback_message = fallback_message.to_string();
 
-    thread::spawn(move || {
-        let result = action(git_access);
-        let _ = sender.send(result);
-    });
+    action(
+        git_handle,
+        Box::new(move |result| {
+            let _ = sender.send(result);
+        }),
+    );
 
     gtk::glib::timeout_add_local(Duration::from_millis(75), {
         let ctx = ctx.clone();

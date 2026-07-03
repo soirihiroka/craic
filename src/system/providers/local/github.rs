@@ -1,4 +1,3 @@
-use crate::git;
 use crate::github::{
     self, GitHubAuthAccount, GitHubPublishRepositoryRequest, GitHubRepoMetadata,
     GitHubRepositoryOwner,
@@ -18,7 +17,8 @@ impl LocalGitHubAccess {
     }
 
     fn saved_auth_account(&self) -> Option<GitHubAuthAccount> {
-        git::settings(Path::new(&self.workspace.root.absolute)).github_auth_account
+        crate::workspace_config::git_config(Path::new(&self.workspace.root.absolute))
+            .github_auth_account
     }
 }
 

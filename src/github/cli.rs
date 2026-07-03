@@ -1,78 +1,29 @@
-use std::path::Path;
-use std::process::Command;
-
-use super::GitHubAuthAccount;
-
-pub fn switch_auth_account(path: &Path, account: Option<&GitHubAuthAccount>) -> Result<(), String> {
-    let Some(account) = account else {
-        return Ok(());
-    };
-
-    log::info!(
-        "switching github auth account for workspace host={} account={}",
-        account.host,
-        account.login
-    );
-    let output = Command::new("gh")
-        .arg("auth")
-        .arg("switch")
-        .arg("--hostname")
-        .arg(&account.host)
-        .arg("--user")
-        .arg(&account.login)
-        .current_dir(path)
-        .output()
-        .map_err(|err| format!("Failed to run gh auth switch: {err}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Err(if stderr.is_empty() {
-            format!("gh auth switch failed: {stdout}")
-        } else {
-            format!("gh auth switch failed: {stderr}")
-        })
-    }
-}
-
-pub fn checkout_pull_request(path: &Path, number: u32) -> Result<String, String> {
-    let output = Command::new("gh")
-        .current_dir(path)
-        .arg("pr")
-        .arg("checkout")
-        .arg(number.to_string())
-        .output()
-        .map_err(|err| format!("Failed to run gh pr checkout {number}: {err}"))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Err(if stderr.is_empty() {
-            format!("gh pr checkout {number} failed: {stdout}")
-        } else {
-            format!("gh pr checkout {number} failed: {stderr}")
-        })
-    }
-}
+const AUTH_SWITCH_SCRIPT: &str = include_str!("scripts/auth_switch.sh");
+const CHECKOUT_PULL_REQUEST_SCRIPT: &str = include_str!("scripts/checkout_pull_request.sh");
+const GH_WITH_ACCOUNT_SCRIPT: &str = include_str!("scripts/gh_with_account.sh");
 
 pub(crate) fn ssh_switch_auth_account_script(quoted_host: &str, quoted_login: &str) -> String {
-    format!(
-        "{} && \"$gh_cmd\" auth switch --hostname {quoted_host} --user {quoted_login}",
-        ssh_gh_command_assignment()
-    )
+    format!("set -- {quoted_host} {quoted_login}\n{AUTH_SWITCH_SCRIPT}")
 }
 
 pub(crate) fn ssh_checkout_pull_request_script(quoted_root: &str, quoted_number: &str) -> String {
-    format!(
-        "cd {quoted_root} && {} && \"$gh_cmd\" pr checkout {quoted_number}",
-        ssh_gh_command_assignment()
-    )
+    format!("set -- {quoted_root} {quoted_number}\n{CHECKOUT_PULL_REQUEST_SCRIPT}")
 }
 
-fn ssh_gh_command_assignment() -> &'static str {
-    "gh_cmd=$(command -v gh 2>/dev/null || { if [ -x /home/linuxbrew/.linuxbrew/bin/gh ]; then printf '%s\\n' /home/linuxbrew/.linuxbrew/bin/gh; elif [ -x \"$HOME/.local/bin/gh\" ]; then printf '%s\\n' \"$HOME/.local/bin/gh\"; else printf '%s\\n' gh; fi; })"
+pub(crate) fn ssh_gh_with_account_script(host: &str, login: &str, args: &[String]) -> String {
+    let mut command = format!("set -- {} {}", shell_quote(host), shell_quote(login));
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    command.push('\n');
+    command.push_str(GH_WITH_ACCOUNT_SCRIPT);
+    command
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }

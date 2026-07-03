@@ -1,8 +1,15 @@
-use crate::system::capabilities::shell::{ShellAccess, ShellCommandSpec, default_shell};
+use crate::system::capabilities::shell::{
+    ShellAccess, ShellCommandOutput, ShellCommandRunRequest, ShellCommandSpec, ShellRunCallback,
+    ShellRunRequest, default_shell,
+};
 use crate::system::path::{WorkspacePath, WorkspaceRef};
 use std::collections::HashMap;
-use std::process::Command;
+use std::ffi::OsString;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalShellAccess {
@@ -81,6 +88,56 @@ impl ShellAccess for LocalShellAccess {
         Ok(command)
     }
 
+    fn fast_command(
+        &self,
+        working_dir: &WorkspacePath,
+        program: &str,
+        args: &[String],
+    ) -> Result<ShellCommandSpec, String> {
+        log::debug!(
+            "local fast command created workspace={} working_dir={} program={}",
+            self.workspace.display_name,
+            working_dir.display(),
+            program
+        );
+        let mut command = ShellCommandSpec::new(program, working_dir.clone());
+        for arg in args {
+            command = command.arg(arg.as_str());
+        }
+        Ok(command)
+    }
+
+    fn run_script(&self, request: ShellRunRequest, callback: ShellRunCallback) {
+        let workspace = self.workspace.display_name.clone();
+        thread::spawn(move || {
+            callback(run_local_script(
+                workspace,
+                request,
+                default_shell(),
+                ShellScriptMode::UserInteractive,
+            ));
+        });
+    }
+
+    fn run_fast_script(&self, request: ShellRunRequest, callback: ShellRunCallback) {
+        let workspace = self.workspace.display_name.clone();
+        thread::spawn(move || {
+            callback(run_local_script(
+                workspace,
+                request,
+                OsString::from("/bin/sh"),
+                ShellScriptMode::Fast,
+            ));
+        });
+    }
+
+    fn run_fast_command(&self, request: ShellCommandRunRequest, callback: ShellRunCallback) {
+        let workspace = self.workspace.display_name.clone();
+        thread::spawn(move || {
+            callback(run_local_command(workspace, request));
+        });
+    }
+
     fn command_display(&self, command: &ShellCommandSpec) -> String {
         std::iter::once(command.program.clone())
             .chain(command.args.iter().cloned())
@@ -110,41 +167,20 @@ impl ShellAccess for LocalShellAccess {
             return Ok(cached);
         }
 
-        let shell = default_shell();
-        let script = format!("command -v {}", shell_quote(program));
-        let output = Command::new(&shell)
-            .arg("-i")
-            .arg("-c")
-            .arg(&script)
-            .current_dir(&self.workspace.root.absolute)
-            .output()
-            .map_err(|err| {
-                format!(
-                    "Failed to start default shell {} for command lookup: {err}",
-                    shell.to_string_lossy()
-                )
-            })?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let resolved = if output.status.success() {
-            let resolved = shell_which_output(&stdout);
-            log::debug!(
-                "local shell which workspace={} program={} resolved={:?}",
-                self.workspace.display_name,
-                program,
-                resolved
-            );
+        let resolved = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths).find_map(|dir| {
+                let path = dir.join(program);
+                let metadata = std::fs::metadata(&path).ok()?;
+                (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                    .then(|| path.to_string_lossy().to_string())
+            })
+        });
+        log::debug!(
+            "local fast which workspace={} program={} resolved={:?}",
+            self.workspace.display_name,
+            program,
             resolved
-        } else {
-            log::debug!(
-                "local shell which missing workspace={} program={} status={} stderr={}",
-                self.workspace.display_name,
-                program,
-                output.status,
-                stderr.trim()
-            );
-            None
-        };
+        );
 
         self.command_lookup
             .lock()
@@ -154,21 +190,159 @@ impl ShellAccess for LocalShellAccess {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellScriptMode {
+    UserInteractive,
+    Fast,
+}
+
+fn run_local_script(
+    workspace_name: String,
+    request: ShellRunRequest,
+    shell: OsString,
+    mode: ShellScriptMode,
+) -> Result<ShellCommandOutput, String> {
+    log::info!(
+        "local shell command start workspace={} operation={} working_dir={} script_bytes={} mode={:?}",
+        workspace_name,
+        request.operation,
+        request.working_dir.display(),
+        request.script.len(),
+        mode
+    );
+
+    let mut command = Command::new(&shell);
+    if mode == ShellScriptMode::UserInteractive {
+        command.arg("-i");
+    }
+    command
+        .arg("-c")
+        .arg(&request.script)
+        .current_dir(&request.working_dir.absolute)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if request.stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+
+    let mut child = command.spawn().map_err(|err| {
+        format!(
+            "Failed to start shell {} for {}: {err}",
+            shell.to_string_lossy(),
+            request.operation
+        )
+    })?;
+    if let Some(stdin_bytes) = request.stdin.as_deref()
+        && let Some(mut child_stdin) = child.stdin.take()
+    {
+        child_stdin.write_all(stdin_bytes).map_err(|err| {
+            format!(
+                "Failed to write shell stdin for {}: {err}",
+                request.operation
+            )
+        })?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("Failed to wait for shell {}: {err}", request.operation))?;
+    if output.status.success() {
+        log::info!(
+            "local shell command complete workspace={} operation={} stdout_bytes={}",
+            workspace_name,
+            request.operation,
+            output.stdout.len()
+        );
+    } else {
+        log::warn!(
+            "local shell command failed workspace={} operation={} status={} stderr={}",
+            workspace_name,
+            request.operation,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(ShellCommandOutput {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        status_code: output.status.code(),
+    })
+}
+
+fn run_local_command(
+    workspace_name: String,
+    request: ShellCommandRunRequest,
+) -> Result<ShellCommandOutput, String> {
+    log::info!(
+        "local fast command start workspace={} operation={} working_dir={} program={} args={}",
+        workspace_name,
+        request.operation,
+        request.working_dir.display(),
+        request.program,
+        request.args.len()
+    );
+    let mut command = Command::new(&request.program);
+    command
+        .args(&request.args)
+        .current_dir(&request.working_dir.absolute)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if request.stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+
+    let mut child = command.spawn().map_err(|err| {
+        format!(
+            "Failed to start fast command {} for {}: {err}",
+            request.program, request.operation
+        )
+    })?;
+    if let Some(stdin_bytes) = request.stdin.as_deref()
+        && let Some(mut child_stdin) = child.stdin.take()
+    {
+        child_stdin.write_all(stdin_bytes).map_err(|err| {
+            format!(
+                "Failed to write fast command stdin for {}: {err}",
+                request.operation
+            )
+        })?;
+    }
+
+    let output = child.wait_with_output().map_err(|err| {
+        format!(
+            "Failed to wait for fast command {}: {err}",
+            request.operation
+        )
+    })?;
+    if output.status.success() {
+        log::info!(
+            "local fast command complete workspace={} operation={} stdout_bytes={}",
+            workspace_name,
+            request.operation,
+            output.stdout.len()
+        );
+    } else {
+        log::warn!(
+            "local fast command failed workspace={} operation={} status={} stderr={}",
+            workspace_name,
+            request.operation,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(ShellCommandOutput {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        status_code: output.status.code(),
+    })
+}
+
 fn command_name_can_use_path(program: &str) -> bool {
     !program.is_empty()
         && !program.contains('/')
         && program
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-}
-
-fn shell_which_output(output: &str) -> Option<String> {
-    output
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(ToString::to_string)
 }
 
 fn shell_quote(value: &str) -> String {

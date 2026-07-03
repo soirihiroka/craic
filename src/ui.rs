@@ -27,6 +27,7 @@ use crate::git;
 use crate::system::capabilities::{
     shell::ShellAccess, terminal_link::TerminalLinkAccess, url::UrlOpenAccess,
 };
+use crate::system::path::SystemId;
 use crate::system::provider::SystemProvider;
 use crate::system::providers::local::LocalProvider;
 use crate::system::providers::ssh::{SshProvider, SshProviderConfig};
@@ -435,7 +436,7 @@ pub fn build_ui(
 enum GitWorkerCommand {
     ProviderSnapshot {
         workspace_key: String,
-        git_access: Arc<dyn crate::system::capabilities::git::GitAccess>,
+        git_handle: Arc<crate::git::GitRepoHandle>,
         respond_to: mpsc::Sender<(String, Result<git::RepositorySnapshot, String>)>,
     },
 }
@@ -451,24 +452,25 @@ fn git_snapshot_worker() -> &'static mpsc::Sender<GitWorkerCommand> {
                 match command {
                     GitWorkerCommand::ProviderSnapshot {
                         workspace_key,
-                        git_access,
+                        git_handle,
                         respond_to,
                     } => {
                         let step_start = Instant::now();
-                        let result = git_access.snapshot();
-                        let status = if result.is_ok() { "ok" } else { "error" };
-                        log::info!(
-                            "git snapshot worker finished workspace={} status={} elapsed_ms={}",
-                            workspace_key,
-                            status,
-                            step_start.elapsed().as_millis()
-                        );
-                        if respond_to.send((workspace_key.clone(), result)).is_err() {
-                            log::warn!(
-                                "git snapshot worker: provider response receiver disconnected for {}",
+                        git_handle.snapshot(Box::new(move |result| {
+                            let status = if result.is_ok() { "ok" } else { "error" };
+                            log::info!(
+                                "git snapshot worker finished workspace={} status={} elapsed_ms={}",
                                 workspace_key,
+                                status,
+                                step_start.elapsed().as_millis()
                             );
-                        }
+                            if respond_to.send((workspace_key.clone(), result)).is_err() {
+                                log::warn!(
+                                    "git snapshot worker: provider response receiver disconnected for {}",
+                                    workspace_key,
+                                );
+                            }
+                        }));
                     }
                 }
             }
@@ -482,7 +484,7 @@ fn git_snapshot_worker() -> &'static mpsc::Sender<GitWorkerCommand> {
 
 pub(crate) fn request_provider_git_snapshot<F>(
     workspace_key: String,
-    git_access: Arc<dyn crate::system::capabilities::git::GitAccess>,
+    git_handle: Arc<crate::git::GitRepoHandle>,
     on_result: F,
 ) where
     F: FnMut(String, Result<git::RepositorySnapshot, String>) + 'static,
@@ -493,7 +495,7 @@ pub(crate) fn request_provider_git_snapshot<F>(
 
     if let Err(err) = git_snapshot_worker().send(GitWorkerCommand::ProviderSnapshot {
         workspace_key: workspace_key.clone(),
-        git_access,
+        git_handle,
         respond_to: sender,
     }) {
         log::error!("failed to enqueue provider git snapshot request for {workspace_key}: {err}");
@@ -535,6 +537,26 @@ pub(crate) fn request_provider_git_snapshot<F>(
             }
         }
     });
+}
+
+fn git_handle_for_active_workspace(state: &Rc<AppState>) -> Option<Arc<crate::git::GitRepoHandle>> {
+    let system_id = state.system_ref.borrow().id.clone();
+    let workspace = state.workspace_ref.borrow().clone();
+    git_handle_for_workspace(state, &system_id, &workspace)
+}
+
+fn git_handle_for_workspace(
+    state: &Rc<AppState>,
+    system_id: &SystemId,
+    workspace: &crate::system::WorkspaceRef,
+) -> Option<Arc<crate::git::GitRepoHandle>> {
+    let files = state.providers.files(system_id, workspace)?;
+    let shell = state.providers.shell(system_id, workspace)?;
+    Some(Arc::new(crate::git::GitRepoHandle::new(
+        workspace.clone(),
+        shell,
+        files,
+    )))
 }
 
 #[derive(Clone)]
@@ -942,7 +964,8 @@ struct QueuedRepositoryRefresh {
 #[derive(Default)]
 struct RepositoryMonitor {
     workspace_key: RefCell<Option<String>>,
-    subscription: RefCell<Option<crate::system::capabilities::git::GitWatchSubscription>>,
+    subscription: RefCell<Option<crate::git::ChangeListenerSubscription>>,
+    background_pull: RefCell<Option<crate::git::BackgroundPullSubscription>>,
     event_source: RefCell<Option<gtk::glib::SourceId>>,
 }
 
@@ -950,14 +973,13 @@ impl RepositoryMonitor {
     fn restart(&self, state: &Rc<AppState>) {
         self.stop();
 
-        let system_id = state.system_ref.borrow().id.clone();
         let workspace = state.workspace_ref.borrow().clone();
         let workspace_key = workspace.id.to_string();
         self.workspace_key.replace(Some(workspace_key.clone()));
 
-        let Some(git_access) = state.providers.git(&system_id, &workspace) else {
+        let Some(git_handle) = git_handle_for_active_workspace(state) else {
             log::debug!(
-                "repository monitor unavailable workspace={} reason=no-git-capability",
+                "repository monitor unavailable workspace={} reason=no-git-handle",
                 workspace.display_name
             );
             return;
@@ -965,23 +987,13 @@ impl RepositoryMonitor {
 
         let (sender, receiver) = mpsc::channel();
         let sender = Arc::new(Mutex::new(sender));
-        let callback: crate::system::capabilities::git::GitWatchCallback = Arc::new(move || {
+        let listener: crate::git::ChangeListener = Arc::new(move || {
             if let Ok(sender) = sender.lock() {
                 let _ = sender.send(());
             }
         });
-
-        let subscription = match git_access.watch(callback) {
-            Ok(subscription) => subscription,
-            Err(err) => {
-                log::warn!(
-                    "repository monitor unavailable workspace={} reason={}",
-                    workspace.display_name,
-                    err
-                );
-                return;
-            }
-        };
+        let subscription = git_handle.add_on_change_listener(listener.clone());
+        let background_pull = git_handle.schedule_background_pull_loop(Some(listener));
 
         let state_weak = Rc::downgrade(state);
         let source_workspace_key = workspace_key.clone();
@@ -1015,6 +1027,7 @@ impl RepositoryMonitor {
         });
 
         self.subscription.replace(Some(subscription));
+        self.background_pull.replace(Some(background_pull));
         self.event_source.replace(Some(source_id));
         log::info!(
             "repository monitor subscribed workspace={} key={}",
@@ -1037,6 +1050,7 @@ impl RepositoryMonitor {
             source_id.remove();
         }
         self.subscription.borrow_mut().take();
+        self.background_pull.borrow_mut().take();
         self.workspace_key.take();
     }
 }
@@ -1183,9 +1197,9 @@ fn refresh_with_toast(state: &Rc<AppState>, message: Option<String>, show_toast:
 fn refresh_active_repo_metadata(state: &Rc<AppState>, item_id: Option<String>) {
     let system = state.system_ref.borrow().clone();
     let workspace = state.workspace_ref.borrow().clone();
-    let Some(git_access) = state.providers.git(&system.id, &workspace) else {
+    let Some(git_handle) = git_handle_for_workspace(state, &system.id, &workspace) else {
         log::debug!(
-            "skipping repo metadata refresh workspace={} reason=no-git-capability",
+            "skipping repo metadata refresh workspace={} reason=no-git-handle",
             workspace.display_name
         );
         state
@@ -1203,7 +1217,7 @@ fn refresh_active_repo_metadata(state: &Rc<AppState>, item_id: Option<String>) {
     state.sidebar.refresh_workspace_repo_metadata(
         workspace.id.to_string(),
         item_id,
-        git_access,
+        git_handle,
         github_access,
     );
 }
@@ -1250,7 +1264,7 @@ fn refresh_repository(
     let system_id = state.system_ref.borrow().id.clone();
     let workspace_ref = state.workspace_ref.borrow().clone();
     let workspace_name = workspace_ref.display_name.clone();
-    let Some(git_access) = state.providers.git(&system_id, &workspace_ref) else {
+    let Some(git_handle) = git_handle_for_workspace(state, &system_id, &workspace_ref) else {
         log::debug!("refresh without git metadata for workspace={workspace_name}");
         let snapshot = git::RepositorySnapshot {
             name: workspace_name,
@@ -1286,7 +1300,7 @@ fn refresh_repository(
         return;
     };
 
-    request_provider_git_snapshot(workspace_key.clone(), git_access, {
+    request_provider_git_snapshot(workspace_key.clone(), git_handle, {
         let state = state.clone();
         move |response_workspace_key, result| {
             if response_workspace_key != workspace_key {
@@ -1454,7 +1468,7 @@ fn refresh_repository_page(
         repo_path.display()
     );
 
-    let Some(git_access) = state.providers.git(&system_id, &workspace_ref) else {
+    let Some(git_handle) = git_handle_for_workspace(state, &system_id, &workspace_ref) else {
         let err = format!(
             "Git is unavailable for workspace {}.",
             workspace_ref.display_name
@@ -1465,7 +1479,7 @@ fn refresh_repository_page(
         return;
     };
 
-    request_provider_git_snapshot(workspace_key.clone(), git_access, {
+    request_provider_git_snapshot(workspace_key.clone(), git_handle, {
         let state = state.clone();
         move |response_workspace_key, result| {
             if !page_refresh_generation_is_current(&state, index, generation) {

@@ -84,24 +84,6 @@ pub(crate) fn git_config_from_file_access(files: &dyn FileAccess) -> GitConfig {
     }
 }
 
-pub(crate) fn save_git_config(
-    path: &Path,
-    commit_timezone: &str,
-    warn_if_remote_owner_mismatch: bool,
-    use_system_timezone: bool,
-    github_auth_account: Option<&github::GitHubAuthAccount>,
-) -> Result<(), String> {
-    let mut config = load(path);
-    apply_git_config(
-        &mut config,
-        commit_timezone,
-        warn_if_remote_owner_mismatch,
-        use_system_timezone,
-        github_auth_account,
-    )?;
-    save(path, &config)
-}
-
 pub(crate) fn save_git_config_with_file_access(
     files: &dyn FileAccess,
     commit_timezone: &str,
@@ -189,6 +171,49 @@ pub(crate) fn add_markdown_lint_ignore_with_file_access(
     ignored_rules.push(toml::Value::String(rule_name.to_string()));
     save_repo_config_with_file_access(files, &config)?;
     Ok(format!("Added {rule_name} to repo markdown lint ignores."))
+}
+
+pub(crate) fn commit_convention_from_file_access(files: &dyn FileAccess) -> Option<String> {
+    let config_path = repo_config_node(files);
+    let value = match load_repo_config_from_file_access(files) {
+        Ok(value) => value,
+        Err(err) => {
+            log::warn!(
+                "failed to parse commit convention from {}: {}",
+                config_path.display(),
+                err
+            );
+            return None;
+        }
+    };
+    let Some(raw) = value.get("commit_convention") else {
+        log::debug!("no commit_convention key in {}", config_path.display());
+        return None;
+    };
+    let convention = match raw {
+        toml::Value::String(value) => value.trim().to_string(),
+        toml::Value::Array(values) => values
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => {
+            log::warn!(
+                "unsupported commit_convention type in {} (expected string or array)",
+                config_path.display()
+            );
+            return None;
+        }
+    };
+    let convention = convention.trim().to_string();
+    if convention.is_empty() {
+        log::warn!("commit_convention in {} is empty", config_path.display());
+        return None;
+    }
+    log::info!("using commit_convention from {}", config_path.display());
+    Some(convention)
 }
 
 pub(crate) fn normalize_timezone(value: &str) -> Result<String, String> {

@@ -8,7 +8,6 @@ use crate::system::capabilities::files::{FileAccess, FileNodeKind};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 const GIT_IGNORE_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -62,7 +61,7 @@ impl FileBrowser {
         if rows.is_empty() {
             return;
         }
-        let Some(git_access) = self.git_access.borrow().clone() else {
+        let Some(git_handle) = self.git_handle.borrow().clone() else {
             return;
         };
 
@@ -102,14 +101,16 @@ impl FileBrowser {
         let disconnected_pending_paths = pending_paths.clone();
         let (sender, receiver) = mpsc::channel();
 
-        thread::spawn(move || {
-            let ignored_paths = git_access.check_ignored_paths(&queries);
-            let _ = sender.send(GitIgnoreQueryResult {
-                generation,
-                paths: pending_paths,
-                ignored_paths,
-            });
-        });
+        git_handle.check_ignored_paths(
+            &queries,
+            Box::new(move |ignored_paths| {
+                let _ = sender.send(GitIgnoreQueryResult {
+                    generation,
+                    paths: pending_paths,
+                    ignored_paths,
+                });
+            }),
+        );
 
         gtk::glib::timeout_add_local(Duration::from_millis(SEARCH_POLL_MS), {
             let browser = self.clone();

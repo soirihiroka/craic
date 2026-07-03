@@ -4,7 +4,6 @@ use crate::system::capabilities::files::{
     FileWriteRequest,
 };
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,28 +170,6 @@ fn finish_add_pattern(
     if let Some(callback) = callback {
         callback(result);
     }
-}
-
-pub fn check_ignored_paths(
-    repo_path: &Path,
-    checks: &[IgnoreCheck],
-) -> Result<HashSet<String>, String> {
-    if checks.is_empty() {
-        return Ok(HashSet::new());
-    }
-
-    let stdout = crate::git::run_git_bytes_owned_with_stdin_and_success_codes(
-        repo_path,
-        &[
-            "check-ignore".to_string(),
-            "--stdin".to_string(),
-            "-z".to_string(),
-        ],
-        &check_ignore_stdin(checks),
-        &[0, 1],
-    )?;
-
-    Ok(parse_check_ignore_output(checks, &stdout))
 }
 
 pub fn check_ignore_stdin(checks: &[IgnoreCheck]) -> Vec<u8> {

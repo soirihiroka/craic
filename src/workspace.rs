@@ -1,7 +1,6 @@
 use crate::config::{ConfiguredWorkspace, WorkspaceProvider};
 use crate::system::provider::{
-    ProviderWorkspaceEntry, ProviderWorkspaceGitStatus, ProviderWorkspaceListRequest,
-    ProviderWorkspaceSource, SystemProvider,
+    ProviderWorkspaceEntry, ProviderWorkspaceListRequest, ProviderWorkspaceSource, SystemProvider,
 };
 use crate::system::providers::local::LocalProvider;
 use crate::system::providers::ssh::{SshProvider, SshProviderConfig};
@@ -12,7 +11,6 @@ use std::path::PathBuf;
 pub(crate) struct WorkspaceEntry {
     pub(crate) workspace: ConfiguredWorkspace,
     pub(crate) label: String,
-    pub(crate) git: Option<ProviderWorkspaceGitStatus>,
 }
 
 impl WorkspaceEntry {
@@ -140,7 +138,7 @@ fn push_listed_workspaces(
                 .map(|configured| (workspace.display_name.clone(), configured.color.clone()))
                 .unwrap_or_else(|| (workspace.display_name.clone(), None)),
         };
-        push_workspace_with_git(
+        push_workspace(
             entries,
             seen,
             ConfiguredWorkspace {
@@ -149,7 +147,6 @@ fn push_listed_workspaces(
                 display_name: Some(display_name),
                 color,
             },
-            Some(workspace.git),
         );
     }
 }
@@ -175,7 +172,7 @@ fn push_missing_configured_workspaces(
             configured_provider_id,
             configured_path
         );
-        push_workspace_with_git(entries, seen, normalize_workspace(workspace.clone()), None);
+        push_workspace(entries, seen, normalize_workspace(workspace.clone()));
     }
 }
 
@@ -220,11 +217,10 @@ pub(crate) fn workspace_from_selection_id(id: &str) -> ConfiguredWorkspace {
     }
 }
 
-fn push_workspace_with_git(
+fn push_workspace(
     entries: &mut Vec<WorkspaceEntry>,
     seen: &mut HashSet<String>,
     workspace: ConfiguredWorkspace,
-    git: Option<ProviderWorkspaceGitStatus>,
 ) {
     let key = workspace.selection_id();
     if !seen.insert(key) {
@@ -233,6 +229,5 @@ fn push_workspace_with_git(
     entries.push(WorkspaceEntry {
         label: workspace.label(),
         workspace,
-        git,
     });
 }

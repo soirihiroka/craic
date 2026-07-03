@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 
 mod cli;
-pub use cli::{checkout_pull_request, switch_auth_account};
+pub(crate) use cli::ssh_gh_with_account_script;
 pub(crate) use cli::{ssh_checkout_pull_request_script, ssh_switch_auth_account_script};
 
 const GITHUB_AVATAR_URL_CACHE_TTL_SECS: i64 = 60 * 60 * 24 * 30;
@@ -291,11 +291,27 @@ fn gh_authenticated_accounts() -> Result<Vec<GitHubAccount>, String> {
         });
     }
 
-    let value = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+    parse_gh_authenticated_accounts(&output.stdout)
+}
+
+fn parse_gh_authenticated_accounts(bytes: &[u8]) -> Result<Vec<GitHubAccount>, String> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes)
         .map_err(|err| format!("Failed to parse gh auth status output: {err}"))?;
     let mut accounts = Vec::new();
     collect_authenticated_accounts(&value, None, &mut accounts);
     Ok(accounts)
+}
+
+pub fn parse_authenticated_accounts(bytes: &[u8]) -> Result<Vec<GitHubAuthAccount>, String> {
+    parse_gh_authenticated_accounts(bytes).map(|accounts| {
+        accounts
+            .into_iter()
+            .map(|account| GitHubAuthAccount {
+                host: account.host,
+                login: account.login,
+            })
+            .collect()
+    })
 }
 
 fn collect_authenticated_accounts(
@@ -886,10 +902,6 @@ pub fn parse_github_url(url: &str) -> Option<String> {
     None
 }
 
-pub fn fetch_repo_metadata(repo_slug: &str) -> Result<GitHubRepoMetadata, String> {
-    fetch_repo_metadata_with_account(repo_slug, None)
-}
-
 pub fn fetch_repo_metadata_with_account(
     repo_slug: &str,
     account: Option<&GitHubAuthAccount>,
@@ -928,10 +940,6 @@ pub fn fetch_repo_metadata_with_account(
             format!("gh repo view {repo_slug} failed: {stderr}")
         })
     }
-}
-
-pub fn open_pull_requests(workspace_root: &str) -> Result<Vec<PullRequestInfo>, String> {
-    open_pull_requests_with_account(workspace_root, None)
 }
 
 pub fn open_pull_requests_with_account(
@@ -1018,6 +1026,33 @@ pub fn repository_owners_for_account(
         }
     }
 
+    Ok(owners)
+}
+
+pub fn repository_owners_from_orgs(
+    account: &GitHubAuthAccount,
+    bytes: &[u8],
+) -> Result<Vec<GitHubRepositoryOwner>, String> {
+    let orgs = serde_json::from_slice::<Vec<GhOrganization>>(bytes)
+        .map_err(|err| format!("Failed to parse gh user/orgs output: {err}"))?;
+    let mut owners = vec![GitHubRepositoryOwner {
+        host: account.host.clone(),
+        auth_login: account.login.clone(),
+        owner: account.login.clone(),
+    }];
+    for org in orgs {
+        let Some(login) = org.login.map(|login| login.trim().to_string()) else {
+            continue;
+        };
+        if login.is_empty() || owners.iter().any(|owner| owner.owner == login) {
+            continue;
+        }
+        owners.push(GitHubRepositoryOwner {
+            host: account.host.clone(),
+            auth_login: account.login.clone(),
+            owner: login,
+        });
+    }
     Ok(owners)
 }
 
