@@ -1,7 +1,7 @@
 use super::capabilities::github::GitHubAccess;
 use super::capabilities::{
-    docker::DockerAccess, files::FileAccess, git::GitAccess, open::DesktopOpenAccess,
-    shell::ShellAccess, terminal_link::TerminalLinkAccess, url::UrlOpenAccess,
+    docker::DockerAccess, files::FileAccess, open::DesktopOpenAccess, shell::ShellAccess,
+    terminal_link::TerminalLinkAccess, url::UrlOpenAccess,
 };
 use super::path::{ProviderKind, SystemId, WorkspaceRef};
 use std::collections::HashMap;
@@ -18,29 +18,12 @@ pub(crate) struct ProviderWorkspaceEntry {
     pub(crate) path: String,
     pub(crate) display_name: String,
     pub(crate) source: ProviderWorkspaceSource,
-    pub(crate) git: ProviderWorkspaceGitStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProviderWorkspaceSource {
     Workspace { path: String },
     Root { path: String },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ProviderWorkspaceRemote {
-    pub(crate) name: Option<String>,
-    pub(crate) url: String,
-    pub(crate) host: Option<String>,
-    pub(crate) slug: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ProviderWorkspaceGitStatus {
-    NotRepo,
-    Repo {
-        remote: Option<ProviderWorkspaceRemote>,
-    },
 }
 
 pub(crate) trait SystemProvider: Send + Sync {
@@ -53,7 +36,6 @@ pub(crate) trait SystemProvider: Send + Sync {
         request: ProviderWorkspaceListRequest,
     ) -> Result<Vec<ProviderWorkspaceEntry>, String>;
     fn files(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn FileAccess>>;
-    fn git(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn GitAccess>>;
     fn github(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn GitHubAccess>>;
     fn shell(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn ShellAccess>>;
     fn docker(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn DockerAccess>>;
@@ -66,7 +48,6 @@ pub(crate) trait SystemProvider: Send + Sync {
 pub(crate) struct SystemProviderRegistry {
     providers: Arc<RwLock<HashMap<SystemId, Arc<dyn SystemProvider>>>>,
     files: Arc<RwLock<HashMap<String, Arc<dyn FileAccess>>>>,
-    git: Arc<RwLock<HashMap<String, Arc<dyn GitAccess>>>>,
     github: Arc<RwLock<HashMap<String, Arc<dyn GitHubAccess>>>>,
     shell: Arc<RwLock<HashMap<String, Arc<dyn ShellAccess>>>>,
     docker: Arc<RwLock<HashMap<String, Arc<dyn DockerAccess>>>>,
@@ -119,27 +100,6 @@ impl SystemProviderRegistry {
             self.files
                 .write()
                 .expect("system files cache poisoned")
-                .insert(key, access.clone());
-        }
-        access
-    }
-
-    pub(crate) fn git(
-        &self,
-        system_id: &SystemId,
-        workspace: &WorkspaceRef,
-    ) -> Option<Arc<dyn GitAccess>> {
-        let key = capability_key(system_id, workspace);
-        if let Some(access) = self.cached_git_access(&key) {
-            return Some(access);
-        }
-        let provider = self.provider(system_id)?;
-        let access = provider.git(workspace);
-        log_capability_absence(access.is_some(), &provider.label(), workspace, "git");
-        if let Some(access) = &access {
-            self.git
-                .write()
-                .expect("system git cache poisoned")
                 .insert(key, access.clone());
         }
         access
@@ -289,14 +249,6 @@ impl SystemProviderRegistry {
             .cloned()
     }
 
-    fn cached_git_access(&self, key: &str) -> Option<Arc<dyn GitAccess>> {
-        self.git
-            .read()
-            .expect("system git cache poisoned")
-            .get(key)
-            .cloned()
-    }
-
     fn cached_github_access(&self, key: &str) -> Option<Arc<dyn GitHubAccess>> {
         self.github
             .read()
@@ -350,10 +302,6 @@ impl SystemProviderRegistry {
         self.files
             .write()
             .expect("system files cache poisoned")
-            .retain(|key, _| !key.starts_with(&prefix));
-        self.git
-            .write()
-            .expect("system git cache poisoned")
             .retain(|key, _| !key.starts_with(&prefix));
         self.github
             .write()

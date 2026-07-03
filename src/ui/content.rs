@@ -878,19 +878,8 @@ fn branch_picker_item(branch: &crate::git::BranchInfo) -> TabbedPickerItem {
     } else {
         "branch-symbolic"
     };
-    let id = match branch.kind {
-        crate::git::BranchKind::Local => format!("branch:{}", branch.name),
-        crate::git::BranchKind::Remote => format!("remote:{}", branch.name),
-    };
-    let subtitle = match branch.kind {
-        crate::git::BranchKind::Local => None,
-        crate::git::BranchKind::Remote => Some("Remote branch".to_string()),
-    };
-    let mut item = TabbedPickerItem::new(id, branch.name.clone(), icon).selected(branch.is_current);
-    if let Some(subtitle) = subtitle {
-        item = item.subtitle(subtitle);
-    }
-    item
+    TabbedPickerItem::new(format!("branch:{}", branch.name), branch.name.clone(), icon)
+        .selected(branch.is_current)
 }
 
 fn pull_requests_tab(

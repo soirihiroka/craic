@@ -1,7 +1,6 @@
 use super::{picker, widgets};
-use crate::git::RepositorySnapshot;
+use crate::git::{GitRepoHandle, RepositorySnapshot};
 use crate::system::SystemRef;
-use crate::system::capabilities::git::GitAccess;
 use crate::system::capabilities::github::GitHubAccess;
 use crate::ui::pages::PageRef;
 use adw::prelude::*;
@@ -116,7 +115,7 @@ impl SidebarPane {
         &self,
         workspace_key: String,
         item_id: Option<String>,
-        git_access: Arc<dyn GitAccess>,
+        git_handle: Arc<GitRepoHandle>,
         github_access: Option<Arc<dyn GitHubAccess>>,
     ) {
         repositories::refresh_repo_icon_kind(
@@ -124,7 +123,7 @@ impl SidebarPane {
             item_id,
             &self.repository_picker,
             self.repo_icon_loading.clone(),
-            git_access,
+            git_handle,
             github_access,
         );
     }

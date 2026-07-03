@@ -1,6 +1,6 @@
 use super::dialogs::show_error_dialog;
 use super::{AppState, refresh, request_provider_git_snapshot};
-use crate::system::capabilities::git::GitAccess;
+use crate::git::GitRepoHandle;
 use adw::prelude::*;
 use gtk::gio;
 use std::rc::Rc;
@@ -82,15 +82,15 @@ fn parse_branch_picker_id(id: &str) -> Option<BranchCheckoutTarget> {
 }
 
 fn checkout_with_change_prompt(state: &Rc<AppState>, target: BranchCheckoutTarget) {
-    let (workspace_key, git_access) = match active_git_access(state) {
+    let (workspace_key, git_handle) = match active_git_handle(state) {
         Ok(access) => access,
         Err(err) => {
             show_error_dialog(&state.window, "Repository Error", &err);
             return;
         }
     };
-    let action_git_access = git_access.clone();
-    request_provider_git_snapshot(workspace_key.clone(), git_access, {
+    let action_git_handle = git_handle.clone();
+    request_provider_git_snapshot(workspace_key.clone(), git_handle, {
         let state = state.clone();
         let target = target.clone();
         move |response_key, result| {
@@ -109,25 +109,9 @@ fn checkout_with_change_prompt(state: &Rc<AppState>, target: BranchCheckoutTarge
             let checkout_fn = {
                 let state = state.clone();
                 let target = target.clone();
-                let git_access = action_git_access.clone();
-                move |pop_after: bool| match checkout_target(git_access.as_ref(), &target) {
-                    Ok(output) => {
-                        if pop_after {
-                            if let Err(err) = git_access.pop_stash() {
-                                show_error_dialog(&state.window, "Failed to Apply Changes", &err);
-                            }
-                        }
-                        super::broadcast_page_command(
-                            &state,
-                            super::pages::PageCommand::ClearSelection,
-                        );
-                        if output.is_empty() {
-                            refresh(&state, Some(format!("Checked out {}.", target.label())));
-                        } else {
-                            refresh(&state, Some(output));
-                        }
-                    }
-                    Err(err) => show_error_dialog(&state.window, "Checkout Failed", &err),
+                let git_handle = action_git_handle.clone();
+                move |pop_after: bool| {
+                    run_checkout_target(&state, git_handle.clone(), target.clone(), pop_after);
                 }
             };
 
@@ -137,7 +121,7 @@ fn checkout_with_change_prompt(state: &Rc<AppState>, target: BranchCheckoutTarge
                 let branch = target.label();
                 show_uncommitted_changes_dialog(
                     &state,
-                    action_git_access.clone(),
+                    action_git_handle.clone(),
                     &branch,
                     &snapshot.branch,
                     checkout_fn,
@@ -148,17 +132,120 @@ fn checkout_with_change_prompt(state: &Rc<AppState>, target: BranchCheckoutTarge
 }
 
 fn checkout_target(
-    git_access: &dyn GitAccess,
+    git_handle: &GitRepoHandle,
     target: &BranchCheckoutTarget,
-) -> Result<String, String> {
+    callback: crate::git::OperationCallback<String>,
+) {
     match target {
-        BranchCheckoutTarget::Local(branch) => git_access.checkout_branch(branch),
+        BranchCheckoutTarget::Local(branch) => git_handle.checkout_branch(branch, callback),
         BranchCheckoutTarget::Remote {
             remote_branch,
             local_branch,
-        } => git_access.checkout_remote_branch(remote_branch, local_branch),
-        BranchCheckoutTarget::PullRequest(number) => git_access.checkout_pull_request(*number),
+        } => git_handle.checkout_remote_branch(remote_branch, local_branch, callback),
+        BranchCheckoutTarget::PullRequest(number) => {
+            git_handle.checkout_pull_request(*number, callback)
+        }
     }
+}
+
+fn run_checkout_target(
+    state: &Rc<AppState>,
+    git_handle: Arc<GitRepoHandle>,
+    target: BranchCheckoutTarget,
+    pop_after: bool,
+) {
+    let (sender, receiver) = mpsc::channel();
+    let pop_handle = git_handle.clone();
+    checkout_target(
+        git_handle.as_ref(),
+        &target,
+        Box::new(move |result| {
+            send_result_after_optional_pop(sender, pop_handle, result, pop_after);
+        }),
+    );
+    poll_branch_action_result(
+        state,
+        receiver,
+        "Checkout Failed",
+        format!("Checked out {}.", target.label()),
+    );
+}
+
+fn run_create_branch(
+    state: &Rc<AppState>,
+    git_handle: Arc<GitRepoHandle>,
+    branch: String,
+    pop_after: bool,
+) {
+    let (sender, receiver) = mpsc::channel();
+    let pop_handle = git_handle.clone();
+    git_handle.create_branch(
+        &branch,
+        Box::new(move |result| {
+            send_result_after_optional_pop(sender, pop_handle, result, pop_after);
+        }),
+    );
+    poll_branch_action_result(
+        state,
+        receiver,
+        "Failed to Create Branch",
+        format!("Created and checked out {branch}."),
+    );
+}
+
+fn send_result_after_optional_pop(
+    sender: mpsc::Sender<Result<String, String>>,
+    git_handle: Arc<GitRepoHandle>,
+    result: Result<String, String>,
+    pop_after: bool,
+) {
+    if !pop_after || result.is_err() {
+        let _ = sender.send(result);
+        return;
+    }
+
+    git_handle.pop_stash(Box::new(move |pop_result| {
+        let result = match pop_result {
+            Ok(_) => result,
+            Err(err) => Err(format!("Failed to apply stashed changes: {err}")),
+        };
+        let _ = sender.send(result);
+    }));
+}
+
+fn poll_branch_action_result(
+    state: &Rc<AppState>,
+    receiver: mpsc::Receiver<Result<String, String>>,
+    error_heading: &'static str,
+    empty_success_message: String,
+) {
+    gtk::glib::timeout_add_local(Duration::from_millis(75), {
+        let state = state.clone();
+        move || match receiver.try_recv() {
+            Ok(Ok(output)) => {
+                super::broadcast_page_command(&state, super::pages::PageCommand::ClearSelection);
+                if output.is_empty() {
+                    refresh(&state, Some(empty_success_message.clone()));
+                } else {
+                    refresh(&state, Some(output));
+                }
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(err)) => {
+                show_error_dialog(&state.window, error_heading, &err);
+                gtk::glib::ControlFlow::Break
+            }
+            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) => {
+                show_error_dialog(
+                    &state.window,
+                    error_heading,
+                    "Git operation did not return a result.",
+                );
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn load_pull_requests(state: &Rc<AppState>) {
@@ -239,15 +326,15 @@ fn show_new_branch_dialog(state: &Rc<AppState>) {
 }
 
 fn create_branch_with_change_prompt(state: &Rc<AppState>, branch: String) {
-    let (workspace_key, git_access) = match active_git_access(state) {
+    let (workspace_key, git_handle) = match active_git_handle(state) {
         Ok(access) => access,
         Err(err) => {
             show_error_dialog(&state.window, "Repository Error", &err);
             return;
         }
     };
-    let action_git_access = git_access.clone();
-    request_provider_git_snapshot(workspace_key.clone(), git_access, {
+    let action_git_handle = git_handle.clone();
+    request_provider_git_snapshot(workspace_key.clone(), git_handle, {
         let state = state.clone();
         let branch = branch.clone();
         move |response_key, result| {
@@ -266,25 +353,9 @@ fn create_branch_with_change_prompt(state: &Rc<AppState>, branch: String) {
             let create_fn = {
                 let state = state.clone();
                 let branch = branch.clone();
-                let git_access = action_git_access.clone();
-                move |pop_after: bool| match git_access.create_branch(&branch) {
-                    Ok(output) => {
-                        if pop_after {
-                            if let Err(err) = git_access.pop_stash() {
-                                show_error_dialog(&state.window, "Failed to Apply Changes", &err);
-                            }
-                        }
-                        super::broadcast_page_command(
-                            &state,
-                            super::pages::PageCommand::ClearSelection,
-                        );
-                        if output.is_empty() {
-                            refresh(&state, Some(format!("Created and checked out {branch}.")));
-                        } else {
-                            refresh(&state, Some(output));
-                        }
-                    }
-                    Err(err) => show_error_dialog(&state.window, "Failed to Create Branch", &err),
+                let git_handle = action_git_handle.clone();
+                move |pop_after: bool| {
+                    run_create_branch(&state, git_handle.clone(), branch.clone(), pop_after);
                 }
             };
 
@@ -293,7 +364,7 @@ fn create_branch_with_change_prompt(state: &Rc<AppState>, branch: String) {
             } else {
                 show_uncommitted_changes_dialog(
                     &state,
-                    action_git_access.clone(),
+                    action_git_handle.clone(),
                     &branch,
                     &snapshot.branch,
                     create_fn,
@@ -305,7 +376,7 @@ fn create_branch_with_change_prompt(state: &Rc<AppState>, branch: String) {
 
 fn show_uncommitted_changes_dialog<F>(
     state: &Rc<AppState>,
-    git_access: Arc<dyn GitAccess>,
+    git_handle: Arc<GitRepoHandle>,
     branch: &str,
     current_branch: &str,
     action: F,
@@ -321,35 +392,61 @@ fn show_uncommitted_changes_dialog<F>(
     dialog.add_response("cancel", "Cancel");
     dialog.set_default_response(Some("bring"));
     dialog.set_close_response("cancel");
+    let action = Rc::new(action);
 
     dialog.choose(Some(&state.window), None::<&gio::Cancellable>, {
         let state = state.clone();
-        let git_access = git_access.clone();
-        move |response| match response.as_str() {
-            "bring" => match git_access.stash_changes() {
-                Ok(_) => action(true),
-                Err(err) => show_error_dialog(&state.window, "Stash Failed", &err),
-            },
-            "stash" => match git_access.stash_changes() {
-                Ok(_) => action(false),
-                Err(err) => show_error_dialog(&state.window, "Stash Failed", &err),
-            },
-            _ => {}
+        let git_handle = git_handle.clone();
+        let action = action.clone();
+        move |response| {
+            let pop_after = match response.as_str() {
+                "bring" => true,
+                "stash" => false,
+                _ => return,
+            };
+            let (sender, receiver) = mpsc::channel();
+            git_handle.stash_changes(Box::new(move |result| {
+                let _ = sender.send(result.map(|_| pop_after));
+            }));
+            gtk::glib::timeout_add_local(Duration::from_millis(75), {
+                let state = state.clone();
+                let action = action.clone();
+                move || match receiver.try_recv() {
+                    Ok(Ok(pop_after)) => {
+                        action(pop_after);
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Ok(Err(err)) => {
+                        show_error_dialog(&state.window, "Stash Failed", &err);
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                    Err(TryRecvError::Disconnected) => {
+                        show_error_dialog(
+                            &state.window,
+                            "Stash Failed",
+                            "Git stash did not return a result.",
+                        );
+                        gtk::glib::ControlFlow::Break
+                    }
+                }
+            });
         }
     });
 }
 
-fn active_git_access(state: &Rc<AppState>) -> Result<(String, Arc<dyn GitAccess>), String> {
+fn active_git_handle(state: &Rc<AppState>) -> Result<(String, Arc<GitRepoHandle>), String> {
     let workspace_key = state.workspace_ref.borrow().id.to_string();
     let system_id = state.system_ref.borrow().id.clone();
     let workspace_ref = state.workspace_ref.borrow().clone();
-    let Some(git_access) = state.providers.git(&system_id, &workspace_ref) else {
+    let Some(git_handle) = super::git_handle_for_workspace(state, &system_id, &workspace_ref)
+    else {
         return Err(format!(
             "Git is unavailable for workspace {}.",
             workspace_ref.display_name
         ));
     };
-    Ok((workspace_key, git_access))
+    Ok((workspace_key, git_handle))
 }
 
 fn active_workspace_matches(state: &Rc<AppState>, workspace_key: &str) -> bool {

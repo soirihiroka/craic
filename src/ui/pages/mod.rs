@@ -1,8 +1,8 @@
 use crate::git::RepositorySnapshot;
 use crate::system::capabilities::shell::ShellCommandSpec;
 use crate::system::capabilities::{
-    docker::DockerAccess, files::FileAccess, git::GitAccess, open::DesktopOpenAccess,
-    shell::ShellAccess, terminal_link::TerminalLinkAccess, url::UrlOpenAccess,
+    docker::DockerAccess, files::FileAccess, open::DesktopOpenAccess, shell::ShellAccess,
+    terminal_link::TerminalLinkAccess, url::UrlOpenAccess,
 };
 use crate::system::{
     FileNodePath, SystemPath, SystemProviderRegistry, SystemRef, WorkspacePath, WorkspaceRef,
@@ -194,9 +194,14 @@ impl PageContext {
             .files(&self.system_ref.borrow().id, &self.workspace_ref())
     }
 
-    pub(super) fn git(&self) -> Option<Arc<dyn GitAccess>> {
-        self.providers
-            .git(&self.system_ref.borrow().id, &self.workspace_ref())
+    pub(super) fn git(&self) -> Option<Arc<crate::git::GitRepoHandle>> {
+        let workspace = self.workspace_ref();
+        let system_id = self.system_ref.borrow().id.clone();
+        let files = self.providers.files(&system_id, &workspace)?;
+        let shell = self.providers.shell(&system_id, &workspace)?;
+        Some(Arc::new(crate::git::GitRepoHandle::new(
+            workspace, shell, files,
+        )))
     }
 
     pub(super) fn git_unavailable_message(&self) -> String {

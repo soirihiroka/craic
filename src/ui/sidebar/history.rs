@@ -1,6 +1,5 @@
 use super::super::{canvas_scroll, widgets};
-use crate::git::{self, Commit, RepositorySnapshot};
-use crate::system::capabilities::git::GitAccess;
+use crate::git::{self, Commit, GitRepoHandle, RepositorySnapshot};
 use crate::ui::components::search::SearchPanel;
 use adw::prelude::*;
 use gtk::glib;
@@ -11,7 +10,6 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
-use std::thread;
 use std::time::Duration;
 
 const HISTORY_PAGE_SIZE: usize = 32;
@@ -40,7 +38,7 @@ pub(in crate::ui) struct HistoryList {
 #[derive(Default)]
 struct HistoryState {
     workspace_key: RefCell<Option<String>>,
-    git_access: RefCell<Option<Arc<dyn GitAccess>>>,
+    git_handle: RefCell<Option<Arc<GitRepoHandle>>>,
     history_head: RefCell<Option<String>>,
     cursor: RefCell<Option<String>>,
     search_query: RefCell<String>,
@@ -300,11 +298,11 @@ impl HistoryList {
         &self,
         snapshot: &RepositorySnapshot,
         workspace_key: String,
-        git_access: Option<Arc<dyn GitAccess>>,
+        git_handle: Option<Arc<GitRepoHandle>>,
     ) {
         let workspace_changed = self.state.workspace_key.borrow().as_ref() != Some(&workspace_key);
         let head_changed = *self.state.history_head.borrow() != snapshot.history_head;
-        self.state.git_access.replace(git_access);
+        self.state.git_handle.replace(git_handle);
 
         if !workspace_changed && !head_changed {
             return;
@@ -341,7 +339,7 @@ impl HistoryList {
         let Some(workspace_key) = self.state.workspace_key.borrow().clone() else {
             return;
         };
-        let Some(git_access) = self.state.git_access.borrow().clone() else {
+        let Some(git_handle) = self.state.git_handle.borrow().clone() else {
             self.finish_page_load(
                 Err("Git is unavailable for this workspace.".to_string()),
                 select_first,
@@ -356,20 +354,30 @@ impl HistoryList {
         self.state.loading.set(true);
         self.update_footer();
 
-        thread::spawn(move || {
-            log::debug!(
-                "history page load start workspace={} cursor={:?} query_len={}",
-                workspace_key,
-                cursor.as_deref().map(short_hash),
-                search_query.len()
+        log::debug!(
+            "history page load start workspace={} cursor={:?} query_len={}",
+            workspace_key,
+            cursor.as_deref().map(short_hash),
+            search_query.len()
+        );
+        if search_query.is_empty() {
+            git_handle.commit_page(
+                cursor.as_deref(),
+                HISTORY_PAGE_SIZE,
+                Box::new(move |result| {
+                    let _ = sender.send(result);
+                }),
             );
-            let result = if search_query.is_empty() {
-                git_access.commit_page(cursor.as_deref(), HISTORY_PAGE_SIZE)
-            } else {
-                git_access.commit_search_page(&search_query, cursor.as_deref(), HISTORY_PAGE_SIZE)
-            };
-            let _ = sender.send(result);
-        });
+        } else {
+            git_handle.commit_search_page(
+                &search_query,
+                cursor.as_deref(),
+                HISTORY_PAGE_SIZE,
+                Box::new(move |result| {
+                    let _ = sender.send(result);
+                }),
+            );
+        }
 
         gtk::glib::timeout_add_local(Duration::from_millis(75), {
             let history = self.clone();
@@ -414,7 +422,7 @@ impl HistoryList {
 
     pub(in crate::ui) fn clear(&self) {
         self.state.workspace_key.borrow_mut().take();
-        self.state.git_access.borrow_mut().take();
+        self.state.git_handle.borrow_mut().take();
         self.state.history_head.borrow_mut().take();
         self.state.cursor.borrow_mut().take();
         self.state.search_query.borrow_mut().clear();

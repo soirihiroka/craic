@@ -3,9 +3,9 @@ use super::{
     AppState, refresh, refresh_active_repo_metadata, refresh_without_toast,
     request_provider_git_snapshot,
 };
-use crate::git::RepositorySnapshot;
+use crate::git::{GitRepoHandle, RepositorySnapshot};
 use crate::github::{GitHubAuthAccount, GitHubPublishRepositoryRequest, GitHubRepositoryOwner};
-use crate::system::capabilities::{git::GitAccess, github::GitHubAccess};
+use crate::system::capabilities::github::GitHubAccess;
 use adw::prelude::*;
 use gtk::gio;
 use std::rc::Rc;
@@ -34,7 +34,7 @@ pub(super) fn execute_git_action(state: &Rc<AppState>, action: GitAction) {
     }
 
     let state = state.clone();
-    let (workspace_key, git_access) = match active_git_access(&state) {
+    let (workspace_key, git_handle) = match active_git_handle(&state) {
         Ok(access) => access,
         Err(err) => {
             show_error_dialog(&state.window, "Repository Error", &err);
@@ -43,10 +43,10 @@ pub(super) fn execute_git_action(state: &Rc<AppState>, action: GitAction) {
         }
     };
     let action = action.clone();
-    let action_git_access = git_access.clone();
+    let action_git_handle = git_handle.clone();
     request_provider_git_snapshot(
         workspace_key.clone(),
-        git_access,
+        git_handle,
         move |response_key, result| match result {
             Ok(snapshot) => {
                 if response_key != workspace_key
@@ -58,7 +58,7 @@ pub(super) fn execute_git_action(state: &Rc<AppState>, action: GitAction) {
                     &state,
                     snapshot,
                     action.clone(),
-                    action_git_access.clone(),
+                    action_git_handle.clone(),
                 );
             }
             Err(err) => {
@@ -74,7 +74,7 @@ pub(super) fn execute_git_action(state: &Rc<AppState>, action: GitAction) {
 
 pub(super) fn run_git_action(state: &Rc<AppState>) {
     let state = state.clone();
-    let (workspace_key, git_access) = match active_git_access(&state) {
+    let (workspace_key, git_handle) = match active_git_handle(&state) {
         Ok(access) => access,
         Err(err) => {
             show_error_dialog(&state.window, "Repository Error", &err);
@@ -82,10 +82,10 @@ pub(super) fn run_git_action(state: &Rc<AppState>) {
             return;
         }
     };
-    let action_git_access = git_access.clone();
+    let action_git_handle = git_handle.clone();
     request_provider_git_snapshot(
         workspace_key.clone(),
-        git_access,
+        git_handle,
         move |response_key, result| {
             if response_key != workspace_key || !active_workspace_matches(&state, &workspace_key) {
                 return;
@@ -120,7 +120,7 @@ pub(super) fn run_git_action(state: &Rc<AppState>) {
                 GitAction::Fetch(remote.clone())
             };
 
-            execute_git_action_with_snapshot(&state, snapshot, action, action_git_access.clone());
+            execute_git_action_with_snapshot(&state, snapshot, action, action_git_handle.clone());
         },
     );
 }
@@ -693,7 +693,7 @@ fn execute_git_action_with_snapshot(
     state: &Rc<AppState>,
     snapshot: RepositorySnapshot,
     action: GitAction,
-    git_access: Arc<dyn GitAccess>,
+    git_handle: Arc<GitRepoHandle>,
 ) {
     let refresh_repo_metadata_on_success = matches!(action, GitAction::Pull | GitAction::PullPush);
     let show_success_toast = !matches!(
@@ -711,56 +711,98 @@ fn execute_git_action_with_snapshot(
         state.workspace_ref.borrow().display_name
     );
 
-    thread::spawn({
-        let action = action.clone();
-        let git_access = git_access.clone();
-        move || {
-            let message = match action {
-                GitAction::Push => match git_access.push() {
-                    Ok(output) if output.is_empty() => Ok("Push complete.".to_string()),
-                    Ok(output) => Ok(output),
-                    Err(err) => Err(err),
-                },
-                GitAction::Pull => match git_access.pull() {
-                    Ok(output) if output.is_empty() => Ok("Pull complete.".to_string()),
-                    Ok(output) => Ok(output),
-                    Err(err) => Err(err),
-                },
-                GitAction::PullPush => match git_access.pull() {
-                    Ok(_) => match git_access.push() {
-                        Ok(output) if output.is_empty() => {
-                            Ok("Pull and push complete.".to_string())
-                        }
-                        Ok(output) => Ok(output),
-                        Err(err) => Err(format!("Pull succeeded, but Push failed: {err}")),
-                    },
-                    Err(err) => Err(err),
-                },
-                GitAction::Publish(remote, branch) => match git_access.publish(&remote, &branch) {
-                    Ok(output) if output.is_empty() => Ok("Publish complete.".to_string()),
-                    Ok(output) => Ok(output),
-                    Err(err) => Err(err),
-                },
-                GitAction::Fetch(remote) => {
-                    let remote_name = remote.as_deref().unwrap_or("remote");
-                    let progress_sender = sender.clone();
-                    let _ = progress_sender.send(GitActionEvent::Progress(format!(
-                        "Fetching {remote_name}..."
-                    )));
-                    let mut progress = move |progress| {
-                        let _ = progress_sender.send(GitActionEvent::Progress(progress));
-                    };
-                    match git_access.fetch_with_progress(remote.as_deref(), &mut progress) {
-                        Ok(output) if output.is_empty() => Ok(format!("Fetched {remote_name}.")),
-                        Ok(output) => Ok(output),
-                        Err(err) => Err(err),
+    match action.clone() {
+        GitAction::Push => {
+            let sender = sender.clone();
+            git_handle.push(Box::new(move |result| {
+                let message = result.map(|output| {
+                    if output.is_empty() {
+                        "Push complete.".to_string()
+                    } else {
+                        output
                     }
-                }
-            };
-
-            let _ = sender.send(GitActionEvent::Finished(message));
+                });
+                let _ = sender.send(GitActionEvent::Finished(message));
+            }));
         }
-    });
+        GitAction::Pull => {
+            let sender = sender.clone();
+            git_handle.pull(Box::new(move |result| {
+                let message = result.map(|output| {
+                    if output.is_empty() {
+                        "Pull complete.".to_string()
+                    } else {
+                        output
+                    }
+                });
+                let _ = sender.send(GitActionEvent::Finished(message));
+            }));
+        }
+        GitAction::PullPush => {
+            let sender = sender.clone();
+            let push_handle = git_handle.clone();
+            git_handle.pull(Box::new(move |pull_result| match pull_result {
+                Ok(_) => {
+                    let sender = sender.clone();
+                    push_handle.push(Box::new(move |push_result| {
+                        let message = match push_result {
+                            Ok(output) if output.is_empty() => {
+                                Ok("Pull and push complete.".to_string())
+                            }
+                            Ok(output) => Ok(output),
+                            Err(err) => Err(format!("Pull succeeded, but Push failed: {err}")),
+                        };
+                        let _ = sender.send(GitActionEvent::Finished(message));
+                    }));
+                }
+                Err(err) => {
+                    let _ = sender.send(GitActionEvent::Finished(Err(err)));
+                }
+            }));
+        }
+        GitAction::Publish(remote, branch) => {
+            let sender = sender.clone();
+            git_handle.publish(
+                &remote,
+                &branch,
+                Box::new(move |result| {
+                    let message = result.map(|output| {
+                        if output.is_empty() {
+                            "Publish complete.".to_string()
+                        } else {
+                            output
+                        }
+                    });
+                    let _ = sender.send(GitActionEvent::Finished(message));
+                }),
+            );
+        }
+        GitAction::Fetch(remote) => {
+            let remote_name = remote.as_deref().unwrap_or("remote").to_string();
+            let progress_sender = sender.clone();
+            let _ = progress_sender.send(GitActionEvent::Progress(format!(
+                "Fetching {remote_name}..."
+            )));
+            let finish_sender = sender.clone();
+            let finished_remote_name = remote_name.clone();
+            git_handle.fetch_with_progress(
+                remote.as_deref(),
+                Box::new(move |progress| {
+                    let _ = progress_sender.send(GitActionEvent::Progress(progress));
+                }),
+                Box::new(move |result| {
+                    let message = result.map(|output| {
+                        if output.is_empty() {
+                            format!("Fetched {finished_remote_name}.")
+                        } else {
+                            output
+                        }
+                    });
+                    let _ = finish_sender.send(GitActionEvent::Finished(message));
+                }),
+            );
+        }
+    }
 
     gtk::glib::timeout_add_local(Duration::from_millis(100), {
         let state = state.clone();
@@ -805,7 +847,7 @@ fn execute_git_action_with_snapshot(
                                 &state,
                                 snapshot.clone(),
                                 action.clone(),
-                                git_access.clone(),
+                                git_handle.clone(),
                                 files,
                             );
                             return gtk::glib::ControlFlow::Break;
@@ -842,7 +884,7 @@ fn show_local_changes_overwritten_dialog(
     state: &Rc<AppState>,
     snapshot: RepositorySnapshot,
     action: GitAction,
-    git_access: Arc<dyn GitAccess>,
+    git_handle: Arc<GitRepoHandle>,
     files: Vec<String>,
 ) {
     let body = local_changes_overwritten_body(&action, &files);
@@ -867,7 +909,7 @@ fn show_local_changes_overwritten_dialog(
                 &state,
                 snapshot.clone(),
                 action.clone(),
-                git_access.clone(),
+                git_handle.clone(),
             );
         }
     });
@@ -900,7 +942,7 @@ fn stash_changes_and_retry_git_action(
     state: &Rc<AppState>,
     snapshot: RepositorySnapshot,
     action: GitAction,
-    git_access: Arc<dyn GitAccess>,
+    git_handle: Arc<GitRepoHandle>,
 ) {
     if state.git_action_running.get() {
         return;
@@ -916,8 +958,8 @@ fn stash_changes_and_retry_git_action(
         action
     );
 
-    thread::spawn(move || {
-        let result = git_access.stash_changes().map(|output| {
+    git_handle.stash_changes(Box::new(move |result| {
+        let result = result.map(|output| {
             if output.is_empty() {
                 "Changes stashed.".to_string()
             } else {
@@ -925,7 +967,7 @@ fn stash_changes_and_retry_git_action(
             }
         });
         let _ = sender.send(GitActionEvent::Finished(result));
-    });
+    }));
 
     gtk::glib::timeout_add_local(Duration::from_millis(100), {
         let state = state.clone();
@@ -1018,17 +1060,18 @@ fn parse_files_to_be_overwritten(message: &str) -> Vec<String> {
     files
 }
 
-fn active_git_access(state: &Rc<AppState>) -> Result<(String, Arc<dyn GitAccess>), String> {
+fn active_git_handle(state: &Rc<AppState>) -> Result<(String, Arc<GitRepoHandle>), String> {
     let workspace_key = state.workspace_ref.borrow().id.to_string();
     let system_id = state.system_ref.borrow().id.clone();
     let workspace_ref = state.workspace_ref.borrow().clone();
-    let Some(git_access) = state.providers.git(&system_id, &workspace_ref) else {
+    let Some(git_handle) = super::git_handle_for_workspace(state, &system_id, &workspace_ref)
+    else {
         return Err(format!(
             "Git is unavailable for workspace {}.",
             workspace_ref.display_name
         ));
     };
-    Ok((workspace_key, git_access))
+    Ok((workspace_key, git_handle))
 }
 
 fn active_workspace_matches(state: &Rc<AppState>, workspace_key: &str) -> bool {

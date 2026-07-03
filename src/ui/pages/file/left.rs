@@ -1,4 +1,5 @@
-use crate::system::capabilities::{files::FileAccess, git::GitAccess};
+use crate::git::GitRepoHandle;
+use crate::system::capabilities::files::FileAccess;
 use crate::ui::sidebar::file_browser::FileBrowser;
 use adw::prelude::*;
 use std::rc::Rc;
@@ -12,13 +13,13 @@ pub(super) struct LeftPane {
 impl LeftPane {
     pub(super) fn new(
         file_access: Option<Arc<dyn FileAccess>>,
-        git_access: Option<Arc<dyn GitAccess>>,
+        git_handle: Option<Arc<GitRepoHandle>>,
     ) -> Self {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .vexpand(true)
             .build();
-        let file_browser = file_access.map(|file_access| FileBrowser::new(file_access, git_access));
+        let file_browser = file_access.map(|file_access| FileBrowser::new(file_access, git_handle));
         if let Some(file_browser) = &file_browser {
             root.append(&file_browser.root);
         }

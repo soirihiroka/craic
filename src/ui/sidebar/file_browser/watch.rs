@@ -34,7 +34,6 @@ impl FileBrowser {
         }
 
         self.stop_file_watch_scope();
-        self.file_watch_signature.replace(Some(signature.clone()));
         let generation = self.file_watch_generation.get();
         let file_access = self.file_access.borrow().clone();
         let (sender, receiver) = mpsc::channel();
@@ -72,6 +71,7 @@ impl FileBrowser {
             return;
         }
 
+        self.file_watch_signature.replace(Some(signature.clone()));
         let browser = Rc::clone(self);
         let source_id =
             glib::timeout_add_local(FILE_BROWSER_WATCH_EVENT_POLL_INTERVAL, move || {

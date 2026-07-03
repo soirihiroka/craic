@@ -34,13 +34,13 @@ impl AgentProvider for Provider {
         shell: Option<&dyn ShellAccess>,
         system: &SystemRef,
         workspace: &WorkspaceRef,
-    ) -> CommandSpec {
-        CommandSpec::target(
+    ) -> Result<CommandSpec, String> {
+        Ok(CommandSpec::target(
             system,
             workspace,
-            command_binary("codex", shell),
+            command_binary("codex", shell)?,
             vec!["--cd".into(), workspace.root.absolute.clone().into()],
-        )
+        ))
     }
 
     fn restore_command(
@@ -53,7 +53,7 @@ impl AgentProvider for Provider {
         Ok(CommandSpec::target(
             system,
             workspace,
-            command_binary("codex", shell),
+            command_binary("codex", shell)?,
             vec![
                 "--cd".into(),
                 workspace.root.absolute.clone().into(),

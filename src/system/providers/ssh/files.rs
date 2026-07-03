@@ -1,5 +1,4 @@
 use super::{SshCommandRunner, remote_workspace_path, shell_quote, workspace_path_for_remote};
-use crate::gitignore;
 use crate::system::capabilities::files::{
     DirectoryListing, FileAccess, FileCopyRequest, FileDeleteRequest, FileKind, FileMoveRequest,
     FileNodeCapabilities, FileNodeInfo, FileOperation, FileOperationCallback, FileOperationError,
@@ -11,13 +10,21 @@ use crate::system::capabilities::files::{
 use crate::system::path::{ArchiveFormat, FileNodePath, SystemRef, WorkspacePath, WorkspaceRef};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const SSH_FILE_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const SSH_LIST_DIR_CACHE_TTL: Duration = Duration::from_millis(500);
+const COPY_PATH_SCRIPT: &str = include_str!("scripts/copy_path.sh");
+const FILE_SIGNATURES_SCRIPT: &str = include_str!("scripts/file_signatures.sh");
+const LIST_DIRS_SCRIPT: &str = include_str!("scripts/list_dirs.sh");
+const METADATA_SCRIPT: &str = include_str!("scripts/metadata.sh");
+const MOVE_PATH_SCRIPT: &str = include_str!("scripts/move_path.sh");
+const READ_WITH_INFO_SCRIPT: &str = include_str!("scripts/read_with_info.sh");
+const WRITE_CREATE_NEW_SCRIPT: &str = include_str!("scripts/write_create_new.sh");
+const WRITE_REPLACE_SCRIPT: &str = include_str!("scripts/write_replace.sh");
 
 #[derive(Clone, Debug)]
 pub(crate) struct SshFileAccess {
@@ -346,11 +353,14 @@ impl SshFileAccess {
             unreachable!();
         };
         let script = match request.mode {
-            FileWriteMode::CreateNew => format!(
-                "p={}; (set -C; cat > \"$p\")",
-                shell_quote(&resolved.remote_path)
+            FileWriteMode::CreateNew => shell_script_with_args(
+                WRITE_CREATE_NEW_SCRIPT,
+                std::slice::from_ref(&resolved.remote_path),
             ),
-            FileWriteMode::Replace => format!("cat > {}", shell_quote(&resolved.remote_path)),
+            FileWriteMode::Replace => shell_script_with_args(
+                WRITE_REPLACE_SCRIPT,
+                std::slice::from_ref(&resolved.remote_path),
+            ),
         };
         self.runner
             .run_script_with_stdin("write file", &script, Some(contents))
@@ -409,17 +419,9 @@ impl SshFileAccess {
                 format!("{} already exists.", request.destination.display()),
             ));
         }
-        let script = format!(
-            r#"src={}
-dst={}
-if [ -e "$dst" ] || [ -L "$dst" ]; then
-  printf 'CRAIC-ERROR\talready-exists\t%s\n' "$dst" >&2
-  printf '%s already exists.\n' "$dst" >&2
-  exit 17
-fi
-cp -a -- "$src" "$dst""#,
-            shell_quote(&source.remote_path),
-            shell_quote(&destination.remote_path)
+        let script = shell_script_with_args(
+            COPY_PATH_SCRIPT,
+            &[source.remote_path.clone(), destination.remote_path.clone()],
         );
         self.runner
             .run_script("copy path", &script)
@@ -500,17 +502,9 @@ cp -a -- "$src" "$dst""#,
                     err,
                 )
             })?;
-        let script = format!(
-            r#"src={}
-dst={}
-if [ -e "$dst" ] || [ -L "$dst" ]; then
-  printf 'CRAIC-ERROR\talready-exists\t%s\n' "$dst" >&2
-  printf '%s already exists.\n' "$dst" >&2
-  exit 17
-fi
-mv -- "$src" "$dst""#,
-            shell_quote(&source.remote_path),
-            shell_quote(&destination.remote_path)
+        let script = shell_script_with_args(
+            MOVE_PATH_SCRIPT,
+            &[source.remote_path.clone(), destination.remote_path.clone()],
         );
         self.runner
             .run_script("move path", &script)
@@ -629,11 +623,10 @@ impl FileAccess for SshFileAccess {
     }
 
     fn info_many(&self, paths: &[FileNodePath]) -> Result<Vec<FileNodeInfo>, String> {
-        let mut infos = paths
+        let infos = paths
             .iter()
             .map(|path| self.info(path))
             .collect::<Result<Vec<_>, _>>()?;
-        apply_remote_git_ignore_to_infos(&self.runner, &self.workspace, &mut infos);
         Ok(infos)
     }
 
@@ -889,21 +882,23 @@ fn parse_kind(kind: &str) -> FileKind {
     }
 }
 
+fn shell_script_with_args(script: &str, args: &[String]) -> String {
+    let mut command = String::from("set --");
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    command.push('\n');
+    command.push_str(script);
+    command
+}
+
 fn remote_time(value: Option<f64>) -> Option<std::time::SystemTime> {
     value.map(|secs| UNIX_EPOCH + Duration::from_secs_f64(secs.max(0.0)))
 }
 
 fn shell_metadata_script(remote_path: &str) -> String {
-    format!(
-        r#"p={}
-if [ -d "$p" ]; then kind=dir; elif [ -f "$p" ]; then kind=file; elif [ -L "$p" ]; then kind=symlink; else kind=other; fi
-metadata=$(stat -Lc '%s %Y' -- "$p") || exit 1
-set -- $metadata
-if [ -w "$p" ]; then readonly=0; else readonly=1; fi
-if [ -x "$p" ]; then executable=1; else executable=0; fi
-printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$1" "$2" "$readonly" "$executable""#,
-        shell_quote(remote_path)
-    )
+    shell_script_with_args(METADATA_SCRIPT, &[remote_path.to_string()])
 }
 
 fn remote_file_signatures(
@@ -920,26 +915,7 @@ fn remote_file_signatures(
 }
 
 fn shell_file_signatures_script(remote_paths: &[String]) -> String {
-    let mut script = String::from("set --");
-    for remote_path in remote_paths {
-        script.push(' ');
-        script.push_str(&shell_quote(remote_path));
-    }
-    script.push_str(
-        r#"
-for p do
-  if [ ! -e "$p" ] && [ ! -L "$p" ]; then
-    printf 'CRAIC-WATCH\037%s\037missing\n' "$p"
-    continue
-  fi
-  if [ -d "$p" ]; then kind=dir; elif [ -f "$p" ]; then kind=file; elif [ -L "$p" ]; then kind=symlink; else kind=other; fi
-  metadata=$(stat -Lc '%s %Y' -- "$p") || { printf 'CRAIC-WATCH\037%s\037missing\n' "$p"; continue; }
-  len=${metadata%% *}
-  modified=${metadata#* }
-  printf 'CRAIC-WATCH\037%s\037present\037%s\037%s\037%s\n' "$p" "$kind" "$len" "$modified"
-done"#,
-    );
-    script
+    shell_script_with_args(FILE_SIGNATURES_SCRIPT, remote_paths)
 }
 
 fn parse_file_signature_lines(
@@ -996,42 +972,12 @@ fn parse_file_signature_lines(
 }
 
 fn shell_list_dirs_script(remote_paths: &[String]) -> String {
-    let mut script = String::from("set --");
-    for remote_path in remote_paths {
-        script.push(' ');
-        script.push_str(&shell_quote(remote_path));
-    }
-    script.push_str(
-        r#"
-for p do
-  printf 'CRAIC-DIR\037%s\n' "$p"
-  find "$p" -mindepth 1 -maxdepth 1 -printf 'CRAIC-ENTRY\037%f\037%p\037%y\037%s\037%T@\037%m\n' 2>/dev/null || true
-done"#,
-    );
-    script
+    shell_script_with_args(LIST_DIRS_SCRIPT, remote_paths)
 }
 
 fn shell_read_with_info_script(remote_path: &str, max_bytes: Option<u64>) -> String {
     let max_bytes = max_bytes.map(|value| value.to_string()).unwrap_or_default();
-    format!(
-        r#"p={}
-max={}
-if [ -d "$p" ]; then kind=dir; elif [ -f "$p" ]; then kind=file; elif [ -L "$p" ]; then kind=symlink; else kind=other; fi
-metadata=$(stat -Lc '%s %Y' -- "$p") || exit 1
-set -- $metadata
-len=$1
-mtime=$2
-if [ -w "$p" ]; then readonly=0; else readonly=1; fi
-if [ -x "$p" ]; then executable=1; else executable=0; fi
-readable=0
-if [ "$kind" = file ]; then
-    if [ -z "$max" ] || [ "$len" -le "$max" ]; then readable=1; fi
-fi
-printf 'CRAIC-FILE-READ\t%s\t%s\t%s\t%s\t%s\t%s\n' "$kind" "$len" "$mtime" "$readonly" "$executable" "$readable"
-if [ "$readable" = 1 ]; then cat -- "$p"; fi"#,
-        shell_quote(remote_path),
-        shell_quote(&max_bytes)
-    )
+    shell_script_with_args(READ_WITH_INFO_SCRIPT, &[remote_path.to_string(), max_bytes])
 }
 
 fn parse_metadata_line(
@@ -1094,65 +1040,6 @@ fn parse_directory_output(
     Ok(listings)
 }
 
-fn apply_remote_git_ignore_to_infos(
-    runner: &SshCommandRunner,
-    workspace: &WorkspaceRef,
-    infos: &mut [FileNodeInfo],
-) {
-    let checks = infos
-        .iter()
-        .filter(|info| info.capabilities.native)
-        .filter_map(|info| {
-            let path = info.path.native_relative()?;
-            (!path.is_empty()).then(|| gitignore::IgnoreCheck {
-                path,
-                is_dir: info.kind == FileKind::Directory,
-            })
-        })
-        .collect::<Vec<_>>();
-    if checks.is_empty() {
-        return;
-    }
-    let ignored_paths = remote_ignored_paths(runner, workspace, &checks);
-    for info in infos {
-        if let Some(path) = info.path.native_relative()
-            && !path.is_empty()
-        {
-            info.git_ignored = Some(ignored_paths.contains(&path));
-        }
-    }
-}
-
-fn remote_ignored_paths(
-    runner: &SshCommandRunner,
-    workspace: &WorkspaceRef,
-    checks: &[gitignore::IgnoreCheck],
-) -> HashSet<String> {
-    let script = shell_check_ignore_script(&workspace.root.absolute);
-    let output = match runner.run_script_with_stdin(
-        "file node git ignore",
-        &script,
-        Some(&gitignore::check_ignore_stdin(checks)),
-    ) {
-        Ok(output) => output,
-        Err(err) => {
-            log::debug!(
-                "ssh git ignore unavailable workspace={} err={err}",
-                workspace.display_name
-            );
-            return HashSet::new();
-        }
-    };
-    gitignore::parse_check_ignore_output(checks, &output.stdout)
-}
-
-fn shell_check_ignore_script(root: &str) -> String {
-    format!(
-        "cd {} && git check-ignore --stdin -z; status=$?; if [ \"$status\" -eq 1 ]; then exit 0; fi; exit \"$status\"",
-        shell_quote(root)
-    )
-}
-
 fn parse_read_output(
     access: &SshFileAccess,
     path: FileNodePath,
@@ -1191,85 +1078,4 @@ fn validate_child_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-const SEARCH_SCRIPT: &str = r#"
-import json, os, re, sys
-root, query = sys.argv[1], sys.argv[2]
-skip = set(json.loads(sys.argv[3]))
-case_sensitive = sys.argv[4] == '1'
-whole_word = sys.argv[5] == '1'
-is_regex = sys.argv[6] == '1'
-max_results = int(sys.argv[7])
-max_file_bytes = int(sys.argv[8])
-pattern = query if is_regex else re.escape(query)
-if whole_word:
-    pattern = r'\b(?:' + pattern + r')\b'
-flags = re.MULTILINE | re.DOTALL
-if not case_sensitive:
-    flags |= re.IGNORECASE
-rx = re.compile(pattern, flags)
-text_matches = []
-file_name_matches = []
-limited = False
-def result_count():
-    return len(text_matches) + len(file_name_matches)
-def finish():
-    print(json.dumps({'text_matches': text_matches, 'file_name_matches': file_name_matches, 'limited': limited}))
-def preview_for_match(text, start, end):
-    line_start = text.rfind('\n', 0, start) + 1
-    line_end = text.find('\n', end)
-    if line_end == -1:
-        line_end = len(text)
-    return text[line_start:line_end].strip().replace('\r', ' ').replace('\n', ' ')[:180]
-def has_nonempty_match(text):
-    for found in rx.finditer(text):
-        if found.start() != found.end():
-            return True
-    return False
-for base, dirs, files in os.walk(root):
-    dirs[:] = [d for d in dirs if d not in skip]
-    for name in files:
-        if name in skip:
-            continue
-        path = os.path.join(base, name)
-        if has_nonempty_match(name):
-            if result_count() >= max_results:
-                limited = True
-                finish()
-                raise SystemExit(0)
-            file_name_matches.append(path)
-            if result_count() >= max_results:
-                limited = True
-                finish()
-                raise SystemExit(0)
-        try:
-            if os.path.getsize(path) > max_file_bytes:
-                continue
-            data = open(path, 'rb').read()
-        except OSError:
-            continue
-        if b'\0' in data:
-            continue
-        try:
-            text = data.decode('utf-8')
-        except UnicodeDecodeError:
-            continue
-        for found in rx.finditer(text):
-            if found.start() == found.end():
-                continue
-            if result_count() >= max_results:
-                limited = True
-                finish()
-                raise SystemExit(0)
-            text_matches.append({
-                'path': path,
-                'line_number': text.count('\n', 0, found.start()) + 1,
-                'start': found.start(),
-                'end': found.end(),
-                'line_text': preview_for_match(text, found.start(), found.end()),
-            })
-            if result_count() >= max_results:
-                limited = True
-                finish()
-                raise SystemExit(0)
-finish()
-"#;
+const SEARCH_SCRIPT: &str = include_str!("scripts/search.py");

@@ -3,16 +3,74 @@ use crate::github::{
     GitHubRepositoryOwner,
 };
 use crate::system::capabilities::github::GitHubAccess;
+use crate::system::capabilities::shell::{
+    ShellAccess, ShellCommandOutput, ShellCommandRunRequest, ShellRunRequest,
+};
 use crate::system::path::WorkspaceRef;
+use std::sync::{Arc, mpsc};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct SshGitHubAccess {
     workspace: WorkspaceRef,
+    shell: Arc<dyn ShellAccess>,
 }
 
 impl SshGitHubAccess {
-    pub(crate) fn new(workspace: WorkspaceRef) -> Self {
-        Self { workspace }
+    pub(crate) fn new(workspace: WorkspaceRef, shell: Arc<dyn ShellAccess>) -> Self {
+        Self { workspace, shell }
+    }
+
+    fn run_gh(&self, operation: &str, args: Vec<String>) -> Result<ShellCommandOutput, String> {
+        let request =
+            ShellCommandRunRequest::new(operation, self.workspace.root.clone(), "gh").args(args);
+        let output = self.run_command(request)?;
+        if output.status_success(&[0]) {
+            Ok(output)
+        } else {
+            Err(gh_failure(operation, output))
+        }
+    }
+
+    fn run_gh_with_account(
+        &self,
+        operation: &str,
+        account: &GitHubAuthAccount,
+        args: &[String],
+    ) -> Result<ShellCommandOutput, String> {
+        let script = github::ssh_gh_with_account_script(&account.host, &account.login, args);
+        let request = ShellRunRequest::new(operation, self.workspace.root.clone(), script);
+        let output = self.run_script(request)?;
+        if output.status_success(&[0]) {
+            Ok(output)
+        } else {
+            Err(gh_failure(operation, output))
+        }
+    }
+
+    fn run_command(&self, request: ShellCommandRunRequest) -> Result<ShellCommandOutput, String> {
+        let (sender, receiver) = mpsc::channel();
+        self.shell.run_fast_command(
+            request,
+            Box::new(move |result| {
+                let _ = sender.send(result);
+            }),
+        );
+        receiver
+            .recv()
+            .map_err(|_| "Remote gh command did not return a result.".to_string())?
+    }
+
+    fn run_script(&self, request: ShellRunRequest) -> Result<ShellCommandOutput, String> {
+        let (sender, receiver) = mpsc::channel();
+        self.shell.run_fast_script(
+            request,
+            Box::new(move |result| {
+                let _ = sender.send(result);
+            }),
+        );
+        receiver
+            .recv()
+            .map_err(|_| "Remote gh script did not return a result.".to_string())?
     }
 }
 
@@ -35,7 +93,24 @@ impl GitHubAccess for SshGitHubAccess {
             repo_slug,
             remote_name,
             remote_url,
-            || github::fetch_repo_metadata(repo_slug),
+            || {
+                let output = self.run_gh(
+                    "gh repo view",
+                    vec![
+                        "repo".to_string(),
+                        "view".to_string(),
+                        repo_slug.trim().to_string(),
+                        "--json".to_string(),
+                        "isFork,isPrivate".to_string(),
+                        "--jq".to_string(),
+                        github::repo_metadata_jq().to_string(),
+                    ],
+                )?;
+                let value = output.stdout_text_trimmed();
+                github::parse_repo_metadata_value(&value).ok_or_else(|| {
+                    format!("Invalid gh repository metadata response for {repo_slug}: {value}")
+                })
+            },
         )
     }
 
@@ -45,7 +120,18 @@ impl GitHubAccess for SshGitHubAccess {
             self.workspace.display_name,
             self.workspace.root.absolute
         );
-        github::open_pull_requests(&self.workspace.root.absolute)
+        let output = self.run_gh(
+            "gh pr list",
+            vec![
+                "pr".to_string(),
+                "list".to_string(),
+                "--state".to_string(),
+                "open".to_string(),
+                "--json".to_string(),
+                "number,title,author,createdAt,isDraft,headRefName".to_string(),
+            ],
+        )?;
+        github::parse_pull_requests(&output.stdout)
     }
 
     fn authenticated_accounts(&self) -> Result<Vec<GitHubAuthAccount>, String> {
@@ -53,7 +139,16 @@ impl GitHubAccess for SshGitHubAccess {
             "ssh github auth accounts start workspace={}",
             self.workspace.display_name
         );
-        github::authenticated_accounts()
+        let output = self.run_gh(
+            "gh auth status",
+            vec![
+                "auth".to_string(),
+                "status".to_string(),
+                "--json".to_string(),
+                "hosts".to_string(),
+            ],
+        )?;
+        github::parse_authenticated_accounts(&output.stdout)
     }
 
     fn repository_owners(
@@ -66,7 +161,22 @@ impl GitHubAccess for SshGitHubAccess {
             account.login,
             account.host
         );
-        github::repository_owners_for_account(account)
+        let args = vec!["api".to_string(), "user/orgs".to_string()];
+        match self.run_gh_with_account("gh user orgs", account, &args) {
+            Ok(output) => github::repository_owners_from_orgs(account, &output.stdout),
+            Err(err) => {
+                log::warn!(
+                    "failed to load ssh github publish owners account={} host={}: {err}",
+                    account.login,
+                    account.host
+                );
+                Ok(vec![GitHubRepositoryOwner {
+                    host: account.host.clone(),
+                    auth_login: account.login.clone(),
+                    owner: account.login.clone(),
+                }])
+            }
+        }
     }
 
     fn publish_repository(
@@ -77,6 +187,58 @@ impl GitHubAccess for SshGitHubAccess {
     }
 
     fn repository_exists(&self, request: &GitHubPublishRepositoryRequest) -> Result<bool, String> {
-        github::repository_exists(request)
+        let host = request.host.trim();
+        let auth_login = request.auth_login.trim();
+        let owner = request.owner.trim();
+        let name = request.name.trim();
+        if host.is_empty() || auth_login.is_empty() || owner.is_empty() || name.is_empty() {
+            return Ok(false);
+        }
+
+        let account = GitHubAuthAccount {
+            host: host.to_string(),
+            login: auth_login.to_string(),
+        };
+        let repo_slug = format!("{owner}/{name}");
+        let args = vec![
+            "repo".to_string(),
+            "view".to_string(),
+            repo_slug.clone(),
+            "--json".to_string(),
+            "name".to_string(),
+        ];
+        let script = github::ssh_gh_with_account_script(&account.host, &account.login, &args);
+        let output = self.run_script(ShellRunRequest::new(
+            "gh repo exists",
+            self.workspace.root.clone(),
+            script,
+        ))?;
+        if output.status_success(&[0]) {
+            return Ok(true);
+        }
+
+        let message = output.failure_message();
+        let lower = message.to_lowercase();
+        if lower.contains("could not resolve to a repository")
+            || lower.contains("not found")
+            || lower.contains("http 404")
+        {
+            Ok(false)
+        } else {
+            Err(if message.is_empty() {
+                format!("gh repo view {repo_slug} failed.")
+            } else {
+                format!("gh repo view {repo_slug} failed: {message}")
+            })
+        }
+    }
+}
+
+fn gh_failure(operation: &str, output: ShellCommandOutput) -> String {
+    let message = output.failure_message();
+    if message.is_empty() {
+        format!("{operation} failed with status {:?}", output.status_code)
+    } else {
+        message
     }
 }

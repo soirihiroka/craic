@@ -264,7 +264,13 @@ impl AgentChat {
         let system = self.ctx.system_ref();
         let workspace = self.ctx.workspace_ref();
         let shell = self.ctx.shell();
-        let command = provider.command(shell.as_deref(), &system, &workspace);
+        let command = match provider.command(shell.as_deref(), &system, &workspace) {
+            Ok(command) => command,
+            Err(err) => {
+                self.ctx.show_error("Start Agent Failed", &err);
+                return;
+            }
+        };
         provider.shell_integration().log_session_create(
             session_id,
             provider,

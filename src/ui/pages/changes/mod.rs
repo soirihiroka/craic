@@ -2,7 +2,9 @@ mod left;
 mod right;
 
 use super::{Page, PageBadge, PageCommand, PageCommandResult, PageContext};
-use crate::git::{self, BytesComparison, FileComparison, RepositorySnapshot};
+use crate::git::{
+    self, BytesComparison, FileComparison, GitRepoHandle, OperationCallback, RepositorySnapshot,
+};
 use crate::github::CommitEmailOption;
 use crate::gitignore::{self, IgnoreTargetKind};
 use crate::system::capabilities::open::{DesktopOpenActivation, DesktopOpenTargetKind};
@@ -23,6 +25,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -215,26 +218,47 @@ impl ChangesPage {
                 let summary = panel.commit_summary();
                 let description = left::text_view_text(&description_view);
                 let files = panel.checked_file_paths();
-                let Some(git_access) = ctx.git() else {
+                let Some(git_handle) = ctx.git() else {
                     ctx.show_error("Commit Failed", &ctx.git_unavailable_message());
                     return;
                 };
-                let message = match git_access.commit_paths(&summary, &description, &files) {
-                    Ok(output) => {
-                        summary_entry.set_text("");
-                        description_view.buffer().set_text("");
-                        if output.is_empty() {
-                            "Commit created.".to_string()
-                        } else {
-                            output
+                let (sender, receiver) = mpsc::channel();
+                git_handle.commit_paths(
+                    &summary,
+                    &description,
+                    &files,
+                    Box::new(move |result| {
+                        let _ = sender.send(result);
+                    }),
+                );
+                gtk::glib::timeout_add_local(Duration::from_millis(75), {
+                    let ctx = ctx.clone();
+                    let summary_entry = summary_entry.clone();
+                    let description_view = description_view.clone();
+
+                    move || match receiver.try_recv() {
+                        Ok(Ok(output)) => {
+                            summary_entry.set_text("");
+                            description_view.buffer().set_text("");
+                            let message = if output.is_empty() {
+                                "Commit created.".to_string()
+                            } else {
+                                output
+                            };
+                            ctx.refresh_without_toast(Some(message));
+                            gtk::glib::ControlFlow::Break
+                        }
+                        Ok(Err(err)) => {
+                            ctx.show_error("Commit Failed", &err);
+                            gtk::glib::ControlFlow::Break
+                        }
+                        Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                        Err(TryRecvError::Disconnected) => {
+                            ctx.show_error("Commit Failed", "Commit did not return a result.");
+                            gtk::glib::ControlFlow::Break
                         }
                     }
-                    Err(err) => {
-                        ctx.show_error("Commit Failed", &err);
-                        return;
-                    }
-                };
-                ctx.refresh_without_toast(Some(message));
+                });
             }
         });
 
@@ -479,27 +503,6 @@ impl Page for ChangesPage {
             &self.ctx.workspace_key(),
         );
 
-        if workspace_can_initialize_git(&self.ctx) {
-            if self.changed_count.replace(0) != 0 {
-                self.ctx.notify_badge_changed();
-            }
-            self.commit_form.clear();
-            self.panel.show_initialize_repository();
-            self.active_preview_signature.borrow_mut().take();
-            self.preview_signatures.borrow_mut().clear();
-            clear_worktree_preview_cache(
-                &self.preview_cache,
-                "initialize-repository",
-                &self.ctx.workspace_key(),
-            );
-            log::info!(
-                "changes page showing git initialization prompt during refresh workspace={}",
-                self.ctx.workspace_key()
-            );
-            self.right.show_initialize_repository();
-            return;
-        }
-
         let changed_count = snapshot.changed_files.len();
         if self.changed_count.replace(changed_count) != changed_count {
             self.ctx.notify_badge_changed();
@@ -542,7 +545,7 @@ impl Page for ChangesPage {
             "repository-error",
             &self.ctx.workspace_key(),
         );
-        if workspace_can_initialize_git(&self.ctx) {
+        if error_can_initialize_git(&self.ctx, message) {
             log::info!(
                 "changes page showing git initialization status workspace={}",
                 self.ctx.workspace_key()
@@ -585,10 +588,15 @@ impl Page for ChangesPage {
     }
 }
 
-fn workspace_can_initialize_git(ctx: &PageContext) -> bool {
-    ctx.local_workspace_path()
-        .as_deref()
-        .is_some_and(|path| git::root_for_path(path).is_none())
+fn error_can_initialize_git(ctx: &PageContext, message: &str) -> bool {
+    ctx.git().is_some() && is_not_git_repository_error(message)
+}
+
+fn is_not_git_repository_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("not a git repository")
+        || message.contains("not in a git directory")
+        || message.contains("outside repository")
 }
 
 fn sync_worktree_preview_workspace(
@@ -666,7 +674,7 @@ fn clear_worktree_preview_cache(
 }
 
 fn initialize_git_repository(ctx: &PageContext) {
-    let Some(repo_path) = ctx.local_workspace_path() else {
+    let Some(git_handle) = ctx.git() else {
         ctx.show_error(
             "Initialize Repository Failed",
             "Git repository initialization is unavailable for this workspace.",
@@ -674,20 +682,32 @@ fn initialize_git_repository(ctx: &PageContext) {
         return;
     };
 
-    if git::root_for_path(&repo_path).is_some() {
-        log::info!(
-            "git init skipped because workspace is already a repository path={}",
-            repo_path.display()
-        );
-        ctx.refresh(Some("Workspace is already a Git repository.".to_string()));
-        return;
-    }
+    let (sender, receiver) = mpsc::channel();
+    git_handle.initialize_repository(Box::new(move |result| {
+        let _ = sender.send(result);
+    }));
 
-    log::info!("git init requested path={}", repo_path.display());
-    match git::initialize_repository(&repo_path) {
-        Ok(message) => ctx.refresh(Some(message)),
-        Err(err) => ctx.show_error("Initialize Repository Failed", &err),
-    }
+    let ctx = ctx.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(75), move || {
+        match receiver.try_recv() {
+            Ok(Ok(message)) => {
+                ctx.refresh(Some(message));
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(err)) => {
+                ctx.show_error("Initialize Repository Failed", &err);
+                gtk::glib::ControlFlow::Break
+            }
+            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) => {
+                ctx.show_error(
+                    "Initialize Repository Failed",
+                    "Git repository initialization did not return a result.",
+                );
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn show_worktree_preview(
@@ -719,7 +739,7 @@ fn show_worktree_preview(
         signature.kind
     );
 
-    let Some(git_access) = ctx.git() else {
+    let Some(git_handle) = ctx.git() else {
         active_preview_signature.borrow_mut().take();
         right.show_home();
         ctx.show_error("Diff Failed", &ctx.git_unavailable_message());
@@ -728,19 +748,7 @@ fn show_worktree_preview(
     let (sender, receiver) = mpsc::channel();
     let workspace_key = ctx.workspace_key();
 
-    thread::spawn({
-        let signature = signature.clone();
-
-        move || {
-            let start = Instant::now();
-            let result = worktree_preview_result(git_access.as_ref(), &signature);
-            let _ = sender.send(WorktreePreviewWorkerResult {
-                signature,
-                result,
-                duration: start.elapsed(),
-            });
-        }
-    });
+    start_worktree_preview_load(git_handle, signature.clone(), sender);
 
     gtk::glib::timeout_add_local(Duration::from_millis(75), {
         let ctx = ctx.clone();
@@ -816,27 +824,52 @@ fn show_worktree_preview(
     });
 }
 
-fn worktree_preview_result(
-    git_access: &dyn crate::system::capabilities::git::GitAccess,
-    signature: &WorktreePreviewSignature,
-) -> Result<WorktreePreview, String> {
-    let result = match signature.kind {
+fn start_worktree_preview_load(
+    git_handle: Arc<GitRepoHandle>,
+    signature: WorktreePreviewSignature,
+    sender: mpsc::Sender<WorktreePreviewWorkerResult>,
+) {
+    let start = Instant::now();
+    let path = signature.path.clone();
+    match signature.kind {
         PreviewKind::Image
         | PreviewKind::Audio
         | PreviewKind::Video
         | PreviewKind::Font
-        | PreviewKind::Pdf => git_access
-            .bytes_comparison(&signature.path)
-            .map(WorktreePreview::Bytes),
-        _ => git_access
-            .comparison(&signature.path)
-            .map(WorktreePreview::Diff),
-    };
-
-    match result {
-        Ok(preview) => Ok(preview),
-        Err(err) if is_preview_limit_message(&err) => Ok(WorktreePreview::PreviewLimit(err)),
-        Err(err) => Err(err),
+        | PreviewKind::Pdf => git_handle.bytes_comparison(
+            &path,
+            Box::new(move |result| {
+                let result = match result.map(WorktreePreview::Bytes) {
+                    Ok(preview) => Ok(preview),
+                    Err(err) if is_preview_limit_message(&err) => {
+                        Ok(WorktreePreview::PreviewLimit(err))
+                    }
+                    Err(err) => Err(err),
+                };
+                let _ = sender.send(WorktreePreviewWorkerResult {
+                    signature,
+                    result,
+                    duration: start.elapsed(),
+                });
+            }),
+        ),
+        _ => git_handle.comparison(
+            &path,
+            Box::new(move |result| {
+                let result = match result.map(WorktreePreview::Diff) {
+                    Ok(preview) => Ok(preview),
+                    Err(err) if is_preview_limit_message(&err) => {
+                        Ok(WorktreePreview::PreviewLimit(err))
+                    }
+                    Err(err) => Err(err),
+                };
+                let _ = sender.send(WorktreePreviewWorkerResult {
+                    signature,
+                    result,
+                    duration: start.elapsed(),
+                });
+            }),
+        ),
     }
 }
 
@@ -922,10 +955,10 @@ fn generate_commit_message(
         return;
     }
 
-    let Some(repo_path) = ctx.local_workspace_path() else {
+    let Some(git_handle) = ctx.git() else {
         ctx.show_error(
             "Generate Commit Message Failed",
-            "Commit message generation is unavailable for remote workspaces.",
+            "Commit message generation is unavailable for this workspace.",
         );
         return;
     };
@@ -950,16 +983,26 @@ fn generate_commit_message(
         hovered.get(),
     );
 
-    thread::spawn(move || {
-        let result = crate::ai_commit::generate(
-            &repo_path,
-            &provider_id,
-            model.as_deref(),
-            &files,
-            &cancellation,
-        );
-        let _ = sender.send(result);
-    });
+    git_handle.commit_message_context(
+        &files,
+        Box::new(move |context_result| {
+            let sender = sender.clone();
+            let provider_id = provider_id.clone();
+            let model = model.clone();
+            let cancellation = cancellation.clone();
+            thread::spawn(move || {
+                let result = context_result.and_then(|context| {
+                    crate::ai_commit::generate_from_context(
+                        context,
+                        &provider_id,
+                        model.as_deref(),
+                        &cancellation,
+                    )
+                });
+                let _ = sender.send(result);
+            });
+        }),
+    );
 
     gtk::glib::timeout_add_local(Duration::from_millis(100), {
         let ctx = ctx.clone();
@@ -1128,19 +1171,43 @@ fn show_commit_author_email_selector(
                 return;
             }
 
-            let Some(git_access) = ctx.git() else {
+            let Some(git_handle) = ctx.git() else {
                 ctx.show_error("Email Selection Failed", &ctx.git_unavailable_message());
                 return;
             };
 
-            match git_access.save_author_email(&email) {
-                Ok(()) => {
-                    log::info!("commit author email updated from selector");
-                    popover.popdown();
-                    ctx.refresh(Some("Commit author email updated.".to_string()));
+            let (sender, receiver) = mpsc::channel();
+            git_handle.save_author_email(
+                &email,
+                Box::new(move |result| {
+                    let _ = sender.send(result);
+                }),
+            );
+            gtk::glib::timeout_add_local(Duration::from_millis(75), {
+                let ctx = ctx.clone();
+                let popover = popover.clone();
+
+                move || match receiver.try_recv() {
+                    Ok(Ok(())) => {
+                        log::info!("commit author email updated from selector");
+                        popover.popdown();
+                        ctx.refresh(Some("Commit author email updated.".to_string()));
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Ok(Err(err)) => {
+                        ctx.show_error("Email Selection Failed", &err);
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                    Err(TryRecvError::Disconnected) => {
+                        ctx.show_error(
+                            "Email Selection Failed",
+                            "Email selection did not return a result.",
+                        );
+                        gtk::glib::ControlFlow::Break
+                    }
                 }
-                Err(err) => ctx.show_error("Email Selection Failed", &err),
-            }
+            });
         }
     });
 
@@ -1386,14 +1453,21 @@ fn show_changed_file_selector_context_menu(
     let stash_all = add_menu_action(&actions, "stash-all", {
         let ctx = ctx.clone();
         move |_, _| {
-            let Some(git_access) = ctx.git() else {
+            let Some(git_handle) = ctx.git() else {
                 ctx.show_error("Stash Failed", &ctx.git_unavailable_message());
                 return;
             };
-            match git_access.stash_changes() {
-                Ok(message) => ctx.refresh(Some(message)),
-                Err(err) => ctx.show_error("Stash Failed", &err),
-            }
+            let (sender, receiver) = mpsc::channel();
+            git_handle.stash_changes(Box::new(move |result| {
+                let _ = sender.send(result);
+            }));
+            poll_changes_git_string_result(
+                &ctx,
+                receiver,
+                "Stash Failed",
+                "Git stash did not return a result.",
+                Some("Changes stashed.".to_string()),
+            );
         }
     });
     stash_all.set_enabled(has_changed_files);
@@ -1543,13 +1617,13 @@ fn changed_file_action_group(ctx: &PageContext, local_workspace: bool) -> gio::S
 fn discard_all_changes(ctx: &PageContext) {
     let ctx = ctx.clone();
     let workspace_key = ctx.workspace_key();
-    let Some(git_access) = ctx.git() else {
+    let Some(git_handle) = ctx.git() else {
         ctx.show_error("Discard Failed", &ctx.git_unavailable_message());
         return;
     };
     request_provider_git_snapshot(
         workspace_key.clone(),
-        git_access,
+        git_handle,
         move |response_key, result| {
             if response_key != workspace_key || !ctx.workspace_is_current(&workspace_key) {
                 return;
@@ -1615,24 +1689,118 @@ fn confirm_discard_changes(ctx: &PageContext, paths: Vec<String>) {
                 return;
             }
 
-            let Some(git_access) = ctx.git() else {
+            let Some(git_handle) = ctx.git() else {
                 ctx.show_error("Discard Failed", &ctx.git_unavailable_message());
                 return;
             };
 
-            for path in &paths {
-                if let Err(err) = git_access.discard_path(path) {
-                    ctx.show_error("Discard Failed", &err);
-                    return;
-                }
-            }
-
+            let (sender, receiver) = mpsc::channel();
+            discard_paths(
+                git_handle,
+                paths.clone(),
+                Box::new(move |result| {
+                    let _ = sender.send(result);
+                }),
+            );
             let message = if paths.len() == 1 {
                 format!("Discarded {}.", paths[0])
             } else {
                 "Discarded all changes.".to_string()
             };
-            ctx.refresh(Some(message));
+            poll_changes_git_unit_result(
+                &ctx,
+                receiver,
+                "Discard Failed",
+                "Discard operation did not return a result.",
+                message,
+            );
+        }
+    });
+}
+
+fn discard_paths(
+    git_handle: Arc<GitRepoHandle>,
+    paths: Vec<String>,
+    callback: OperationCallback<()>,
+) {
+    discard_path_at(git_handle, Arc::new(paths), 0, callback);
+}
+
+fn discard_path_at(
+    git_handle: Arc<GitRepoHandle>,
+    paths: Arc<Vec<String>>,
+    index: usize,
+    callback: OperationCallback<()>,
+) {
+    let Some(path) = paths.get(index).cloned() else {
+        callback(Ok(()));
+        return;
+    };
+    let next_handle = git_handle.clone();
+    git_handle.discard_path(
+        &path,
+        Box::new(move |result| match result {
+            Ok(_) => discard_path_at(next_handle, paths, index + 1, callback),
+            Err(err) => callback(Err(err)),
+        }),
+    );
+}
+
+fn poll_changes_git_string_result(
+    ctx: &PageContext,
+    receiver: mpsc::Receiver<Result<String, String>>,
+    error_heading: &'static str,
+    disconnected_message: &'static str,
+    empty_success_message: Option<String>,
+) {
+    let ctx = ctx.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(75), move || {
+        match receiver.try_recv() {
+            Ok(Ok(output)) => {
+                let message = if output.is_empty() {
+                    empty_success_message.clone().unwrap_or_default()
+                } else {
+                    output
+                };
+                ctx.refresh((!message.is_empty()).then_some(message));
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(err)) => {
+                ctx.show_error(error_heading, &err);
+                gtk::glib::ControlFlow::Break
+            }
+            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) => {
+                ctx.show_error(error_heading, disconnected_message);
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn poll_changes_git_unit_result(
+    ctx: &PageContext,
+    receiver: mpsc::Receiver<Result<(), String>>,
+    error_heading: &'static str,
+    disconnected_message: &'static str,
+    success_message: String,
+) {
+    let ctx = ctx.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(75), move || {
+        match receiver.try_recv() {
+            Ok(Ok(())) => {
+                ctx.refresh(Some(success_message.clone()));
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(err)) => {
+                ctx.show_error(error_heading, &err);
+                gtk::glib::ControlFlow::Break
+            }
+            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) => {
+                ctx.show_error(error_heading, disconnected_message);
+                gtk::glib::ControlFlow::Break
+            }
         }
     });
 }
@@ -1789,13 +1957,13 @@ fn launch_path(ctx: &PageContext, program: &str, paths: &[PathBuf], success_mess
 fn open_remote_repository(ctx: &PageContext) {
     let ctx = ctx.clone();
     let workspace_key = ctx.workspace_key();
-    let Some(git_access) = ctx.git() else {
+    let Some(git_handle) = ctx.git() else {
         ctx.show_error("Open Remote Failed", &ctx.git_unavailable_message());
         return;
     };
     request_provider_git_snapshot(
         workspace_key.clone(),
-        git_access,
+        git_handle,
         move |response_key, result| {
             if response_key != workspace_key || !ctx.workspace_is_current(&workspace_key) {
                 return;

@@ -9,6 +9,8 @@ use super::{
 };
 use crate::config::{ConfiguredWorkspace, WorkspaceProvider};
 use crate::git;
+use crate::system::SystemProviderRegistry;
+use crate::system::providers::local::LocalProvider;
 use adw::prelude::*;
 use gtk::{gdk, gio};
 use std::cell::{Cell, RefCell};
@@ -117,7 +119,7 @@ fn connect_app_actions(state: &Rc<AppState>) {
                 let workspace = state.workspace_ref.borrow().clone();
                 show_preferences_window(
                     &state.window,
-                    state.providers.git(&system.id, &workspace),
+                    super::git_handle_for_workspace(&state, &system.id, &workspace),
                     state.providers.github(&system.id, &workspace),
                 );
             }
@@ -505,8 +507,9 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
             status_row.set_subtitle("This may take a moment.");
 
             let (sender, receiver) = mpsc::channel();
+            let providers = state.providers.clone();
             thread::spawn(move || {
-                let result = create_workspace(request);
+                let result = create_workspace(&providers, request);
                 let _ = sender.send(result);
             });
 
@@ -602,12 +605,24 @@ fn create_workspace_request(
     Ok(CreateWorkspaceRequest { root, name, remote })
 }
 
-fn create_workspace(request: CreateWorkspaceRequest) -> Result<(PathBuf, String), String> {
+fn create_workspace(
+    providers: &SystemProviderRegistry,
+    request: CreateWorkspaceRequest,
+) -> Result<(PathBuf, String), String> {
     let destination = request.root.join(&request.name);
     ensure_destination_available(&destination)?;
 
     if let Some(remote) = request.remote {
-        let message = git::clone_repository(&remote, &destination)?;
+        let workspace = LocalProvider::workspace_for_path(&request.root);
+        let shell = providers
+            .shell(&LocalProvider::new().system_ref().id, &workspace)
+            .ok_or_else(|| "Local shell access is unavailable.".to_string())?;
+        let message = git::clone_repository_with_shell(
+            shell,
+            workspace.root.clone(),
+            &remote,
+            &request.name,
+        )?;
         return Ok((destination, message));
     }
 

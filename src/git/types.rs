@@ -1,4 +1,5 @@
-use super::*;
+use crate::github;
+use std::time::SystemTime;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RepositorySnapshot {
@@ -19,8 +20,6 @@ pub struct RepositorySnapshot {
     pub changed_files: Vec<ChangedFile>,
     pub history_head: Option<String>,
 }
-
-pub const RECENT_BRANCHES_LIMIT: usize = 5;
 
 #[derive(Clone, Debug, Default)]
 pub struct GitSettings {
@@ -76,17 +75,10 @@ pub struct CommitPage {
     pub has_more: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BranchKind {
-    Local,
-    Remote,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchInfo {
     pub name: String,
     pub is_current: bool,
-    pub kind: BranchKind,
     pub upstream: Option<String>,
     pub is_default: bool,
     pub is_recent: bool,
@@ -100,12 +92,6 @@ pub struct FileComparison {
     pub deletions: usize,
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct FilePathPair {
-    pub(crate) old_path: Option<String>,
-    pub(crate) new_path: Option<String>,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct GitStatusEntry {
     pub(crate) status_code: String,
@@ -113,6 +99,167 @@ pub(crate) struct GitStatusEntry {
     pub(crate) old_path: Option<String>,
     pub(crate) unmerged: bool,
     pub(crate) untracked: bool,
+}
+
+pub(crate) fn parse_porcelain_status_entries(bytes: &[u8]) -> Vec<GitStatusEntry> {
+    let tokens = bytes
+        .split(|byte| *byte == 0)
+        .filter(|token| !token.is_empty())
+        .map(|token| String::from_utf8_lossy(token).to_string())
+        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    let mut index = 0;
+
+    while index < tokens.len() {
+        let field = &tokens[index];
+        index += 1;
+
+        match field.as_bytes().first().copied() {
+            Some(b'1') => {
+                if let Some(entry) = parse_porcelain_changed_entry(field) {
+                    entries.push(entry);
+                }
+            }
+            Some(b'2') => {
+                let old_path = tokens.get(index).cloned();
+                index += usize::from(old_path.is_some());
+                if let Some(entry) = parse_porcelain_renamed_entry(field, old_path) {
+                    entries.push(entry);
+                }
+            }
+            Some(b'u') => {
+                if let Some(entry) = parse_porcelain_unmerged_entry(field) {
+                    entries.push(entry);
+                }
+            }
+            Some(b'?') => {
+                if let Some(path) = field.strip_prefix("? ").filter(|path| !path.is_empty()) {
+                    entries.push(GitStatusEntry {
+                        status_code: "??".to_string(),
+                        path: path.to_string(),
+                        old_path: None,
+                        unmerged: false,
+                        untracked: true,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    entries
+}
+
+fn parse_porcelain_changed_entry(field: &str) -> Option<GitStatusEntry> {
+    let mut parts = field.splitn(9, ' ');
+    parts.next()?;
+    let status_code = parts.next()?.to_string();
+    for _ in 0..6 {
+        parts.next()?;
+    }
+    let path = parts.next()?.to_string();
+    Some(GitStatusEntry {
+        status_code,
+        path,
+        old_path: None,
+        unmerged: false,
+        untracked: false,
+    })
+}
+
+fn parse_porcelain_renamed_entry(field: &str, old_path: Option<String>) -> Option<GitStatusEntry> {
+    let mut parts = field.splitn(10, ' ');
+    parts.next()?;
+    let status_code = parts.next()?.to_string();
+    for _ in 0..6 {
+        parts.next()?;
+    }
+    parts.next()?;
+    let path = parts.next()?.to_string();
+    Some(GitStatusEntry {
+        status_code,
+        path,
+        old_path,
+        unmerged: false,
+        untracked: false,
+    })
+}
+
+fn parse_porcelain_unmerged_entry(field: &str) -> Option<GitStatusEntry> {
+    let mut parts = field.splitn(11, ' ');
+    parts.next()?;
+    let status_code = parts.next()?.to_string();
+    for _ in 0..8 {
+        parts.next()?;
+    }
+    let path = parts.next()?.to_string();
+    Some(GitStatusEntry {
+        status_code,
+        path,
+        old_path: None,
+        unmerged: true,
+        untracked: false,
+    })
+}
+
+pub(crate) fn status_entry_visible(entry: &GitStatusEntry) -> bool {
+    entry.status_code != "AD"
+}
+
+pub(crate) fn changed_file_from_porcelain_entry(entry: &GitStatusEntry) -> ChangedFile {
+    ChangedFile {
+        status: porcelain_entry_status_label(entry).to_string(),
+        path: entry.path.clone(),
+        git_status_bits: 0,
+        worktree_signature: None,
+    }
+}
+
+fn porcelain_entry_status_label(entry: &GitStatusEntry) -> &'static str {
+    if entry.unmerged || entry.status_code.contains('U') {
+        "U"
+    } else if entry.status_code.contains('R') || entry.status_code.contains('C') {
+        "R"
+    } else if entry.status_code.contains('D') {
+        "D"
+    } else if entry.untracked || entry.status_code.contains('A') || entry.status_code.contains('?')
+    {
+        "A"
+    } else {
+        "M"
+    }
+}
+
+pub(crate) fn porcelain_entry_matches_path(entry: &GitStatusEntry, path: &str) -> bool {
+    entry.path == path || entry.old_path.as_deref() == Some(path)
+}
+
+pub(crate) fn porcelain_entry_force_remove_paths(entry: &GitStatusEntry) -> Vec<String> {
+    if entry.old_path.is_some() || entry.status_code.contains('D') {
+        return vec![entry.old_path.as_ref().unwrap_or(&entry.path).clone()];
+    }
+    Vec::new()
+}
+
+pub(crate) fn porcelain_entry_update_paths(entry: &GitStatusEntry) -> Vec<String> {
+    if entry.status_code.contains('D') && entry.old_path.is_none() {
+        return Vec::new();
+    }
+    vec![entry.path.clone()]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetMode {
+    Mixed,
+    Hard,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoMetadata {
+    Fork,
+    Private,
+    Public,
+    Folder,
 }
 
 #[derive(Clone, Debug)]

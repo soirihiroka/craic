@@ -1,33 +1,36 @@
 mod docker;
 mod files;
-mod git;
 mod github;
 mod shell;
 mod terminal_link;
 
 use self::docker::SshDockerAccess;
 use self::files::SshFileAccess;
-use self::git::SshGitAccess;
 use self::github::SshGitHubAccess;
 use self::shell::SshShellAccess;
 use self::terminal_link::SshTerminalLinkAccess;
 use super::url::GioUrlOpenAccess;
 use crate::system::capabilities::github::GitHubAccess;
 use crate::system::capabilities::{
-    docker::DockerAccess, files::FileAccess, git::GitAccess, open::DesktopOpenAccess,
-    shell::ShellAccess, terminal_link::TerminalLinkAccess, url::UrlOpenAccess,
+    docker::DockerAccess,
+    files::FileAccess,
+    open::DesktopOpenAccess,
+    shell::{ShellAccess, ShellCommandOutput},
+    terminal_link::TerminalLinkAccess,
+    url::UrlOpenAccess,
 };
 use crate::system::path::{
     HostRef, ProviderKind, SystemId, SystemRef, WorkspaceId, WorkspacePath, WorkspaceRef,
 };
 use crate::system::provider::{
-    ProviderWorkspaceEntry, ProviderWorkspaceGitStatus, ProviderWorkspaceListRequest,
-    ProviderWorkspaceRemote, ProviderWorkspaceSource, SystemProvider,
+    ProviderWorkspaceEntry, ProviderWorkspaceListRequest, ProviderWorkspaceSource, SystemProvider,
 };
-use crate::{bitbucket, github as github_api, gitlab};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+
+const SSH_WORKSPACE_LIST_SCRIPT: &str = include_str!("scripts/list_workspaces.sh");
+const SSH_RESOLVE_PATH_SCRIPT: &str = include_str!("scripts/resolve_path.sh");
 
 #[derive(Clone, Debug)]
 pub(crate) struct SshProviderConfig {
@@ -153,10 +156,9 @@ impl SystemProvider for SshProvider {
             input.push('\n');
         }
 
-        let script = crate::git::ssh_workspace_list_script();
         let output = runner.run_script_with_stdin(
             "bulk list ssh workspaces",
-            script,
+            SSH_WORKSPACE_LIST_SCRIPT,
             Some(input.as_bytes()),
         )?;
         let output = String::from_utf8(output.stdout)
@@ -164,12 +166,10 @@ impl SystemProvider for SshProvider {
         let mut workspaces = output
             .lines()
             .filter_map(|line| {
-                let mut fields = line.splitn(5, '\t');
+                let mut fields = line.splitn(3, '\t');
                 let source_kind = fields.next().unwrap_or_default();
                 let source_path = fields.next().unwrap_or_default().to_string();
                 let path = fields.next().unwrap_or_default().trim();
-                let remote_name = fields.next().unwrap_or_default().trim();
-                let remote_url = fields.next().unwrap_or_default().trim();
                 let path = path.trim();
                 if path.is_empty() {
                     return None;
@@ -178,17 +178,6 @@ impl SystemProvider for SshProvider {
                     "W" => ProviderWorkspaceSource::Workspace { path: source_path },
                     "R" => ProviderWorkspaceSource::Root { path: source_path },
                     _ => return None,
-                };
-                let git = if remote_url.is_empty() {
-                    ProviderWorkspaceGitStatus::NotRepo
-                } else {
-                    let remote = (remote_url != "-").then(|| ProviderWorkspaceRemote {
-                        name: (!remote_name.is_empty()).then(|| remote_name.to_string()),
-                        url: remote_url.to_string(),
-                        host: remote_host(remote_url),
-                        slug: remote_slug(remote_url),
-                    });
-                    ProviderWorkspaceGitStatus::Repo { remote }
                 };
                 Some(ProviderWorkspaceEntry {
                     display_name: path
@@ -200,7 +189,6 @@ impl SystemProvider for SshProvider {
                         .to_string(),
                     path: path.to_string(),
                     source,
-                    git,
                 })
             })
             .collect::<Vec<_>>();
@@ -233,25 +221,6 @@ impl SystemProvider for SshProvider {
         )))
     }
 
-    fn git(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn GitAccess>> {
-        log::debug!(
-            "creating ssh git capability provider={} workspace={} root={}",
-            self.label(),
-            workspace.display_name,
-            workspace.root.absolute
-        );
-        let files: Arc<dyn FileAccess> = Arc::new(SshFileAccess::new(
-            self.system.clone(),
-            workspace.clone(),
-            self.runner(),
-        ));
-        Some(Arc::new(SshGitAccess::new(
-            workspace.clone(),
-            self.runner(),
-            files,
-        )))
-    }
-
     fn github(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn GitHubAccess>> {
         log::debug!(
             "creating ssh github capability provider={} workspace={} root={}",
@@ -259,7 +228,13 @@ impl SystemProvider for SshProvider {
             workspace.display_name,
             workspace.root.absolute
         );
-        Some(Arc::new(SshGitHubAccess::new(workspace.clone())))
+        Some(Arc::new(SshGitHubAccess::new(
+            workspace.clone(),
+            Arc::new(SshShellAccess::new(
+                workspace.clone(),
+                self.config.host.clone(),
+            )),
+        )))
     }
 
     fn shell(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn ShellAccess>> {
@@ -320,12 +295,12 @@ impl SshCommandRunner {
         self.run_script_with_stdin(operation, script, None)
     }
 
-    pub(crate) fn run_script_with_stdin(
+    pub(crate) fn run_script_output_with_stdin(
         &self,
         operation: &str,
         script: &str,
         stdin: Option<&[u8]>,
-    ) -> Result<SshOutput, String> {
+    ) -> Result<ShellCommandOutput, String> {
         let remote_command = format!("sh -lc {}", shell_quote(script));
         log::info!(
             "ssh command start provider={} operation={} script_bytes={}",
@@ -368,8 +343,6 @@ impl SshCommandRunner {
         let output = child
             .wait_with_output()
             .map_err(|err| format!("Failed to wait for ssh {operation}: {err}"))?;
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-
         if output.status.success() {
             log::info!(
                 "ssh command complete provider={} operation={} stdout_bytes={}",
@@ -377,20 +350,43 @@ impl SshCommandRunner {
                 operation,
                 output.stdout.len()
             );
-            Ok(SshOutput {
-                stdout: output.stdout,
-                stderr,
-            })
         } else {
             log::warn!(
                 "ssh command failed provider={} operation={} status={} stderr={}",
                 self.label,
                 operation,
                 output.status,
-                stderr
+                String::from_utf8_lossy(&output.stderr).trim()
             );
+        }
+
+        Ok(ShellCommandOutput {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            status_code: output.status.code(),
+        })
+    }
+
+    pub(crate) fn run_script_with_stdin(
+        &self,
+        operation: &str,
+        script: &str,
+        stdin: Option<&[u8]>,
+    ) -> Result<SshOutput, String> {
+        let output = self.run_script_output_with_stdin(operation, script, stdin)?;
+        let stderr = output.stderr_text_trimmed();
+
+        if output.status_success(&[0]) {
+            Ok(SshOutput {
+                stdout: output.stdout,
+                stderr,
+            })
+        } else {
             Err(if stderr.is_empty() {
-                format!("ssh {operation} failed with status {}", output.status)
+                format!(
+                    "ssh {operation} failed with status {:?}",
+                    output.status_code
+                )
             } else {
                 stderr
             })
@@ -403,10 +399,7 @@ impl SshCommandRunner {
     }
 
     pub(crate) fn resolve_path(&self, path: &str) -> Result<String, String> {
-        let script = format!(
-            "p={}; if [ \"$p\" = '~' ]; then printf '%s\\n' \"$HOME\"; else case \"$p\" in \"~/\"*) printf '%s/%s\\n' \"$HOME\" \"${{p#\\~/}}\" ;; *) printf '%s\\n' \"$p\" ;; esac; fi",
-            shell_quote(path)
-        );
+        let script = format!("set -- {}\n{SSH_RESOLVE_PATH_SCRIPT}", shell_quote(path));
         let output = self.run_text("resolve remote path", &script)?;
         let resolved = output.lines().next().unwrap_or(path).trim().to_string();
         log::debug!(
@@ -446,27 +439,6 @@ pub(crate) fn workspace_path_for_remote(workspace: &WorkspaceRef, absolute: &str
         .and_then(|suffix| suffix.strip_prefix('/'))
         .unwrap_or("");
     WorkspacePath::from_workspace_relative(&workspace.root, relative)
-}
-
-fn remote_slug(remote_url: &str) -> Option<String> {
-    github_api::parse_github_url(remote_url)
-        .or_else(|| gitlab::parse_gitlab_url(remote_url))
-        .or_else(|| bitbucket::parse_bitbucket_url(remote_url))
-}
-
-fn remote_host(remote_url: &str) -> Option<String> {
-    let remote_url = remote_url.trim();
-    if let Some(rest) = remote_url.strip_prefix("git@") {
-        return rest.split_once(':').map(|(host, _)| host.to_string());
-    }
-    if let Some((_, rest)) = remote_url.split_once("://") {
-        return rest
-            .split('/')
-            .next()
-            .filter(|host| !host.is_empty())
-            .map(|host| host.trim_start_matches("git@").to_string());
-    }
-    None
 }
 
 fn sanitize_id(value: &str) -> String {

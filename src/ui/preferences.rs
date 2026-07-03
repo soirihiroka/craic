@@ -1,9 +1,9 @@
 use super::dialogs::show_error_dialog;
 use crate::agent_provider;
 use crate::config::{self, FontSizes};
+use crate::git::GitRepoHandle;
 use crate::git::GitSettings;
 use crate::github::GitHubAuthAccount;
-use crate::system::capabilities::git::GitAccess;
 use crate::system::capabilities::github::GitHubAccess;
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -15,11 +15,10 @@ use std::time::Duration;
 
 pub(super) fn show_preferences_window(
     parent: &adw::ApplicationWindow,
-    git_access: Option<Arc<dyn GitAccess>>,
+    git_handle: Option<Arc<GitRepoHandle>>,
     github_access: Option<Arc<dyn GitHubAccess>>,
 ) {
     let app_config = config::load();
-    let git_settings = git_access.as_ref().map(|access| access.settings());
     let prefs_window = adw::PreferencesDialog::builder()
         .title("Preferences")
         .content_width(550)
@@ -220,221 +219,300 @@ pub(super) fn show_preferences_window(
 
     general_page.add(&font_group);
 
-    if let (Some(git_access), Some(settings)) = (git_access, git_settings) {
-        let workspace_page = adw::PreferencesPage::new();
-        workspace_page.set_title("Workspace");
-        workspace_page.set_icon_name(Some("git-symbolic"));
-
-        let profile_group = adw::PreferencesGroup::new();
-        profile_group.set_title("Git Author Profile");
-        profile_group.set_description(Some("Settings for the current workspace"));
-
-        let use_global_row = adw::ActionRow::builder()
-            .title("Use Global User")
-            .subtitle("Use the global Git user.name and user.email for this workspace")
-            .build();
-        let use_global_switch = gtk::Switch::builder()
-            .active(settings.use_global_user)
-            .valign(gtk::Align::Center)
-            .build();
-        use_global_row.add_suffix(&use_global_switch);
-        profile_group.add(&use_global_row);
-
-        let name_row = adw::EntryRow::builder().title("Author Name").build();
-        name_row.set_text(
-            settings
-                .local_user_name
-                .as_deref()
-                .or(settings.global_user_name.as_deref())
-                .unwrap_or(""),
-        );
-        name_row.set_sensitive(!settings.use_global_user);
-        profile_group.add(&name_row);
-
-        let email_row = adw::EntryRow::builder().title("Author Email").build();
-        email_row.set_text(
-            settings
-                .local_user_email
-                .as_deref()
-                .or(settings.global_user_email.as_deref())
-                .unwrap_or(""),
-        );
-        email_row.set_sensitive(!settings.use_global_user);
-        profile_group.add(&email_row);
-
-        workspace_page.add(&profile_group);
-
-        let privacy_group = adw::PreferencesGroup::new();
-        privacy_group.set_title("Commit Privacy");
-        privacy_group.set_description(Some("Optional settings applied when Craic creates commits"));
-
-        let timezone_row = adw::EntryRow::builder().title("Commit Timezone").build();
-        timezone_row.set_text(settings.commit_timezone.as_deref().unwrap_or(""));
-        timezone_row.set_tooltip_text(Some(
-            "Use +0000, -0500, or +09:30. Leave empty to use +0000 unless system timezone is enabled.",
-        ));
-        privacy_group.add(&timezone_row);
-
-        let use_system_timezone_row = adw::ActionRow::builder()
-            .title("Use System Timezone")
-            .subtitle("Use Git's default timezone when no commit timezone is set")
-            .build();
-        let use_system_timezone_switch = gtk::Switch::builder()
-            .active(settings.use_system_timezone)
-            .valign(gtk::Align::Center)
-            .build();
-        use_system_timezone_row.add_suffix(&use_system_timezone_switch);
-        privacy_group.add(&use_system_timezone_row);
-        let remote_owner_warning_row = adw::ActionRow::builder()
-            .title("Show Remote Owner Warning")
-            .subtitle("Warn when the Git author does not match the remote owner.")
-            .build();
-        let remote_owner_warning_switch = gtk::Switch::builder()
-            .active(settings.warn_if_remote_owner_mismatch)
-            .valign(gtk::Align::Center)
-            .build();
-        remote_owner_warning_row.add_suffix(&remote_owner_warning_switch);
-        privacy_group.add(&remote_owner_warning_row);
-
-        workspace_page.add(&privacy_group);
-
-        let github_group = adw::PreferencesGroup::new();
-        github_group.set_title("GitHub");
-        github_group.set_description(Some(
-            "Local GitHub CLI account preference for this workspace",
-        ));
-        let mut initial_github_account_choices = vec![None::<GitHubAuthAccount>];
-        let mut initial_github_account_labels = vec!["Use active gh account".to_string()];
-        if let Some(account) = settings.github_auth_account.clone() {
-            initial_github_account_labels.push(github_auth_account_label(&account));
-            initial_github_account_choices.push(Some(account));
-        }
-        let initial_github_account_label_refs = initial_github_account_labels
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let github_account_choices = Rc::new(RefCell::new(initial_github_account_choices));
-        let github_account_model = gtk::StringList::new(&initial_github_account_label_refs);
-        let github_account_row = adw::ComboRow::builder()
-            .title("Authenticated Account")
-            .model(&github_account_model)
-            .selected(if settings.github_auth_account.is_some() {
-                1
-            } else {
-                0
-            })
-            .build();
-        let github_account_spinner = adw::Spinner::new();
-        github_account_spinner.set_size_request(16, 16);
-        github_account_spinner.set_valign(gtk::Align::Center);
-        github_account_spinner.set_visible(github_access.is_some());
-        github_account_row.add_suffix(&github_account_spinner);
-        if let Some(github_access) = github_access {
-            load_github_auth_account_choices(
-                github_access,
-                settings.github_auth_account.as_ref(),
-                &github_account_row,
-                &github_account_spinner,
-                &github_account_choices,
-            );
-        } else {
-            github_account_row.set_sensitive(false);
-            github_account_row.set_subtitle("GitHub CLI access is unavailable for this workspace.");
-        }
-        github_group.add(&github_account_row);
-        workspace_page.add(&github_group);
-
-        let save_workspace_settings = Rc::new({
-            let parent = parent.clone();
-            let git_access = git_access.clone();
-            let base_settings = settings.clone();
-            let use_global_switch = use_global_switch.clone();
-            let name_row = name_row.clone();
-            let email_row = email_row.clone();
-            let timezone_row = timezone_row.clone();
-            let use_system_timezone_switch = use_system_timezone_switch.clone();
-            let remote_owner_warning_switch = remote_owner_warning_switch.clone();
-            let github_account_row = github_account_row.clone();
-            let github_account_choices = github_account_choices.clone();
-
-            move || {
-                let github_auth_account = github_account_choices
-                    .borrow()
-                    .get(github_account_row.selected() as usize)
-                    .cloned()
-                    .flatten();
-                let next_settings = GitSettings {
-                    global_user_name: base_settings.global_user_name.clone(),
-                    global_user_email: base_settings.global_user_email.clone(),
-                    local_user_name: text_option(&name_row.text()),
-                    local_user_email: text_option(&email_row.text()),
-                    use_global_user: use_global_switch.is_active(),
-                    commit_timezone: text_option(&timezone_row.text()),
-                    warn_if_remote_owner_mismatch: remote_owner_warning_switch.is_active(),
-                    use_system_timezone: use_system_timezone_switch.is_active(),
-                    github_auth_account,
-                };
-                match git_access.save_settings(&next_settings) {
-                    Ok(()) => {}
-                    Err(err) => show_error_dialog(&parent, "Failed to Save Preferences", &err),
-                }
-            }
-        });
-
-        use_global_switch.connect_active_notify({
-            let name_row = name_row.clone();
-            let email_row = email_row.clone();
-            let save_workspace_settings = save_workspace_settings.clone();
-
-            move |switch| {
-                let sensitive = !switch.is_active();
-                name_row.set_sensitive(sensitive);
-                email_row.set_sensitive(sensitive);
-                save_workspace_settings();
-            }
-        });
-
-        name_row.connect_changed({
-            let save_workspace_settings = save_workspace_settings.clone();
-
-            move |_| save_workspace_settings()
-        });
-
-        email_row.connect_changed({
-            let save_workspace_settings = save_workspace_settings.clone();
-
-            move |_| save_workspace_settings()
-        });
-
-        timezone_row.connect_changed({
-            let save_workspace_settings = save_workspace_settings.clone();
-
-            move |_| save_workspace_settings()
-        });
-
-        use_system_timezone_switch.connect_active_notify({
-            let save_workspace_settings = save_workspace_settings.clone();
-
-            move |_| save_workspace_settings()
-        });
-        remote_owner_warning_switch.connect_active_notify({
-            let save_workspace_settings = save_workspace_settings.clone();
-
-            move |_| save_workspace_settings()
-        });
-        github_account_row.connect_selected_notify({
-            let save_workspace_settings = save_workspace_settings.clone();
-
-            move |_| save_workspace_settings()
-        });
-
-        prefs_window.add(&workspace_page);
-    }
-
     prefs_window.add(&general_page);
     prefs_window.add(&agent_page);
 
+    if let Some(git_handle) = git_handle {
+        let workspace_page = adw::PreferencesPage::new();
+        workspace_page.set_title("Workspace");
+        workspace_page.set_icon_name(Some("git-symbolic"));
+        let loading_group = adw::PreferencesGroup::new();
+        let loading_row = adw::ActionRow::builder()
+            .title("Loading Git Settings")
+            .subtitle("Reading workspace Git configuration")
+            .build();
+        let loading_spinner = adw::Spinner::new();
+        loading_spinner.set_size_request(16, 16);
+        loading_spinner.set_valign(gtk::Align::Center);
+        loading_row.add_suffix(&loading_spinner);
+        loading_group.add(&loading_row);
+        workspace_page.add(&loading_group);
+        prefs_window.add(&workspace_page);
+
+        let (sender, receiver) = mpsc::channel();
+        git_handle.settings(Box::new(move |result| {
+            let _ = sender.send(result);
+        }));
+        gtk::glib::timeout_add_local(Duration::from_millis(75), {
+            let parent = parent.clone();
+            let workspace_page = workspace_page.clone();
+            let loading_group = loading_group.clone();
+            let github_access = github_access.clone();
+            let git_handle = git_handle.clone();
+
+            move || match receiver.try_recv() {
+                Ok(Ok(settings)) => {
+                    loading_group.set_visible(false);
+                    add_workspace_preferences_page(
+                        &parent,
+                        &workspace_page,
+                        git_handle.clone(),
+                        github_access.clone(),
+                        settings,
+                    );
+                    gtk::glib::ControlFlow::Break
+                }
+                Ok(Err(err)) => {
+                    show_error_dialog(&parent, "Failed to Load Preferences", &err);
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                Err(TryRecvError::Disconnected) => {
+                    show_error_dialog(
+                        &parent,
+                        "Failed to Load Preferences",
+                        "Git settings did not return a result.",
+                    );
+                    gtk::glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
     prefs_window.present(Some(parent));
+}
+
+fn add_workspace_preferences_page(
+    parent: &adw::ApplicationWindow,
+    workspace_page: &adw::PreferencesPage,
+    git_handle: Arc<GitRepoHandle>,
+    github_access: Option<Arc<dyn GitHubAccess>>,
+    settings: GitSettings,
+) {
+    let profile_group = adw::PreferencesGroup::new();
+    profile_group.set_title("Git Author Profile");
+    profile_group.set_description(Some("Settings for the current workspace"));
+
+    let use_global_row = adw::ActionRow::builder()
+        .title("Use Global User")
+        .subtitle("Use the global Git user.name and user.email for this workspace")
+        .build();
+    let use_global_switch = gtk::Switch::builder()
+        .active(settings.use_global_user)
+        .valign(gtk::Align::Center)
+        .build();
+    use_global_row.add_suffix(&use_global_switch);
+    profile_group.add(&use_global_row);
+
+    let name_row = adw::EntryRow::builder().title("Author Name").build();
+    name_row.set_text(
+        settings
+            .local_user_name
+            .as_deref()
+            .or(settings.global_user_name.as_deref())
+            .unwrap_or(""),
+    );
+    name_row.set_sensitive(!settings.use_global_user);
+    profile_group.add(&name_row);
+
+    let email_row = adw::EntryRow::builder().title("Author Email").build();
+    email_row.set_text(
+        settings
+            .local_user_email
+            .as_deref()
+            .or(settings.global_user_email.as_deref())
+            .unwrap_or(""),
+    );
+    email_row.set_sensitive(!settings.use_global_user);
+    profile_group.add(&email_row);
+
+    workspace_page.add(&profile_group);
+
+    let privacy_group = adw::PreferencesGroup::new();
+    privacy_group.set_title("Commit Privacy");
+    privacy_group.set_description(Some("Optional settings applied when Craic creates commits"));
+
+    let timezone_row = adw::EntryRow::builder().title("Commit Timezone").build();
+    timezone_row.set_text(settings.commit_timezone.as_deref().unwrap_or(""));
+    timezone_row.set_tooltip_text(Some(
+        "Use +0000, -0500, or +09:30. Leave empty to use +0000 unless system timezone is enabled.",
+    ));
+    privacy_group.add(&timezone_row);
+
+    let use_system_timezone_row = adw::ActionRow::builder()
+        .title("Use System Timezone")
+        .subtitle("Use Git's default timezone when no commit timezone is set")
+        .build();
+    let use_system_timezone_switch = gtk::Switch::builder()
+        .active(settings.use_system_timezone)
+        .valign(gtk::Align::Center)
+        .build();
+    use_system_timezone_row.add_suffix(&use_system_timezone_switch);
+    privacy_group.add(&use_system_timezone_row);
+    let remote_owner_warning_row = adw::ActionRow::builder()
+        .title("Show Remote Owner Warning")
+        .subtitle("Warn when the Git author does not match the remote owner.")
+        .build();
+    let remote_owner_warning_switch = gtk::Switch::builder()
+        .active(settings.warn_if_remote_owner_mismatch)
+        .valign(gtk::Align::Center)
+        .build();
+    remote_owner_warning_row.add_suffix(&remote_owner_warning_switch);
+    privacy_group.add(&remote_owner_warning_row);
+
+    workspace_page.add(&privacy_group);
+
+    let github_group = adw::PreferencesGroup::new();
+    github_group.set_title("GitHub");
+    github_group.set_description(Some(
+        "Local GitHub CLI account preference for this workspace",
+    ));
+    let mut initial_github_account_choices = vec![None::<GitHubAuthAccount>];
+    let mut initial_github_account_labels = vec!["Use active gh account".to_string()];
+    if let Some(account) = settings.github_auth_account.clone() {
+        initial_github_account_labels.push(github_auth_account_label(&account));
+        initial_github_account_choices.push(Some(account));
+    }
+    let initial_github_account_label_refs = initial_github_account_labels
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let github_account_choices = Rc::new(RefCell::new(initial_github_account_choices));
+    let github_account_model = gtk::StringList::new(&initial_github_account_label_refs);
+    let github_account_row = adw::ComboRow::builder()
+        .title("Authenticated Account")
+        .model(&github_account_model)
+        .selected(if settings.github_auth_account.is_some() {
+            1
+        } else {
+            0
+        })
+        .build();
+    let github_account_spinner = adw::Spinner::new();
+    github_account_spinner.set_size_request(16, 16);
+    github_account_spinner.set_valign(gtk::Align::Center);
+    github_account_spinner.set_visible(github_access.is_some());
+    github_account_row.add_suffix(&github_account_spinner);
+    if let Some(github_access) = github_access {
+        load_github_auth_account_choices(
+            github_access,
+            settings.github_auth_account.as_ref(),
+            &github_account_row,
+            &github_account_spinner,
+            &github_account_choices,
+        );
+    } else {
+        github_account_row.set_sensitive(false);
+        github_account_row.set_subtitle("GitHub CLI access is unavailable for this workspace.");
+    }
+    github_group.add(&github_account_row);
+    workspace_page.add(&github_group);
+
+    let save_workspace_settings = Rc::new({
+        let parent = parent.clone();
+        let git_handle = git_handle.clone();
+        let base_settings = settings.clone();
+        let use_global_switch = use_global_switch.clone();
+        let name_row = name_row.clone();
+        let email_row = email_row.clone();
+        let timezone_row = timezone_row.clone();
+        let use_system_timezone_switch = use_system_timezone_switch.clone();
+        let remote_owner_warning_switch = remote_owner_warning_switch.clone();
+        let github_account_row = github_account_row.clone();
+        let github_account_choices = github_account_choices.clone();
+
+        move || {
+            let github_auth_account = github_account_choices
+                .borrow()
+                .get(github_account_row.selected() as usize)
+                .cloned()
+                .flatten();
+            let next_settings = GitSettings {
+                global_user_name: base_settings.global_user_name.clone(),
+                global_user_email: base_settings.global_user_email.clone(),
+                local_user_name: text_option(&name_row.text()),
+                local_user_email: text_option(&email_row.text()),
+                use_global_user: use_global_switch.is_active(),
+                commit_timezone: text_option(&timezone_row.text()),
+                warn_if_remote_owner_mismatch: remote_owner_warning_switch.is_active(),
+                use_system_timezone: use_system_timezone_switch.is_active(),
+                github_auth_account,
+            };
+            let (sender, receiver) = mpsc::channel();
+            git_handle.save_settings(
+                &next_settings,
+                Box::new(move |result| {
+                    let _ = sender.send(result);
+                }),
+            );
+            gtk::glib::timeout_add_local(Duration::from_millis(75), {
+                let parent = parent.clone();
+                move || match receiver.try_recv() {
+                    Ok(Ok(())) => gtk::glib::ControlFlow::Break,
+                    Ok(Err(err)) => {
+                        show_error_dialog(&parent, "Failed to Save Preferences", &err);
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                    Err(TryRecvError::Disconnected) => {
+                        show_error_dialog(
+                            &parent,
+                            "Failed to Save Preferences",
+                            "Git settings save did not return a result.",
+                        );
+                        gtk::glib::ControlFlow::Break
+                    }
+                }
+            });
+        }
+    });
+
+    use_global_switch.connect_active_notify({
+        let name_row = name_row.clone();
+        let email_row = email_row.clone();
+        let save_workspace_settings = save_workspace_settings.clone();
+
+        move |switch| {
+            let sensitive = !switch.is_active();
+            name_row.set_sensitive(sensitive);
+            email_row.set_sensitive(sensitive);
+            save_workspace_settings();
+        }
+    });
+
+    name_row.connect_changed({
+        let save_workspace_settings = save_workspace_settings.clone();
+
+        move |_| save_workspace_settings()
+    });
+
+    email_row.connect_changed({
+        let save_workspace_settings = save_workspace_settings.clone();
+
+        move |_| save_workspace_settings()
+    });
+
+    timezone_row.connect_changed({
+        let save_workspace_settings = save_workspace_settings.clone();
+
+        move |_| save_workspace_settings()
+    });
+
+    use_system_timezone_switch.connect_active_notify({
+        let save_workspace_settings = save_workspace_settings.clone();
+
+        move |_| save_workspace_settings()
+    });
+    remote_owner_warning_switch.connect_active_notify({
+        let save_workspace_settings = save_workspace_settings.clone();
+
+        move |_| save_workspace_settings()
+    });
+    github_account_row.connect_selected_notify({
+        let save_workspace_settings = save_workspace_settings.clone();
+
+        move |_| save_workspace_settings()
+    });
 }
 
 fn text_option(text: &str) -> Option<String> {
