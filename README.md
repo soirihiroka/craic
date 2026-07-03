@@ -1,3 +1,7 @@
+<p align="center">
+<img src="data/icons/hicolor/scalable/apps/dev.craic.Craic.svg" width="128">
+</p>
+
 # Craic
 
 A development environment made by me for me :D
