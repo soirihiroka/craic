@@ -63,3 +63,4 @@ base64 = "0.22.1"
 syntect = "5"
 craic-diff-ui = { path = "crates/craic-diff-ui" }
 sourceview5 = "0.11.0"
+safetensors = "0.8.0"

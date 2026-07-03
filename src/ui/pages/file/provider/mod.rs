@@ -5,6 +5,7 @@ pub(in crate::ui::pages::file) mod media;
 pub(in crate::ui::pages::file) mod notebook;
 mod notebook_readonly;
 mod pdf;
+mod safetensors;
 pub(in crate::ui::pages::file) mod sqlite;
 pub(in crate::ui::pages::file) mod svg;
 mod text;
@@ -109,6 +110,10 @@ pub(in crate::ui::pages::file) fn for_file(
         file_type::PreviewKind::Svg => Provider {
             show: svg::show,
             show_match: svg::show_match,
+        },
+        file_type::PreviewKind::Safetensors => Provider {
+            show: safetensors::show,
+            show_match: safetensors::show_match,
         },
         file_type::PreviewKind::Markdown => Provider {
             show: markdown::show,

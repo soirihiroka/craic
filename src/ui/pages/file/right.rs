@@ -38,6 +38,7 @@ pub(super) struct RightPane {
     pub(in crate::ui::pages::file) file_font_preview: binary_preview::BinaryPreviewWidgets,
     pub(in crate::ui::pages::file) file_pdf_preview: binary_preview::BinaryPreviewWidgets,
     pub(in crate::ui::pages::file) file_sqlite_preview: Rc<super::provider::sqlite::SqlitePreview>,
+    pub(in crate::ui::pages::file) file_safetensors_metadata_preview: gtk::TextView,
     status_label: gtk::Label,
 }
 
@@ -96,6 +97,24 @@ impl RightPane {
         let file_pdf_preview = binary_preview::BinaryPreviewWidgets::new("PDF");
         let file_sqlite_preview = super::provider::sqlite::SqlitePreview::new();
         install_markdown_scroll_sync(&file_editor, &file_markdown_preview);
+        let file_safetensors_metadata_preview = gtk::TextView::builder()
+            .editable(false)
+            .cursor_visible(false)
+            .top_margin(12)
+            .bottom_margin(12)
+            .left_margin(12)
+            .right_margin(12)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        file_safetensors_metadata_preview.set_monospace(true);
+        let file_safetensors_metadata_scroller = gtk::ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .min_content_width(360)
+            .child(&file_safetensors_metadata_preview)
+            .build();
+        file_safetensors_metadata_scroller.set_has_frame(false);
 
         let file_view_split = gtk::Paned::new(gtk::Orientation::Horizontal);
         file_view_split.set_start_child(Some(&file_editor.root));
@@ -146,6 +165,7 @@ impl RightPane {
         stack.set_hhomogeneous(false);
         stack.set_vhomogeneous(false);
         stack.add_named(&file_view_split, Some("editor"));
+        stack.add_named(&file_safetensors_metadata_scroller, Some("safetensors"));
         stack.add_named(&folder_view.root, Some("folder"));
         stack.add_named(&file_media_preview.root, Some("media"));
         stack.add_named(&file_notebook_preview.root, Some("notebook"));
@@ -186,6 +206,7 @@ impl RightPane {
             file_font_preview,
             file_pdf_preview,
             file_sqlite_preview,
+            file_safetensors_metadata_preview,
             status_label,
         }
     }
@@ -375,6 +396,19 @@ impl RightPane {
         self.file_media_preview.clear();
     }
 
+    pub(in crate::ui::pages::file) fn show_safetensors_metadata(
+        &self,
+        file_path: &str,
+        metadata_text: &str,
+    ) {
+        self.set_title(file_path, file_path);
+        self.stack.set_visible_child_name("safetensors");
+        self.clear_file_state();
+        self.file_safetensors_metadata_preview
+            .buffer()
+            .set_text(metadata_text);
+    }
+
     fn cancel_preview_load(&self) {
         let generation = self.preview_generation.get().wrapping_add(1).max(1);
         self.preview_generation.set(generation);
@@ -396,6 +430,7 @@ impl RightPane {
         self.file_media_preview.clear();
         self.file_sqlite_preview.clear();
         self.file_notebook_preview.clear();
+        self.file_safetensors_metadata_preview.buffer().set_text("");
     }
 
     fn set_title(&self, file_path: &str, subtitle: &str) {

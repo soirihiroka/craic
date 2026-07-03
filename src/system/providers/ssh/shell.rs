@@ -74,7 +74,10 @@ impl ShellAccess for SshShellAccess {
         }
 
         let lookup = format!("command -v {}", shell_quote(program));
-        let remote = format!("exec \"${{SHELL:-/bin/sh}}\" -i -c {}", shell_quote(&lookup));
+        let remote = format!(
+            "exec \"${{SHELL:-/bin/sh}}\" -i -c {}",
+            shell_quote(&lookup)
+        );
         let output = Command::new("ssh")
             .arg(&self.host)
             .arg(remote)
