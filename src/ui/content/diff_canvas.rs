@@ -52,6 +52,7 @@ struct DiffCanvasState {
     scrollbar_active: Rc<Cell<bool>>,
     scrollbar_hover_progress: Rc<Cell<f64>>,
     scrollbar_animating: Rc<Cell<bool>>,
+    scrollbar_smooth_scroll: canvas_scrollbar::SmoothScroll,
     scrollbar_drag: Cell<Option<canvas_scrollbar::Drag>>,
     middle_autoscroll: Rc<canvas_scroll::MiddleAutoscroll>,
     fold_callback: RefCell<Option<Rc<dyn Fn(usize)>>>,
@@ -198,6 +199,7 @@ impl DiffCanvas {
             scrollbar_active: Rc::new(Cell::new(false)),
             scrollbar_hover_progress: Rc::new(Cell::new(0.0)),
             scrollbar_animating: Rc::new(Cell::new(false)),
+            scrollbar_smooth_scroll: canvas_scrollbar::SmoothScroll::new(),
             scrollbar_drag: Cell::new(None),
             middle_autoscroll: Rc::new(canvas_scroll::MiddleAutoscroll::new()),
             fold_callback: RefCell::new(None),
@@ -1048,10 +1050,20 @@ fn draw_scrollbar(
     let hover = state.scrollbar_hover_progress.get();
     let theme = canvas_scrollbar::Theme::for_widget(area);
     canvas_scrollbar::draw_track(context, width, height, total_height, hover, theme);
+    canvas_scrollbar::draw_thumb_fill(
+        context,
+        width,
+        height,
+        total_height,
+        state.scroll_y.get(),
+        hover,
+        state.scrollbar_active.get(),
+        theme,
+    );
     if let Some(cache) = state.layout_cache.borrow().as_ref() {
         draw_scrollbar_markers(context, width, height, total_height, hover, cache);
     }
-    canvas_scrollbar::draw_thumb(
+    canvas_scrollbar::draw_thumb_outline(
         context,
         width,
         height,
@@ -1138,19 +1150,46 @@ fn install_scroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
     scroll.connect_scroll({
         let area = area.clone();
         let state = state.clone();
-        move |_, _, dy| {
+        move |controller, _, dy| {
             let line_height =
                 canvas::measure_font_metrics(&area, state.font_size.get(), |font_size| {
                     (font_size + 9.0).ceil()
                 })
                 .line_height;
-            let delta = dy * line_height * 3.0;
             let viewport_height = area.allocated_height().max(1) as f64;
+            let max_scroll =
+                canvas_scrollbar::max_scroll(state.content_height.get(), viewport_height);
+            if state.scrollbar_hover.get() && canvas_scrollbar::is_mouse_scroll(controller) {
+                let delta = canvas_scrollbar::mouse_wheel_delta(viewport_height, dy);
+                canvas_overshoot::pull_for_delta(
+                    &area,
+                    &state.overshoot,
+                    state.scroll_y.get(),
+                    max_scroll,
+                    delta,
+                    canvas_overshoot::Edge::Top,
+                    canvas_overshoot::Edge::Bottom,
+                );
+                let area_for_scroll = area.clone();
+                let state_for_scroll = state.clone();
+                state.scrollbar_smooth_scroll.scroll_relative(
+                    &area,
+                    state.scroll_y.get(),
+                    delta,
+                    0.0,
+                    max_scroll,
+                    move |value| set_scroll_y(&area_for_scroll, &state_for_scroll, value),
+                );
+                return gtk::glib::Propagation::Stop;
+            }
+
+            state.scrollbar_smooth_scroll.pause();
+            let delta = dy * line_height * 3.0;
             canvas_overshoot::pull_for_delta(
                 &area,
                 &state.overshoot,
                 state.scroll_y.get(),
-                canvas_scrollbar::max_scroll(state.content_height.get(), viewport_height),
+                max_scroll,
                 delta,
                 canvas_overshoot::Edge::Top,
                 canvas_overshoot::Edge::Bottom,
@@ -1291,6 +1330,7 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
                     x,
                     y,
                 ) {
+                    state.scrollbar_smooth_scroll.pause();
                     set_scroll_y(&area, &state, scroll_y);
                     canvas_scrollbar::set_active(
                         &area,
@@ -1368,6 +1408,7 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
                 x,
                 y,
             ) {
+                state.scrollbar_smooth_scroll.pause();
                 set_scroll_y(&area, &state, scroll_y);
                 state
                     .scrollbar_drag
@@ -1420,6 +1461,7 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
                 let viewport_height = area.allocated_height().max(1) as f64;
                 let max_scroll =
                     canvas_scrollbar::max_scroll(state.content_height.get(), viewport_height);
+                state.scrollbar_smooth_scroll.pause();
                 set_scroll_y(
                     &area,
                     &state,

@@ -1157,8 +1157,18 @@ fn draw_scrollbar(
         hover,
         theme,
     );
+    canvas_scrollbar::draw_thumb_fill(
+        context,
+        width,
+        height,
+        state.content_height.get(),
+        state.scroll_y.get(),
+        hover,
+        active,
+        theme,
+    );
     draw_scrollbar_markers(context, width, height, state, hover);
-    canvas_scrollbar::draw_thumb(
+    canvas_scrollbar::draw_thumb_outline(
         context,
         width,
         height,

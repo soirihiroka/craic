@@ -1,7 +1,7 @@
+use adw::prelude::*;
 use gtk::cairo;
 use gtk::gdk::RGBA;
-use gtk::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -16,12 +16,13 @@ const TROUGH_VERTICAL_MARGIN: f64 = 9.0;
 const HOVER_ANIMATION_DURATION_MS: f64 = 200.0;
 const HOVER_ANIMATION_FRAME_MS: f64 = 16.0;
 const HOVER_TROUGH_ALPHA: f64 = 0.10;
-const IDLE_THUMB_ALPHA: f64 = 0.20;
-const HOVER_THUMB_ALPHA: f64 = 0.40;
-const ACTIVE_THUMB_ALPHA: f64 = 0.60;
+const IDLE_THUMB_ALPHA: f64 = 0.14;
+const HOVER_THUMB_ALPHA: f64 = 0.24;
+const ACTIVE_THUMB_ALPHA: f64 = 0.38;
 const IDLE_OUTLINE_ALPHA: f64 = 0.35;
 const HOVER_OUTLINE_ALPHA: f64 = 0.60;
 const HANDLE_OUTLINE_WIDTH: f64 = 1.0;
+const SCROLL_ANIMATION_DURATION_MS: u32 = 200;
 
 #[derive(Clone, Copy)]
 pub(in crate::ui) enum MarkerKind {
@@ -137,12 +138,95 @@ impl Drag {
     }
 }
 
+pub(in crate::ui) struct SmoothScroll {
+    animation: RefCell<Option<adw::TimedAnimation>>,
+    target_value: Cell<f64>,
+}
+
+impl SmoothScroll {
+    pub(in crate::ui) fn new() -> Self {
+        Self {
+            animation: RefCell::new(None),
+            target_value: Cell::new(0.0),
+        }
+    }
+
+    pub(in crate::ui) fn pause(&self) {
+        if let Some(animation) = self.animation.borrow().as_ref() {
+            animation.pause();
+        }
+    }
+
+    pub(in crate::ui) fn scroll_relative<Apply>(
+        &self,
+        widget: &impl IsA<gtk::Widget>,
+        current_value: f64,
+        delta: f64,
+        lower: f64,
+        upper: f64,
+        apply: Apply,
+    ) -> bool
+    where
+        Apply: Fn(f64) + 'static,
+    {
+        if delta.abs() <= f64::EPSILON || upper <= lower {
+            return false;
+        }
+
+        let animation = self.animation(widget, apply);
+        let base = if animation.state() == adw::AnimationState::Playing {
+            self.target_value.get()
+        } else {
+            current_value
+        };
+        let target = (base + delta).clamp(lower, upper);
+        if (target - current_value).abs() <= f64::EPSILON {
+            return false;
+        }
+
+        self.target_value.set(target);
+        animation.set_value_from(current_value);
+        animation.set_value_to(target);
+        animation.set_duration(SCROLL_ANIMATION_DURATION_MS);
+        animation.play();
+        true
+    }
+
+    fn animation<Apply>(&self, widget: &impl IsA<gtk::Widget>, apply: Apply) -> adw::TimedAnimation
+    where
+        Apply: Fn(f64) + 'static,
+    {
+        if let Some(animation) = self.animation.borrow().as_ref() {
+            return animation.clone();
+        }
+
+        let target = adw::CallbackAnimationTarget::new(apply);
+        let animation =
+            adw::TimedAnimation::new(widget, 0.0, 0.0, SCROLL_ANIMATION_DURATION_MS, target);
+        animation.set_easing(adw::Easing::Ease);
+        self.animation.replace(Some(animation.clone()));
+        animation
+    }
+}
+
 pub(in crate::ui) fn content_width(width: i32) -> i32 {
     (width - WIDTH.ceil() as i32).max(1)
 }
 
 pub(in crate::ui) fn max_scroll(total_height: f64, viewport_height: f64) -> f64 {
     (total_height - viewport_height).max(0.0)
+}
+
+pub(in crate::ui) fn mouse_wheel_delta(page_size: f64, dy: f64) -> f64 {
+    let page_size = page_size.max(1.0);
+    let pow_unit = page_size.powf(2.0 / 3.0);
+    dy * pow_unit.min(page_size / 2.0)
+}
+
+pub(in crate::ui) fn is_mouse_scroll(controller: &gtk::EventControllerScroll) -> bool {
+    controller
+        .current_event_device()
+        .is_some_and(|device| device.source() == gtk::gdk::InputSource::Mouse)
 }
 
 pub(in crate::ui) fn point_in_lane(width: i32, height: i32, total_height: f64, x: f64) -> bool {
@@ -323,6 +407,38 @@ pub(in crate::ui) fn draw_thumb(
     active: bool,
     theme: Theme,
 ) {
+    draw_thumb_outline(
+        context,
+        width,
+        height,
+        total_height,
+        scroll_y,
+        hover_progress,
+        active,
+        theme,
+    );
+    draw_thumb_fill(
+        context,
+        width,
+        height,
+        total_height,
+        scroll_y,
+        hover_progress,
+        active,
+        theme,
+    );
+}
+
+pub(in crate::ui) fn draw_thumb_fill(
+    context: &cairo::Context,
+    width: i32,
+    height: i32,
+    total_height: f64,
+    scroll_y: f64,
+    hover_progress: f64,
+    active: bool,
+    theme: Theme,
+) {
     let Some(thumb) = handle_thumb_rect(width, height, total_height, scroll_y, hover_progress)
     else {
         return;
@@ -332,6 +448,32 @@ pub(in crate::ui) fn draw_thumb(
         ACTIVE_THUMB_ALPHA
     } else {
         lerp(IDLE_THUMB_ALPHA, HOVER_THUMB_ALPHA, hover_progress)
+    };
+
+    fill_rounded_rect(
+        context,
+        thumb.x,
+        thumb.y,
+        thumb.width,
+        thumb.height,
+        thumb.radius(),
+        theme.foreground.with_alpha(thumb_alpha),
+    );
+}
+
+pub(in crate::ui) fn draw_thumb_outline(
+    context: &cairo::Context,
+    width: i32,
+    height: i32,
+    total_height: f64,
+    scroll_y: f64,
+    hover_progress: f64,
+    active: bool,
+    theme: Theme,
+) {
+    let Some(thumb) = handle_thumb_rect(width, height, total_height, scroll_y, hover_progress)
+    else {
+        return;
     };
 
     let outline_alpha = if active {
@@ -349,16 +491,6 @@ pub(in crate::ui) fn draw_thumb(
         outline.height,
         outline.radius(),
         theme.outline.with_alpha(outline_alpha),
-    );
-
-    fill_rounded_rect(
-        context,
-        thumb.x,
-        thumb.y,
-        thumb.width,
-        thumb.height,
-        thumb.radius(),
-        theme.foreground.with_alpha(thumb_alpha),
     );
 }
 

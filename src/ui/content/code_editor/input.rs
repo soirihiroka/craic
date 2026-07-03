@@ -74,13 +74,44 @@ pub(super) fn install_interactions(
             }
             if dy.abs() > f64::EPSILON {
                 let line_height = render::line_height(&state);
-                let delta = dy * line_height * 3.0;
                 let viewport_height = area.allocated_height().max(1) as f64;
+                let max_scroll = render::max_scroll_y(&state, viewport_height);
+                if state.scrollbar_visible.get()
+                    && state.scrollbar_hover.get()
+                    && canvas_scrollbar::is_mouse_scroll(controller)
+                {
+                    let delta = canvas_scrollbar::mouse_wheel_delta(viewport_height, dy);
+                    canvas_overshoot::pull_for_delta(
+                        &area,
+                        &state.overshoot,
+                        state.scroll_y.get(),
+                        max_scroll,
+                        delta,
+                        canvas_overshoot::Edge::Top,
+                        canvas_overshoot::Edge::Bottom,
+                    );
+                    let area_for_scroll = area.clone();
+                    let state_for_scroll = state.clone();
+                    state.scrollbar_smooth_scroll.scroll_relative(
+                        &area,
+                        state.scroll_y.get(),
+                        delta,
+                        0.0,
+                        max_scroll,
+                        move |value| {
+                            render::set_scroll_y(&area_for_scroll, &state_for_scroll, value)
+                        },
+                    );
+                    return gtk::glib::Propagation::Stop;
+                }
+
+                state.scrollbar_smooth_scroll.pause();
+                let delta = dy * line_height * 3.0;
                 canvas_overshoot::pull_for_delta(
                     &area,
                     &state.overshoot,
                     state.scroll_y.get(),
-                    render::max_scroll_y(&state, viewport_height),
+                    max_scroll,
                     delta,
                     canvas_overshoot::Edge::Top,
                     canvas_overshoot::Edge::Bottom,
@@ -88,6 +119,7 @@ pub(super) fn install_interactions(
                 render::set_scroll_y(&area, &state, state.scroll_y.get() + delta);
             }
             if dx.abs() > f64::EPSILON {
+                state.scrollbar_smooth_scroll.pause();
                 let line_height = render::line_height(&state);
                 let delta = dx * line_height * 3.0;
                 let viewport_width = render::viewport_width(area.allocated_width()) as f64;
@@ -261,6 +293,7 @@ pub(super) fn install_interactions(
                     );
                     pending_selection_click.set(None);
                     set_fold_pressed(&area, &state, None);
+                    state.scrollbar_smooth_scroll.pause();
                     render::set_scroll_y(&area, &state, scroll_y);
                     return;
                 }
@@ -369,6 +402,7 @@ pub(super) fn install_interactions(
                     log::debug!(
                         "code_editor drag_begin scrollbar x={x:.1} y={y:.1} scroll_y={scroll_y:.1}",
                     );
+                    state.scrollbar_smooth_scroll.pause();
                     render::set_scroll_y(&area, &state, scroll_y);
                     canvas_scrollbar::set_active(
                         &area,
@@ -452,6 +486,7 @@ pub(super) fn install_interactions(
                 };
                 let viewport_height = area.allocated_height().max(1) as f64;
                 let max_scroll = render::max_scroll_y(&state, viewport_height);
+                state.scrollbar_smooth_scroll.pause();
                 render::set_scroll_y(
                     &area,
                     &state,
