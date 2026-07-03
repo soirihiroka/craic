@@ -456,8 +456,6 @@ fn install_markdown_scroll_sync(
 ) {
     let updating_editor = Rc::new(Cell::new(false));
 
-    let preview_adjustment = preview.root.vadjustment();
-
     editor.connect_scroll_changed({
         let editor = editor.clone();
         let preview = Rc::clone(preview);
@@ -471,11 +469,11 @@ fn install_markdown_scroll_sync(
         }
     });
 
-    preview_adjustment.connect_value_changed({
+    preview.connect_source_offset_changed({
         let editor = editor.clone();
         let preview = Rc::clone(preview);
         let updating_editor = Rc::clone(&updating_editor);
-        move |_| {
+        move || {
             updating_editor.set(true);
             if let Some(offset) = preview.source_offset_at_viewport_top() {
                 editor.set_source_offset_at_scroll_top(offset);

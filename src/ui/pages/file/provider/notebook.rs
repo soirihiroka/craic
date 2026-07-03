@@ -1,6 +1,7 @@
 use super::{PreviewMatchRequest, PreviewRequest};
 use crate::config;
 use crate::ui::content::code_editor;
+use crate::ui::markdown_preview_web;
 use adw::prelude::*;
 use std::cell::RefCell;
 use std::fs::{self, File};
@@ -711,40 +712,7 @@ fn readonly_markdown_cell(source: &str, base_uri: Option<&str>) -> gtk::Widget {
         source.len(),
         visible_markdown_line_count(source)
     );
-    let html = format!(
-        r#"<!doctype html>
-<html><head><meta charset="utf-8"><style>
-:root {{
-  color-scheme: light dark;
-  font-family: Cantarell, "Adwaita Sans", sans-serif;
-  font-size: 15px;
-  line-height: 1.5;
-}}
-body {{
-  margin: 0;
-  padding: 16px 18px;
-  color: CanvasText;
-  background: transparent;
-}}
-pre {{
-  overflow-x: auto;
-  padding: 12px;
-  border-radius: 8px;
-  background: color-mix(in srgb, CanvasText 9%, transparent);
-}}
-code {{
-  font-family: "Adwaita Mono", "Cascadia Code", "Source Code Pro", monospace;
-}}
-img {{
-  max-width: 100%;
-  height: auto;
-}}
-a {{
-  color: LinkText;
-}}
-</style></head><body>{}</body></html>"#,
-        super::markdown::markdown_fragment_to_html(source)
-    );
+    let html = markdown_preview_web::markdown_document_html(source);
     let web_view = webkit6::WebView::new();
     web_view.set_hexpand(true);
     web_view.set_vexpand(false);

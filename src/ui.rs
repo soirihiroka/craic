@@ -14,6 +14,7 @@ mod file_status;
 pub(crate) mod file_type;
 mod git_actions;
 mod left_clamp;
+pub(crate) mod markdown_preview_web;
 mod pages;
 mod picker;
 mod preferences;
