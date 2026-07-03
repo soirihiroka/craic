@@ -58,6 +58,66 @@ body.markdown-body {
   vertical-align: text-bottom;
 }
 
+.craic-overshoot {
+  position: fixed;
+  pointer-events: none;
+  z-index: 2147483647;
+  opacity: 0;
+  color: CanvasText;
+  background-repeat: no-repeat;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.craic-overshoot-top,
+.craic-overshoot-bottom {
+  left: 0;
+  right: 0;
+  height: 0;
+  background-size: 100% 3%, 100% 50%;
+}
+
+.craic-overshoot-left,
+.craic-overshoot-right {
+  top: 0;
+  bottom: 0;
+  width: 0;
+  background-size: 3% 100%, 50% 100%;
+}
+
+.craic-overshoot-top {
+  top: 0;
+  background-image:
+    radial-gradient(farthest-side at top, color-mix(in srgb, currentColor 12%, transparent) 85%, rgb(from currentColor r g b / 0)),
+    radial-gradient(farthest-side at top, color-mix(in srgb, currentColor 5%, transparent), rgb(from currentColor r g b / 0));
+  background-position: top;
+}
+
+.craic-overshoot-bottom {
+  bottom: 0;
+  background-image:
+    radial-gradient(farthest-side at bottom, color-mix(in srgb, currentColor 12%, transparent) 85%, rgb(from currentColor r g b / 0)),
+    radial-gradient(farthest-side at bottom, color-mix(in srgb, currentColor 5%, transparent), rgb(from currentColor r g b / 0));
+  background-position: bottom;
+}
+
+.craic-overshoot-left {
+  left: 0;
+  background-image:
+    radial-gradient(farthest-side at left, color-mix(in srgb, currentColor 12%, transparent) 85%, rgb(from currentColor r g b / 0)),
+    radial-gradient(farthest-side at left, color-mix(in srgb, currentColor 5%, transparent), rgb(from currentColor r g b / 0));
+  background-position: left;
+}
+
+.craic-overshoot-right {
+  right: 0;
+  background-image:
+    radial-gradient(farthest-side at right, color-mix(in srgb, currentColor 12%, transparent) 85%, rgb(from currentColor r g b / 0)),
+    radial-gradient(farthest-side at right, color-mix(in srgb, currentColor 5%, transparent), rgb(from currentColor r g b / 0));
+  background-position: right;
+}
+
 @media (max-width: 720px) {
   body.markdown-body {
     padding: 16px;
@@ -90,6 +150,167 @@ pub(crate) const SOURCE_MAP_SCRIPT: &str = r#"
 
   function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
+  }
+
+  const maxOvershootDistance = 100;
+  const overshootDecay = 0.80;
+  const overshootEdges = ["top", "bottom", "left", "right"];
+  const overshootOpposite = {
+    top: "bottom",
+    bottom: "top",
+    left: "right",
+    right: "left",
+  };
+  const overshoot = {
+    top: 0,
+    bottom: 0,
+    left: 0,
+    right: 0,
+  };
+  let overshootNodes = null;
+  let overshootAnimationFrame = 0;
+  let previousTouchPoint = null;
+
+  function ensureOvershootNodes() {
+    if (overshootNodes) return overshootNodes;
+
+    overshootNodes = {};
+    for (const edge of overshootEdges) {
+      const node = document.createElement("div");
+      node.className = `craic-overshoot craic-overshoot-${edge}`;
+      node.setAttribute("aria-hidden", "true");
+      overshootNodes[edge] = node;
+      (document.body || document.documentElement).appendChild(node);
+    }
+
+    return overshootNodes;
+  }
+
+  function updateOvershootNodes() {
+    const nodes = ensureOvershootNodes();
+    nodes.top.style.height = `${overshoot.top}px`;
+    nodes.bottom.style.height = `${overshoot.bottom}px`;
+    nodes.left.style.width = `${overshoot.left}px`;
+    nodes.right.style.width = `${overshoot.right}px`;
+
+    for (const edge of overshootEdges) {
+      nodes[edge].style.opacity = overshoot[edge] > 0.5 ? "1" : "0";
+    }
+  }
+
+  function animateOvershoot() {
+    overshootAnimationFrame = 0;
+    let active = false;
+
+    for (const edge of overshootEdges) {
+      const next = overshoot[edge] * overshootDecay;
+      if (next < 0.5) {
+        overshoot[edge] = 0;
+      } else {
+        overshoot[edge] = next;
+        active = true;
+      }
+    }
+
+    updateOvershootNodes();
+    if (active) overshootAnimationFrame = window.requestAnimationFrame(animateOvershoot);
+  }
+
+  function queueOvershootDecay() {
+    if (!overshootAnimationFrame) {
+      overshootAnimationFrame = window.requestAnimationFrame(animateOvershoot);
+    }
+  }
+
+  function pullOvershoot(edge, overflow) {
+    if (!Number.isFinite(overflow) || overflow <= 0) return;
+
+    overshoot[overshootOpposite[edge]] = 0;
+    overshoot[edge] = clamp(overshoot[edge] + Math.abs(overflow), 0, maxOvershootDistance);
+    updateOvershootNodes();
+    queueOvershootDecay();
+  }
+
+  function scrollMetrics() {
+    const scroller = document.scrollingElement || document.documentElement;
+    return {
+      x: window.scrollX,
+      y: window.scrollY,
+      maxX: Math.max(0, scroller.scrollWidth - window.innerWidth),
+      maxY: Math.max(0, scroller.scrollHeight - window.innerHeight),
+    };
+  }
+
+  function pullOvershootForDelta(deltaX, deltaY) {
+    if (Math.abs(deltaX) <= Number.EPSILON && Math.abs(deltaY) <= Number.EPSILON) return;
+
+    const metrics = scrollMetrics();
+    const desiredX = metrics.x + deltaX;
+    const desiredY = metrics.y + deltaY;
+
+    if (metrics.maxX > Number.EPSILON && desiredX < 0) {
+      pullOvershoot("left", -desiredX);
+    } else if (metrics.maxX > Number.EPSILON && desiredX > metrics.maxX) {
+      pullOvershoot("right", desiredX - metrics.maxX);
+    }
+
+    if (metrics.maxY > Number.EPSILON && desiredY < 0) {
+      pullOvershoot("top", -desiredY);
+    } else if (metrics.maxY > Number.EPSILON && desiredY > metrics.maxY) {
+      pullOvershoot("bottom", desiredY - metrics.maxY);
+    }
+  }
+
+  function wheelDeltaPixels(event) {
+    let multiplier = 1;
+    if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+      const lineHeight = Number.parseFloat(window.getComputedStyle(document.body).lineHeight);
+      multiplier = Number.isFinite(lineHeight) ? lineHeight : 16;
+    } else if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+      multiplier = Math.max(window.innerHeight, 1);
+    }
+
+    return {
+      x: event.deltaX * multiplier,
+      y: event.deltaY * multiplier,
+    };
+  }
+
+  function installOvershootHandlers() {
+    ensureOvershootNodes();
+
+    window.addEventListener("wheel", (event) => {
+      const delta = wheelDeltaPixels(event);
+      pullOvershootForDelta(delta.x, delta.y);
+    }, { passive: true });
+
+    window.addEventListener("touchstart", (event) => {
+      if (event.touches.length !== 1) {
+        previousTouchPoint = null;
+        return;
+      }
+
+      const touch = event.touches[0];
+      previousTouchPoint = { x: touch.clientX, y: touch.clientY };
+    }, { passive: true });
+
+    window.addEventListener("touchmove", (event) => {
+      if (event.touches.length !== 1 || previousTouchPoint === null) return;
+
+      const touch = event.touches[0];
+      const deltaX = previousTouchPoint.x - touch.clientX;
+      const deltaY = previousTouchPoint.y - touch.clientY;
+      previousTouchPoint = { x: touch.clientX, y: touch.clientY };
+      pullOvershootForDelta(deltaX, deltaY);
+    }, { passive: true });
+
+    window.addEventListener("touchend", () => {
+      previousTouchPoint = null;
+    }, { passive: true });
+
+    window.addEventListener("touchcancel", () => {
+      previousTouchPoint = null;
+    }, { passive: true });
   }
 
   function yForSourceOffset(offset) {
@@ -178,6 +399,7 @@ pub(crate) const SOURCE_MAP_SCRIPT: &str = r#"
     const handler = window.webkit?.messageHandlers?.openMarkdownLink;
     if (handler) handler.postMessage(link.href);
   }, true);
+  installOvershootHandlers();
   postSourceOffset();
 })();
 "#;
