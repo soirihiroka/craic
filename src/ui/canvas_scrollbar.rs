@@ -16,9 +16,9 @@ const TROUGH_VERTICAL_MARGIN: f64 = 9.0;
 const HOVER_ANIMATION_DURATION_MS: f64 = 200.0;
 const HOVER_ANIMATION_FRAME_MS: f64 = 16.0;
 const HOVER_TROUGH_ALPHA: f64 = 0.10;
-const IDLE_THUMB_ALPHA: f64 = 0.14;
-const HOVER_THUMB_ALPHA: f64 = 0.24;
-const ACTIVE_THUMB_ALPHA: f64 = 0.38;
+const IDLE_THUMB_ALPHA: f64 = 0.20;
+const HOVER_THUMB_ALPHA: f64 = 0.40;
+const ACTIVE_THUMB_ALPHA: f64 = 0.60;
 const IDLE_OUTLINE_ALPHA: f64 = 0.35;
 const HOVER_OUTLINE_ALPHA: f64 = 0.60;
 const HANDLE_OUTLINE_WIDTH: f64 = 1.0;
@@ -381,9 +381,9 @@ pub(in crate::ui) fn draw_marker(
     height: f64,
     hover_progress: f64,
 ) {
-    let added = lerp_color((0.12, 0.46, 0.22), (0.18, 0.58, 0.28), hover_progress);
-    let deleted = lerp_color((0.54, 0.13, 0.15), (0.68, 0.18, 0.20), hover_progress);
-    let alpha = lerp(0.36, 0.50, hover_progress);
+    let added = lerp_color((0.10, 0.52, 0.24), (0.16, 0.68, 0.32), hover_progress);
+    let deleted = lerp_color((0.62, 0.12, 0.15), (0.78, 0.16, 0.20), hover_progress);
+    let alpha = lerp(0.58, 0.82, hover_progress);
 
     match kind {
         MarkerKind::Added => fill_rect_rgba(context, x, y, width, height, added, alpha),
