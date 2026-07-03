@@ -3,9 +3,9 @@ pub(in crate::ui::pages::agent) mod codex;
 pub(in crate::ui::pages::agent) mod opencode;
 
 use std::ffi::OsString;
-use std::path::PathBuf;
 
 use super::agent_shell_integration::AgentShellIntegration;
+use crate::system::capabilities::shell::ShellAccess;
 use crate::system::{ProviderKind, SystemRef, WorkspacePath, WorkspaceRef};
 use crate::ui::agent_status::AgentActiveState;
 
@@ -16,9 +16,15 @@ pub(in crate::ui::pages::agent) trait AgentProvider: Sync {
     fn provider_id(&self) -> &'static str;
     fn label(&self) -> &'static str;
     fn session_icon_name(&self) -> &'static str;
-    fn command(&self, system: &SystemRef, workspace: &WorkspaceRef) -> CommandSpec;
+    fn command(
+        &self,
+        shell: Option<&dyn ShellAccess>,
+        system: &SystemRef,
+        workspace: &WorkspaceRef,
+    ) -> CommandSpec;
     fn restore_command(
         &self,
+        shell: Option<&dyn ShellAccess>,
         system: &SystemRef,
         workspace: &WorkspaceRef,
         cli_session_id: &str,
@@ -123,67 +129,21 @@ pub(in crate::ui::pages::agent) fn normalize_title_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn command_path(name: &str) -> PathBuf {
-    if let Some(paths) = std::env::var_os("PATH") {
-        for path in std::env::split_paths(&paths) {
-            let p = path.join(name);
-            if p.is_file() {
-                return p;
-            }
+fn command_binary(name: &str, shell: Option<&dyn ShellAccess>) -> OsString {
+    if let Some(shell) = shell {
+        match shell.which(name) {
+            Ok(Some(path)) => return OsString::from(path),
+            Ok(None) => {}
+            Err(err) => log::warn!("agent command lookup failed program={} error={}", name, err),
         }
     }
 
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = PathBuf::from(home).join(".local/bin").join(name);
-        if p.is_file() {
-            return p;
-        }
-    }
-
-    for dir in &[
-        "/home/linuxbrew/.linuxbrew/bin",
-        "/usr/local/bin",
-        "/usr/bin",
-    ] {
-        let p = PathBuf::from(dir).join(name);
-        if p.is_file() {
-            return p;
-        }
-    }
-
-    PathBuf::from(name)
-}
-
-fn command_binary(name: &str, system: &SystemRef) -> OsString {
-    if system.provider_kind == ProviderKind::Local {
-        command_path(name).into_os_string()
-    } else {
-        OsString::from(name)
-    }
+    OsString::from(name)
 }
 
 fn remote_command_start(program: &OsString) -> String {
     let program = program.to_string_lossy();
-    if remote_command_name_can_use_path(&program) {
-        let linuxbrew_path = format!("/home/linuxbrew/.linuxbrew/bin/{program}");
-        let local_bin_path = format!("\"$HOME/.local/bin/{program}\"");
-        return format!(
-            "cmd=$(command -v {program} 2>/dev/null || {{ if [ -x {linuxbrew} ]; then printf '%s\\n' {linuxbrew}; elif [ -x {local_bin} ]; then printf '%s\\n' {local_bin}; else printf '%s\\n' {program}; fi; }}) && exec \"$cmd\"",
-            program = shell_quote(&program),
-            linuxbrew = shell_quote(&linuxbrew_path),
-            local_bin = local_bin_path,
-        );
-    }
-
     format!("exec {}", shell_quote(&program))
-}
-
-fn remote_command_name_can_use_path(program: &str) -> bool {
-    !program.is_empty()
-        && !program.contains('/')
-        && program
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
 }
 
 fn shell_quote(value: &str) -> String {

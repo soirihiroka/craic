@@ -615,6 +615,10 @@ fn json_value_from_output(output: &str) -> Option<serde_json::Value> {
 }
 
 fn command_path(name: &str) -> PathBuf {
+    if let Some(path) = default_shell_command_path(name) {
+        return path;
+    }
+
     if let Some(paths) = std::env::var_os("PATH") {
         for path in std::env::split_paths(&paths) {
             let p = path.join(name);
@@ -643,6 +647,76 @@ fn command_path(name: &str) -> PathBuf {
     }
 
     PathBuf::from(name)
+}
+
+fn default_shell_command_path(name: &str) -> Option<PathBuf> {
+    if !command_name_can_use_path(name) {
+        return None;
+    }
+
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+    let script = format!("command -v {}", shell_quote(name));
+    let output = Command::new(&shell)
+        .arg("-i")
+        .arg("-c")
+        .arg(&script)
+        .current_dir(std::env::temp_dir())
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(err) => {
+            log::warn!(
+                "agent command shell lookup failed program={} shell={} error={}",
+                name,
+                shell.to_string_lossy(),
+                err
+            );
+            return None;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        let resolved = shell_which_output(&stdout).map(PathBuf::from);
+        log::debug!(
+            "agent command shell lookup program={} resolved={:?}",
+            name,
+            resolved
+        );
+        resolved
+    } else {
+        log::debug!(
+            "agent command shell lookup missing program={} status={} stderr={}",
+            name,
+            output.status,
+            stderr.trim()
+        );
+        None
+    }
+}
+
+fn command_name_can_use_path(program: &str) -> bool {
+    !program.is_empty()
+        && !program.contains('/')
+        && program
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn shell_which_output(output: &str) -> Option<String> {
+    output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToString::to_string)
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn preview_text(text: &str) -> String {
