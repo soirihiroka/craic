@@ -174,18 +174,24 @@ impl SmoothScroll {
         }
 
         let animation = self.animation(widget, apply);
-        let base = if animation.state() == adw::AnimationState::Playing {
-            self.target_value.get()
+        let playing = animation.state() == adw::AnimationState::Playing;
+        let from = if playing {
+            animation.value()
         } else {
             current_value
         };
+        let base = if playing {
+            self.target_value.get()
+        } else {
+            from
+        };
         let target = (base + delta).clamp(lower, upper);
-        if (target - current_value).abs() <= f64::EPSILON {
+        if (target - from).abs() <= f64::EPSILON {
             return false;
         }
 
         self.target_value.set(target);
-        animation.set_value_from(current_value);
+        animation.set_value_from(from);
         animation.set_value_to(target);
         animation.set_duration(SCROLL_ANIMATION_DURATION_MS);
         animation.play();
