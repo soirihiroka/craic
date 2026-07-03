@@ -1,7 +1,7 @@
 use crate::system::capabilities::git::{GitAccess, GitWatchCallback, GitWatchSubscription};
 use crate::system::capabilities::github::GitHubAccess;
 use crate::system::path::WorkspaceRef;
-use crate::{bitbucket, git, gitignore, gitlab};
+use crate::{bitbucket, git, github, gitignore, gitlab};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,6 +18,11 @@ impl LocalGitAccess {
     pub(crate) fn new(workspace: WorkspaceRef) -> Self {
         let root = PathBuf::from(&workspace.root.absolute);
         Self { workspace, root }
+    }
+
+    fn switch_github_auth(&self) -> Result<(), String> {
+        let account = self.settings().github_auth_account;
+        github::switch_auth_account(&self.root, account.as_ref())
     }
 }
 
@@ -159,6 +164,7 @@ impl GitAccess for LocalGitAccess {
             "local git push start workspace={}",
             self.workspace.display_name
         );
+        self.switch_github_auth()?;
         git::push(&self.root)
     }
 
@@ -167,10 +173,12 @@ impl GitAccess for LocalGitAccess {
             "local git pull start workspace={}",
             self.workspace.display_name
         );
+        self.switch_github_auth()?;
         git::pull(&self.root)
     }
 
     fn publish(&self, remote: &str, branch: &str) -> Result<String, String> {
+        self.switch_github_auth()?;
         git::publish(&self.root, remote, branch)
     }
 
@@ -184,6 +192,7 @@ impl GitAccess for LocalGitAccess {
             self.workspace.display_name,
             remote
         );
+        self.switch_github_auth()?;
         git::fetch_with_progress(&self.root, remote, progress)
     }
 
@@ -216,7 +225,8 @@ impl GitAccess for LocalGitAccess {
             self.workspace.display_name,
             number
         );
-        git::checkout_pull_request(&self.root, number)
+        self.switch_github_auth()?;
+        github::checkout_pull_request(&self.root, number)
     }
 
     fn create_branch(&self, branch: &str) -> Result<String, String> {

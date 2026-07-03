@@ -1,5 +1,6 @@
 use adw::prelude::*;
 use gtk::{gio, glib};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 mod agent_provider;
@@ -34,6 +35,10 @@ fn main() -> glib::ExitCode {
             crash_log_dir.display()
         );
     }
+    let startup_workspace = startup_workspace_arg();
+    if let Some(error) = startup_workspace.error.as_deref() {
+        log::warn!("startup workspace argument ignored: {error}");
+    }
 
     let app = adw::Application::builder()
         .application_id(APP_ID)
@@ -52,11 +57,96 @@ fn main() -> glib::ExitCode {
             step_start.elapsed().as_millis()
         );
     });
-    app.connect_activate(move |app| ui::build_ui(app, launch_start));
-    let exit_code = app.run();
+    app.connect_activate(move |app| {
+        ui::build_ui(
+            app,
+            launch_start,
+            startup_workspace.workspace.clone(),
+            startup_workspace.error.clone(),
+        )
+    });
+    let app_args = application_args_without_workspace();
+    let exit_code = app.run_with_args(&app_args);
     log::info!(
         "application exit total_ms={}",
         launch_start.elapsed().as_millis()
     );
     exit_code
+}
+
+#[derive(Clone, Default)]
+struct StartupWorkspaceArg {
+    workspace: Option<config::ConfiguredWorkspace>,
+    error: Option<String>,
+}
+
+fn startup_workspace_arg() -> StartupWorkspaceArg {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.is_empty() {
+        return StartupWorkspaceArg::default();
+    }
+    if args.len() > 1 {
+        return StartupWorkspaceArg {
+            workspace: None,
+            error: Some("Expected at most one workspace path.".to_string()),
+        };
+    }
+
+    match resolve_workspace_arg(Path::new(&args[0])) {
+        Ok(path) => {
+            log::info!(
+                "startup workspace argument resolved path={}",
+                path.display()
+            );
+            StartupWorkspaceArg {
+                workspace: Some(config::ConfiguredWorkspace::local(
+                    path.to_string_lossy().to_string(),
+                )),
+                error: None,
+            }
+        }
+        Err(error) => StartupWorkspaceArg {
+            workspace: None,
+            error: Some(error),
+        },
+    }
+}
+
+fn resolve_workspace_arg(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("Could not resolve current directory: {err}"))?
+            .join(path)
+    };
+    let metadata = std::fs::metadata(&absolute).map_err(|err| {
+        format!(
+            "Workspace path does not exist or cannot be read: {} ({err})",
+            path.display()
+        )
+    })?;
+    let workspace = if metadata.is_dir() {
+        absolute
+    } else if metadata.is_file() {
+        absolute
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| format!("File has no parent directory: {}", path.display()))?
+    } else {
+        return Err(format!(
+            "Workspace path must be a file or directory: {}",
+            path.display()
+        ));
+    };
+
+    Ok(workspace.canonicalize().unwrap_or(workspace))
+}
+
+fn application_args_without_workspace() -> Vec<String> {
+    vec![
+        std::env::args()
+            .next()
+            .unwrap_or_else(|| "craic".to_string()),
+    ]
 }

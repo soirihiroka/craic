@@ -133,10 +133,6 @@ pub(crate) fn save_quick_action_config(
     save(path, &config)
 }
 
-pub(crate) fn github_auth_account(path: &Path) -> Option<github::GitHubAuthAccount> {
-    git_config(path).github_auth_account
-}
-
 pub(crate) fn markdown_lint_ignored_rules_from_file_access(files: &dyn FileAccess) -> Vec<String> {
     let config = load_repo_config_from_file_access(files)
         .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));

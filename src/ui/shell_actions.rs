@@ -1,3 +1,4 @@
+use super::app_menu::launch_workspace_in_new_instance;
 use super::dialogs::show_error_dialog;
 use super::git_actions::{GitAction, execute_git_action};
 use super::preferences::show_preferences_window;
@@ -7,9 +8,15 @@ use super::{
     pages::PageCommand, refresh, refresh_active_page, refresh_active_repo_metadata,
 };
 use crate::config::{ConfiguredWorkspace, WorkspaceProvider};
+use crate::git;
 use adw::prelude::*;
 use gtk::{gdk, gio};
+use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
+use std::time::Duration;
 
 pub(super) fn connect_shell_actions(state: &Rc<AppState>) {
     connect_app_actions(state);
@@ -27,8 +34,7 @@ fn connect_app_actions(state: &Rc<AppState>) {
             move |_, parameter| {
                 if let Some(val) = parameter.and_then(|v| v.str()) {
                     let workspace = crate::workspace::workspace_from_selection_id(val);
-                    set_active_workspace(&state, workspace);
-                    refresh(&state, None);
+                    prompt_workspace_open(&state, workspace);
                 }
             }
         });
@@ -162,14 +168,13 @@ fn connect_repository_picker(state: &Rc<AppState>) {
         let state = state.clone();
         move |id| {
             let workspace = crate::workspace::workspace_from_selection_id(&id);
-            set_active_workspace(&state, workspace);
-            refresh(&state, None);
+            prompt_workspace_open(&state, workspace);
         }
     });
 
     state.sidebar.repository_picker.connect_add_clicked({
         let state = state.clone();
-        move || open_repository_folder_dialog(&state)
+        move || show_create_workspace_dialog(&state)
     });
 
     state.sidebar.repository_picker.connect_opened({
@@ -202,35 +207,504 @@ fn set_active_workspace(state: &Rc<AppState>, workspace: ConfiguredWorkspace) {
     refresh_active_repo_metadata(state, Some(item_id));
 }
 
-fn open_repository_folder_dialog(state: &Rc<AppState>) {
-    let dialog = gtk::FileDialog::builder()
-        .title("Open Workspace")
-        .modal(true)
+fn prompt_workspace_open(state: &Rc<AppState>, workspace: ConfiguredWorkspace) {
+    let label = workspace.label();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Open Workspace")
+        .body(format!("Open {label} in this window or a new window?"))
         .build();
-    dialog.select_folder(Some(&state.window), None::<&gio::Cancellable>, {
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("current", "Open Here");
+    dialog.add_response("new", "Open in New Window");
+    dialog.set_default_response(Some("current"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("current", adw::ResponseAppearance::Suggested);
+
+    dialog.choose(Some(&state.window), None::<&gio::Cancellable>, {
         let state = state.clone();
-        move |result| match result {
-            Ok(folder) => match folder.path() {
-                Some(path) => {
-                    set_active_workspace(
-                        &state,
-                        ConfiguredWorkspace {
-                            path: path.to_string_lossy().to_string(),
-                            provider: WorkspaceProvider::Local,
-                            display_name: None,
-                            color: None,
-                        },
-                    );
-                    refresh(&state, None);
+        move |response| match response.as_str() {
+            "current" => {
+                log::info!("workspace open selected target=current label={label}");
+                open_workspace_here(&state, workspace.clone(), None);
+            }
+            "new" => {
+                log::info!("workspace open selected target=new-window label={label}");
+                match open_workspace_in_new_window(&workspace) {
+                    Ok(()) => {}
+                    Err(err) => show_error_dialog(&state.window, "Open Workspace Failed", &err),
                 }
-                None => show_error_dialog(
-                    &state.window,
-                    "Open Workspace Failed",
-                    "The selected folder does not have a local path.",
-                ),
-            },
-            Err(err) if err.matches(gtk::DialogError::Dismissed) => {}
-            Err(err) => show_error_dialog(&state.window, "Open Workspace Failed", &err.to_string()),
+            }
+            _ => {}
         }
     });
+}
+
+fn open_workspace_here(
+    state: &Rc<AppState>,
+    workspace: ConfiguredWorkspace,
+    message: Option<String>,
+) {
+    set_active_workspace(state, workspace);
+    refresh(state, message);
+}
+
+fn open_workspace_in_new_window(workspace: &ConfiguredWorkspace) -> Result<(), String> {
+    let path = local_workspace_launch_path(workspace)?;
+    launch_workspace_in_new_instance(&path)
+}
+
+fn local_workspace_launch_path(workspace: &ConfiguredWorkspace) -> Result<PathBuf, String> {
+    match &workspace.provider {
+        WorkspaceProvider::Local => {}
+        WorkspaceProvider::Ssh { .. } => {
+            return Err(
+                "Opening remote workspaces in a new window is not supported yet.".to_string(),
+            );
+        }
+    }
+
+    let path = crate::config::expand_config_path_for_ui(&workspace.path)
+        .unwrap_or_else(|| PathBuf::from(&workspace.path));
+    if !path.exists() {
+        return Err(format!("Workspace path does not exist: {}", path.display()));
+    }
+    Ok(path.canonicalize().unwrap_or(path))
+}
+
+fn show_create_workspace_dialog(state: &Rc<AppState>) {
+    let dialog = adw::PreferencesDialog::builder()
+        .title("Create Workspace")
+        .content_width(560)
+        .content_height(360)
+        .build();
+
+    let root_path = Rc::new(RefCell::new(default_workspace_root()));
+    let auto_name = Rc::new(Cell::new(true));
+    let updating_name = Rc::new(Cell::new(false));
+    let create_loading = Rc::new(Cell::new(false));
+
+    let root_row = adw::ActionRow::builder()
+        .title("Workspace Root")
+        .subtitle("Choose a folder")
+        .build();
+    if let Some(path) = root_path.borrow().as_ref() {
+        root_row.set_subtitle(&path.display().to_string());
+    }
+    let choose_root_button = gtk::Button::builder().label("Choose").build();
+    root_row.add_suffix(&choose_root_button);
+    root_row.set_activatable_widget(Some(&choose_root_button));
+
+    let name_row = adw::EntryRow::builder().title("Repository Name").build();
+    let remote_row = adw::EntryRow::builder().title("Remote Git Source").build();
+    remote_row.set_tooltip_text(Some("Optional git remote URL to clone."));
+
+    let status_row = adw::ActionRow::builder()
+        .title("Choose a workspace root")
+        .subtitle("A root folder and repository name are required.")
+        .build();
+
+    let cancel_button = gtk::Button::builder().label("Cancel").build();
+    let create_spinner = adw::Spinner::new();
+    create_spinner.set_size_request(16, 16);
+    create_spinner.set_visible(false);
+    let create_label = gtk::Label::new(Some("Create"));
+    let create_content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::Center)
+        .build();
+    create_content.append(&create_spinner);
+    create_content.append(&create_label);
+    let create_button = gtk::Button::builder()
+        .child(&create_content)
+        .sensitive(false)
+        .build();
+    create_button.add_css_class("suggested-action");
+
+    let actions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
+    actions.append(&cancel_button);
+    actions.append(&create_button);
+
+    let workspace_group = adw::PreferencesGroup::new();
+    workspace_group.set_title("Workspace");
+    workspace_group.add(&root_row);
+    workspace_group.add(&name_row);
+    workspace_group.add(&remote_row);
+
+    let status_group = adw::PreferencesGroup::new();
+    status_group.add(&status_row);
+
+    let action_group = adw::PreferencesGroup::new();
+    action_group.add(&actions);
+
+    let page = adw::PreferencesPage::new();
+    page.set_title("Create Workspace");
+    page.set_icon_name(Some("folder-new-symbolic"));
+    page.add(&workspace_group);
+    page.add(&status_group);
+    page.add(&action_group);
+    dialog.add(&page);
+
+    let update_create_state: Rc<dyn Fn()> = Rc::new({
+        let root_path = root_path.clone();
+        let name_row = name_row.clone();
+        let remote_row = remote_row.clone();
+        let status_row = status_row.clone();
+        let create_button = create_button.clone();
+        let create_loading = create_loading.clone();
+
+        move || {
+            if create_loading.get() {
+                create_button.set_sensitive(false);
+                return;
+            }
+            let remote = remote_row.text();
+            let remote = remote.trim();
+            let name = name_row.text();
+            let has_name = !name.trim().is_empty()
+                || (!remote.is_empty() && workspace_name_from_remote(remote).is_some());
+            let has_root = root_path.borrow().is_some();
+            let ready = has_root && has_name;
+            create_button.set_sensitive(ready);
+            if !has_root {
+                status_row.set_title("Choose a workspace root");
+                status_row.set_subtitle("Select the folder that will contain the new workspace.");
+            } else if !has_name {
+                status_row.set_title("Repository name required");
+                status_row.set_subtitle("Enter a name or a remote URL that includes one.");
+            } else {
+                status_row.set_title("Ready");
+                status_row.set_subtitle("Create the workspace when you are ready.");
+            }
+        }
+    });
+    update_create_state();
+
+    choose_root_button.connect_clicked({
+        let state = state.clone();
+        let root_path = root_path.clone();
+        let root_row = root_row.clone();
+        let update_create_state = update_create_state.clone();
+
+        move |_| {
+            let dialog = gtk::FileDialog::builder()
+                .title("Choose Workspace Root")
+                .modal(true)
+                .build();
+            dialog.select_folder(Some(&state.window), None::<&gio::Cancellable>, {
+                let state = state.clone();
+                let root_path = root_path.clone();
+                let root_row = root_row.clone();
+                let update_create_state = update_create_state.clone();
+
+                move |result| match result {
+                    Ok(folder) => match folder.path() {
+                        Some(path) => {
+                            let path = path.canonicalize().unwrap_or(path);
+                            root_row.set_subtitle(&path.display().to_string());
+                            root_path.replace(Some(path));
+                            update_create_state();
+                        }
+                        None => show_error_dialog(
+                            &state.window,
+                            "Choose Workspace Root Failed",
+                            "The selected folder does not have a local path.",
+                        ),
+                    },
+                    Err(err) if err.matches(gtk::DialogError::Dismissed) => {}
+                    Err(err) => show_error_dialog(
+                        &state.window,
+                        "Choose Workspace Root Failed",
+                        &err.to_string(),
+                    ),
+                }
+            });
+        }
+    });
+
+    name_row.connect_changed({
+        let auto_name = auto_name.clone();
+        let updating_name = updating_name.clone();
+        let update_create_state = update_create_state.clone();
+
+        move |row| {
+            if !updating_name.get() {
+                auto_name.set(row.text().trim().is_empty());
+            }
+            update_create_state();
+        }
+    });
+
+    remote_row.connect_changed({
+        let name_row = name_row.clone();
+        let auto_name = auto_name.clone();
+        let updating_name = updating_name.clone();
+        let update_create_state = update_create_state.clone();
+
+        move |row| {
+            if auto_name.get() || name_row.text().trim().is_empty() {
+                let next_name = workspace_name_from_remote(&row.text()).unwrap_or_default();
+                updating_name.set(true);
+                name_row.set_text(&next_name);
+                updating_name.set(false);
+                auto_name.set(true);
+            }
+            update_create_state();
+        }
+    });
+
+    cancel_button.connect_clicked({
+        let dialog = dialog.clone();
+        move |_| {
+            dialog.close();
+        }
+    });
+
+    create_button.connect_clicked({
+        let state = state.clone();
+        let dialog = dialog.clone();
+        let root_path = root_path.clone();
+        let name_row = name_row.clone();
+        let remote_row = remote_row.clone();
+        let status_row = status_row.clone();
+        let create_button = create_button.clone();
+        let create_spinner = create_spinner.clone();
+        let create_label = create_label.clone();
+        let update_create_state = update_create_state.clone();
+        let create_loading = create_loading.clone();
+
+        move |_| {
+            let request = match create_workspace_request(
+                root_path.borrow().clone(),
+                &name_row.text(),
+                &remote_row.text(),
+            ) {
+                Ok(request) => request,
+                Err(err) => {
+                    status_row.set_title("Workspace details incomplete");
+                    status_row.set_subtitle(&err);
+                    return;
+                }
+            };
+
+            log::info!(
+                "workspace creation requested root={} name={} remote_present={}",
+                request.root.display(),
+                request.name,
+                request.remote.is_some()
+            );
+            create_loading.set(true);
+            set_create_button_loading(&create_button, &create_spinner, &create_label, true);
+            status_row.set_title("Creating workspace");
+            status_row.set_subtitle("This may take a moment.");
+
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || {
+                let result = create_workspace(request);
+                let _ = sender.send(result);
+            });
+
+            gtk::glib::timeout_add_local(Duration::from_millis(100), {
+                let state = state.clone();
+                let dialog = dialog.clone();
+                let status_row = status_row.clone();
+                let create_button = create_button.clone();
+                let create_spinner = create_spinner.clone();
+                let create_label = create_label.clone();
+                let update_create_state = update_create_state.clone();
+                let create_loading = create_loading.clone();
+
+                move || match receiver.try_recv() {
+                    Ok(Ok((path, message))) => {
+                        dialog.close();
+                        open_workspace_here(
+                            &state,
+                            ConfiguredWorkspace::local(path.to_string_lossy().to_string()),
+                            Some(message),
+                        );
+                        state.sidebar.load_repos_async();
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Ok(Err(err)) => {
+                        create_loading.set(false);
+                        set_create_button_loading(
+                            &create_button,
+                            &create_spinner,
+                            &create_label,
+                            false,
+                        );
+                        update_create_state();
+                        status_row.set_title("Create workspace failed");
+                        status_row.set_subtitle(&err);
+                        show_error_dialog(&state.window, "Create Workspace Failed", &err);
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                    Err(TryRecvError::Disconnected) => {
+                        create_loading.set(false);
+                        set_create_button_loading(
+                            &create_button,
+                            &create_spinner,
+                            &create_label,
+                            false,
+                        );
+                        update_create_state();
+                        let err = "Workspace creation stopped unexpectedly.";
+                        status_row.set_title("Create workspace failed");
+                        status_row.set_subtitle(err);
+                        show_error_dialog(&state.window, "Create Workspace Failed", err);
+                        gtk::glib::ControlFlow::Break
+                    }
+                }
+            });
+        }
+    });
+
+    dialog.present(Some(&state.window));
+}
+
+#[derive(Debug)]
+struct CreateWorkspaceRequest {
+    root: PathBuf,
+    name: String,
+    remote: Option<String>,
+}
+
+fn create_workspace_request(
+    root: Option<PathBuf>,
+    name: &str,
+    remote: &str,
+) -> Result<CreateWorkspaceRequest, String> {
+    let root = root.ok_or_else(|| "Choose a workspace root.".to_string())?;
+    if !root.is_dir() {
+        return Err(format!(
+            "Workspace root is not a directory: {}",
+            root.display()
+        ));
+    }
+    let remote = text_option(remote);
+    let name = if name.trim().is_empty() {
+        remote
+            .as_deref()
+            .and_then(workspace_name_from_remote)
+            .unwrap_or_default()
+    } else {
+        name.trim().to_string()
+    };
+    let name = validated_workspace_name(&name)?;
+
+    Ok(CreateWorkspaceRequest { root, name, remote })
+}
+
+fn create_workspace(request: CreateWorkspaceRequest) -> Result<(PathBuf, String), String> {
+    let destination = request.root.join(&request.name);
+    ensure_destination_available(&destination)?;
+
+    if let Some(remote) = request.remote {
+        let message = git::clone_repository(&remote, &destination)?;
+        return Ok((destination, message));
+    }
+
+    log::info!(
+        "workspace folder create start path={}",
+        destination.display()
+    );
+    if !destination.exists() {
+        std::fs::create_dir_all(&destination).map_err(|err| {
+            format!(
+                "Could not create workspace folder {}: {err}",
+                destination.display()
+            )
+        })?;
+    }
+    log::info!(
+        "workspace folder create complete path={}",
+        destination.display()
+    );
+    Ok((destination, "Workspace created.".to_string()))
+}
+
+fn ensure_destination_available(destination: &Path) -> Result<(), String> {
+    if !destination.exists() {
+        return Ok(());
+    }
+    if !destination.is_dir() {
+        return Err(format!(
+            "Destination already exists and is not a folder: {}",
+            destination.display()
+        ));
+    }
+    let mut entries = std::fs::read_dir(destination).map_err(|err| {
+        format!(
+            "Could not inspect destination folder {}: {err}",
+            destination.display()
+        )
+    })?;
+    if entries.next().is_some() {
+        return Err(format!(
+            "Destination folder is not empty: {}",
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+fn default_workspace_root() -> Option<PathBuf> {
+    crate::config::load()
+        .workspace_roots
+        .into_iter()
+        .find_map(|workspace| {
+            workspace
+                .provider
+                .is_local()
+                .then(|| crate::config::expand_config_path_for_ui(&workspace.path))
+                .flatten()
+        })
+        .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn text_option(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn workspace_name_from_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches('/');
+    if remote.is_empty() {
+        return None;
+    }
+    let remote = remote.strip_suffix(".git").unwrap_or(remote);
+    let name = remote
+        .rsplit(|ch| ch == '/' || ch == ':')
+        .next()
+        .unwrap_or(remote);
+    validated_workspace_name(name).ok()
+}
+
+fn validated_workspace_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Repository name is required.".to_string());
+    }
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err("Repository name must be a single folder name.".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn set_create_button_loading(
+    button: &gtk::Button,
+    spinner: &adw::Spinner,
+    label: &gtk::Label,
+    loading: bool,
+) {
+    spinner.set_visible(loading);
+    label.set_label(if loading { "Creating..." } else { "Create" });
+    button.set_sensitive(!loading);
 }

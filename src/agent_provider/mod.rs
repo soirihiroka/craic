@@ -3,6 +3,7 @@ mod codex;
 mod ollama;
 mod opencode;
 
+use crate::system::capabilities::shell::default_shell;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -21,6 +22,7 @@ const OUTPUT_PREVIEW_CHARS: usize = 300;
 const REPAIR_OUTPUT_CHARS: usize = 8_000;
 
 static MODEL_OPTIONS_CACHE: OnceLock<Mutex<HashMap<String, Vec<ModelOption>>>> = OnceLock::new();
+static COMMAND_PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
 
 static PROVIDERS: [&'static dyn AgentProvider; 4] = [
     &opencode::PROVIDER,
@@ -654,7 +656,21 @@ fn default_shell_command_path(name: &str) -> Option<PathBuf> {
         return None;
     }
 
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+    let cache = COMMAND_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some(cached) = cache.get(name).cloned() {
+            log::debug!(
+                "agent command shell lookup cache hit program={} resolved={:?}",
+                name,
+                cached
+            );
+            return cached;
+        }
+    } else {
+        log::warn!("agent command shell lookup cache unavailable");
+    }
+
+    let shell = default_shell();
     let script = format!("command -v {}", shell_quote(name));
     let output = Command::new(&shell)
         .arg("-i")
@@ -676,7 +692,7 @@ fn default_shell_command_path(name: &str) -> Option<PathBuf> {
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if output.status.success() {
+    let resolved = if output.status.success() {
         let resolved = shell_which_output(&stdout).map(PathBuf::from);
         log::debug!(
             "agent command shell lookup program={} resolved={:?}",
@@ -692,7 +708,13 @@ fn default_shell_command_path(name: &str) -> Option<PathBuf> {
             stderr.trim()
         );
         None
+    };
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(name.to_string(), resolved.clone());
+    } else {
+        log::warn!("agent command shell lookup cache unavailable");
     }
+    resolved
 }
 
 fn command_name_can_use_path(program: &str) -> bool {

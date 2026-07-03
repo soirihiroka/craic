@@ -71,7 +71,7 @@ impl SshGitAccess {
         self.runner.run_text(
             "git",
             &format!(
-                "git -C {} {}",
+                "cd {} && git {}",
                 shell_quote(&self.workspace.root.absolute),
                 args
             ),
@@ -80,6 +80,17 @@ impl SshGitAccess {
 
     fn git_ok(&self, args: &[String]) -> Result<String, String> {
         self.git(args).map(|out| out.trim().to_string())
+    }
+
+    fn switch_github_auth(&self) -> Result<(), String> {
+        let Some(account) = self.settings().github_auth_account else {
+            return Ok(());
+        };
+        let script = crate::github::ssh_switch_auth_account_script(
+            &shell_quote(&account.host),
+            &shell_quote(&account.login),
+        );
+        self.runner.run_text("gh auth switch", &script).map(|_| ())
     }
 }
 
@@ -517,10 +528,12 @@ impl GitAccess for SshGitAccess {
     }
 
     fn push(&self) -> Result<String, String> {
+        self.switch_github_auth()?;
         self.git(&["push".into()])
     }
 
     fn pull(&self) -> Result<String, String> {
+        self.switch_github_auth()?;
         self.git(&[
             "-c".into(),
             "rebase.backend=merge".into(),
@@ -531,6 +544,7 @@ impl GitAccess for SshGitAccess {
     }
 
     fn publish(&self, remote: &str, branch: &str) -> Result<String, String> {
+        self.switch_github_auth()?;
         self.git(&["push".into(), "-u".into(), remote.into(), branch.into()])
     }
 
@@ -544,6 +558,7 @@ impl GitAccess for SshGitAccess {
         if let Some(remote) = remote {
             args.push(remote.to_string());
         }
+        self.switch_github_auth()?;
         self.git(&args)
     }
 
@@ -577,10 +592,10 @@ impl GitAccess for SshGitAccess {
             self.workspace.display_name,
             number
         );
-        let script = format!(
-            "cd {} && gh_cmd=$(command -v gh 2>/dev/null || {{ if [ -x /home/linuxbrew/.linuxbrew/bin/gh ]; then printf '%s\\n' /home/linuxbrew/.linuxbrew/bin/gh; elif [ -x \"$HOME/.local/bin/gh\" ]; then printf '%s\\n' \"$HOME/.local/bin/gh\"; else printf '%s\\n' gh; fi; }}) && \"$gh_cmd\" pr checkout {}",
-            shell_quote(&self.workspace.root.absolute),
-            shell_quote(&number.to_string())
+        self.switch_github_auth()?;
+        let script = crate::github::ssh_checkout_pull_request_script(
+            &shell_quote(&self.workspace.root.absolute),
+            &shell_quote(&number.to_string()),
         );
         self.runner.run_text("gh pr checkout", &script)
     }

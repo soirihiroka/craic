@@ -1,16 +1,21 @@
-use crate::system::capabilities::shell::{ShellAccess, ShellCommandSpec};
+use crate::system::capabilities::shell::{ShellAccess, ShellCommandSpec, default_shell};
 use crate::system::path::{WorkspacePath, WorkspaceRef};
-use std::ffi::OsString;
+use std::collections::HashMap;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalShellAccess {
     workspace: WorkspaceRef,
+    command_lookup: Arc<Mutex<HashMap<String, Option<String>>>>,
 }
 
 impl LocalShellAccess {
     pub(crate) fn new(workspace: WorkspaceRef) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            command_lookup: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -19,7 +24,7 @@ impl ShellAccess for LocalShellAccess {
         &self,
         working_dir: Option<&WorkspacePath>,
     ) -> Result<ShellCommandSpec, String> {
-        let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
+        let shell = default_shell();
         let working_dir = working_dir
             .cloned()
             .unwrap_or_else(|| self.workspace.root.clone());
@@ -37,14 +42,39 @@ impl ShellAccess for LocalShellAccess {
         program: &str,
         args: &[String],
     ) -> Result<ShellCommandSpec, String> {
-        let program = self.resolved_or_original(program);
+        if command_name_can_use_path(program) {
+            if let Err(err) = self.which(program) {
+                log::warn!(
+                    "local shell command lookup failed workspace={} program={} error={}",
+                    self.workspace.display_name,
+                    program,
+                    err
+                );
+            }
+            let mut script = format!("exec {}", shell_quote(program));
+            for arg in args {
+                script.push(' ');
+                script.push_str(&shell_quote(arg));
+            }
+            log::debug!(
+                "local shell command created workspace={} working_dir={} program={} via_default_shell=true",
+                self.workspace.display_name,
+                working_dir.display(),
+                program
+            );
+            return Ok(ShellCommandSpec::new(default_shell(), working_dir.clone())
+                .arg("-i")
+                .arg("-c")
+                .arg(script));
+        }
+
         log::debug!(
             "local shell command created workspace={} working_dir={} program={}",
             self.workspace.display_name,
             working_dir.display(),
             program
         );
-        let mut command = ShellCommandSpec::new(program.as_str(), working_dir.clone());
+        let mut command = ShellCommandSpec::new(program, working_dir.clone());
         for arg in args {
             command = command.arg(arg.as_str());
         }
@@ -64,7 +94,23 @@ impl ShellAccess for LocalShellAccess {
             return Ok(None);
         }
 
-        let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
+        if let Some(cached) = self
+            .command_lookup
+            .lock()
+            .map_err(|_| "Shell command lookup cache is unavailable.".to_string())?
+            .get(program)
+            .cloned()
+        {
+            log::debug!(
+                "local shell which cache hit workspace={} program={} resolved={:?}",
+                self.workspace.display_name,
+                program,
+                cached
+            );
+            return Ok(cached);
+        }
+
+        let shell = default_shell();
         let script = format!("command -v {}", shell_quote(program));
         let output = Command::new(&shell)
             .arg("-i")
@@ -80,7 +126,7 @@ impl ShellAccess for LocalShellAccess {
             })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.success() {
+        let resolved = if output.status.success() {
             let resolved = shell_which_output(&stdout);
             log::debug!(
                 "local shell which workspace={} program={} resolved={:?}",
@@ -88,7 +134,7 @@ impl ShellAccess for LocalShellAccess {
                 program,
                 resolved
             );
-            Ok(resolved)
+            resolved
         } else {
             log::debug!(
                 "local shell which missing workspace={} program={} status={} stderr={}",
@@ -97,26 +143,14 @@ impl ShellAccess for LocalShellAccess {
                 output.status,
                 stderr.trim()
             );
-            Ok(None)
-        }
-    }
-}
+            None
+        };
 
-impl LocalShellAccess {
-    fn resolved_or_original(&self, program: &str) -> String {
-        match self.which(program) {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => program.to_string(),
-            Err(err) => {
-                log::warn!(
-                    "local shell command lookup failed workspace={} program={} error={}",
-                    self.workspace.display_name,
-                    program,
-                    err
-                );
-                program.to_string()
-            }
-        }
+        self.command_lookup
+            .lock()
+            .map_err(|_| "Shell command lookup cache is unavailable.".to_string())?
+            .insert(program.to_string(), resolved.clone());
+        Ok(resolved)
     }
 }
 

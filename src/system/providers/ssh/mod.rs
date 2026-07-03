@@ -153,30 +153,7 @@ impl SystemProvider for SshProvider {
             input.push('\n');
         }
 
-        let script = "emit_workspace() { \
-             kind=$1; source=$2; d=$3; remote=''; url=''; \
-             if git -C \"$d\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
-               remote=$(git -C \"$d\" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null | sed 's#/.*##' || true); \
-               if [ -z \"$remote\" ] && git -C \"$d\" remote get-url origin >/dev/null 2>&1; then remote=origin; fi; \
-               if [ -z \"$remote\" ]; then remote=$(git -C \"$d\" remote 2>/dev/null | head -n 1); fi; \
-               if [ -n \"$remote\" ]; then url=$(git -C \"$d\" remote get-url \"$remote\" 2>/dev/null || true); fi; \
-               if [ -z \"$url\" ]; then url='-'; fi; \
-             fi; \
-             printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$kind\" \"$source\" \"$d\" \"$remote\" \"$url\"; \
-           }; \
-           resolve_path() { \
-             p=$1; \
-             if [ \"$p\" = '~' ]; then printf '%s\\n' \"$HOME\"; \
-             else case \"$p\" in \"~/\"*) printf '%s/%s\\n' \"$HOME\" \"${p#\\~/}\" ;; *) printf '%s\\n' \"$p\" ;; esac; fi; \
-           }; \
-           while IFS='	' read -r kind raw_path; do \
-             [ -n \"$kind\" ] || continue; \
-             path=$(resolve_path \"$raw_path\"); \
-             case \"$kind\" in \
-               W) [ -d \"$path\" ] && emit_workspace W \"$raw_path\" \"$path\" ;; \
-               R) [ -d \"$path\" ] && find \"$path\" -mindepth 1 -maxdepth 1 -type d -print | while IFS= read -r d; do emit_workspace R \"$raw_path\" \"$d\"; done ;; \
-             esac; \
-           done";
+        let script = crate::git::ssh_workspace_list_script();
         let output = runner.run_script_with_stdin(
             "bulk list ssh workspaces",
             script,

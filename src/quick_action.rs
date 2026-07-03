@@ -1,4 +1,3 @@
-use crate::terminal::CommandSpec;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
@@ -53,13 +52,6 @@ pub fn discover(repo_path: &Path) -> Vec<RunItem> {
 
     targets.extend(discover_bun_scripts(repo_path));
     targets
-}
-
-pub fn command_for(repo_path: &Path, item: &RunItem) -> CommandSpec {
-    match &item.command {
-        RunCommand::MakeTarget { target } => make_target_command(repo_path, target),
-        RunCommand::BunScript { script } => bun_script_command(repo_path, script),
-    }
 }
 
 fn file_signature(path: Option<PathBuf>) -> FileSignature {
@@ -186,10 +178,6 @@ fn is_runnable_make_target(target: &str) -> bool {
         && !target.contains('\\')
 }
 
-fn make_target_command(repo_path: &Path, target: &str) -> CommandSpec {
-    CommandSpec::new("make", repo_path).arg(target)
-}
-
 fn discover_bun_scripts(repo_path: &Path) -> Vec<RunItem> {
     let (Some(package_json_path), Some(_bun_lock_path)) =
         (package_json_path(repo_path), bun_lock_path(repo_path))
@@ -234,8 +222,4 @@ fn discover_bun_scripts(repo_path: &Path) -> Vec<RunItem> {
             })
         })
         .collect()
-}
-
-fn bun_script_command(repo_path: &Path, script: &str) -> CommandSpec {
-    CommandSpec::new("bun", repo_path).arg("run").arg(script)
 }

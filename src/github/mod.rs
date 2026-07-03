@@ -7,6 +7,10 @@ use moka::sync::Cache;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 
+mod cli;
+pub use cli::{checkout_pull_request, switch_auth_account};
+pub(crate) use cli::{ssh_checkout_pull_request_script, ssh_switch_auth_account_script};
+
 const GITHUB_AVATAR_URL_CACHE_TTL_SECS: i64 = 60 * 60 * 24 * 30;
 const GITHUB_AVATAR_BYTES_CACHE_TTL_SECS: i64 = 60 * 60 * 24 * 30;
 const MAX_AVATAR_CACHE_BYTES: usize = 2 * 1024 * 1024;
