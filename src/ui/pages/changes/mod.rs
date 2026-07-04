@@ -737,6 +737,7 @@ fn show_worktree_preview(
         file_path,
         signature.kind
     );
+    right.show_loading(&file_path);
 
     let Some(git_handle) = ctx.git() else {
         active_preview_signature.borrow_mut().take();
