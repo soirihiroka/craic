@@ -264,6 +264,12 @@ pub enum RepoMetadata {
     Folder,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceRepositoryMetadata {
+    pub kind: RepoMetadata,
+    pub remote_url: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct BytesComparison {
     pub before: Option<Vec<u8>>,

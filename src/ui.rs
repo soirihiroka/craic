@@ -1274,6 +1274,7 @@ fn refresh_with_toast(state: &Rc<AppState>, message: Option<String>, show_toast:
 fn refresh_active_repo_metadata(state: &Rc<AppState>, item_id: Option<String>) {
     let system = state.system_ref.borrow().clone();
     let workspace = state.workspace_ref.borrow().clone();
+    let workspace_host = system.host.as_ref().map(|host| host.label().to_string());
     let Some(git_handle) = git_handle_for_workspace(state, &system.id, &workspace) else {
         log::debug!(
             "skipping repo metadata refresh workspace={} reason=no-git-handle",
@@ -1294,6 +1295,7 @@ fn refresh_active_repo_metadata(state: &Rc<AppState>, item_id: Option<String>) {
     state.sidebar.refresh_workspace_repo_metadata(
         workspace.id.to_string(),
         item_id,
+        workspace_host,
         git_handle,
         github_access,
     );

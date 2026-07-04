@@ -220,11 +220,15 @@ pub(crate) fn workspace_from_selection_id(id: &str) -> ConfiguredWorkspace {
 fn push_workspace(
     entries: &mut Vec<WorkspaceEntry>,
     seen: &mut HashSet<String>,
-    workspace: ConfiguredWorkspace,
+    mut workspace: ConfiguredWorkspace,
 ) {
     let key = workspace.selection_id();
     if !seen.insert(key) {
         return;
+    }
+    if workspace.color.is_none() {
+        workspace.color =
+            crate::config::workspace_color_for(&workspace.provider_id(), &workspace.path);
     }
     entries.push(WorkspaceEntry {
         label: workspace.label(),

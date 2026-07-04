@@ -60,7 +60,7 @@ impl Drop for MaterializedFile {
 pub(crate) fn materialize_for_view<F>(
     files: Arc<dyn FileAccess>,
     source: FileNodeInfo,
-    max_bytes: u64,
+    max_bytes: Option<u64>,
     callback: F,
 ) where
     F: FnOnce(Result<MaterializedFile, String>) + Send + 'static,
@@ -70,7 +70,7 @@ pub(crate) fn materialize_for_view<F>(
     files.read_with_info(
         FileReadRequest {
             path,
-            max_bytes: Some(max_bytes),
+            max_bytes,
             cancel_requested: None,
         },
         Box::new(move |event| {
@@ -94,9 +94,11 @@ pub(crate) fn materialize_for_view<F>(
 fn materialize_bytes(
     source: &FileNodeInfo,
     bytes: Vec<u8>,
-    max_bytes: u64,
+    max_bytes: Option<u64>,
 ) -> Result<MaterializedFile, String> {
-    if bytes.len() as u64 > max_bytes {
+    if let Some(max_bytes) = max_bytes
+        && bytes.len() as u64 > max_bytes
+    {
         return Err(format!(
             "{} is too large to materialize for preview.",
             source.path.display()

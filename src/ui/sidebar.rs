@@ -117,12 +117,14 @@ impl SidebarPane {
         &self,
         workspace_key: String,
         item_id: Option<String>,
+        workspace_host: Option<String>,
         git_handle: Arc<GitRepoHandle>,
         github_access: Option<Arc<dyn GitHubAccess>>,
     ) {
         repositories::refresh_repo_icon_kind(
             workspace_key,
             item_id,
+            workspace_host,
             &self.repository_picker,
             self.repo_icon_loading.clone(),
             git_handle,

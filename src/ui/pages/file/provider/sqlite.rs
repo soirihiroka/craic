@@ -15,7 +15,6 @@ use std::thread;
 use std::time::Duration;
 
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
-const MAX_SQLITE_PREVIEW_BYTES: u64 = 128 * 1024 * 1024;
 const SQLITE_PAGE_SIZE: usize = 100;
 const SQLITE_FILTER_DEBOUNCE_MS: u64 = 180;
 const SQLITE_POLL_MS: u64 = 30;
@@ -38,14 +37,9 @@ pub(in crate::ui::pages::file) fn show(request: PreviewRequest<'_>) {
     let file_path = request.file_path.to_string();
     let apply_file_path = file_path.clone();
     let (sender, receiver) = mpsc::channel();
-    crate::system::materialize::materialize_for_view(
-        files,
-        source,
-        MAX_SQLITE_PREVIEW_BYTES,
-        move |result| {
-            let _ = sender.send(result);
-        },
-    );
+    crate::system::materialize::materialize_for_view(files, source, None, move |result| {
+        let _ = sender.send(result);
+    });
     super::receive_preview_load(
         request.right,
         request.load_token,
@@ -676,25 +670,12 @@ impl SqlitePreview {
                 is_filter: true,
             }));
 
-        if page.rows.is_empty() {
-            let message = if page.total_rows == 0 {
-                "No rows in this table."
-            } else {
-                "No rows match the current filters."
-            };
+        for row in &page.rows {
             self.row_model
                 .append(&glib::BoxedAnyObject::new(SqliteDisplayRow {
-                    cells: message_row(message, page.columns.len()),
+                    cells: row.clone(),
                     is_filter: false,
                 }));
-        } else {
-            for row in &page.rows {
-                self.row_model
-                    .append(&glib::BoxedAnyObject::new(SqliteDisplayRow {
-                        cells: row.clone(),
-                        is_filter: false,
-                    }));
-            }
         }
 
         if page.total_rows == 0 {
@@ -990,14 +971,6 @@ fn filters_for_columns(filters: &[String], column_count: usize) -> Vec<String> {
     (0..column_count)
         .map(|index| filters.get(index).cloned().unwrap_or_default())
         .collect()
-}
-
-fn message_row(message: &str, column_count: usize) -> Vec<String> {
-    let mut cells = vec![String::new(); column_count];
-    if let Some(first) = cells.first_mut() {
-        *first = message.to_string();
-    }
-    cells
 }
 
 impl SqliteSortDirection {
@@ -1332,24 +1305,6 @@ fn table_row(table: &SqliteTable) -> gtk::ListBoxRow {
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
-    let subtitle = gtk::Label::builder()
-        .label(if table.kind == "view" {
-            "View"
-        } else {
-            "Table"
-        })
-        .xalign(0.0)
-        .css_classes(["dim-label"])
-        .build();
-
-    let labels = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
-        .hexpand(true)
-        .build();
-    labels.append(&title);
-    labels.append(&subtitle);
-
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -1359,7 +1314,7 @@ fn table_row(table: &SqliteTable) -> gtk::ListBoxRow {
         .margin_end(10)
         .build();
     content.append(&icon);
-    content.append(&labels);
+    content.append(&title);
 
     let row = gtk::ListBoxRow::builder()
         .activatable(true)

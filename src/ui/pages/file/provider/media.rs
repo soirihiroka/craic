@@ -314,7 +314,7 @@ fn show_media(request: PreviewRequest<'_>, kind: MediaKind) {
         crate::system::materialize::materialize_for_view(
             files,
             source,
-            MAX_MEDIA_PREVIEW_BYTES,
+            Some(MAX_MEDIA_PREVIEW_BYTES),
             move |result| {
                 let result = result.map(|materialized| MediaPreviewLoad {
                     kind,

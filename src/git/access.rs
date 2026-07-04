@@ -578,15 +578,15 @@ impl GitRepoHandle {
         )
     }
 
-    pub(crate) fn repo_metadata(
+    pub(crate) fn workspace_metadata(
         &self,
         github: Option<Arc<dyn GitHubAccess>>,
-        callback: OperationCallback<git::RepoMetadata>,
+        callback: OperationCallback<git::WorkspaceRepositoryMetadata>,
     ) {
         let handle = self.clone();
-        run_operation("git repo metadata", callback, move || {
-            handle.run_with_hooks("git repo metadata", || {
-                Ok(handle.repo_metadata_blocking(github.as_deref()))
+        run_operation("git workspace metadata", callback, move || {
+            handle.run_with_hooks("git workspace metadata", || {
+                Ok(handle.workspace_metadata_blocking(github.as_deref()))
             })
         });
     }
@@ -1048,7 +1048,10 @@ impl GitRepoHandle {
         ChangeListenerSubscription::spawn(label, command, listener)
     }
 
-    fn repo_metadata_blocking(&self, github: Option<&dyn GitHubAccess>) -> git::RepoMetadata {
+    fn workspace_metadata_blocking(
+        &self,
+        github: Option<&dyn GitHubAccess>,
+    ) -> git::WorkspaceRepositoryMetadata {
         log::debug!(
             "shell git repo metadata start workspace={} root={}",
             self.workspace.display_name,
@@ -1062,60 +1065,66 @@ impl GitRepoHandle {
                 "shell git repo metadata unavailable workspace={} reason=not-a-repo",
                 self.workspace.display_name
             );
-            return git::RepoMetadata::Folder;
+            return git::WorkspaceRepositoryMetadata {
+                kind: git::RepoMetadata::Folder,
+                remote_url: None,
+            };
         }
 
-        if self
+        let has_upstream_remote = self
             .git_ok(&["remote".into(), "get-url".into(), "upstream".into()])
-            .is_ok()
-        {
-            return git::RepoMetadata::Fork;
-        }
-
-        let remote_name = self
-            .git_ok(&[
-                "rev-parse".into(),
-                "--abbrev-ref".into(),
-                "--symbolic-full-name".into(),
-                "@{upstream}".into(),
-            ])
-            .ok()
-            .and_then(|upstream| upstream.split('/').next().map(ToString::to_string))
-            .filter(|remote| !remote.is_empty())
-            .or_else(|| {
-                self.git_ok(&["remote".into(), "get-url".into(), "origin".into()])
-                    .ok()
-                    .map(|_| "origin".to_string())
-            });
+            .is_ok();
+        let remote_name = self.primary_remote_name();
 
         let Some(remote_name) = remote_name else {
             log::debug!(
                 "shell git repo metadata unavailable workspace={} reason=no-remote",
                 self.workspace.display_name
             );
-            return git::RepoMetadata::Local;
+            return git::WorkspaceRepositoryMetadata {
+                kind: git::RepoMetadata::Local,
+                remote_url: None,
+            };
         };
-        let Some(remote_url) = self
-            .git_ok(&["remote".into(), "get-url".into(), remote_name.clone()])
-            .ok()
-        else {
+        let Some(remote_url) = self.remote_url(&remote_name) else {
             log::debug!(
                 "shell git repo metadata unavailable workspace={} remote={} reason=no-url",
                 self.workspace.display_name,
                 remote_name
             );
-            return git::RepoMetadata::Unknown;
+            return git::WorkspaceRepositoryMetadata {
+                kind: git::RepoMetadata::Unknown,
+                remote_url: None,
+            };
         };
+
+        if has_upstream_remote {
+            return git::WorkspaceRepositoryMetadata {
+                kind: git::RepoMetadata::Fork,
+                remote_url: Some(remote_url),
+            };
+        }
 
         if let Some(repo_slug) = crate::github::parse_github_url(&remote_url) {
             if let Some(github) = github {
                 match github.repo_metadata(&repo_slug, Some(&remote_name), Some(&remote_url)) {
-                    Ok(crate::github::GitHubRepoMetadata::Fork) => return git::RepoMetadata::Fork,
+                    Ok(crate::github::GitHubRepoMetadata::Fork) => {
+                        return git::WorkspaceRepositoryMetadata {
+                            kind: git::RepoMetadata::Fork,
+                            remote_url: Some(remote_url),
+                        };
+                    }
                     Ok(crate::github::GitHubRepoMetadata::Private) => {
-                        return git::RepoMetadata::Private;
+                        return git::WorkspaceRepositoryMetadata {
+                            kind: git::RepoMetadata::Private,
+                            remote_url: Some(remote_url),
+                        };
                     }
                     Ok(crate::github::GitHubRepoMetadata::Public) => {
-                        return git::RepoMetadata::Public;
+                        return git::WorkspaceRepositoryMetadata {
+                            kind: git::RepoMetadata::Public,
+                            remote_url: Some(remote_url),
+                        };
                     }
                     Err(err) => {
                         log::warn!(
@@ -1124,7 +1133,10 @@ impl GitRepoHandle {
                             repo_slug,
                             err
                         );
-                        return git::RepoMetadata::Unknown;
+                        return git::WorkspaceRepositoryMetadata {
+                            kind: git::RepoMetadata::Unknown,
+                            remote_url: Some(remote_url),
+                        };
                     }
                 }
             }
@@ -1133,7 +1145,10 @@ impl GitRepoHandle {
                 self.workspace.display_name,
                 repo_slug
             );
-            return git::RepoMetadata::Unknown;
+            return git::WorkspaceRepositoryMetadata {
+                kind: git::RepoMetadata::Unknown,
+                remote_url: Some(remote_url),
+            };
         }
 
         if let Some(repo_slug) = crate::gitlab::parse_gitlab_url(&remote_url) {
@@ -1145,12 +1160,23 @@ impl GitRepoHandle {
                 Some(&remote_url),
                 || gitlab::fetch_repo_metadata(&remote_url),
             ) {
-                Ok(crate::gitlab::GitLabRepoMetadata::Fork) => return git::RepoMetadata::Fork,
+                Ok(crate::gitlab::GitLabRepoMetadata::Fork) => {
+                    return git::WorkspaceRepositoryMetadata {
+                        kind: git::RepoMetadata::Fork,
+                        remote_url: Some(remote_url),
+                    };
+                }
                 Ok(crate::gitlab::GitLabRepoMetadata::Private) => {
-                    return git::RepoMetadata::Private;
+                    return git::WorkspaceRepositoryMetadata {
+                        kind: git::RepoMetadata::Private,
+                        remote_url: Some(remote_url),
+                    };
                 }
                 Ok(crate::gitlab::GitLabRepoMetadata::Public) => {
-                    return git::RepoMetadata::Public;
+                    return git::WorkspaceRepositoryMetadata {
+                        kind: git::RepoMetadata::Public,
+                        remote_url: Some(remote_url),
+                    };
                 }
                 Err(err) => {
                     log::warn!(
@@ -1159,7 +1185,10 @@ impl GitRepoHandle {
                         repo_slug,
                         err
                     );
-                    return git::RepoMetadata::Unknown;
+                    return git::WorkspaceRepositoryMetadata {
+                        kind: git::RepoMetadata::Unknown,
+                        remote_url: Some(remote_url),
+                    };
                 }
             }
         }
@@ -1174,13 +1203,22 @@ impl GitRepoHandle {
                 || bitbucket::fetch_repo_metadata(&remote_url),
             ) {
                 Ok(crate::bitbucket::BitbucketRepoMetadata::Fork) => {
-                    return git::RepoMetadata::Fork;
+                    return git::WorkspaceRepositoryMetadata {
+                        kind: git::RepoMetadata::Fork,
+                        remote_url: Some(remote_url),
+                    };
                 }
                 Ok(crate::bitbucket::BitbucketRepoMetadata::Private) => {
-                    return git::RepoMetadata::Private;
+                    return git::WorkspaceRepositoryMetadata {
+                        kind: git::RepoMetadata::Private,
+                        remote_url: Some(remote_url),
+                    };
                 }
                 Ok(crate::bitbucket::BitbucketRepoMetadata::Public) => {
-                    return git::RepoMetadata::Public;
+                    return git::WorkspaceRepositoryMetadata {
+                        kind: git::RepoMetadata::Public,
+                        remote_url: Some(remote_url),
+                    };
                 }
                 Err(err) => {
                     log::warn!(
@@ -1189,7 +1227,10 @@ impl GitRepoHandle {
                         repo_slug,
                         err
                     );
-                    return git::RepoMetadata::Unknown;
+                    return git::WorkspaceRepositoryMetadata {
+                        kind: git::RepoMetadata::Unknown,
+                        remote_url: Some(remote_url),
+                    };
                 }
             }
         }
@@ -1199,7 +1240,35 @@ impl GitRepoHandle {
             self.workspace.display_name,
             remote_name
         );
-        git::RepoMetadata::Unknown
+        git::WorkspaceRepositoryMetadata {
+            kind: git::RepoMetadata::Unknown,
+            remote_url: Some(remote_url),
+        }
+    }
+
+    fn primary_remote_name(&self) -> Option<String> {
+        self.git_ok(&[
+            "rev-parse".into(),
+            "--abbrev-ref".into(),
+            "--symbolic-full-name".into(),
+            "@{upstream}".into(),
+        ])
+        .ok()
+        .and_then(|upstream| upstream.split('/').next().map(ToString::to_string))
+        .filter(|remote| !remote.is_empty())
+        .or_else(|| self.remote_url("origin").map(|_| "origin".to_string()))
+        .or_else(|| {
+            self.git_ok(&["remote".into()])
+                .ok()
+                .and_then(|out| out.lines().next().map(ToString::to_string))
+                .filter(|remote| !remote.is_empty())
+        })
+    }
+
+    fn remote_url(&self, remote_name: &str) -> Option<String> {
+        self.git_ok(&["remote".into(), "get-url".into(), remote_name.to_string()])
+            .ok()
+            .filter(|url| !url.is_empty())
     }
 
     fn commit_paths_blocking(
