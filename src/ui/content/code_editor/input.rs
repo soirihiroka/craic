@@ -1322,6 +1322,10 @@ fn handle_key(
             run_action(area, state, TextContextAction::Redo);
             return gtk::glib::Propagation::Stop;
         }
+        if ctrl && !shift && matches!(key, gdk::Key::slash | gdk::Key::KP_Divide) {
+            toggle_line_comment(area, state);
+            return gtk::glib::Propagation::Stop;
+        }
         if matches!(key, gdk::Key::a | gdk::Key::A) {
             run_action(area, state, TextContextAction::SelectAll);
             return gtk::glib::Propagation::Stop;
@@ -1499,7 +1503,11 @@ fn handle_key(
     }
     if !command {
         if let Some(ch) = key.to_unicode().filter(|ch| !ch.is_control()) {
-            insert_text(area, state, &ch.to_string());
+            if let Some(close) = matching_auto_pair(ch) {
+                insert_auto_pair(area, state, ch, close);
+            } else {
+                insert_text(area, state, &ch.to_string());
+            }
             request_or_dismiss_completion(area, state);
             return gtk::glib::Propagation::Stop;
         }
@@ -2136,6 +2144,48 @@ fn insert_text(area: &gtk::DrawingArea, state: &Rc<EditorState>, inserted: &str)
     commit_edit(area, state, start, end, inserted, cursor, None, true);
 }
 
+fn matching_auto_pair(ch: char) -> Option<char> {
+    match ch {
+        '(' => Some(')'),
+        '<' => Some('>'),
+        _ => None,
+    }
+}
+
+fn insert_auto_pair(area: &gtk::DrawingArea, state: &Rc<EditorState>, open: char, close: char) {
+    let text = state.text.borrow();
+    let (start, end) = selection_bounds(state).unwrap_or_else(|| {
+        let cursor = state.cursor.get().min(text.len());
+        (cursor, cursor)
+    });
+    let selected = text[start..end].to_string();
+    drop(text);
+
+    let mut inserted = String::with_capacity(open.len_utf8() + selected.len() + close.len_utf8());
+    inserted.push(open);
+    inserted.push_str(&selected);
+    inserted.push(close);
+
+    let inner_start = start + open.len_utf8();
+    let inner_end = inner_start + selected.len();
+    let restored_selection = (start < end).then_some(Selection {
+        anchor: inner_start,
+        focus: inner_end,
+        visual_anchor: inner_start,
+        visual_focus: inner_end,
+    });
+    commit_edit(
+        area,
+        state,
+        start,
+        end,
+        &inserted,
+        inner_end,
+        restored_selection,
+        true,
+    );
+}
+
 fn insert_newline(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     let text = state.text.borrow();
     let (start, end) = selection_bounds(state).unwrap_or_else(|| {
@@ -2258,6 +2308,185 @@ fn line_indentation_edit(
 
     replacement.push_str(&text[copied_until..range_end]);
     (range_start, range_end, replacement, edits)
+}
+
+fn toggle_line_comment(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+    if !state.editable.get() {
+        return;
+    }
+
+    let language = state.language.borrow();
+    let Some(prefix) = line_comment_prefix(&language) else {
+        log::debug!(
+            "code_editor line_comment skipped unsupported language={}",
+            language.as_str()
+        );
+        return;
+    };
+    drop(language);
+
+    let text = state.text.borrow();
+    let (first_line_start, last_line_start) = indentation_line_range(&text, state);
+    let range_start = first_line_start;
+    let range_end = current_line_end(&text, last_line_start);
+    let line_starts = line_starts_between(&text, first_line_start, last_line_start);
+    let uncomment = should_uncomment_line_comment(&text, &line_starts, prefix);
+    let (replacement, edits) = line_comment_edit(
+        &text,
+        range_start,
+        range_end,
+        &line_starts,
+        prefix,
+        uncomment,
+    );
+    let before_cursor = state.cursor.get().min(text.len());
+    let before_selection = *state.selection.borrow();
+    drop(text);
+
+    if edits.is_empty() {
+        log::debug!(
+            "code_editor line_comment skipped action={}",
+            if uncomment { "uncomment" } else { "comment" }
+        );
+        return;
+    }
+
+    let cursor = map_offset_through_prefix_edits(before_cursor, &edits);
+    let restored_selection = before_selection.map(|selection| Selection {
+        anchor: map_offset_through_prefix_edits(selection.anchor, &edits),
+        focus: map_offset_through_prefix_edits(selection.focus, &edits),
+        visual_anchor: map_offset_through_prefix_edits(selection.visual_anchor, &edits),
+        visual_focus: map_offset_through_prefix_edits(selection.visual_focus, &edits),
+    });
+    log::debug!(
+        "code_editor line_comment action={} range={}..{} lines={}",
+        if uncomment { "uncomment" } else { "comment" },
+        range_start,
+        range_end,
+        edits.len()
+    );
+    commit_edit(
+        area,
+        state,
+        range_start,
+        range_end,
+        &replacement,
+        cursor,
+        restored_selection,
+        true,
+    );
+}
+
+fn line_comment_prefix(language: &str) -> Option<&'static str> {
+    match language
+        .trim()
+        .trim_start_matches('.')
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "bash" | "sh" | "shell" | "zsh" | "ignore" | "dockerfile" | "caddy" | "caddyfile"
+        | "cmake" | "ini" | "make" | "mk" | "makefile" | "nim" | "nims" | "perl" | "pl" | "pm"
+        | "powershell" | "ps1" | "psm1" | "psd1" | "python" | "py" | "pyw" | "r" | "rmd"
+        | "ruby" | "rb" | "terraform" | "tf" | "tfvars" | "toml" | "yaml" | "yml" => Some("#"),
+        "c" | "h" | "cpp" | "c++" | "cc" | "cxx" | "hh" | "hpp" | "hxx" | "cs" | "csx" | "cuda"
+        | "cu" | "cuh" | "dart" | "go" | "golang" | "hlsl" | "java" | "javascript" | "js"
+        | "mjs" | "cjs" | "jsx" | "jsonc" | "json5" | "kotlin" | "kt" | "kts" | "ktm" | "php"
+        | "phtml" | "rust" | "rs" | "scala" | "sc" | "slang" | "sol" | "swift" | "typescript"
+        | "ts" | "tsx" | "vala" | "vapi" => Some("//"),
+        "elm" | "haskell" | "hs" | "lua" | "sql" => Some("--"),
+        _ => None,
+    }
+}
+
+fn should_uncomment_line_comment(text: &str, line_starts: &[usize], prefix: &str) -> bool {
+    let mut has_nonblank_line = false;
+
+    for &line_start in line_starts {
+        let line_end = current_line_end(text, line_start);
+        let line = &text[line_start..line_end];
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        has_nonblank_line = true;
+        let indent_len = leading_whitespace(line).len();
+        if line_comment_remove_len(&line[indent_len..], prefix).is_none() {
+            return false;
+        }
+    }
+
+    has_nonblank_line
+}
+
+fn line_comment_edit(
+    text: &str,
+    range_start: usize,
+    range_end: usize,
+    line_starts: &[usize],
+    prefix: &str,
+    uncomment: bool,
+) -> (String, Vec<LinePrefixEdit>) {
+    let mut replacement = String::with_capacity(
+        range_end
+            .saturating_sub(range_start)
+            .saturating_add(line_starts.len() * (prefix.len() + 1)),
+    );
+    let mut edits = Vec::new();
+    let mut copied_until = range_start;
+
+    for &line_start in line_starts {
+        let line_end = current_line_end(text, line_start);
+        let line = &text[line_start..line_end];
+        let indent_len = leading_whitespace(line).len();
+        let edit_start = line_start + indent_len;
+        replacement.push_str(&text[copied_until..edit_start]);
+
+        if uncomment {
+            if let Some(removed) = line_comment_remove_len(&line[indent_len..], prefix) {
+                edits.push(LinePrefixEdit {
+                    start: edit_start,
+                    removed,
+                    inserted: 0,
+                });
+                copied_until = edit_start + removed;
+            } else {
+                copied_until = edit_start;
+            }
+            continue;
+        }
+
+        replacement.push_str(prefix);
+        replacement.push(' ');
+        edits.push(LinePrefixEdit {
+            start: edit_start,
+            removed: 0,
+            inserted: prefix.len() + 1,
+        });
+        copied_until = edit_start;
+    }
+
+    replacement.push_str(&text[copied_until..range_end]);
+    (replacement, edits)
+}
+
+fn line_comment_remove_len(line_after_indent: &str, prefix: &str) -> Option<usize> {
+    let rest = line_after_indent.strip_prefix(prefix)?;
+    if prefix == "#" && rest.starts_with('!') {
+        return None;
+    }
+
+    Some(
+        prefix.len()
+            + rest
+                .chars()
+                .next()
+                .filter(|ch| matches!(ch, ' ' | '\t'))
+                .map(char::len_utf8)
+                .unwrap_or(0),
+    )
 }
 
 fn indentation_line_range(text: &str, state: &Rc<EditorState>) -> (usize, usize) {

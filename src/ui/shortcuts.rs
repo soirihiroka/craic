@@ -39,6 +39,7 @@ const SHORTCUT_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Undo", "<Control>z"),
             ("Redo", "<Control><Shift>z"),
             ("Redo", "<Control>y"),
+            ("Toggle line comment", "<Control>slash"),
             ("Copy", "<Control>c"),
             ("Copy", "<Control>Insert"),
             ("Cut", "<Control>x"),
