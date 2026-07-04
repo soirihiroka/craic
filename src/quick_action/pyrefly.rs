@@ -11,20 +11,26 @@ pub(super) fn discover_pyrefly_targets(repo_path: &Path) -> Vec<RunItem> {
         return Vec::new();
     };
 
-    let Ok(contents) = std::fs::read_to_string(&pyproject_path) else {
-        log::warn!(
-            "quick action Pyrefly discovery skipped: failed to read {}",
-            pyproject_path.display()
-        );
-        return Vec::new();
+    let contents = match std::fs::read_to_string(&pyproject_path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            log::warn!(
+                "quick action Pyrefly discovery skipped: failed to read {}: {err}",
+                pyproject_path.display()
+            );
+            return Vec::new();
+        }
     };
 
-    let Ok(pyproject) = contents.parse::<toml::Value>() else {
-        log::warn!(
-            "quick action Pyrefly discovery skipped: failed to parse {}",
-            pyproject_path.display()
-        );
-        return Vec::new();
+    let pyproject = match toml::from_str::<toml::Value>(&contents) {
+        Ok(pyproject) => pyproject,
+        Err(err) => {
+            log::warn!(
+                "quick action Pyrefly discovery skipped: failed to parse {}: {err}",
+                pyproject_path.display()
+            );
+            return Vec::new();
+        }
     };
 
     if !pyproject
@@ -32,9 +38,17 @@ pub(super) fn discover_pyrefly_targets(repo_path: &Path) -> Vec<RunItem> {
         .and_then(|tool| tool.get("pyrefly"))
         .is_some_and(toml::Value::is_table)
     {
+        log::debug!(
+            "quick action Pyrefly discovery skipped: no [tool.pyrefly] table in {}",
+            pyproject_path.display()
+        );
         return Vec::new();
     }
 
+    log::debug!(
+        "quick action Pyrefly discovery found config in {}",
+        pyproject_path.display()
+    );
     vec![RunItem {
         id: "pyrefly:check".to_string(),
         label: "Check (Pyrefly)".to_string(),
