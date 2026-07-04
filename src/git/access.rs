@@ -956,6 +956,20 @@ impl GitRepoHandle {
             self.workspace.display_name,
             self.workspace.root.absolute
         );
+        if self
+            .git_ok(&["rev-parse".into(), "--is-inside-work-tree".into()])
+            .is_err()
+        {
+            log::debug!(
+                "shell git snapshot unavailable workspace={} reason=not-a-repo",
+                self.workspace.display_name
+            );
+            return Ok(RepositorySnapshot {
+                name: self.workspace.display_name.clone(),
+                ..Default::default()
+            });
+        }
+
         let name = self.workspace.display_name.clone();
         let branch = self
             .git_ok(&["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()])
