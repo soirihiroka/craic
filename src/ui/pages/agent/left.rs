@@ -4,9 +4,11 @@ use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
-use crate::ui::agent_history::{self, AgentSessionRow, RestoreState, WorkspaceKey};
+use crate::ui::agent_history::{self, AgentSessionRow, RestoreState, WorkspaceKey, WorkspaceTag};
 use crate::ui::agent_status::{AgentActiveState, AgentInactiveState, AgentSessionState};
 use crate::ui::agent_usage::AgentResourceUsage;
 use crate::ui::canvas_scroll;
@@ -92,6 +94,15 @@ struct ActiveSessionInfo {
     state: AgentSessionState,
     usage: Option<AgentResourceUsage>,
     last_seen_at_ms: i64,
+}
+
+struct AgentHistoryLoad {
+    workspace_key: String,
+    search_query: String,
+    selected_tags: Vec<String>,
+    loaded_limit: usize,
+    rows: Result<Vec<AgentSessionRow>, String>,
+    tags: Option<Result<Vec<WorkspaceTag>, String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,8 +264,10 @@ impl AgentList {
         self.loaded_limit.set(HISTORY_PAGE_SIZE);
         self.has_more.set(false);
         self.selected_tags.borrow_mut().clear();
-        self.reload_tags();
-        self.reload_history();
+        self.history_rows.borrow_mut().clear();
+        self.search_panel.set_tags(Vec::new());
+        self.reconcile_rows();
+        self.reload_workspace_history();
     }
 
     pub(in crate::ui) fn install_search_shortcuts<W: IsA<gtk::Widget>>(&self, widget: &W) {
@@ -270,29 +283,106 @@ impl AgentList {
             return;
         }
 
+        self.spawn_history_load(false);
+    }
+
+    pub(in crate::ui) fn reload_workspace_history(&self) {
+        log::debug!("agent workspace history refresh requested");
+        if self.loading.replace(true) {
+            return;
+        }
+
+        self.spawn_history_load(true);
+    }
+
+    fn spawn_history_load(&self, load_tags: bool) {
+        let Some(workspace) = self.workspace.borrow().clone() else {
+            self.loading.set(false);
+            self.history_rows.borrow_mut().clear();
+            self.has_more.set(false);
+            self.reconcile_rows();
+            return;
+        };
+
+        let workspace_key = workspace.key().to_string();
         let search_query = self.search_query.borrow().clone();
         let selected_tags = sorted_tags(&self.selected_tags.borrow());
-        let rows = self
-            .workspace
-            .borrow()
-            .as_ref()
-            .map(|workspace| {
-                agent_history::list_sessions(
-                    workspace.key(),
-                    self.loaded_limit.get().saturating_add(1),
+        let loaded_limit = self.loaded_limit.get();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn({
+            let workspace_key = workspace_key.clone();
+            let search_query = search_query.clone();
+            let selected_tags = selected_tags.clone();
+
+            move || {
+                let tags = load_tags.then(|| agent_history::workspace_tag_counts(&workspace_key));
+                let rows = agent_history::list_sessions(
+                    &workspace_key,
+                    loaded_limit.saturating_add(1),
                     0,
                     Some(&search_query),
                     &selected_tags,
-                )
-            })
-            .unwrap_or_else(|| Ok(Vec::new()));
+                );
+                let _ = sender.send(AgentHistoryLoad {
+                    workspace_key,
+                    search_query,
+                    selected_tags,
+                    loaded_limit,
+                    rows,
+                    tags,
+                });
+            }
+        });
 
+        let agent_list = self.clone();
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            match receiver.try_recv() {
+                Ok(load) => {
+                    agent_list.finish_history_load(load);
+                    glib::ControlFlow::Break
+                }
+                Err(TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(TryRecvError::Disconnected) => {
+                    agent_list.loading.set(false);
+                    log::warn!("agent history load worker disconnected");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    fn finish_history_load(&self, load: AgentHistoryLoad) {
         self.loading.set(false);
-        match rows {
+        if !self.history_load_matches(&load) {
+            log::debug!(
+                "discarding stale agent history load workspace={} query_len={} tags={} limit={}",
+                load.workspace_key,
+                load.search_query.len(),
+                load.selected_tags.len(),
+                load.loaded_limit
+            );
+            if self.workspace.borrow().is_some() {
+                self.reload_workspace_history();
+            }
+            return;
+        }
+
+        if let Some(tags) = load.tags {
+            match tags {
+                Ok(tags) => self.apply_tags(tags),
+                Err(err) => {
+                    log::warn!("agent history tags load failed: {err}");
+                    self.search_panel.set_tags(Vec::new());
+                }
+            }
+        }
+
+        match load.rows {
             Ok(mut rows) => {
-                let has_more = rows.len() > self.loaded_limit.get();
+                let has_more = rows.len() > load.loaded_limit;
                 if has_more {
-                    rows.truncate(self.loaded_limit.get());
+                    rows.truncate(load.loaded_limit);
                 }
                 self.has_more.set(has_more);
                 self.history_rows.replace(rows);
@@ -307,10 +397,14 @@ impl AgentList {
         }
     }
 
-    pub(in crate::ui) fn reload_workspace_history(&self) {
-        log::debug!("agent workspace history refresh requested");
-        self.reload_tags();
-        self.reload_history();
+    fn history_load_matches(&self, load: &AgentHistoryLoad) -> bool {
+        self.workspace
+            .borrow()
+            .as_ref()
+            .is_some_and(|workspace| workspace.key() == load.workspace_key)
+            && *self.search_query.borrow() == load.search_query
+            && sorted_tags(&self.selected_tags.borrow()) == load.selected_tags
+            && self.loaded_limit.get() == load.loaded_limit
     }
 
     pub(in crate::ui) fn connect_new_chat<F>(&self, callback: F)
@@ -597,8 +691,7 @@ impl AgentList {
         );
         self.loaded_limit.set(HISTORY_PAGE_SIZE);
         self.has_more.set(false);
-        self.reload_tags();
-        self.reload_history();
+        self.reload_workspace_history();
     }
 
     fn clear_search_filters(&self) {
@@ -616,8 +709,7 @@ impl AgentList {
             "agent list search cleared query_changed={} tag_count=0",
             query_changed
         );
-        self.reload_tags();
-        self.reload_history();
+        self.reload_workspace_history();
     }
 
     fn connect_context_menu(&self) {
@@ -731,24 +823,13 @@ impl AgentList {
         let agent_list = self.clone();
         let source_id = glib::timeout_add_local(HISTORY_DB_REFRESH_DEBOUNCE, move || {
             agent_list.debounce_source.borrow_mut().take();
-            agent_list.reload_tags();
-            agent_list.reload_history();
+            agent_list.reload_workspace_history();
             glib::ControlFlow::Break
         });
         self.debounce_source.replace(Some(source_id));
     }
 
-    fn reload_tags(&self) {
-        let tags = self
-            .workspace
-            .borrow()
-            .as_ref()
-            .map(|workspace| agent_history::workspace_tag_counts(workspace.key()))
-            .unwrap_or_else(|| Ok(Vec::new()))
-            .unwrap_or_else(|err| {
-                log::warn!("agent history tags load failed: {err}");
-                Vec::new()
-            });
+    fn apply_tags(&self, tags: Vec<WorkspaceTag>) {
         let selected_tags = self.selected_tags.borrow();
         let tags = tags
             .into_iter()

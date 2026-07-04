@@ -1,4 +1,4 @@
-use super::{Page, PageCommand, PageCommandResult, PageContext};
+use super::{Page, PageCommand, PageCommandResult, PageContext, PageInitializeComplete};
 use crate::git::GitRepoHandle;
 use crate::git::{self, BytesComparison, FileComparison, RepositorySnapshot};
 use crate::system::capabilities::url::UrlOpenActivation;
@@ -183,12 +183,8 @@ impl Page for HistoryPage {
         "document-open-recent-symbolic"
     }
 
-    fn left(&self) -> gtk::Widget {
-        self.left.root.clone().upcast()
-    }
-
-    fn right(&self) -> gtk::Widget {
-        self.right.root()
+    fn initialize(&self, completion: PageInitializeComplete) {
+        completion(self.left.root.clone().upcast(), self.right.root());
     }
 
     fn activate(&self) {

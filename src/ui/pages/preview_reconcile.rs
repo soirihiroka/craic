@@ -9,6 +9,9 @@ pub(super) type RightPreviewReconciler =
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum RightPreviewState {
     Home,
+    Loading {
+        file_path: String,
+    },
     Diff {
         file_path: String,
         row_count: usize,
@@ -70,6 +73,12 @@ fn log_preview_stats(log_target: &str, state: &RightPreviewState, stats: Reconci
     match state {
         RightPreviewState::Home => {
             log::debug!("{log_target} preview reconcile state=home stats={stats:?}");
+        }
+        RightPreviewState::Loading { file_path } => {
+            log::debug!(
+                "{log_target} preview reconcile state=loading path={} stats={stats:?}",
+                file_path
+            );
         }
         RightPreviewState::Diff {
             file_path,

@@ -1,7 +1,8 @@
 mod docker;
 
 use super::{
-    Page, PageCommand, PageCommandResult, PageContext, PageRefreshComplete, PageRefreshRequest,
+    Page, PageCommand, PageCommandResult, PageContext, PageInitializeComplete, PageRefreshComplete,
+    PageRefreshRequest,
 };
 use crate::git::RepositorySnapshot;
 use crate::system::WorkspacePath;
@@ -219,12 +220,11 @@ impl Page for ContainersPage {
         "container-symbolic"
     }
 
-    fn left(&self) -> gtk::Widget {
-        self.left.root.clone().upcast()
-    }
-
-    fn right(&self) -> gtk::Widget {
-        self.right.root.clone().upcast()
+    fn initialize(&self, completion: PageInitializeComplete) {
+        completion(
+            self.left.root.clone().upcast(),
+            self.right.root.clone().upcast(),
+        );
     }
 
     fn activate(&self) {

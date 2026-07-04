@@ -2,7 +2,7 @@ mod left;
 mod provider;
 mod right;
 
-use super::{Page, PageCommand, PageCommandResult, PageContext};
+use super::{Page, PageCommand, PageCommandResult, PageContext, PageInitializeComplete};
 use crate::git::RepositorySnapshot;
 use crate::gitignore;
 use crate::system::capabilities::docker::ComposeFileAction;
@@ -595,12 +595,11 @@ impl Page for FilePage {
         "code-symbolic"
     }
 
-    fn left(&self) -> gtk::Widget {
-        self.left.root.clone().upcast()
-    }
-
-    fn right(&self) -> gtk::Widget {
-        self.right.root.clone().upcast()
+    fn initialize(&self, completion: PageInitializeComplete) {
+        completion(
+            self.left.root.clone().upcast(),
+            self.right.root.clone().upcast(),
+        );
     }
 
     fn activate(&self) {

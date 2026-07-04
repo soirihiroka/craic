@@ -5,9 +5,11 @@ use gtk::glib;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const FILE_BROWSER_WATCH_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const FILE_BROWSER_WATCH_REFRESH_DEBOUNCE: Duration = Duration::from_millis(350);
+const FILE_BROWSER_WATCH_REFRESH_MAX_DELAY: Duration = Duration::from_millis(1200);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct FileBrowserWatchSignature {
@@ -73,18 +75,38 @@ impl FileBrowser {
 
         self.file_watch_signature.replace(Some(signature.clone()));
         let browser = Rc::clone(self);
+        let mut pending_changed_paths = HashSet::new();
+        let mut pending_since = None::<Instant>;
+        let mut last_change_at = None::<Instant>;
         let source_id =
             glib::timeout_add_local(FILE_BROWSER_WATCH_EVENT_POLL_INTERVAL, move || {
                 if browser.file_watch_generation.get() != generation {
                     return glib::ControlFlow::Break;
                 }
 
-                let mut changed_paths = HashSet::new();
+                let now = Instant::now();
+                let mut received = false;
                 while let Ok(changes) = receiver.try_recv() {
-                    changed_paths.extend(changes);
+                    pending_changed_paths.extend(changes);
+                    received = true;
+                }
+                if received {
+                    if pending_since.is_none() {
+                        pending_since = Some(now);
+                    }
+                    last_change_at = Some(now);
                 }
 
-                if !changed_paths.is_empty() {
+                let quiet = last_change_at.is_some_and(|last| {
+                    now.duration_since(last) >= FILE_BROWSER_WATCH_REFRESH_DEBOUNCE
+                });
+                let max_waited = pending_since.is_some_and(|since| {
+                    now.duration_since(since) >= FILE_BROWSER_WATCH_REFRESH_MAX_DELAY
+                });
+                if !pending_changed_paths.is_empty() && (quiet || max_waited) {
+                    let changed_paths = std::mem::take(&mut pending_changed_paths);
+                    pending_since = None;
+                    last_change_at = None;
                     browser.refresh_watched_folder_view(generation, changed_paths);
                 }
 
