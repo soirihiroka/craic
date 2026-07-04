@@ -87,17 +87,17 @@ fn android_manifest_candidates(repo_path: &Path) -> Vec<PathBuf> {
         }
     }
 
-    let mut modules = fs::read_dir(repo_path).ok()?;
+    if let Ok(entries) = fs::read_dir(repo_path) {
+        for entry in entries.filter_map(Result::ok) {
+            let module_path = entry.path();
+            if !module_path.is_dir() {
+                continue;
+            }
 
-    for entry in modules.by_ref().filter_map(Result::ok) {
-        let module_path = entry.path();
-        if !module_path.is_dir() {
-            continue;
-        }
-
-        let manifest_path = module_path.join("src/main/AndroidManifest.xml");
-        if manifest_path.is_file() {
-            manifests.push(manifest_path);
+            let manifest_path = module_path.join("src/main/AndroidManifest.xml");
+            if manifest_path.is_file() {
+                manifests.push(manifest_path);
+            }
         }
     }
 
@@ -111,15 +111,6 @@ fn android_manifest_candidates(repo_path: &Path) -> Vec<PathBuf> {
     }
 
     manifests
-}
-
-fn android_manifest_package_name(repo_path: &Path) -> Option<String> {
-    android_manifest_candidates(repo_path)
-        .into_iter()
-        .find_map(|manifest_path| {
-            let manifest = fs::read_to_string(manifest_path).ok()?;
-            android_manifest_package_name_from_contents(&manifest)
-        })
 }
 
 fn android_manifest_package_name_from_contents(contents: &str) -> Option<String> {
@@ -184,8 +175,9 @@ fn android_manifest_launch_component_from_contents(
         }
     }
 
-    let alias_re = Regex::new(r#"(?s)<activity-alias\b[^>]*>.*?</activity-alias>|<activity-alias\b[^>]*/>"#)
-        .ok()?;
+    let alias_re =
+        Regex::new(r#"(?s)<activity-alias\b[^>]*>.*?</activity-alias>|<activity-alias\b[^>]*/>"#)
+            .ok()?;
     for alias in alias_re.find_iter(manifest) {
         let tag = alias.as_str();
         let has_launcher_intent_filter = if tag.contains("<intent-filter") {
@@ -211,11 +203,11 @@ fn android_manifest_launch_component_from_contents(
 
 fn normalize_android_class_name(package_name: &str, class_name: &str) -> String {
     if class_name.starts_with('.') {
-        format!("{package_name}{class_name}")
+        format!("{package_name}/{class_name}")
     } else if class_name.contains('.') {
-        class_name.to_string()
+        format!("{package_name}/{class_name}")
     } else {
-        format!("{package_name}.{class_name}")
+        format!("{package_name}/{package_name}.{class_name}")
     }
 }
 
@@ -282,39 +274,17 @@ pub(super) fn discover_gradle_targets(repo_path: &Path) -> Vec<RunItem> {
 }
 
 fn adb_debug_run_command(repo_path: &Path, gradle_program: &str) -> String {
-    let launch_command = android_manifest_launch_component(repo_path).map_or_else(
-        || {
-            android_manifest_package_name(repo_path).map_or_else(
-                || {
-                    "adb shell am start -D -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER"
-                        .to_string()
-                },
-                |package_name| {
-                    format!(
-                        "adb shell am start -D -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package_name}"
-                    )
-                },
-            )
-        },
-        |component| format!("adb shell am start -D -W -n {component}"),
-    );
-
-    let launch_command = if !launch_command.contains("package_name=") {
-        format!(
-            "if [[ \"{launch_command}\" == *\"-n\"* ]]; then\n            {launch_command};\n        else\n            package_name=\"{package_name}\"; adb shell monkey -p \"$package_name\" -c android.intent.category.LAUNCHER 1;\n        fi"
-        )
-    } else {
-        launch_command
+    let Some(component) = android_manifest_launch_component(repo_path) else {
+        return include_str!("android_debug_run_missing_launcher.sh")
+            .replace("__GRADLE_PROGRAM__", gradle_program);
     };
+    let component = shell_quote(&component);
 
-    format!(
-        r#"{gradle_program} assembleDebug && \
-apk_path="$(find . -type f -path '*/build/outputs/apk/debug/*.apk' | head -n 1)" && \
-if [ -z "$apk_path" ]; then \
-    echo "No debug APK found to install." >&2; \
-    exit 1; \
-fi && \
-adb install -r "$apk_path" && \
-{launch_command}"#
-    )
+    include_str!("android_debug_run.sh")
+        .replace("__GRADLE_PROGRAM__", gradle_program)
+        .replace("__COMPONENT__", &component)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
