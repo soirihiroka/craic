@@ -7,14 +7,16 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 mod bun;
+mod cargo;
 mod gradle;
 mod makefile;
 mod pyrefly;
 
 const MAKEFILE_ICON_NAME: &str = "text-makefile-symbolic";
 const BUN_ICON_NAME: &str = "devicon-bun-symbolic";
+const CARGO_ICON_NAME: &str = "text-rust-symbolic";
 const GRADLE_ICON_NAME: &str = "devicon-gradle-symbolic";
-const PYREFLY_ICON_NAME: &str = "devicon-python-symbolic";
+const PYREFLY_ICON_NAME: &str = "text-x-python-symbolic";
 const CUSTOM_ICON_NAME: &str = "utilities-terminal-symbolic";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +36,7 @@ pub enum RunCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunTargetsSignature {
+    cargo: FileSignature,
     makefile: FileSignature,
     package_json: FileSignature,
     bun_lock: FileSignature,
@@ -52,6 +55,7 @@ struct FileSignature {
 
 pub fn targets_signature(repo_path: &Path) -> RunTargetsSignature {
     RunTargetsSignature {
+        cargo: file_signature(cargo::cargo_manifest_path(repo_path)),
         makefile: file_signature(makefile::makefile_path(repo_path)),
         package_json: file_signature(bun::package_json_path(repo_path)),
         bun_lock: file_signature(bun::bun_lock_path(repo_path)),
@@ -68,7 +72,8 @@ fn local_config_path(repo_path: &Path) -> Option<PathBuf> {
 }
 
 pub fn discover(repo_path: &Path) -> Vec<RunItem> {
-    let mut targets = makefile::discover_makefile_targets(repo_path);
+    let mut targets = cargo::discover_cargo_targets(repo_path);
+    targets.extend(makefile::discover_makefile_targets(repo_path));
     targets.extend(bun::discover_bun_scripts(repo_path));
     targets.extend(gradle::discover_gradle_targets(repo_path));
     targets.extend(pyrefly::discover_pyrefly_targets(repo_path));
