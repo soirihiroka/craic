@@ -1,5 +1,5 @@
 use super::{picker, widgets};
-use crate::git::{GitRepoHandle, RepositorySnapshot};
+use crate::git::{GitRepoHandle, RepositorySnapshot, WorkspaceSnapshot};
 use crate::system::SystemRef;
 use crate::system::capabilities::github::GitHubAccess;
 use crate::ui::pages::PageRef;
@@ -130,6 +130,21 @@ impl SidebarPane {
             git_handle,
             github_access,
         );
+    }
+
+    pub fn update_workspace(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        workspace_key: &str,
+        system: &SystemRef,
+    ) {
+        match snapshot {
+            WorkspaceSnapshot::Repository(snapshot) => self.update(snapshot, workspace_key, system),
+            WorkspaceSnapshot::NonRepository { name } => {
+                self.repository_picker.set_button_label(name);
+                self.repository_picker.set_button_icon("folder-symbolic");
+            }
+        }
     }
 
     pub fn update(&self, snapshot: &RepositorySnapshot, workspace_key: &str, system: &SystemRef) {

@@ -204,6 +204,9 @@ fn set_active_workspace(state: &Rc<AppState>, workspace: ConfiguredWorkspace) {
     *state.repo_path.borrow_mut() = active.repo_path.clone();
     state.system_ref.replace(active.system_ref);
     state.workspace_ref.replace(active.workspace_ref);
+    for page in &state.pages {
+        page.workspace_changed();
+    }
     apply_workspace_color(state);
     crate::config::save_last_workspace(&workspace);
     refresh_active_repo_metadata(state, Some(item_id));

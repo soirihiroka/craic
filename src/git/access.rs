@@ -1,5 +1,7 @@
 use crate::ai_commit::CommitMessageContext;
-use crate::git::{self, BranchInfo, ChangedFile, GitSettings, RepositorySnapshot};
+use crate::git::{
+    self, BranchInfo, ChangedFile, GitSettings, RepositorySnapshot, WorkspaceSnapshot,
+};
 use crate::gitignore;
 use crate::system::capabilities::{
     files::FileAccess,
@@ -548,7 +550,16 @@ where
 impl GitRepoHandle {
     pub(crate) fn snapshot(&self, callback: OperationCallback<RepositorySnapshot>) {
         let handle = self.clone();
-        run_operation("git snapshot", callback, move || handle.snapshot_blocking());
+        run_operation("git snapshot", callback, move || {
+            handle.repository_snapshot_blocking()
+        });
+    }
+
+    pub(crate) fn workspace_snapshot(&self, callback: OperationCallback<WorkspaceSnapshot>) {
+        let handle = self.clone();
+        run_operation("git workspace snapshot", callback, move || {
+            handle.workspace_snapshot_blocking()
+        });
     }
 
     pub(crate) fn add_on_change_listener(
@@ -950,7 +961,7 @@ impl GitRepoHandle {
         });
     }
 
-    fn snapshot_blocking(&self) -> Result<RepositorySnapshot, String> {
+    fn workspace_snapshot_blocking(&self) -> Result<WorkspaceSnapshot, String> {
         log::info!(
             "shell git snapshot start workspace={} root={}",
             self.workspace.display_name,
@@ -964,10 +975,25 @@ impl GitRepoHandle {
                 "shell git snapshot unavailable workspace={} reason=not-a-repo",
                 self.workspace.display_name
             );
-            return Ok(RepositorySnapshot {
+            return Ok(WorkspaceSnapshot::NonRepository {
                 name: self.workspace.display_name.clone(),
-                ..Default::default()
             });
+        }
+
+        self.repository_snapshot_blocking()
+            .map(WorkspaceSnapshot::Repository)
+    }
+
+    fn repository_snapshot_blocking(&self) -> Result<RepositorySnapshot, String> {
+        if self
+            .git_ok(&["rev-parse".into(), "--is-inside-work-tree".into()])
+            .is_err()
+        {
+            log::debug!(
+                "shell git snapshot unavailable workspace={} reason=not-a-repo",
+                self.workspace.display_name
+            );
+            return Err("Not a git repository.".to_string());
         }
 
         let name = self.workspace.display_name.clone();
@@ -1683,7 +1709,7 @@ impl GitRepoHandle {
             self.workspace.display_name,
             files.len()
         );
-        let snapshot = self.snapshot_blocking()?;
+        let snapshot = self.repository_snapshot_blocking()?;
         let response: PythonCommitMessageDiffResponse = self.run_python_json(
             "git commit message diff",
             PYTHON_COMMIT_MESSAGE_DIFF_SCRIPT,

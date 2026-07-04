@@ -4,7 +4,7 @@ use super::{
     Page, PageCommand, PageCommandResult, PageContext, PageInitializeComplete, PageRefreshComplete,
     PageRefreshRequest,
 };
-use crate::git::RepositorySnapshot;
+use crate::git::WorkspaceSnapshot;
 use crate::system::WorkspacePath;
 use crate::system::capabilities::shell::ShellCommandSpec;
 use crate::ui::components::context_menu::{self, ActionMenuItem, ActionMenuSection};
@@ -231,7 +231,9 @@ impl Page for ContainersPage {
         self.refresh_containers();
     }
 
-    fn refresh(&self, _snapshot: &RepositorySnapshot) {}
+    fn refresh(&self, _snapshot: &WorkspaceSnapshot, completion: PageRefreshComplete) {
+        completion();
+    }
 
     fn refresh_page(&self, completion: PageRefreshComplete) -> PageRefreshRequest {
         log::info!("containers page refresh requested");

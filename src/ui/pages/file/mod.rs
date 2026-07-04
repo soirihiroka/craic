@@ -2,8 +2,10 @@ mod left;
 mod provider;
 mod right;
 
-use super::{Page, PageCommand, PageCommandResult, PageContext, PageInitializeComplete};
-use crate::git::RepositorySnapshot;
+use super::{
+    Page, PageCommand, PageCommandResult, PageContext, PageInitializeComplete, PageRefreshComplete,
+};
+use crate::git::WorkspaceSnapshot;
 use crate::gitignore;
 use crate::system::capabilities::docker::ComposeFileAction;
 use crate::system::capabilities::files::{
@@ -610,20 +612,27 @@ impl Page for FilePage {
         self.show_active_selection();
     }
 
-    fn refresh(&self, snapshot: &RepositorySnapshot) {
+    fn refresh(&self, snapshot: &WorkspaceSnapshot, completion: PageRefreshComplete) {
         let workspace = self.ctx.workspace_ref();
         self.file_monitor.stop_if_workspace_changed(&workspace);
         clear_displayed_preview_if_workspace_changed(&self.displayed_preview, &workspace);
         let Some(file_browser) = &self.left.file_browser else {
             self.right
                 .show_unavailable("Files", "Files are unavailable for this workspace.");
+            completion();
             return;
         };
         if let Some(file_access) = self.ctx.files() {
             file_browser.set_desktop_opener(self.ctx.desktop_opener());
             file_browser.set_terminal_actions_available(self.ctx.shell().is_some());
             file_browser.set_container_actions_available(self.ctx.docker().is_some());
-            file_browser.refresh(Some(&snapshot.changed_files), file_access, self.ctx.git());
+            file_browser.refresh(
+                snapshot
+                    .repository()
+                    .map(|snapshot| snapshot.changed_files.as_slice()),
+                file_access,
+                self.ctx.git(),
+            );
         } else {
             file_browser.set_desktop_opener(None);
             file_browser.set_terminal_actions_available(false);
@@ -631,6 +640,7 @@ impl Page for FilePage {
             self.right
                 .show_unavailable("Files", "Files are unavailable for this workspace.");
         }
+        completion();
     }
 
     fn set_error(&self, message: &str) {

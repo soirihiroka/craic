@@ -1,4 +1,4 @@
-use crate::git::RepositorySnapshot;
+use crate::git::WorkspaceSnapshot;
 use crate::system::capabilities::shell::ShellCommandSpec;
 use crate::system::capabilities::{
     docker::DockerAccess, files::FileAccess, open::DesktopOpenAccess, shell::ShellAccess,
@@ -27,9 +27,10 @@ pub(crate) trait Page {
     fn icon_name(&self) -> &'static str;
     fn initialize(&self, completion: PageInitializeComplete);
     fn activate(&self) {}
-    fn refresh(&self, snapshot: &RepositorySnapshot);
+    fn workspace_changed(&self) {}
+    fn refresh(&self, snapshot: &WorkspaceSnapshot, completion: PageRefreshComplete);
     fn refresh_page(&self, _completion: PageRefreshComplete) -> PageRefreshRequest {
-        PageRefreshRequest::RepositorySnapshot
+        PageRefreshRequest::WorkspaceSnapshot
     }
     fn set_error(&self, message: &str);
     fn badge(&self) -> Option<PageBadge> {
@@ -55,7 +56,7 @@ pub(crate) type PageRefreshComplete = Rc<dyn Fn() + 'static>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PageRefreshRequest {
-    RepositorySnapshot,
+    WorkspaceSnapshot,
     Custom,
 }
 

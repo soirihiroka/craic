@@ -8,7 +8,7 @@ pub(super) mod folder_view;
 pub(super) mod pdf_preview;
 
 use super::{file_type, widgets};
-use crate::git::RepositorySnapshot;
+use crate::git::{RepositorySnapshot, WorkspaceSnapshot};
 use crate::github::PullRequestInfo;
 use crate::quick_action::{self, RunCommand, RunItem, RunTargetsSignature};
 use crate::system::WorkspacePath;
@@ -250,6 +250,13 @@ impl ContentPane {
             self.header.add_css_class("workspace-titlebar-color");
         } else {
             self.header.remove_css_class("workspace-titlebar-color");
+        }
+    }
+
+    pub fn update_workspace(&self, snapshot: &WorkspaceSnapshot, action_running: bool) {
+        match snapshot {
+            WorkspaceSnapshot::Repository(snapshot) => self.update(snapshot, action_running),
+            WorkspaceSnapshot::NonRepository { .. } => self.set_error("Not a git repository."),
         }
     }
 

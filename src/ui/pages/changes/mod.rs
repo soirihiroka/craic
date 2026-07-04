@@ -1,9 +1,13 @@
 mod left;
 mod right;
 
-use super::{Page, PageBadge, PageCommand, PageCommandResult, PageContext, PageInitializeComplete};
+use super::{
+    Page, PageBadge, PageCommand, PageCommandResult, PageContext, PageInitializeComplete,
+    PageRefreshComplete,
+};
 use crate::git::{
     self, BytesComparison, FileComparison, GitRepoHandle, OperationCallback, RepositorySnapshot,
+    WorkspaceSnapshot,
 };
 use crate::github::CommitEmailOption;
 use crate::gitignore::{self, IgnoreTargetKind};
@@ -493,7 +497,13 @@ impl Page for ChangesPage {
         );
     }
 
-    fn refresh(&self, snapshot: &RepositorySnapshot) {
+    fn refresh(&self, snapshot: &WorkspaceSnapshot, completion: PageRefreshComplete) {
+        let Some(snapshot) = snapshot.repository() else {
+            self.set_error("Not a git repository.");
+            completion();
+            return;
+        };
+
         sync_worktree_preview_workspace(
             &self.preview_workspace_key,
             &self.preview_signatures,
@@ -516,6 +526,7 @@ impl Page for ChangesPage {
         if let Some(file_path) = self.panel.selected_file_path() {
             let signature = worktree_preview_signature(snapshot, &file_path);
             if self.active_preview_signature.borrow().as_ref() == Some(&signature) {
+                completion();
                 return;
             }
             show_worktree_preview(
@@ -529,6 +540,7 @@ impl Page for ChangesPage {
             self.active_preview_signature.borrow_mut().take();
             self.right.show_home();
         }
+        completion();
     }
 
     fn set_error(&self, message: &str) {
