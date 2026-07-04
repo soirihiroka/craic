@@ -270,10 +270,42 @@ impl SshFileAccess {
                 )
             })?;
         let script = shell_read_with_info_script(&resolved.remote_path, request.max_bytes);
-        let output = self
-            .runner
-            .run_script("read file node with info", &script)
-            .map_err(|err| Self::remote_error(operation, Some(request.path.clone()), None, err))?;
+        let output_result = self.runner.run_script_with_stdout_progress(
+            "read file node with info",
+            &script,
+            |stdout| {
+                Self::check_canceled(operation, &request.path, &request.cancel_requested)
+                    .map_err(|err| err.to_string())?;
+                if let Some((completed_bytes, total_bytes)) = remote_read_progress(stdout) {
+                    Self::emit_progress(
+                        callback,
+                        FileOperationProgress {
+                            operation,
+                            source: Some(request.path.clone()),
+                            current_path: Some(request.path.clone()),
+                            completed_bytes,
+                            total_bytes,
+                            completed_files: (completed_bytes == total_bytes) as u64,
+                            total_files: 1,
+                            destination: None,
+                        },
+                    );
+                }
+                Ok(())
+            },
+        );
+        let output = match output_result {
+            Ok(output) => output,
+            Err(err) => {
+                Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
+                return Err(Self::remote_error(
+                    operation,
+                    Some(request.path.clone()),
+                    None,
+                    err,
+                ));
+            }
+        };
         let read = parse_read_output(self, resolved.path, output.stdout).map_err(|err| {
             Self::operation_error(
                 operation,
@@ -367,22 +399,38 @@ impl SshFileAccess {
                 std::slice::from_ref(&resolved.remote_path),
             ),
         };
-        self.runner
-            .run_script_with_stdin("write file", &script, Some(contents))
-            .map_err(|err| Self::remote_error(operation, Some(request.path.clone()), None, err))?;
-        Self::emit_progress(
-            callback,
-            FileOperationProgress {
-                operation,
-                source: Some(request.path.clone()),
-                destination: Some(request.path.clone()),
-                current_path: Some(request.path.clone()),
-                completed_bytes: contents.len() as u64,
-                total_bytes: contents.len() as u64,
-                completed_files: 1,
-                total_files: 1,
+        let write_result = self.runner.run_script_with_stdin_progress(
+            "write file",
+            &script,
+            contents,
+            |completed_bytes, total_bytes| {
+                Self::check_canceled(operation, &request.path, &request.cancel_requested)
+                    .map_err(|err| err.to_string())?;
+                Self::emit_progress(
+                    callback,
+                    FileOperationProgress {
+                        operation,
+                        source: Some(request.path.clone()),
+                        destination: Some(request.path.clone()),
+                        current_path: Some(request.path.clone()),
+                        completed_bytes,
+                        total_bytes,
+                        completed_files: (completed_bytes == total_bytes) as u64,
+                        total_files: 1,
+                    },
+                );
+                Ok(())
             },
         );
+        if let Err(err) = write_result {
+            Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
+            return Err(Self::remote_error(
+                operation,
+                Some(request.path.clone()),
+                None,
+                err,
+            ));
+        }
         Ok(())
     }
 
@@ -1071,6 +1119,21 @@ fn parse_read_output(
     let info = access.node_info(path, kind, len, modified, readonly, executable, None);
     let bytes = readable.then(|| stdout[header_end + 1..].to_vec());
     Ok(FileRead { info, bytes })
+}
+
+fn remote_read_progress(stdout: &[u8]) -> Option<(u64, u64)> {
+    let header_end = stdout.iter().position(|byte| *byte == b'\n')?;
+    let header = std::str::from_utf8(&stdout[..header_end]).ok()?;
+    let fields = header.split('\t').collect::<Vec<_>>();
+    if fields.len() < 7 || fields[0] != "CRAIC-FILE-READ" || fields[6] != "1" {
+        return None;
+    }
+    let total_bytes = fields[2].parse::<u64>().ok()?;
+    let completed_bytes = stdout
+        .len()
+        .saturating_sub(header_end + 1)
+        .min(total_bytes as usize) as u64;
+    Some((completed_bytes, total_bytes))
 }
 
 fn validate_child_name(name: &str) -> Result<(), String> {
