@@ -231,6 +231,14 @@ impl TerminalPanel {
         !self.sessions.borrow().is_empty()
     }
 
+    pub fn active_task_count(&self) -> usize {
+        self.sessions
+            .borrow()
+            .iter()
+            .filter(|session| active_task_name(session).is_some())
+            .count()
+    }
+
     pub fn connect_empty<F: Fn() + 'static>(&self, callback: F) {
         self.empty_handlers.borrow_mut().push(Box::new(callback));
     }

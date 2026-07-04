@@ -873,6 +873,9 @@ impl LocalFileAccess {
             FileWriteMode::Replace => {
                 options.create(true).truncate(true);
             }
+            FileWriteMode::Append => {
+                options.create(false).append(true);
+            }
         }
         let mut file = options.open(&local_path).map_err(|err| {
             Self::io_error(

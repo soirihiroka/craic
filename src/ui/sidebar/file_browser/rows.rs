@@ -7,6 +7,7 @@ use crate::system::capabilities::files::FileNodeKind;
 use crate::ui::{canvas_scrollbar, components::tree_view, file_status, file_type};
 use gtk::gdk;
 use gtk::prelude::*;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 const ROOT_GAP_HEIGHT: f64 = tree_view::ICON_ROW_HEIGHT_F64 * 4.0;
@@ -19,6 +20,7 @@ pub(super) enum BrowserListRow {
     NewEntry(NewEntryRow),
     RenameEntry(RenameEntryRow),
     Loading(LoadingRow),
+    Transfer(TransferPlaceholderRow),
     Search(SearchMatch),
     Status(String),
     RootGap,
@@ -31,6 +33,7 @@ impl BrowserListRow {
             | Self::NewEntry(_)
             | Self::RenameEntry(_)
             | Self::Loading(_)
+            | Self::Transfer(_)
             | Self::Search(_) => tree_view::ICON_ROW_HEIGHT_F64,
             Self::Status(_) => tree_view::ICON_ROW_HEIGHT_F64,
             Self::RootGap => ROOT_GAP_HEIGHT,
@@ -55,6 +58,13 @@ pub(super) struct RenameEntryRow {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct LoadingRow {
     pub(super) folder: FileNodePath,
+    pub(super) depth: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct TransferPlaceholderRow {
+    pub(super) path: FileNodePath,
+    pub(super) name: String,
     pub(super) depth: usize,
 }
 
@@ -105,33 +115,27 @@ impl FileBrowser {
                 let browser = self.clone();
 
                 move |paths, y, actions, modifiers| {
-                    browser.handle_drop_hover(
-                        paths.as_ref().is_some_and(|paths| !paths.is_empty()),
-                        browser.drop_target_folder_at_y(y),
-                        actions,
-                        modifiers,
-                    )
+                    let target_path = browser.drop_target_folder_at_y(y);
+                    if paths.as_ref().is_some_and(|paths| !paths.is_empty()) {
+                        browser.handle_external_drop_hover(target_path, actions)
+                    } else {
+                        browser.handle_internal_drop_hover(target_path, actions, modifiers)
+                    }
                 }
             })
             .on_file_drop({
                 let browser = self.clone();
 
-                move |sources, y, actions, modifiers| {
+                move |sources, y, actions, _| {
                     let target_path = browser.drop_target_folder_at_y(y);
-                    browser.handle_dropped_paths(
-                        !sources.is_empty(),
-                        target_path,
-                        actions,
-                        modifiers,
-                    )
+                    browser.handle_external_dropped_paths(sources, target_path, actions)
                 }
             })
             .on_async_hover({
                 let browser = self.clone();
 
                 move |y, actions, modifiers| {
-                    browser.handle_drop_hover(
-                        false,
+                    browser.handle_internal_drop_hover(
                         browser.drop_target_folder_at_y(y),
                         actions,
                         modifiers,
@@ -143,7 +147,7 @@ impl FileBrowser {
 
                 move |_drop, y, actions, modifiers| {
                     let target_path = browser.drop_target_folder_at_y(y);
-                    browser.handle_dropped_paths(false, target_path, actions, modifiers)
+                    browser.handle_internal_dropped_paths(target_path, actions, modifiers)
                 }
             })
             .on_leave({
@@ -156,9 +160,11 @@ impl FileBrowser {
     }
 
     pub(super) fn set_browser_rows(self: &Rc<Self>, mut rows: Vec<BrowserListRow>) {
+        rows.retain(|row| !matches!(row, BrowserListRow::Transfer(_)));
         if !self.deleting_paths.borrow().is_empty() {
             rows.retain(|row| !self.browser_row_is_deleting(row));
         }
+        self.insert_transfer_rows(&mut rows);
         if !matches!(rows.last(), Some(BrowserListRow::RootGap)) {
             rows.push(BrowserListRow::RootGap);
         }
@@ -195,10 +201,33 @@ impl FileBrowser {
             BrowserListRow::Tree(row) => self.path_is_deleting(&row.node_path),
             BrowserListRow::RenameEntry(row) => self.path_is_deleting(&row.row.node_path),
             BrowserListRow::Loading(row) => self.path_is_deleting(&row.folder),
+            BrowserListRow::Transfer(row) => self.path_is_deleting(&row.path),
             BrowserListRow::Search(search_match) => self.path_is_deleting(&search_match.node_path),
             BrowserListRow::NewEntry(_) | BrowserListRow::Status(_) | BrowserListRow::RootGap => {
                 false
             }
+        }
+    }
+
+    fn insert_transfer_rows(&self, rows: &mut Vec<BrowserListRow>) {
+        let existing_paths = rows
+            .iter()
+            .filter_map(|row| match row {
+                BrowserListRow::Tree(row) => Some(row.node_path.clone()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut inserted_paths = HashSet::new();
+        for transfer in self.active_transfer_rows() {
+            if existing_paths.contains(&transfer.path)
+                || !inserted_paths.insert(transfer.path.clone())
+            {
+                continue;
+            }
+            let Some(index) = transfer_row_insert_index(rows, &transfer.path) else {
+                continue;
+            };
+            rows.insert(index, BrowserListRow::Transfer(transfer));
         }
     }
 
@@ -313,6 +342,9 @@ impl FileBrowser {
                 update_status_row_widget(widget, previous, next);
             }
             (BrowserListRowRenderState::Loading(_), BrowserListRowRenderState::Loading(_)) => {}
+            (BrowserListRowRenderState::Transfer(_), BrowserListRowRenderState::Transfer(_)) => {
+                replace_row_widget(widget, self.row_widget(index, next));
+            }
             (BrowserListRowRenderState::RootGap, BrowserListRowRenderState::RootGap) => {}
             _ => replace_row_widget(widget, self.row_widget(index, next)),
         }
@@ -403,6 +435,7 @@ impl FileBrowser {
                 self.rename_entry_row_widget(row, *expanded)
             }
             BrowserListRowRenderState::Loading(row) => self.loading_row_widget(row),
+            BrowserListRowRenderState::Transfer(row) => self.transfer_row_widget(row),
             BrowserListRowRenderState::Search {
                 search_match,
                 selected,
@@ -553,6 +586,25 @@ impl FileBrowser {
         icon_row.root
     }
 
+    fn transfer_row_widget(self: &Rc<Self>, row: &TransferPlaceholderRow) -> gtk::Box {
+        let mut builder = tree_view::IconRow::builder(&row.name)
+            .set_icon(file_row_icon(&row.name, false))
+            .depth(row.depth)
+            .end_padding(row_end_padding());
+        if let Some(progress) = self.transfer_progress_for_path(&row.path) {
+            let browser = self.clone();
+            let row_path = row.path.clone();
+            builder = builder.progress(icon_row_progress(&progress), move || {
+                if let Some(progress) = browser.transfer_progress_for_path(&row_path) {
+                    browser.confirm_cancel_transfers(progress.transfer_ids);
+                }
+            });
+        }
+        let icon_row = builder.build();
+        icon_row.title.add_css_class("dim-label");
+        icon_row.root
+    }
+
     fn search_row_widget(self: &Rc<Self>, search_match: &SearchMatch, selected: bool) -> gtk::Box {
         let line = gtk::Label::builder()
             .label(format!("{}:", search_match.line_number))
@@ -646,25 +698,19 @@ impl FileBrowser {
                 let folder = folder.clone();
 
                 move |paths, _, actions, modifiers| {
-                    browser.handle_drop_hover(
-                        paths.as_ref().is_some_and(|paths| !paths.is_empty()),
-                        folder.clone(),
-                        actions,
-                        modifiers,
-                    )
+                    if paths.as_ref().is_some_and(|paths| !paths.is_empty()) {
+                        browser.handle_external_drop_hover(folder.clone(), actions)
+                    } else {
+                        browser.handle_internal_drop_hover(folder.clone(), actions, modifiers)
+                    }
                 }
             })
             .on_file_drop({
                 let browser = self.clone();
                 let folder = folder.clone();
 
-                move |sources, _, actions, modifiers| {
-                    browser.handle_dropped_paths(
-                        !sources.is_empty(),
-                        folder.clone(),
-                        actions,
-                        modifiers,
-                    )
+                move |sources, _, actions, _| {
+                    browser.handle_external_dropped_paths(sources, folder.clone(), actions)
                 }
             })
             .on_async_hover({
@@ -672,7 +718,7 @@ impl FileBrowser {
                 let folder = folder.clone();
 
                 move |_, actions, modifiers| {
-                    browser.handle_drop_hover(false, folder.clone(), actions, modifiers)
+                    browser.handle_internal_drop_hover(folder.clone(), actions, modifiers)
                 }
             })
             .on_async_drop({
@@ -680,7 +726,7 @@ impl FileBrowser {
 
                 move |_drop, _, actions, modifiers| {
                     let folder = folder.clone();
-                    browser.handle_dropped_paths(false, folder, actions, modifiers)
+                    browser.handle_internal_dropped_paths(folder, actions, modifiers)
                 }
             })
             .on_leave({
@@ -724,6 +770,9 @@ impl FileBrowser {
                 .parent()
                 .unwrap_or_else(|| self.root_node_path()),
             BrowserListRow::Loading(row) => row.folder,
+            BrowserListRow::Transfer(row) => {
+                row.path.parent().unwrap_or_else(|| self.root_node_path())
+            }
             BrowserListRow::Search(search_match) => search_match
                 .node_path
                 .parent()
@@ -782,6 +831,7 @@ impl FileBrowser {
                 (row.row.depth, false, false, false)
             }
             BrowserListRowRenderState::Loading(row) => (row.depth, false, false, false),
+            BrowserListRowRenderState::Transfer(row) => (row.depth, false, false, false),
             BrowserListRowRenderState::Search { search_match, .. } => {
                 (search_match.depth, false, false, false)
             }
@@ -823,6 +873,7 @@ impl FileBrowser {
                 expanded: self.tree_row_expanded(&row.row),
             },
             BrowserListRow::Loading(row) => BrowserListRowRenderState::Loading(row.clone()),
+            BrowserListRow::Transfer(row) => BrowserListRowRenderState::Transfer(row.clone()),
             BrowserListRow::Search(search_match) => BrowserListRowRenderState::Search {
                 search_match: search_match.clone(),
                 selected: selected_search_match.as_ref() == Some(&search_match.selection_key()),
@@ -883,6 +934,9 @@ pub(super) enum BrowserListRowKey {
     Loading {
         folder: FileNodePath,
     },
+    Transfer {
+        path: FileNodePath,
+    },
     Search {
         path: FileNodePath,
         line_number: u64,
@@ -913,6 +967,7 @@ pub(super) enum BrowserListRowRenderState {
         expanded: bool,
     },
     Loading(LoadingRow),
+    Transfer(TransferPlaceholderRow),
     Search {
         search_match: SearchMatch,
         selected: bool,
@@ -928,6 +983,7 @@ impl BrowserListRowRenderState {
             Self::NewEntry(row) => BrowserListRow::NewEntry(row.clone()),
             Self::RenameEntry { row, .. } => BrowserListRow::RenameEntry(row.clone()),
             Self::Loading(row) => BrowserListRow::Loading(row.clone()),
+            Self::Transfer(row) => BrowserListRow::Transfer(row.clone()),
             Self::Search { search_match, .. } => BrowserListRow::Search(search_match.clone()),
             Self::Status(message) => BrowserListRow::Status(message.clone()),
             Self::RootGap => BrowserListRow::RootGap,
@@ -945,6 +1001,9 @@ pub(super) fn browser_list_row_key(row: &BrowserListRow, index: usize) -> Browse
         BrowserListRow::RenameEntry(row) => rename_row_key(&row.row.node_path),
         BrowserListRow::Loading(row) => BrowserListRowKey::Loading {
             folder: row.folder.clone(),
+        },
+        BrowserListRow::Transfer(row) => BrowserListRowKey::Transfer {
+            path: row.path.clone(),
         },
         BrowserListRow::Search(search_match) => BrowserListRowKey::Search {
             path: search_match.node_path.clone(),
@@ -983,6 +1042,48 @@ fn root_gap_row_widget() -> gtk::Box {
 
 fn row_end_padding() -> i32 {
     canvas_scrollbar::WIDTH.ceil() as i32 + 4
+}
+
+fn transfer_row_insert_index(rows: &[BrowserListRow], path: &FileNodePath) -> Option<usize> {
+    let parent = path.parent().unwrap_or_else(|| path.clone());
+    if parent.is_root() {
+        return Some(
+            rows.iter()
+                .position(|row| matches!(row, BrowserListRow::RootGap))
+                .unwrap_or(rows.len()),
+        );
+    }
+
+    let parent_index = rows.iter().position(|row| {
+        matches!(
+            row,
+            BrowserListRow::Tree(row) if row.node_path == parent && row.is_dir
+        )
+    })?;
+    let parent_depth = browser_list_row_depth(&rows[parent_index])?;
+    let mut index = parent_index + 1;
+    while index < rows.len() {
+        let Some(depth) = browser_list_row_depth(&rows[index]) else {
+            break;
+        };
+        if depth <= parent_depth {
+            break;
+        }
+        index += 1;
+    }
+    Some(index)
+}
+
+fn browser_list_row_depth(row: &BrowserListRow) -> Option<usize> {
+    match row {
+        BrowserListRow::Tree(row) => Some(row.depth),
+        BrowserListRow::NewEntry(row) => Some(row.depth),
+        BrowserListRow::RenameEntry(row) => Some(row.row.depth),
+        BrowserListRow::Loading(row) => Some(row.depth),
+        BrowserListRow::Transfer(row) => Some(row.depth),
+        BrowserListRow::Search(row) => Some(row.depth),
+        BrowserListRow::Status(_) | BrowserListRow::RootGap => None,
+    }
 }
 
 fn loading_disclosure_spinner() -> adw::Spinner {
@@ -1084,6 +1185,7 @@ fn file_drag_source(browser: &Rc<FileBrowser>, path: FileNodePath) -> tree_view:
                     return None;
                 }
 
+                browser.set_internal_drag_paths(vec![path.clone()]);
                 let bytes = gtk::glib::Bytes::from_owned(path.display().into_bytes());
                 Some(gdk::ContentProvider::for_bytes("text/plain", &bytes))
             }

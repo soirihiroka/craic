@@ -1140,11 +1140,22 @@ fn connect_window_close_confirmation(state: &Rc<AppState>) {
             }
 
             let running_agent_sessions = running_agent_session_count(&state);
-            if running_agent_sessions == 0 {
+            let active_terminal_tasks = state.content.active_terminal_task_count();
+            if running_agent_sessions == 0 && active_terminal_tasks == 0 {
                 return gtk::glib::Propagation::Proceed;
             }
 
-            confirm_close_with_active_agents(window, running_agent_sessions, &confirmed_close);
+            log::info!(
+                "window close confirmation requested running_agent_sessions={} active_terminal_tasks={}",
+                running_agent_sessions,
+                active_terminal_tasks
+            );
+            confirm_close_with_running_tasks(
+                window,
+                running_agent_sessions,
+                active_terminal_tasks,
+                &confirmed_close,
+            );
             gtk::glib::Propagation::Stop
         }
     });
@@ -1158,20 +1169,18 @@ fn running_agent_session_count(state: &AppState) -> usize {
         .sum()
 }
 
-fn confirm_close_with_active_agents(
+fn confirm_close_with_running_tasks(
     window: &adw::ApplicationWindow,
     active_agent_sessions: usize,
+    active_terminal_tasks: usize,
     confirmed_close: &Rc<Cell<bool>>,
 ) {
-    let body = if active_agent_sessions == 1 {
-        "An agent session is still running. Closing this window will terminate it.".to_string()
-    } else {
-        format!(
-            "{active_agent_sessions} agent sessions are still running. Closing this window will terminate them."
-        )
-    };
+    let body = close_confirmation_body(active_agent_sessions, active_terminal_tasks);
     let dialog = adw::AlertDialog::builder()
-        .heading("Close Window with Running Agent?")
+        .heading(close_confirmation_heading(
+            active_agent_sessions,
+            active_terminal_tasks,
+        ))
         .body(&body)
         .build();
     dialog.add_response("cancel", "Cancel");
@@ -1193,6 +1202,57 @@ fn confirm_close_with_active_agents(
             window.close();
         }
     });
+}
+
+fn close_confirmation_heading(
+    active_agent_sessions: usize,
+    active_terminal_tasks: usize,
+) -> &'static str {
+    match (active_agent_sessions > 0, active_terminal_tasks > 0) {
+        (true, true) => "Close Window with Running Tasks?",
+        (true, false) => "Close Window with Running Agent?",
+        (false, true) => "Close Window with Running Terminal?",
+        (false, false) => "Close Window?",
+    }
+}
+
+fn close_confirmation_body(active_agent_sessions: usize, active_terminal_tasks: usize) -> String {
+    match (active_agent_sessions, active_terminal_tasks) {
+        (1, 0) => {
+            "An agent session is still running. Closing this window will terminate it.".to_string()
+        }
+        (agents, 0) => {
+            format!(
+                "{agents} agent sessions are still running. Closing this window will terminate them."
+            )
+        }
+        (0, 1) => {
+            "A terminal program is still running. Closing this window will terminate it.".to_string()
+        }
+        (0, tasks) => {
+            format!(
+                "{tasks} terminal programs are still running. Closing this window will terminate them."
+            )
+        }
+        (1, 1) => {
+            "An agent session and a terminal program are still running. Closing this window will terminate them.".to_string()
+        }
+        (1, tasks) => {
+            format!(
+                "An agent session and {tasks} terminal programs are still running. Closing this window will terminate them."
+            )
+        }
+        (agents, 1) => {
+            format!(
+                "{agents} agent sessions and a terminal program are still running. Closing this window will terminate them."
+            )
+        }
+        (agents, tasks) => {
+            format!(
+                "{agents} agent sessions and {tasks} terminal programs are still running. Closing this window will terminate them."
+            )
+        }
+    }
 }
 
 fn start_repository_monitor(state: &Rc<AppState>) {

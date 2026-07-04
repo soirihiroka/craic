@@ -574,7 +574,8 @@ impl FileBrowser {
             }
             rows::BrowserListRow::NewEntry(_)
             | rows::BrowserListRow::RenameEntry(_)
-            | rows::BrowserListRow::Loading(_) => {}
+            | rows::BrowserListRow::Loading(_)
+            | rows::BrowserListRow::Transfer(_) => {}
             rows::BrowserListRow::Search(search_match) => {
                 self.set_selected_search_match(search_match.clone());
             }
@@ -1177,7 +1178,8 @@ fn row_matches_selection(
         }
         rows::BrowserListRow::NewEntry(_)
         | rows::BrowserListRow::RenameEntry(_)
-        | rows::BrowserListRow::Loading(_) => false,
+        | rows::BrowserListRow::Loading(_)
+        | rows::BrowserListRow::Transfer(_) => false,
         rows::BrowserListRow::Search(search_match) => {
             selected_search_match == Some(&search_match.selection_key())
         }
