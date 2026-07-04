@@ -270,14 +270,53 @@ fn fill_items(list: &gtk::ListBox, items: &[PickerItem], filter: &str) {
         list.remove(&row);
     }
     let filter = filter.trim().to_lowercase();
+    let terms = filter
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
 
     for item in items {
-        if !filter.is_empty() && !item.label.to_lowercase().contains(&filter) {
+        if !terms.is_empty() && !item_matches_terms(item, &terms) {
             continue;
         }
 
         list.append(&item_row(item));
     }
+}
+
+fn item_matches_terms(item: &PickerItem, terms: &[&str]) -> bool {
+    let label = item.label.to_lowercase();
+    let fallback_label = item.fallback_label.to_lowercase();
+    let id = item.id.to_lowercase();
+
+    terms.iter().all(|term| {
+        fuzzy_text_matches(&label, term)
+            || fuzzy_text_matches(&fallback_label, term)
+            || fuzzy_text_matches(&id, term)
+    })
+}
+
+fn fuzzy_text_matches(text: &str, term: &str) -> bool {
+    text.contains(term) || ordered_chars_match(text, term)
+}
+
+fn ordered_chars_match(text: &str, term: &str) -> bool {
+    let mut term_chars = term.chars();
+    let Some(mut target) = term_chars.next() else {
+        return true;
+    };
+
+    for ch in text.chars() {
+        if ch != target {
+            continue;
+        }
+        let Some(next) = term_chars.next() else {
+            return true;
+        };
+        target = next;
+    }
+
+    false
 }
 
 fn item_row(item: &PickerItem) -> gtk::ListBoxRow {
