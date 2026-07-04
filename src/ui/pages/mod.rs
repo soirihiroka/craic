@@ -25,9 +25,7 @@ mod preview_reconcile;
 pub(crate) trait Page {
     fn label(&self) -> &'static str;
     fn icon_name(&self) -> &'static str;
-    fn left(&self) -> gtk::Widget;
-    fn right(&self) -> gtk::Widget;
-
+    fn initialize(&self, completion: PageInitializeComplete);
     fn activate(&self) {}
     fn refresh(&self, snapshot: &RepositorySnapshot);
     fn refresh_page(&self, _completion: PageRefreshComplete) -> PageRefreshRequest {
@@ -52,6 +50,7 @@ pub(crate) trait Page {
 }
 
 pub(crate) type PageRef = Rc<dyn Page + 'static>;
+pub(crate) type PageInitializeComplete = Box<dyn FnOnce(gtk::Widget, gtk::Widget) + 'static>;
 pub(crate) type PageRefreshComplete = Rc<dyn Fn() + 'static>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,12 +323,23 @@ pub(crate) fn build_pages(ctx: PageContext) -> Vec<PageRef> {
     ]
 }
 
+pub(crate) fn warm_pages_in_background(pages: &[PageRef]) {
+    for page in pages {
+        let label = page.label();
+        log::debug!("page background initialization requested label={label}");
+        page.initialize(Box::new(move |_, _| {
+            log::debug!("page background initialization completed label={label}");
+        }));
+    }
+}
+
 pub(crate) struct PageHost {
     left_slot: gtk::Box,
     right_slot: gtk::Box,
     left_hovered: Rc<Cell<bool>>,
     right_hovered: Rc<Cell<bool>>,
     active_index: Cell<Option<usize>>,
+    show_generation: Rc<Cell<u64>>,
 }
 
 impl PageHost {
@@ -368,6 +378,7 @@ impl PageHost {
             left_hovered,
             right_hovered,
             active_index: Cell::new(None),
+            show_generation: Rc::new(Cell::new(0)),
         }
     }
 
@@ -384,16 +395,39 @@ impl PageHost {
             return;
         }
 
-        let Some(page) = pages.get(index) else {
+        let Some(page) = pages.get(index).cloned() else {
             return;
         };
 
+        let generation = self.show_generation.get().wrapping_add(1).max(1);
+        self.show_generation.set(generation);
         clear_slot(&self.left_slot);
         clear_slot(&self.right_slot);
 
-        self.left_slot.append(&page.left());
-        self.right_slot.append(&page.right());
+        self.left_slot.append(&loading_screen(page.label()));
+        self.right_slot.append(&loading_screen(page.label()));
         self.active_index.set(Some(index));
+
+        let left_slot = self.left_slot.clone();
+        let right_slot = self.right_slot.clone();
+        let show_generation = self.show_generation.clone();
+        let label = page.label();
+        page.initialize(Box::new(move |left, right| {
+            if show_generation.get() != generation {
+                log::trace!(
+                    "ignored stale page panes label={} generation={}",
+                    label,
+                    generation
+                );
+                return;
+            }
+
+            clear_slot(&left_slot);
+            clear_slot(&right_slot);
+            left_slot.append(&left);
+            right_slot.append(&right);
+            log::debug!("page panes displayed label={label}");
+        }));
     }
 }
 
@@ -401,4 +435,25 @@ fn clear_slot(slot: &gtk::Box) {
     while let Some(child) = slot.first_child() {
         slot.remove(&child);
     }
+}
+
+fn loading_screen(label: &str) -> gtk::Widget {
+    let spinner = adw::Spinner::new();
+    spinner.set_size_request(28, 28);
+    let label = gtk::Label::builder()
+        .label(format!("Loading {label}..."))
+        .halign(gtk::Align::Center)
+        .css_classes(["dim-label"])
+        .build();
+    let root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    root.append(&spinner);
+    root.append(&label);
+    root.upcast()
 }

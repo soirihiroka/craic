@@ -1,7 +1,7 @@
 mod left;
 mod right;
 
-use super::{Page, PageBadge, PageCommand, PageCommandResult, PageContext};
+use super::{Page, PageBadge, PageCommand, PageCommandResult, PageContext, PageInitializeComplete};
 use crate::git::{
     self, BytesComparison, FileComparison, GitRepoHandle, OperationCallback, RepositorySnapshot,
 };
@@ -486,12 +486,11 @@ impl Page for ChangesPage {
         "document-edit-symbolic"
     }
 
-    fn left(&self) -> gtk::Widget {
-        self.panel.root.clone().upcast()
-    }
-
-    fn right(&self) -> gtk::Widget {
-        self.right.root.clone().upcast()
+    fn initialize(&self, completion: PageInitializeComplete) {
+        completion(
+            self.panel.root.clone().upcast(),
+            self.right.root.clone().upcast(),
+        );
     }
 
     fn refresh(&self, snapshot: &RepositorySnapshot) {

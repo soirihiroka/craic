@@ -48,9 +48,24 @@ impl ChangesRight {
 
         let diff = DiffView::new("File");
         let file_preview = BinaryPreviewWidgets::new("File");
+        let loading_spinner = adw::Spinner::builder()
+            .width_request(24)
+            .height_request(24)
+            .halign(gtk::Align::Center)
+            .build();
+        let loading_content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(14)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        loading_content.append(&loading_spinner);
 
         let root = gtk::Stack::builder().hexpand(true).vexpand(true).build();
         root.add_named(&suggestions_content, Some("suggestions"));
+        root.add_named(&loading_content, Some("loading"));
         root.add_named(&diff.root, Some("diff"));
         root.add_named(&file_preview.root, Some("preview"));
         root.set_visible_child_name("suggestions");
@@ -102,6 +117,19 @@ impl ChangesRight {
             return;
         }
         self.root.set_visible_child_name("suggestions");
+    }
+
+    pub(super) fn show_loading(&self, file_path: &str) {
+        if !should_update_preview(
+            &self.preview_reconciler,
+            RightPreviewState::Loading {
+                file_path: file_path.to_string(),
+            },
+            "changes",
+        ) {
+            return;
+        }
+        self.root.set_visible_child_name("loading");
     }
 
     pub(super) fn show_comparison(&self, file_path: &str, comparison: &FileComparison) {

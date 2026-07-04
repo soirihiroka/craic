@@ -6,8 +6,8 @@ mod right;
 mod smart_summary;
 
 use super::{
-    Page, PageBadge, PageCommand, PageCommandResult, PageContext, PageRefreshComplete,
-    PageRefreshRequest,
+    Page, PageBadge, PageCommand, PageCommandResult, PageContext, PageInitializeComplete,
+    PageRefreshComplete, PageRefreshRequest,
 };
 use crate::git::RepositorySnapshot;
 use crate::ui::agent_history;
@@ -15,43 +15,112 @@ use adw::prelude::*;
 use gtk::gio;
 use left::{AgentList, AgentListContextAction, AgentListSelection};
 use right::AgentChat;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub(super) const AGENT_ICON_PIXEL_SIZE: i32 = 18;
 
+#[derive(Clone)]
 pub(super) struct AgentPage {
     ctx: PageContext,
+    state: Rc<RefCell<Option<AgentPageState>>>,
+    initializing: Rc<Cell<bool>>,
+    init_callbacks: Rc<RefCell<Vec<PageInitializeComplete>>>,
+    pending_snapshot: Rc<RefCell<Option<RepositorySnapshot>>>,
+    pending_commands: Rc<RefCell<Vec<PageCommand>>>,
+}
+
+#[derive(Clone)]
+struct AgentPageState {
     list: Rc<AgentList>,
     chat: Rc<AgentChat>,
 }
 
 impl AgentPage {
     pub(super) fn new(ctx: PageContext) -> Self {
-        let page = Self {
-            ctx: ctx.clone(),
-            list: Rc::new(AgentList::new()),
-            chat: Rc::new(AgentChat::new(ctx)),
-        };
-        let workspace = page.ctx.workspace_ref();
-        page.list
-            .set_workspace_key(page.ctx.workspace_key(), workspace.root.absolute);
-        page.connect_session_lifecycle();
-        page.chat.connect_prompt_bar();
-        page
+        Self {
+            ctx,
+            state: Rc::new(RefCell::new(None)),
+            initializing: Rc::new(Cell::new(false)),
+            init_callbacks: Rc::new(RefCell::new(Vec::new())),
+            pending_snapshot: Rc::new(RefCell::new(None)),
+            pending_commands: Rc::new(RefCell::new(Vec::new())),
+        }
     }
 
-    fn connect_session_lifecycle(&self) {
-        self.chat.connect_title_changed({
-            let list = self.list.clone();
+    fn finish_initialize(&self) {
+        if self.state.borrow().is_some() {
+            self.initializing.set(false);
+            self.complete_init_callbacks();
+            return;
+        }
+
+        let started = Instant::now();
+        log::info!("agent page initialization started");
+        let state = AgentPageState {
+            list: Rc::new(AgentList::new()),
+            chat: Rc::new(AgentChat::new(self.ctx.clone())),
+        };
+        let workspace = self.ctx.workspace_ref();
+        state
+            .list
+            .set_workspace_key(self.ctx.workspace_key(), workspace.root.absolute);
+        self.connect_session_lifecycle(&state);
+        state.chat.connect_prompt_bar();
+        self.state.replace(Some(state));
+
+        if let Some(snapshot) = self.pending_snapshot.borrow_mut().take() {
+            self.refresh(&snapshot);
+        }
+
+        for command in self
+            .pending_commands
+            .borrow_mut()
+            .drain(..)
+            .collect::<Vec<_>>()
+        {
+            self.handle_command(&command);
+        }
+
+        self.initializing.set(false);
+        self.complete_init_callbacks();
+        log::info!(
+            "agent page initialization completed elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
+
+    fn complete_init_callbacks(&self) {
+        let Some(state) = self.state.borrow().clone() else {
+            return;
+        };
+
+        for callback in self.init_callbacks.borrow_mut().drain(..) {
+            callback(
+                state.list.root.clone().upcast(),
+                state.chat.root.clone().upcast(),
+            );
+        }
+    }
+
+    fn connect_session_lifecycle(&self, state: &AgentPageState) {
+        let list = state.list.clone();
+        let chat = state.chat.clone();
+
+        chat.connect_title_changed({
+            let list = list.clone();
 
             move |session_id, title| {
                 list.update_title(session_id, &title);
             }
         });
 
-        self.chat.connect_state_changed({
+        chat.connect_state_changed({
             let ctx = self.ctx.clone();
-            let list = self.list.clone();
+            let list = list.clone();
 
             move |session_id, provider, state| {
                 let state_changed = list.set_session_state(session_id, provider, state);
@@ -61,17 +130,17 @@ impl AgentPage {
             }
         });
 
-        self.chat.connect_resource_usage_changed({
-            let list = self.list.clone();
+        chat.connect_resource_usage_changed({
+            let list = list.clone();
 
             move |session_id, usage| {
                 list.set_resource_usage(session_id, usage);
             }
         });
 
-        self.chat.connect_new_session({
+        chat.connect_new_session({
             let ctx = self.ctx.clone();
-            let list = self.list.clone();
+            let list = list.clone();
 
             move |session_id, provider, title, local_history_id, state| {
                 list.add_session_row(session_id, provider, &title, local_history_id, state);
@@ -80,17 +149,17 @@ impl AgentPage {
             }
         });
 
-        self.chat.connect_history_changed({
-            let list = self.list.clone();
+        chat.connect_history_changed({
+            let list = list.clone();
 
             move || {
                 list.reload_history();
             }
         });
 
-        self.chat.connect_close_requested({
+        chat.connect_close_requested({
             let ctx = self.ctx.clone();
-            let list = self.list.clone();
+            let list = list.clone();
 
             move |session_id| {
                 if list.remove_session(session_id) {
@@ -99,18 +168,18 @@ impl AgentPage {
             }
         });
 
-        self.list.connect_new_chat({
-            let chat = self.chat.clone();
+        list.connect_new_chat({
+            let chat = chat.clone();
 
             move |provider| {
                 chat.start_chat(provider);
             }
         });
 
-        self.list.connect_selected({
+        list.connect_selected({
             let ctx = self.ctx.clone();
-            let chat = self.chat.clone();
-            let list = self.list.clone();
+            let chat = chat.clone();
+            let list = list.clone();
 
             move |selection| match selection {
                 AgentListSelection::Active(session_id) => {
@@ -146,10 +215,10 @@ impl AgentPage {
             }
         });
 
-        self.list.connect_context_action({
+        list.connect_context_action({
             let ctx = self.ctx.clone();
-            let list = self.list.clone();
-            let chat = self.chat.clone();
+            let list = list.clone();
+            let chat = chat.clone();
 
             move |action| match action {
                 AgentListContextAction::ViewStatusHistory(local_id) => {
@@ -179,8 +248,8 @@ impl AgentPage {
             }
         });
 
-        self.list.connect_close_requested({
-            let chat = self.chat.clone();
+        list.connect_close_requested({
+            let chat = chat.clone();
 
             move |session_id| {
                 chat.request_close_session(session_id);
@@ -607,57 +676,147 @@ impl Page for AgentPage {
         "brain-augemnted-symbolic"
     }
 
-    fn left(&self) -> gtk::Widget {
-        self.list.root.clone().upcast()
-    }
+    fn initialize(&self, completion: PageInitializeComplete) {
+        if let Some(state) = self.state.borrow().clone() {
+            completion(
+                state.list.root.clone().upcast(),
+                state.chat.root.clone().upcast(),
+            );
+            return;
+        }
 
-    fn right(&self) -> gtk::Widget {
-        self.chat.root.clone().upcast()
+        self.init_callbacks.borrow_mut().push(completion);
+        if self.initializing.replace(true) {
+            return;
+        }
+
+        log::info!("agent page initialization queued");
+        let (sender, receiver) = mpsc::channel();
+        let shell = self.ctx.shell();
+        thread::spawn(move || {
+            let started = Instant::now();
+            if let Some(shell) = shell {
+                for program in ["codex", "agy", "opencode"] {
+                    match shell.which(program) {
+                        Ok(Some(path)) => {
+                            log::debug!("agent page warmed command program={program} path={path}");
+                        }
+                        Ok(None) => {
+                            log::debug!("agent page command unavailable program={program}");
+                        }
+                        Err(err) => {
+                            log::warn!("agent page command warm failed program={program}: {err}");
+                        }
+                    }
+                }
+            }
+            log::info!(
+                "agent page background initialization completed elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            let _ = sender.send(());
+        });
+
+        let page = self.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(30), move || {
+            match receiver.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                    page.finish_initialize();
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            }
+        });
     }
 
     fn activate(&self) {
-        self.chat.show();
+        if let Some(state) = self.state.borrow().as_ref() {
+            state.chat.show();
+            return;
+        }
+
+        let page = self.clone();
+        self.initialize(Box::new(move |_, _| page.activate()));
     }
 
-    fn refresh(&self, _snapshot: &RepositorySnapshot) {
-        self.chat.set_workspace_from_context();
+    fn refresh(&self, snapshot: &RepositorySnapshot) {
+        let Some(state) = self.state.borrow().clone() else {
+            self.pending_snapshot.replace(Some(snapshot.clone()));
+            return;
+        };
+
+        state.chat.set_workspace_from_context();
         let workspace = self.ctx.workspace_ref();
-        self.list
+        state
+            .list
             .set_workspace_key(self.ctx.workspace_key(), workspace.root.absolute);
     }
 
     fn refresh_page(&self, completion: PageRefreshComplete) -> PageRefreshRequest {
         log::info!("agent page refresh requested");
-        self.list.reload_workspace_history();
-        completion();
+        if let Some(state) = self.state.borrow().as_ref() {
+            state.list.reload_workspace_history();
+            completion();
+        } else {
+            let page = self.clone();
+            self.initialize(Box::new(move |_, _| {
+                if let Some(state) = page.state.borrow().as_ref() {
+                    state.list.reload_workspace_history();
+                }
+                completion();
+            }));
+        }
         PageRefreshRequest::Custom
     }
 
     fn set_error(&self, _message: &str) {}
 
     fn badge(&self) -> Option<PageBadge> {
-        let running = self.chat.running_session_count();
+        let running = self
+            .state
+            .borrow()
+            .as_ref()
+            .map(|state| state.chat.running_session_count())
+            .unwrap_or(0);
         (running > 0).then(|| PageBadge::new(running.to_string()))
     }
 
     fn running_agent_session_count(&self) -> usize {
-        self.chat.running_session_count()
+        self.state
+            .borrow()
+            .as_ref()
+            .map(|state| state.chat.running_session_count())
+            .unwrap_or(0)
     }
 
     fn toggle_left_search(&self) -> bool {
-        self.list.toggle_search();
+        let Some(state) = self.state.borrow().clone() else {
+            return false;
+        };
+        state.list.toggle_search();
         true
     }
 
     fn handle_command(&self, command: &PageCommand) -> PageCommandResult {
+        let Some(state) = self.state.borrow().clone() else {
+            return match command {
+                PageCommand::AddFileToAgent(_) | PageCommand::OpenAgentSession(_) => {
+                    self.pending_commands.borrow_mut().push(command.clone());
+                    self.initialize(Box::new(|_, _| {}));
+                    PageCommandResult::HandledAndActivate
+                }
+                _ => PageCommandResult::Ignored,
+            };
+        };
+
         match command {
             PageCommand::AddFileToAgent(file_path) => {
-                self.chat.add_file_reference(file_path);
+                state.chat.add_file_reference(file_path);
                 PageCommandResult::HandledAndActivate
             }
             PageCommand::OpenAgentSession(session_id) => {
-                if self.chat.show_session(*session_id) {
-                    self.list.select_session(*session_id);
+                if state.chat.show_session(*session_id) {
+                    state.list.select_session(*session_id);
                     log::debug!("agent session opened from command session_id={session_id}");
                     PageCommandResult::HandledAndActivate
                 } else {

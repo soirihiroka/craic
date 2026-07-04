@@ -421,6 +421,9 @@ pub fn build_ui(
     window.present();
     startup.mark("present-window");
 
+    pages::warm_pages_in_background(&state.pages);
+    startup.mark("queue-page-background-initialization");
+
     if let Some(notice) = crate::crash_log::take_latest_crash_notice() {
         log::warn!(
             "showing previous crash notice path={}",
@@ -1435,22 +1438,38 @@ fn refresh_active_page(state: &Rc<AppState>) {
 
     let label = page.label();
     log::info!("page refresh requested index={index} label={label}");
-
     let state_weak = Rc::downgrade(state);
-    let completion: pages::PageRefreshComplete = Rc::new(move || {
-        if let Some(state) = state_weak.upgrade() {
-            complete_page_refresh(&state, index, generation);
+    let refresh_page = page.clone();
+    page.initialize(Box::new(move |_, _| {
+        let Some(state) = state_weak.upgrade() else {
+            return;
+        };
+        if !page_refresh_generation_is_current(&state, index, generation) {
+            log::trace!(
+                "ignored page refresh after stale initialization index={} label={} generation={}",
+                index,
+                label,
+                generation
+            );
+            return;
         }
-    });
 
-    match page.refresh_page(completion) {
-        PageRefreshRequest::RepositorySnapshot => {
-            refresh_repository_page(state, index, generation, page);
+        let state_weak = Rc::downgrade(&state);
+        let completion: pages::PageRefreshComplete = Rc::new(move || {
+            if let Some(state) = state_weak.upgrade() {
+                complete_page_refresh(&state, index, generation);
+            }
+        });
+
+        match refresh_page.refresh_page(completion) {
+            PageRefreshRequest::RepositorySnapshot => {
+                refresh_repository_page(&state, index, generation, refresh_page);
+            }
+            PageRefreshRequest::Custom => {
+                log::debug!("page refresh delegated to page index={index} label={label}");
+            }
         }
-        PageRefreshRequest::Custom => {
-            log::debug!("page refresh delegated to page index={index} label={label}");
-        }
-    }
+    }));
 }
 
 fn refresh_repository_page(
@@ -1556,7 +1575,9 @@ fn activate_page(state: &Rc<AppState>, index: usize) {
     if state.active_page.get() != index {
         state.active_page.set(index);
         state.page_host.show(&state.pages, index);
-        state.pages[index].activate();
+        let page = state.pages[index].clone();
+        let activate_page = page.clone();
+        page.initialize(Box::new(move |_, _| activate_page.activate()));
     }
 
     if let Some(button) = state.sidebar.mode_switcher.buttons.get(index) {
