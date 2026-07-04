@@ -585,7 +585,9 @@ impl GitRepoHandle {
     ) {
         let handle = self.clone();
         run_operation("git repo metadata", callback, move || {
-            Ok(handle.repo_metadata_blocking(github.as_deref()))
+            handle.run_with_hooks("git repo metadata", || {
+                Ok(handle.repo_metadata_blocking(github.as_deref()))
+            })
         });
     }
 
@@ -1091,7 +1093,7 @@ impl GitRepoHandle {
                 "shell git repo metadata unavailable workspace={} reason=no-remote",
                 self.workspace.display_name
             );
-            return git::RepoMetadata::Private;
+            return git::RepoMetadata::Local;
         };
         let Some(remote_url) = self
             .git_ok(&["remote".into(), "get-url".into(), remote_name.clone()])
@@ -1102,7 +1104,7 @@ impl GitRepoHandle {
                 self.workspace.display_name,
                 remote_name
             );
-            return git::RepoMetadata::Private;
+            return git::RepoMetadata::Unknown;
         };
 
         if let Some(repo_slug) = crate::github::parse_github_url(&remote_url) {
@@ -1122,7 +1124,7 @@ impl GitRepoHandle {
                             repo_slug,
                             err
                         );
-                        return git::RepoMetadata::Private;
+                        return git::RepoMetadata::Unknown;
                     }
                 }
             }
@@ -1131,7 +1133,7 @@ impl GitRepoHandle {
                 self.workspace.display_name,
                 repo_slug
             );
-            return git::RepoMetadata::Private;
+            return git::RepoMetadata::Unknown;
         }
 
         if let Some(repo_slug) = crate::gitlab::parse_gitlab_url(&remote_url) {
@@ -1157,7 +1159,7 @@ impl GitRepoHandle {
                         repo_slug,
                         err
                     );
-                    return git::RepoMetadata::Private;
+                    return git::RepoMetadata::Unknown;
                 }
             }
         }
@@ -1187,7 +1189,7 @@ impl GitRepoHandle {
                         repo_slug,
                         err
                     );
-                    return git::RepoMetadata::Private;
+                    return git::RepoMetadata::Unknown;
                 }
             }
         }
@@ -1197,7 +1199,7 @@ impl GitRepoHandle {
             self.workspace.display_name,
             remote_name
         );
-        git::RepoMetadata::Private
+        git::RepoMetadata::Unknown
     }
 
     fn commit_paths_blocking(

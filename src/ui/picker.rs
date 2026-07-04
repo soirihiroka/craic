@@ -9,20 +9,6 @@ pub struct PickerItem {
     pub icon_name: Option<String>,
 }
 
-impl PickerItem {
-    pub fn new(
-        id: impl Into<String>,
-        label: impl Into<String>,
-        icon_name: impl Into<String>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            label: label.into(),
-            icon_name: Some(icon_name.into()),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct Picker {
     pub button: gtk::MenuButton,
@@ -218,6 +204,14 @@ impl Picker {
     }
 
     pub fn update_item_icon(&self, id: &str, icon_name: &str) {
+        let icon_name = icon_name.to_string();
+        for item in self.items.borrow_mut().iter_mut() {
+            if item.id == id {
+                item.icon_name = Some(icon_name.clone());
+                break;
+            }
+        }
+
         let mut child = self.list.first_child();
         while let Some(widget) = child {
             let next = widget.next_sibling();
@@ -225,7 +219,7 @@ impl Picker {
             if let Ok(row) = widget.downcast::<gtk::ListBoxRow>() {
                 if row.widget_name() == id {
                     if let Some(image) = find_image(row.upcast_ref()) {
-                        image.set_icon_name(Some(icon_name));
+                        image.set_icon_name(Some(icon_name.as_str()));
                     }
                     if let Some(stack) = find_stack(row.upcast_ref()) {
                         stack.set_visible_child_name("icon");
