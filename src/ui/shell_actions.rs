@@ -277,33 +277,53 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
     let dialog = adw::PreferencesDialog::builder()
         .title("Create Workspace")
         .content_width(560)
-        .content_height(360)
         .build();
 
-    let root_path = Rc::new(RefCell::new(default_workspace_root()));
+    let workspace_roots = Rc::new(
+        crate::config::load()
+            .workspace_roots
+            .into_iter()
+            .filter_map(|workspace_root| {
+                workspace_root
+                    .provider
+                    .is_local()
+                    .then(|| {
+                        crate::config::expand_config_path_for_ui(&workspace_root.path)
+                            .map(|path| (workspace_root, path.canonicalize().unwrap_or(path)))
+                    })
+                    .flatten()
+            })
+            .collect::<Vec<_>>(),
+    );
+    let workspace_root_labels = workspace_roots
+        .iter()
+        .map(|(_, path)| path.display().to_string())
+        .collect::<Vec<_>>();
+    let workspace_root_label_refs = workspace_root_labels
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let workspace_root_model = gtk::StringList::new(&workspace_root_label_refs);
+    let root_path = Rc::new(RefCell::new(
+        workspace_roots.first().map(|(_, path)| path.to_path_buf()),
+    ));
     let auto_name = Rc::new(Cell::new(true));
     let updating_name = Rc::new(Cell::new(false));
     let create_loading = Rc::new(Cell::new(false));
 
-    let root_row = adw::ActionRow::builder()
-        .title("Workspace Root")
-        .subtitle("Choose a folder")
-        .build();
-    if let Some(path) = root_path.borrow().as_ref() {
-        root_row.set_subtitle(&path.display().to_string());
+    let root_row = adw::ComboRow::builder().title("Workspace Root").build();
+    root_row.set_model(Some(&workspace_root_model));
+    root_row.set_sensitive(!workspace_roots.is_empty());
+    if !workspace_roots.is_empty() {
+        root_row.set_selected(0);
+        if let Some((_, path)) = workspace_roots.first() {
+            root_row.set_subtitle(&path.display().to_string());
+        }
     }
-    let choose_root_button = gtk::Button::builder().label("Choose").build();
-    root_row.add_suffix(&choose_root_button);
-    root_row.set_activatable_widget(Some(&choose_root_button));
 
     let name_row = adw::EntryRow::builder().title("Repository Name").build();
     let remote_row = adw::EntryRow::builder().title("Remote Git Source").build();
     remote_row.set_tooltip_text(Some("Optional git remote URL to clone."));
-
-    let status_row = adw::ActionRow::builder()
-        .title("Choose a workspace root")
-        .subtitle("A root folder and repository name are required.")
-        .build();
 
     let cancel_button = gtk::Button::builder().label("Cancel").build();
     let create_spinner = adw::Spinner::new();
@@ -334,13 +354,9 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
     actions.append(&create_button);
 
     let workspace_group = adw::PreferencesGroup::new();
-    workspace_group.set_title("Workspace");
     workspace_group.add(&root_row);
     workspace_group.add(&name_row);
     workspace_group.add(&remote_row);
-
-    let status_group = adw::PreferencesGroup::new();
-    status_group.add(&status_row);
 
     let action_group = adw::PreferencesGroup::new();
     action_group.add(&actions);
@@ -349,7 +365,6 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
     page.set_title("Create Workspace");
     page.set_icon_name(Some("folder-new-symbolic"));
     page.add(&workspace_group);
-    page.add(&status_group);
     page.add(&action_group);
     dialog.add(&page);
 
@@ -357,7 +372,6 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
         let root_path = root_path.clone();
         let name_row = name_row.clone();
         let remote_row = remote_row.clone();
-        let status_row = status_row.clone();
         let create_button = create_button.clone();
         let create_loading = create_loading.clone();
 
@@ -374,59 +388,32 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
             let has_root = root_path.borrow().is_some();
             let ready = has_root && has_name;
             create_button.set_sensitive(ready);
-            if !has_root {
-                status_row.set_title("Choose a workspace root");
-                status_row.set_subtitle("Select the folder that will contain the new workspace.");
-            } else if !has_name {
-                status_row.set_title("Repository name required");
-                status_row.set_subtitle("Enter a name or a remote URL that includes one.");
-            } else {
-                status_row.set_title("Ready");
-                status_row.set_subtitle("Create the workspace when you are ready.");
-            }
         }
     });
     update_create_state();
 
-    choose_root_button.connect_clicked({
-        let state = state.clone();
+    root_row.connect_selected_notify({
+        let workspace_roots = workspace_roots.clone();
         let root_path = root_path.clone();
-        let root_row = root_row.clone();
         let update_create_state = update_create_state.clone();
+        let root_row = root_row.clone();
 
-        move |_| {
-            let dialog = gtk::FileDialog::builder()
-                .title("Choose Workspace Root")
-                .modal(true)
-                .build();
-            dialog.select_folder(Some(&state.window), None::<&gio::Cancellable>, {
-                let state = state.clone();
-                let root_path = root_path.clone();
-                let root_row = root_row.clone();
-                let update_create_state = update_create_state.clone();
-
-                move |result| match result {
-                    Ok(folder) => match folder.path() {
-                        Some(path) => {
-                            let path = path.canonicalize().unwrap_or(path);
-                            root_row.set_subtitle(&path.display().to_string());
-                            root_path.replace(Some(path));
-                            update_create_state();
-                        }
-                        None => show_error_dialog(
-                            &state.window,
-                            "Choose Workspace Root Failed",
-                            "The selected folder does not have a local path.",
-                        ),
-                    },
-                    Err(err) if err.matches(gtk::DialogError::Dismissed) => {}
-                    Err(err) => show_error_dialog(
-                        &state.window,
-                        "Choose Workspace Root Failed",
-                        &err.to_string(),
-                    ),
-                }
-            });
+        move |row| {
+            if workspace_roots.is_empty() {
+                root_path.replace(None);
+                root_row.set_subtitle("No workspace roots available.");
+                update_create_state();
+                return;
+            }
+            let selected = row.selected() as usize;
+            if let Some((_, path)) = workspace_roots.get(selected) {
+                root_row.set_subtitle(&path.display().to_string());
+                root_path.replace(Some(path.clone()));
+            } else {
+                root_row.set_subtitle("Invalid workspace root.");
+                root_path.replace(None);
+            }
+            update_create_state();
         }
     });
 
@@ -474,7 +461,6 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
         let root_path = root_path.clone();
         let name_row = name_row.clone();
         let remote_row = remote_row.clone();
-        let status_row = status_row.clone();
         let create_button = create_button.clone();
         let create_spinner = create_spinner.clone();
         let create_label = create_label.clone();
@@ -489,8 +475,7 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
             ) {
                 Ok(request) => request,
                 Err(err) => {
-                    status_row.set_title("Workspace details incomplete");
-                    status_row.set_subtitle(&err);
+                    show_error_dialog(&state.window, "Create Workspace Failed", &err);
                     return;
                 }
             };
@@ -503,8 +488,6 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
             );
             create_loading.set(true);
             set_create_button_loading(&create_button, &create_spinner, &create_label, true);
-            status_row.set_title("Creating workspace");
-            status_row.set_subtitle("This may take a moment.");
 
             let (sender, receiver) = mpsc::channel();
             let providers = state.providers.clone();
@@ -516,7 +499,6 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
             gtk::glib::timeout_add_local(Duration::from_millis(100), {
                 let state = state.clone();
                 let dialog = dialog.clone();
-                let status_row = status_row.clone();
                 let create_button = create_button.clone();
                 let create_spinner = create_spinner.clone();
                 let create_label = create_label.clone();
@@ -543,8 +525,6 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
                             false,
                         );
                         update_create_state();
-                        status_row.set_title("Create workspace failed");
-                        status_row.set_subtitle(&err);
                         show_error_dialog(&state.window, "Create Workspace Failed", &err);
                         gtk::glib::ControlFlow::Break
                     }
@@ -559,8 +539,6 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
                         );
                         update_create_state();
                         let err = "Workspace creation stopped unexpectedly.";
-                        status_row.set_title("Create workspace failed");
-                        status_row.set_subtitle(err);
                         show_error_dialog(&state.window, "Create Workspace Failed", err);
                         gtk::glib::ControlFlow::Break
                     }
@@ -668,20 +646,6 @@ fn ensure_destination_available(destination: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn default_workspace_root() -> Option<PathBuf> {
-    crate::config::load()
-        .workspace_roots
-        .into_iter()
-        .find_map(|workspace| {
-            workspace
-                .provider
-                .is_local()
-                .then(|| crate::config::expand_config_path_for_ui(&workspace.path))
-                .flatten()
-        })
-        .map(|path| path.canonicalize().unwrap_or(path))
 }
 
 fn text_option(text: &str) -> Option<String> {
