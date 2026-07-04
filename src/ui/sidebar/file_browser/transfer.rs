@@ -9,23 +9,34 @@ use crate::system::capabilities::files::{
 use crate::system::capabilities::open::{DesktopOpenActivation, DesktopOpenTargetKind};
 use adw::prelude::*;
 use gtk::gdk;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
-    mpsc::{self, TryRecvError},
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TRANSFER_CANCELED_MESSAGE: &str = "Transfer canceled.";
-const LOCAL_FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
+const LOCAL_FILE_TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
+const TRANSFER_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_secs(1);
 
 static FILE_CLIPBOARD: OnceLock<Mutex<Option<FileClipboard>>> = OnceLock::new();
 static DRAG_CLIPBOARD: OnceLock<Mutex<Option<FileClipboard>>> = OnceLock::new();
+static NEXT_TRANSFER_UI_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
+
+type TransferEventQueue = Arc<Mutex<VecDeque<TransferEvent>>>;
+
+thread_local! {
+    static TRANSFER_UI_HANDLERS: RefCell<HashMap<u64, TransferUiHandler>> =
+        RefCell::new(HashMap::new());
+}
 
 impl FileBrowser {
     pub(super) fn set_internal_drag_paths(&self, paths: Vec<FileNodePath>) {
@@ -236,63 +247,36 @@ impl FileBrowser {
         );
         self.refresh_transfer_progress_rows();
 
-        let (sender, receiver) = mpsc::channel();
+        let dispatcher = TransferUiDispatcher::new(self, transfer_id, operation);
         thread::spawn(move || {
             log::info!(
                 "local file drop transfer start destination_workspace={} operation={operation:?} count={}",
                 workspace.display_name,
                 sources.len()
             );
-            let progress_sender = sender.clone();
+            let mut progress_sender = TransferProgressSender::new(dispatcher.clone());
             let result = transfer_local_paths(
                 file_access,
                 sources,
                 target_folder,
                 cancel_requested,
                 move |progress| {
-                    let _ = progress_sender.send(TransferEvent::Progress(progress));
+                    progress_sender.send(progress);
                 },
             );
-            let _ = sender.send(TransferEvent::Finished(result));
-        });
-
-        gtk::glib::timeout_add_local(Duration::from_millis(super::SEARCH_POLL_MS), {
-            let browser = self.clone();
-
-            move || loop {
-                match receiver.try_recv() {
-                    Ok(TransferEvent::Progress(progress)) => {
-                        let progress_path_changed =
-                            browser.set_transfer_progress(transfer_id, progress);
-                        if progress_path_changed {
-                            browser.invalidate_tree_rows_cache();
-                            browser.rebuild_if_changed();
-                        } else {
-                            browser.refresh_transfer_progress_rows();
-                        }
-                    }
-                    Ok(TransferEvent::Finished(result)) => {
-                        browser.finish_transfer(transfer_id, operation, result);
-                        return gtk::glib::ControlFlow::Break;
-                    }
-                    Err(TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
-                    Err(TryRecvError::Disconnected) => {
-                        browser.finish_disconnected_transfer(transfer_id, operation);
-                        return gtk::glib::ControlFlow::Break;
-                    }
-                }
-            }
+            dispatcher.send(TransferEvent::Finished(result));
         });
     }
 
-    pub(super) fn active_transfer_rows(&self) -> Vec<rows::TransferPlaceholderRow> {
+    pub(super) fn active_transfer_rows(&self) -> Vec<rows::TransferRow> {
         self.active_transfers
             .borrow()
             .values()
             .filter_map(|transfer| {
                 let path = transfer.current_path.clone()?;
-                Some(rows::TransferPlaceholderRow {
-                    name: path.file_name().unwrap_or("Copying...").to_string(),
+                let file_name = path.file_name().unwrap_or("item");
+                Some(rows::TransferRow {
+                    name: format!("{} {file_name}", transfer.operation.present_participle()),
                     depth: file_row_depth(&path),
                     path,
                 })
@@ -339,14 +323,14 @@ impl FileBrowser {
         );
         self.refresh_transfer_progress_rows();
 
-        let (sender, receiver) = mpsc::channel();
+        let dispatcher = TransferUiDispatcher::new(self, transfer_id, operation);
         thread::spawn(move || {
             log::info!(
                 "file transfer start destination_workspace={} operation={operation:?} count={}",
                 workspace.display_name,
                 clipboard.paths.len()
             );
-            let progress_sender = sender.clone();
+            let mut progress_sender = TransferProgressSender::new(dispatcher.clone());
             let result = transfer_workspace_paths(
                 clipboard.source_access,
                 file_access,
@@ -355,47 +339,10 @@ impl FileBrowser {
                 operation,
                 cancel_requested,
                 move |progress| {
-                    let _ = progress_sender.send(TransferEvent::Progress(progress));
+                    progress_sender.send(progress);
                 },
             );
-            let _ = sender.send(TransferEvent::Finished(result));
-        });
-
-        gtk::glib::timeout_add_local(Duration::from_millis(super::SEARCH_POLL_MS), {
-            let browser = self.clone();
-
-            move || {
-                let mut progress_changed = false;
-                let mut progress_path_changed = false;
-
-                loop {
-                    match receiver.try_recv() {
-                        Ok(TransferEvent::Progress(progress)) => {
-                            if browser.set_transfer_progress(transfer_id, progress) {
-                                progress_path_changed = true;
-                            }
-                            progress_changed = true;
-                        }
-                        Ok(TransferEvent::Finished(result)) => {
-                            browser.finish_transfer(transfer_id, operation, result);
-                            return gtk::glib::ControlFlow::Break;
-                        }
-                        Err(TryRecvError::Empty) => {
-                            if progress_path_changed {
-                                browser.invalidate_tree_rows_cache();
-                                browser.rebuild_if_changed();
-                            } else if progress_changed {
-                                browser.refresh_transfer_progress_rows();
-                            }
-                            return gtk::glib::ControlFlow::Continue;
-                        }
-                        Err(TryRecvError::Disconnected) => {
-                            browser.finish_disconnected_transfer(transfer_id, operation);
-                            return gtk::glib::ControlFlow::Break;
-                        }
-                    }
-                }
-            }
+            dispatcher.send(TransferEvent::Finished(result));
         });
     }
 
@@ -403,9 +350,17 @@ impl FileBrowser {
         if let Some(active) = self.active_transfers.borrow_mut().get_mut(&transfer_id) {
             let current_path_changed = active.current_path != progress.current_path;
             active.current_path = progress.current_path;
-            active.copied_bytes = progress.copied_bytes;
+            active.copied_bytes = if current_path_changed {
+                progress.copied_bytes
+            } else {
+                active.copied_bytes.max(progress.copied_bytes)
+            };
             active.total_bytes = progress.total_bytes;
-            active.copied_files = progress.copied_files;
+            active.copied_files = if current_path_changed {
+                progress.copied_files
+            } else {
+                active.copied_files.max(progress.copied_files)
+            };
             active.total_files = progress.total_files;
             return current_path_changed;
         }
@@ -418,15 +373,22 @@ impl FileBrowser {
         operation: TransferOperation,
         result: Result<Vec<FileNodePath>, String>,
     ) {
-        let auto_focus = self
-            .active_transfers
-            .borrow_mut()
-            .remove(&transfer_id)
-            .is_some_and(|active| active.auto_focus);
+        let selected_path = self.selected_node_path.borrow().clone();
+        let active = self.active_transfers.borrow_mut().remove(&transfer_id);
+        let auto_focus = active.as_ref().is_some_and(|active| active.auto_focus);
+        let selected_active_path = selected_path.clone().filter(|path| {
+            active
+                .as_ref()
+                .and_then(|active| active.current_path.as_ref())
+                == Some(path)
+        });
         self.refresh_transfer_progress_rows();
 
         match result {
             Ok(destinations) => {
+                let selected_destination = selected_path
+                    .clone()
+                    .filter(|path| destinations.iter().any(|destination| destination == path));
                 if operation == TransferOperation::Move {
                     self.file_clipboard.borrow_mut().take();
                 }
@@ -434,33 +396,26 @@ impl FileBrowser {
                 self.rebuild_if_changed();
                 if auto_focus {
                     self.auto_focus_transferred_items(destinations);
+                } else if let Some(selected) = selected_destination.or(selected_active_path) {
+                    self.emit_selected_node_path(selected);
                 }
             }
             Err(message) => {
                 self.invalidate_tree_rows_cache();
                 self.rebuild_if_changed();
                 if message == TRANSFER_CANCELED_MESSAGE {
+                    if selected_active_path.is_some() {
+                        self.set_selected_node_path(None);
+                    }
                     log::info!("file transfer canceled id={transfer_id}");
                 } else {
+                    if let Some(selected) = selected_active_path {
+                        self.emit_selected_node_path(selected);
+                    }
                     self.show_error(operation.failure_heading(), &message);
                 }
             }
         }
-    }
-
-    fn finish_disconnected_transfer(
-        self: &Rc<Self>,
-        transfer_id: u64,
-        operation: TransferOperation,
-    ) {
-        self.active_transfers.borrow_mut().remove(&transfer_id);
-        self.refresh_transfer_progress_rows();
-        self.invalidate_tree_rows_cache();
-        self.rebuild_if_changed();
-        self.show_error(
-            operation.failure_heading(),
-            "Transfer operation did not return a result.",
-        );
     }
 
     fn refresh_transfer_progress_rows(self: &Rc<Self>) {
@@ -519,6 +474,20 @@ impl FileBrowser {
         }
     }
 
+    pub(super) fn cancel_transfers_for_workspace_change(self: &Rc<Self>) {
+        let transfer_ids = self.active_transfers.borrow().keys().copied().collect::<Vec<_>>();
+        if transfer_ids.is_empty() {
+            return;
+        }
+        self.cancel_transfers(&transfer_ids);
+        self.active_transfers.borrow_mut().clear();
+        self.refresh_transfer_progress_rows();
+        log::info!(
+            "file transfers canceled for workspace change count={}",
+            transfer_ids.len()
+        );
+    }
+
     pub(super) fn transfer_progress_for_path(
         &self,
         path: &FileNodePath,
@@ -573,6 +542,13 @@ impl FileBrowser {
             transfer_ids,
             tooltip: format!("{action}: {label}"),
         })
+    }
+
+    pub(in crate::ui) fn path_has_active_transfer(&self, path: &FileNodePath) -> bool {
+        self.active_transfers
+            .borrow()
+            .values()
+            .any(|transfer| transfer.current_path.as_ref() == Some(path))
     }
 
     pub(super) fn paste_target_folder(self: &Rc<Self>) -> FileNodePath {
@@ -850,6 +826,215 @@ enum TransferEvent {
     Finished(Result<Vec<FileNodePath>, String>),
 }
 
+struct TransferUiHandler {
+    browser: Weak<FileBrowser>,
+    transfer_id: u64,
+    operation: TransferOperation,
+    queue: TransferEventQueue,
+    latest_progress: Arc<Mutex<Option<TransferProgressUpdate>>>,
+    drain_scheduled: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct TransferUiDispatcher {
+    handler_id: u64,
+    queue: TransferEventQueue,
+    latest_progress: Arc<Mutex<Option<TransferProgressUpdate>>>,
+    drain_scheduled: Arc<AtomicBool>,
+}
+
+impl TransferUiDispatcher {
+    fn new(browser: &Rc<FileBrowser>, transfer_id: u64, operation: TransferOperation) -> Self {
+        let handler_id = NEXT_TRANSFER_UI_HANDLER_ID.fetch_add(1, Ordering::Relaxed);
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let latest_progress = Arc::new(Mutex::new(None));
+        let drain_scheduled = Arc::new(AtomicBool::new(false));
+        TRANSFER_UI_HANDLERS.with(|handlers| {
+            handlers.borrow_mut().insert(
+                handler_id,
+                TransferUiHandler {
+                    browser: Rc::downgrade(browser),
+                    transfer_id,
+                    operation,
+                    queue: queue.clone(),
+                    latest_progress: latest_progress.clone(),
+                    drain_scheduled: drain_scheduled.clone(),
+                },
+            );
+        });
+        gtk::glib::timeout_add_local(TRANSFER_PROGRESS_EMIT_INTERVAL, move || {
+            transfer_ui_tick(handler_id)
+        });
+
+        Self {
+            handler_id,
+            queue,
+            latest_progress,
+            drain_scheduled,
+        }
+    }
+
+    fn send(&self, event: TransferEvent) {
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.push_back(event);
+        } else {
+            return;
+        }
+
+        if self
+            .drain_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let handler_id = self.handler_id;
+            gtk::glib::idle_add_once(move || drain_transfer_ui_events(handler_id));
+        }
+    }
+}
+
+struct TransferProgressSender {
+    dispatcher: TransferUiDispatcher,
+    last_progress_at: Option<Instant>,
+    last_path: Option<FileNodePath>,
+}
+
+impl TransferProgressSender {
+    fn new(dispatcher: TransferUiDispatcher) -> Self {
+        Self {
+            dispatcher,
+            last_progress_at: None,
+            last_path: None,
+        }
+    }
+
+    fn send(&mut self, progress: TransferProgressUpdate) {
+        let now = Instant::now();
+        let path_changed = self.last_path.as_ref() != progress.current_path.as_ref();
+        let elapsed = self
+            .last_progress_at
+            .is_none_or(|last| now.duration_since(last) >= TRANSFER_PROGRESS_EMIT_INTERVAL);
+        if let Ok(mut latest_progress) = self.dispatcher.latest_progress.lock() {
+            *latest_progress = Some(progress.clone());
+        }
+        if !path_changed && !elapsed {
+            return;
+        }
+
+        self.last_progress_at = Some(now);
+        self.last_path.clone_from(&progress.current_path);
+        self.dispatcher.send(TransferEvent::Progress(progress));
+    }
+}
+
+fn transfer_ui_tick(handler_id: u64) -> gtk::glib::ControlFlow {
+    let Some((browser, transfer_id, latest_progress)) = TRANSFER_UI_HANDLERS.with(|handlers| {
+        let handlers = handlers.borrow();
+        let handler = handlers.get(&handler_id)?;
+        Some((
+            handler.browser.upgrade(),
+            handler.transfer_id,
+            handler.latest_progress.clone(),
+        ))
+    }) else {
+        return gtk::glib::ControlFlow::Break;
+    };
+    let Some(browser) = browser else {
+        TRANSFER_UI_HANDLERS.with(|handlers| {
+            handlers.borrow_mut().remove(&handler_id);
+        });
+        return gtk::glib::ControlFlow::Break;
+    };
+    if !browser.active_transfers.borrow().contains_key(&transfer_id) {
+        return gtk::glib::ControlFlow::Break;
+    }
+
+    let progress = latest_progress
+        .lock()
+        .ok()
+        .and_then(|mut progress| progress.take());
+    if let Some(progress) = progress {
+        if browser.set_transfer_progress(transfer_id, progress) {
+            browser.invalidate_tree_rows_cache();
+            browser.rebuild_if_changed();
+        } else {
+            browser.refresh_transfer_progress_rows();
+        }
+    } else {
+        browser.refresh_transfer_progress_rows();
+    }
+    gtk::glib::ControlFlow::Continue
+}
+
+fn drain_transfer_ui_events(handler_id: u64) {
+    let Some((browser, transfer_id, operation, queue, drain_scheduled)) = TRANSFER_UI_HANDLERS
+        .with(|handlers| {
+            let handlers = handlers.borrow();
+            let handler = handlers.get(&handler_id)?;
+            Some((
+                handler.browser.upgrade(),
+                handler.transfer_id,
+                handler.operation,
+                handler.queue.clone(),
+                handler.drain_scheduled.clone(),
+            ))
+        })
+    else {
+        return;
+    };
+    let Some(browser) = browser else {
+        TRANSFER_UI_HANDLERS.with(|handlers| {
+            handlers.borrow_mut().remove(&handler_id);
+        });
+        return;
+    };
+
+    let mut progress_changed = false;
+    let mut progress_path_changed = false;
+    let mut finished = false;
+
+    loop {
+        let event = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+        match event {
+            Some(TransferEvent::Progress(progress)) => {
+                if browser.set_transfer_progress(transfer_id, progress) {
+                    progress_path_changed = true;
+                }
+                progress_changed = true;
+            }
+            Some(TransferEvent::Finished(result)) => {
+                browser.finish_transfer(transfer_id, operation, result);
+                finished = true;
+                break;
+            }
+            None => break,
+        }
+    }
+
+    if finished {
+        TRANSFER_UI_HANDLERS.with(|handlers| {
+            handlers.borrow_mut().remove(&handler_id);
+        });
+        return;
+    }
+
+    if progress_path_changed {
+        browser.invalidate_tree_rows_cache();
+        browser.rebuild_if_changed();
+    } else if progress_changed {
+        browser.refresh_transfer_progress_rows();
+    }
+
+    drain_scheduled.store(false, Ordering::Release);
+    let has_more = queue.lock().is_ok_and(|queue| !queue.is_empty());
+    if has_more
+        && drain_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        gtk::glib::idle_add_once(move || drain_transfer_ui_events(handler_id));
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct LocalTransferTotals {
     bytes: u64,
@@ -868,7 +1053,7 @@ impl LocalTransferProgress {
     fn from_totals(totals: LocalTransferTotals) -> Self {
         Self {
             completed_bytes: 0,
-            total_bytes: totals.bytes.saturating_mul(2),
+            total_bytes: totals.bytes,
             completed_files: 0,
             total_files: totals.files,
         }
@@ -999,7 +1184,7 @@ fn copy_local_path_to_file_access(
     if destination_access.info(&destination).is_ok() {
         return Err(format!("{} already exists.", destination.display()));
     }
-    if metadata.is_dir() {
+    let result = if metadata.is_dir() {
         write_with_progress(
             destination_access.clone(),
             FileWriteRequest {
@@ -1008,55 +1193,63 @@ fn copy_local_path_to_file_access(
                 payload: FileWritePayload::Directory,
                 cancel_requested: Some(cancel_requested.clone()),
             },
-            &destination,
             &display_path,
             local_progress,
             progress,
-        )?;
-        local_progress.complete_file();
-        progress(local_progress.to_update(&display_path));
-        for entry in fs::read_dir(source)
-            .map_err(|err| format!("Unable to list {}: {err}", source.display()))?
-        {
-            let entry = entry.map_err(|err| format!("Unable to read directory entry: {err}"))?;
-            let child_source = entry.path();
-            let name = file_name_for_local_transfer(&child_source)?;
-            copy_local_path_to_file_access(
-                destination_access.clone(),
-                &child_source,
-                destination.join_child(name),
-                display_path.clone(),
-                cancel_requested.clone(),
-                local_progress,
-                progress,
-            )?;
-        }
-        return Ok(());
-    }
-
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
+        )
+        .and_then(|_| {
+            local_progress.complete_file();
+            progress(local_progress.to_update(&display_path));
+            for entry in fs::read_dir(source)
+                .map_err(|err| format!("Unable to list {}: {err}", source.display()))?
+            {
+                let entry =
+                    entry.map_err(|err| format!("Unable to read directory entry: {err}"))?;
+                let child_source = entry.path();
+                let name = file_name_for_local_transfer(&child_source)?;
+                copy_local_path_to_file_access(
+                    destination_access.clone(),
+                    &child_source,
+                    destination.join_child(name),
+                    display_path.clone(),
+                    cancel_requested.clone(),
+                    local_progress,
+                    progress,
+                )?;
+            }
+            Ok(())
+        })
+    } else if metadata.file_type().is_symlink() {
+        Err(format!(
             "Copying symlinks from local file drops is unsupported: {}",
             source.display()
-        ));
-    }
-    if !metadata.is_file() {
-        return Err(format!(
+        ))
+    } else if !metadata.is_file() {
+        Err(format!(
             "Only files and folders can be dropped into the file browser: {}",
             source.display()
-        ));
+        ))
+    } else {
+        write_local_file_chunks(
+            destination_access.clone(),
+            source,
+            metadata.len(),
+            destination.clone(),
+            display_path,
+            cancel_requested,
+            local_progress,
+            progress,
+        )
+    };
+    if matches!(&result, Err(message) if message == TRANSFER_CANCELED_MESSAGE) {
+        if let Err(err) = delete_file_access_node(destination_access, destination.clone(), None) {
+            log::warn!(
+                "file transfer canceled cleanup failed path={} err={err}",
+                destination.display()
+            );
+        }
     }
-
-    write_local_file_chunks(
-        destination_access,
-        source,
-        metadata.len(),
-        destination,
-        display_path,
-        cancel_requested,
-        local_progress,
-        progress,
-    )
+    result
 }
 
 fn write_local_file_chunks(
@@ -1082,8 +1275,6 @@ fn write_local_file_chunks(
         if read == 0 {
             break;
         }
-        local_progress.add_bytes(read as u64);
-        progress(local_progress.to_update(&display_path));
         write_with_progress(
             destination_access.clone(),
             FileWriteRequest {
@@ -1092,7 +1283,6 @@ fn write_local_file_chunks(
                 payload: FileWritePayload::File(buffer[..read].to_vec()),
                 cancel_requested: Some(cancel_requested.clone()),
             },
-            &destination,
             &display_path,
             local_progress,
             progress,
@@ -1110,7 +1300,6 @@ fn write_local_file_chunks(
                 payload: FileWritePayload::File(Vec::new()),
                 cancel_requested: Some(cancel_requested),
             },
-            &destination,
             &display_path,
             local_progress,
             progress,
@@ -1124,7 +1313,6 @@ fn write_local_file_chunks(
 fn write_with_progress(
     file_access: Arc<dyn FileAccess>,
     request: FileWriteRequest,
-    _destination: &FileNodePath,
     display_path: &FileNodePath,
     local_progress: &mut LocalTransferProgress,
     progress: &mut impl FnMut(TransferProgressUpdate),
@@ -1238,7 +1426,7 @@ fn run_transfer_file_operation(
                     total_files,
                     progress,
                 )?;
-                delete_file_access_node(source_access, source, cancel_requested)?;
+                delete_file_access_node(source_access, source, Some(cancel_requested))?;
                 Ok(destination)
             }
         };
@@ -1277,6 +1465,8 @@ fn run_transfer_file_operation(
                     completed_before,
                     total_files,
                     &destination,
+                    0,
+                    None,
                 ));
             }
             Ok(FileOperationEvent::Finished(result)) => {
@@ -1302,6 +1492,37 @@ fn copy_between_file_accesses(
     total_files: u64,
     progress: &mut impl FnMut(TransferProgressUpdate),
 ) -> Result<FileNodePath, String> {
+    let result = copy_between_file_accesses_inner(
+        source_access,
+        destination_access.clone(),
+        source,
+        destination.clone(),
+        cancel_requested,
+        completed_before,
+        total_files,
+        progress,
+    );
+    if matches!(&result, Err(message) if message == TRANSFER_CANCELED_MESSAGE) {
+        if let Err(err) = delete_file_access_node(destination_access, destination.clone(), None) {
+            log::warn!(
+                "file transfer canceled cleanup failed path={} err={err}",
+                destination.display()
+            );
+        }
+    }
+    result
+}
+
+fn copy_between_file_accesses_inner(
+    source_access: Arc<dyn FileAccess>,
+    destination_access: Arc<dyn FileAccess>,
+    source: FileNodePath,
+    destination: FileNodePath,
+    cancel_requested: Arc<AtomicBool>,
+    completed_before: u64,
+    total_files: u64,
+    progress: &mut impl FnMut(TransferProgressUpdate),
+) -> Result<FileNodePath, String> {
     check_transfer_canceled(cancel_requested.as_ref())?;
     let info = source_access.info(&source)?;
     match info.kind {
@@ -1317,6 +1538,8 @@ fn copy_between_file_accesses(
                 completed_before,
                 total_files,
                 &destination,
+                0,
+                None,
                 progress,
             )?;
             let listings = source_access.list_dirs(std::slice::from_ref(&source))?;
@@ -1340,6 +1563,8 @@ fn copy_between_file_accesses(
             Ok(destination)
         }
         FileKind::File | FileKind::Archive { .. } => {
+            let source_bytes = info.len_or_zero();
+            let total_transfer_bytes = source_bytes.saturating_mul(2);
             let read = read_file_access_node(
                 source_access,
                 FileReadRequest {
@@ -1350,6 +1575,8 @@ fn copy_between_file_accesses(
                 completed_before,
                 total_files,
                 &destination,
+                0,
+                Some(total_transfer_bytes),
                 progress,
             )?;
             let bytes = read.into_bytes()?;
@@ -1364,6 +1591,8 @@ fn copy_between_file_accesses(
                 completed_before,
                 total_files,
                 &destination,
+                source_bytes,
+                Some(total_transfer_bytes),
                 progress,
             )?;
             Ok(destination)
@@ -1381,6 +1610,8 @@ fn read_file_access_node(
     completed_before: u64,
     total_files: u64,
     destination: &FileNodePath,
+    byte_offset: u64,
+    total_bytes: Option<u64>,
     progress: &mut impl FnMut(TransferProgressUpdate),
 ) -> Result<FileRead, String> {
     let (sender, receiver) = mpsc::channel();
@@ -1396,6 +1627,8 @@ fn read_file_access_node(
         completed_before,
         total_files,
         destination,
+        byte_offset,
+        total_bytes,
         progress,
     )
 }
@@ -1406,6 +1639,8 @@ fn write_file_access_node(
     completed_before: u64,
     total_files: u64,
     destination: &FileNodePath,
+    byte_offset: u64,
+    total_bytes: Option<u64>,
     progress: &mut impl FnMut(TransferProgressUpdate),
 ) -> Result<(), String> {
     let (sender, receiver) = mpsc::channel();
@@ -1421,6 +1656,8 @@ fn write_file_access_node(
         completed_before,
         total_files,
         destination,
+        byte_offset,
+        total_bytes,
         progress,
     )
 }
@@ -1428,13 +1665,13 @@ fn write_file_access_node(
 fn delete_file_access_node(
     file_access: Arc<dyn FileAccess>,
     path: FileNodePath,
-    cancel_requested: Arc<AtomicBool>,
+    cancel_requested: Option<Arc<AtomicBool>>,
 ) -> Result<(), String> {
     let (sender, receiver) = mpsc::channel();
     file_access.delete(
         FileDeleteRequest {
             path,
-            cancel_requested: Some(cancel_requested),
+            cancel_requested,
         },
         Box::new(move |event| {
             let _ = sender.send(event);
@@ -1457,6 +1694,8 @@ fn wait_for_file_operation<T>(
     completed_before: u64,
     total_files: u64,
     destination: &FileNodePath,
+    byte_offset: u64,
+    total_bytes: Option<u64>,
     progress: &mut impl FnMut(TransferProgressUpdate),
 ) -> Result<T, String> {
     loop {
@@ -1467,6 +1706,8 @@ fn wait_for_file_operation<T>(
                     completed_before,
                     total_files,
                     destination,
+                    byte_offset,
+                    total_bytes,
                 ));
             }
             Ok(FileOperationEvent::Finished(result)) => {
@@ -1487,11 +1728,13 @@ fn transfer_progress_update(
     completed_before: u64,
     total_files: u64,
     destination: &FileNodePath,
+    byte_offset: u64,
+    total_bytes: Option<u64>,
 ) -> TransferProgressUpdate {
     TransferProgressUpdate {
         current_path: update.current_path.or_else(|| Some(destination.clone())),
-        copied_bytes: update.completed_bytes,
-        total_bytes: update.total_bytes,
+        copied_bytes: byte_offset.saturating_add(update.completed_bytes),
+        total_bytes: total_bytes.unwrap_or(update.total_bytes),
         copied_files: completed_before.saturating_add(update.completed_files),
         total_files,
     }
