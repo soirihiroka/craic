@@ -2179,11 +2179,6 @@ fn install_terminal_shortcuts(
                 return glib::Propagation::Stop;
             }
 
-            if let Some(sequence) = modified_key_sequence(key, modifiers) {
-                terminal.feed_child(sequence.as_bytes());
-                return glib::Propagation::Stop;
-            }
-
             glib::Propagation::Proceed
         }
     });
@@ -2264,51 +2259,6 @@ fn is_modifier_key(key: gdk::Key) -> bool {
             | gdk::Key::Caps_Lock
             | gdk::Key::Num_Lock
     )
-}
-
-fn modified_key_sequence(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<String> {
-    let modifier_mask = kitty_modifier_mask(modifiers)?;
-    let codepoint = modified_key_codepoint(key)?;
-    Some(format!("\x1b[{codepoint};{modifier_mask}:1u"))
-}
-
-fn kitty_modifier_mask(modifiers: gdk::ModifierType) -> Option<u8> {
-    let mut mask = 1;
-
-    if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
-        mask += 1;
-    }
-    if modifiers.contains(gdk::ModifierType::ALT_MASK) {
-        mask += 2;
-    }
-    if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
-        mask += 4;
-    }
-    if modifiers.contains(gdk::ModifierType::SUPER_MASK) {
-        mask += 8;
-    }
-
-    (mask != 1).then_some(mask)
-}
-
-fn modified_key_codepoint(key: gdk::Key) -> Option<u32> {
-    match key {
-        gdk::Key::Return | gdk::Key::KP_Enter => Some(13),
-        gdk::Key::Tab | gdk::Key::ISO_Left_Tab => Some(9),
-        gdk::Key::BackSpace => Some(127),
-        gdk::Key::Escape => Some(27),
-        gdk::Key::Left => Some(57_417),
-        gdk::Key::Right => Some(57_418),
-        gdk::Key::Up => Some(57_419),
-        gdk::Key::Down => Some(57_420),
-        gdk::Key::Page_Up => Some(57_421),
-        gdk::Key::Page_Down => Some(57_422),
-        gdk::Key::Home => Some(57_423),
-        gdk::Key::End => Some(57_424),
-        gdk::Key::Insert => Some(57_425),
-        gdk::Key::Delete => Some(57_426),
-        _ => None,
-    }
 }
 
 fn install_focus_tracking(terminal: &vte4::Terminal, focus_handlers: &FocusHandlers) {
