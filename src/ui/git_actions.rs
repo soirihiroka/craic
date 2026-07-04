@@ -144,19 +144,8 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
     let dialog = adw::PreferencesDialog::builder()
         .title("Publish Repository")
         .content_width(620)
-        .content_height(520)
+        .content_height(440)
         .build();
-
-    let status_spinner = adw::Spinner::new();
-    status_spinner.set_size_request(18, 18);
-    status_spinner.set_valign(gtk::Align::Center);
-    let status_row = adw::ActionRow::builder()
-        .title("Loading GitHub")
-        .subtitle("Loading accounts and owners")
-        .build();
-    status_row.add_suffix(&status_spinner);
-    let status_group = adw::PreferencesGroup::new();
-    status_group.add(&status_row);
 
     let loading_model = gtk::StringList::new(&["Loading..."]);
     let account_row = adw::ComboRow::builder()
@@ -258,8 +247,7 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
     let cancel_button = gtk::Button::builder().label("Cancel").build();
     let publish_spinner = adw::Spinner::new();
     publish_spinner.set_size_request(16, 16);
-    publish_spinner.set_visible(false);
-    let publish_label = gtk::Label::new(Some("Publish Repository"));
+    let publish_label = gtk::Label::new(Some("Loading..."));
     let publish_content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -288,7 +276,6 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
     let page = adw::PreferencesPage::new();
     page.set_title("Publish Repository");
     page.set_icon_name(Some("github-symbolic"));
-    page.add(&status_group);
     page.add(&destination_group);
     page.add(&repository_group);
     page.add(&action_group);
@@ -313,7 +300,6 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
         let name_check_message = name_check_message.clone();
         let name_check_label = name_check_label.clone();
         let private_switch = private_switch.clone();
-        let status_row = status_row.clone();
         let publish_button = publish_button.clone();
         let publish_spinner = publish_spinner.clone();
         let publish_label = publish_label.clone();
@@ -335,8 +321,7 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
                 .get(owner_row.selected() as usize)
                 .cloned()
             else {
-                status_row.set_title("Repository owner required");
-                status_row.set_subtitle("");
+                owner_row.set_subtitle("Repository owner required.");
                 return;
             };
 
@@ -466,13 +451,13 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
     gtk::glib::timeout_add_local(Duration::from_millis(100), {
         let state = state.clone();
         let snapshot = snapshot.clone();
-        let status_spinner = status_spinner.clone();
-        let status_row = status_row.clone();
         let account_row = account_row.clone();
         let owner_row = owner_row.clone();
         let name_row = name_row.clone();
         let private_row = private_row.clone();
         let publish_button = publish_button.clone();
+        let publish_spinner = publish_spinner.clone();
+        let publish_label = publish_label.clone();
         let owners_by_account = owners_by_account.clone();
         let owner_choices = owner_choices.clone();
         let preferred_auth_account = preferred_auth_account.clone();
@@ -482,9 +467,8 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
                 state.git_action_running.set(false);
                 state.content.clear_git_action_progress();
                 state.content.update(&snapshot, false);
-                status_spinner.set_visible(false);
-                status_row.set_title("Ready");
-                status_row.set_subtitle("Choose a destination.");
+                publish_spinner.set_visible(false);
+                publish_label.set_label("Publish Repository");
 
                 let account_labels = accounts.iter().map(auth_account_label).collect::<Vec<_>>();
                 let account_label_refs = account_labels
@@ -519,9 +503,9 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
                 state.git_action_running.set(false);
                 state.content.clear_git_action_progress();
                 state.content.update(&snapshot, false);
-                status_spinner.set_visible(false);
-                status_row.set_title("GitHub loading failed");
-                status_row.set_subtitle(&err);
+                publish_spinner.set_visible(false);
+                publish_label.set_label("Publish Repository");
+                account_row.set_subtitle(&err);
                 gtk::glib::ControlFlow::Break
             }
             Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
@@ -529,9 +513,9 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
                 state.git_action_running.set(false);
                 state.content.clear_git_action_progress();
                 state.content.update(&snapshot, false);
-                status_spinner.set_visible(false);
-                status_row.set_title("GitHub loading failed");
-                status_row.set_subtitle("Loading stopped unexpectedly.");
+                publish_spinner.set_visible(false);
+                publish_label.set_label("Publish Repository");
+                account_row.set_subtitle("GitHub loading stopped unexpectedly.");
                 gtk::glib::ControlFlow::Break
             }
         }

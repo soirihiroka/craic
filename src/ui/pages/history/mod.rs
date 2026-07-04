@@ -1,6 +1,8 @@
-use super::{Page, PageCommand, PageCommandResult, PageContext, PageInitializeComplete};
+use super::{
+    Page, PageCommand, PageCommandResult, PageContext, PageInitializeComplete, PageRefreshComplete,
+};
 use crate::git::GitRepoHandle;
-use crate::git::{self, BytesComparison, FileComparison, RepositorySnapshot};
+use crate::git::{self, BytesComparison, FileComparison, WorkspaceSnapshot};
 use crate::system::capabilities::url::UrlOpenActivation;
 use crate::ui::components::context_menu;
 use crate::ui::file_type::PreviewKind;
@@ -193,7 +195,13 @@ impl Page for HistoryPage {
         }
     }
 
-    fn refresh(&self, snapshot: &RepositorySnapshot) {
+    fn refresh(&self, snapshot: &WorkspaceSnapshot, completion: PageRefreshComplete) {
+        let Some(snapshot) = snapshot.repository() else {
+            self.set_error("Not a git repository.");
+            completion();
+            return;
+        };
+
         sync_history_preview_workspace(
             &self.preview_workspace_key,
             &self.preview_cache,
@@ -210,6 +218,7 @@ impl Page for HistoryPage {
             );
             self.right.show_empty();
         }
+        completion();
     }
 
     fn set_error(&self, message: &str) {

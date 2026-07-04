@@ -1,6 +1,28 @@
 use crate::github;
 use std::time::SystemTime;
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorkspaceSnapshot {
+    Repository(RepositorySnapshot),
+    NonRepository { name: String },
+}
+
+impl WorkspaceSnapshot {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Repository(snapshot) => &snapshot.name,
+            Self::NonRepository { name } => name,
+        }
+    }
+
+    pub fn repository(&self) -> Option<&RepositorySnapshot> {
+        match self {
+            Self::Repository(snapshot) => Some(snapshot),
+            Self::NonRepository { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RepositorySnapshot {
     pub name: String,

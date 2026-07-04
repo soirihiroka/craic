@@ -218,7 +218,7 @@ pub fn build_ui(
 
     let repo_path = active_workspace.repo_path.clone();
     let initial_workspace_key = active_workspace.workspace_ref.id.to_string();
-    let initial_snapshot: Option<git::RepositorySnapshot> = None;
+    let initial_snapshot: Option<git::WorkspaceSnapshot> = None;
 
     let repo_path_cell = Rc::new(RefCell::new(repo_path.clone()));
     let system_ref_cell = Rc::new(RefCell::new(active_workspace.system_ref));
@@ -319,7 +319,9 @@ pub fn build_ui(
 
     let sidebar = sidebar::build(
         &menu,
-        initial_snapshot.as_ref(),
+        initial_snapshot
+            .as_ref()
+            .and_then(git::WorkspaceSnapshot::repository),
         &initial_workspace_key,
         &workspace_ref_cell.borrow().display_name,
         &system_ref_cell.borrow(),
@@ -327,7 +329,12 @@ pub fn build_ui(
     );
     startup.mark("build-sidebar");
 
-    let content = content::build(&menu, initial_snapshot.as_ref());
+    let content = content::build(
+        &menu,
+        initial_snapshot
+            .as_ref()
+            .and_then(git::WorkspaceSnapshot::repository),
+    );
     startup.mark("build-content");
 
     if system_ref_cell.borrow().provider_kind == crate::system::path::ProviderKind::Local {
@@ -391,7 +398,7 @@ pub fn build_ui(
         last_snapshot_repo: RefCell::new(initial_snapshot.as_ref().map(|_| repo_path.clone())),
         snapshot_sequence: Cell::new(0),
         snapshot_refresh_running: Cell::new(false),
-        queued_snapshot_refresh: RefCell::new(None),
+        queued_workspace_refresh: RefCell::new(None),
         repository_monitor: RepositoryMonitor::default(),
         workspace_color_provider,
     });
@@ -446,6 +453,11 @@ enum GitWorkerCommand {
         git_handle: Arc<crate::git::GitRepoHandle>,
         respond_to: mpsc::Sender<(String, Result<git::RepositorySnapshot, String>)>,
     },
+    ProviderWorkspaceSnapshot {
+        workspace_key: String,
+        git_handle: Arc<crate::git::GitRepoHandle>,
+        respond_to: mpsc::Sender<(String, Result<git::WorkspaceSnapshot, String>)>,
+    },
 }
 
 fn git_snapshot_worker() -> &'static mpsc::Sender<GitWorkerCommand> {
@@ -474,6 +486,28 @@ fn git_snapshot_worker() -> &'static mpsc::Sender<GitWorkerCommand> {
                             if respond_to.send((workspace_key.clone(), result)).is_err() {
                                 log::warn!(
                                     "git snapshot worker: provider response receiver disconnected for {}",
+                                    workspace_key,
+                                );
+                            }
+                        }));
+                    }
+                    GitWorkerCommand::ProviderWorkspaceSnapshot {
+                        workspace_key,
+                        git_handle,
+                        respond_to,
+                    } => {
+                        let step_start = Instant::now();
+                        git_handle.workspace_snapshot(Box::new(move |result| {
+                            let status = if result.is_ok() { "ok" } else { "error" };
+                            log::info!(
+                                "git workspace snapshot worker finished workspace={} status={} elapsed_ms={}",
+                                workspace_key,
+                                status,
+                                step_start.elapsed().as_millis()
+                            );
+                            if respond_to.send((workspace_key.clone(), result)).is_err() {
+                                log::warn!(
+                                    "git workspace snapshot worker: provider response receiver disconnected for {}",
                                     workspace_key,
                                 );
                             }
@@ -540,6 +574,65 @@ pub(crate) fn request_provider_git_snapshot<F>(
             Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
             Err(mpsc::TryRecvError::Disconnected) => {
                 log::warn!("provider git snapshot response channel disconnected before completion");
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+pub(crate) fn request_provider_workspace_snapshot<F>(
+    workspace_key: String,
+    git_handle: Arc<crate::git::GitRepoHandle>,
+    on_result: F,
+) where
+    F: FnMut(String, Result<git::WorkspaceSnapshot, String>) + 'static,
+{
+    let mut on_result = on_result;
+    let (sender, receiver) = mpsc::channel();
+    let request_start = Instant::now();
+
+    if let Err(err) = git_snapshot_worker().send(GitWorkerCommand::ProviderWorkspaceSnapshot {
+        workspace_key: workspace_key.clone(),
+        git_handle,
+        respond_to: sender,
+    }) {
+        log::error!(
+            "failed to enqueue provider workspace snapshot request for {workspace_key}: {err}"
+        );
+        on_result(
+            workspace_key,
+            Err("Git snapshot worker is unavailable.".to_string()),
+        );
+        return;
+    }
+
+    log::info!("provider workspace snapshot queued workspace={workspace_key}");
+
+    gtk::glib::timeout_add_local(GIT_SNAPSHOT_POLL_INTERVAL, move || {
+        match receiver.try_recv() {
+            Ok((key, result)) => {
+                match &result {
+                    Ok(snapshot) => log::info!(
+                        "provider workspace snapshot received workspace={} elapsed_ms={} name={}",
+                        key,
+                        request_start.elapsed().as_millis(),
+                        snapshot.name()
+                    ),
+                    Err(err) => log::warn!(
+                        "provider workspace snapshot failed workspace={} elapsed_ms={}: {}",
+                        key,
+                        request_start.elapsed().as_millis(),
+                        err
+                    ),
+                }
+                on_result(key, result);
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                log::warn!(
+                    "provider workspace snapshot response channel disconnected before completion"
+                );
                 gtk::glib::ControlFlow::Break
             }
         }
@@ -840,11 +933,11 @@ struct AppState {
     page_refresh_generations: Vec<Cell<u64>>,
     git_action_running: Rc<Cell<bool>>,
     last_error: RefCell<Option<String>>,
-    last_snapshot: RefCell<Option<git::RepositorySnapshot>>,
+    last_snapshot: RefCell<Option<git::WorkspaceSnapshot>>,
     last_snapshot_repo: RefCell<Option<PathBuf>>,
     snapshot_sequence: Cell<u64>,
     snapshot_refresh_running: Cell<bool>,
-    queued_snapshot_refresh: RefCell<Option<QueuedRepositoryRefresh>>,
+    queued_workspace_refresh: RefCell<Option<QueuedWorkspaceRefresh>>,
     repository_monitor: RepositoryMonitor,
     workspace_color_provider: gtk::CssProvider,
 }
@@ -972,7 +1065,7 @@ fn relative_luminance(value: u8) -> f64 {
 }
 
 #[derive(Clone, Debug)]
-struct QueuedRepositoryRefresh {
+struct QueuedWorkspaceRefresh {
     message: Option<String>,
     show_toast: bool,
     force_update: bool,
@@ -1260,15 +1353,15 @@ fn start_repository_monitor(state: &Rc<AppState>) {
 }
 
 fn refresh(state: &Rc<AppState>, message: Option<String>) {
-    refresh_repository(state, message, true, true);
+    refresh_workspace(state, message, true, true);
 }
 
 fn refresh_without_toast(state: &Rc<AppState>, message: Option<String>) {
-    refresh_repository(state, message, false, true);
+    refresh_workspace(state, message, false, true);
 }
 
 fn refresh_with_toast(state: &Rc<AppState>, message: Option<String>, show_toast: bool) {
-    refresh_repository(state, message, show_toast, true);
+    refresh_workspace(state, message, show_toast, true);
 }
 
 fn refresh_active_repo_metadata(state: &Rc<AppState>, item_id: Option<String>) {
@@ -1302,26 +1395,26 @@ fn refresh_active_repo_metadata(state: &Rc<AppState>, item_id: Option<String>) {
 }
 
 fn refresh_from_monitor(state: &Rc<AppState>, force_update: bool) {
-    refresh_repository(state, None, false, force_update);
+    refresh_workspace(state, None, false, force_update);
 }
 
-fn refresh_repository(
+fn refresh_workspace(
     state: &Rc<AppState>,
     message: Option<String>,
     show_toast: bool,
     force_update: bool,
 ) {
-    let request = QueuedRepositoryRefresh {
+    let request = QueuedWorkspaceRefresh {
         message,
         show_toast,
         force_update,
     };
     if state.snapshot_refresh_running.get() {
         if request.message.is_none() && !request.show_toast && !request.force_update {
-            log::trace!("skipped repository polling refresh because a snapshot is already running");
+            log::trace!("skipped workspace polling refresh because a snapshot is already running");
             return;
         }
-        queue_snapshot_refresh(state, request);
+        queue_workspace_refresh(state, request);
         return;
     }
     state.snapshot_refresh_running.set(true);
@@ -1345,32 +1438,35 @@ fn refresh_repository(
     let workspace_name = workspace_ref.display_name.clone();
     let Some(git_handle) = git_handle_for_workspace(state, &system_id, &workspace_ref) else {
         log::debug!("refresh without git metadata for workspace={workspace_name}");
-        let snapshot = git::RepositorySnapshot {
+        let snapshot = git::WorkspaceSnapshot::NonRepository {
             name: workspace_name,
-            ..Default::default()
         };
 
         let should_update_snapshot = state.last_snapshot.borrow().as_ref() != Some(&snapshot);
         if should_update_snapshot || force_update || message.is_some() {
             let workspace_key = state.workspace_ref.borrow().id.to_string();
             let system = state.system_ref.borrow().clone();
-            state.sidebar.update(&snapshot, &workspace_key, &system);
+            state
+                .sidebar
+                .update_workspace(&snapshot, &workspace_key, &system);
             state
                 .content
-                .update(&snapshot, state.git_action_running.get());
+                .update_workspace(&snapshot, state.git_action_running.get());
             if let Some(message) = message.as_deref()
                 && show_toast
             {
                 state.show_toast(message);
             }
-            for page in &state.pages {
-                page.refresh(&snapshot);
-            }
-            state.last_snapshot.replace(Some(snapshot));
+            state.last_snapshot.replace(Some(snapshot.clone()));
             state
                 .last_snapshot_repo
                 .replace(Some(state.repo_path.borrow().clone()));
             state.last_error.borrow_mut().take();
+            let completion_state = state.clone();
+            refresh_pages(&state.pages, &snapshot, move || {
+                complete_snapshot_refresh(&completion_state);
+            });
+            return;
         } else if let Some(message) = message.as_deref()
             && show_toast
         {
@@ -1381,7 +1477,7 @@ fn refresh_repository(
         return;
     };
 
-    request_provider_git_snapshot(workspace_key.clone(), git_handle, {
+    request_provider_workspace_snapshot(workspace_key.clone(), git_handle, {
         let state = state.clone();
         move |response_workspace_key, result| {
             if response_workspace_key != workspace_key {
@@ -1409,7 +1505,7 @@ fn refresh_repository(
 
                         if !should_update_snapshot && !force_update && message.is_none() {
                             log::debug!(
-                                "skipping repository refresh for {} due no changes",
+                                "skipping workspace refresh for {} due no changes",
                                 repo_path.display(),
                             );
                             complete_snapshot_refresh(&state);
@@ -1423,18 +1519,22 @@ fn refresh_repository(
                         if should_update_snapshot || force_update {
                             let workspace_key = state.workspace_ref.borrow().id.to_string();
                             let system = state.system_ref.borrow().clone();
-                            state.sidebar.update(&snapshot, &workspace_key, &system);
+                            state
+                                .sidebar
+                                .update_workspace(&snapshot, &workspace_key, &system);
                             state
                                 .content
-                                .update(&snapshot, state.git_action_running.get());
+                                .update_workspace(&snapshot, state.git_action_running.get());
                             if let Some(message) = message.as_deref()
                                 && show_toast
                             {
                                 state.show_toast(message);
                             }
-                            for page in &state.pages {
-                                page.refresh(&snapshot);
-                            }
+                            let completion_state = state.clone();
+                            refresh_pages(&state.pages, &snapshot, move || {
+                                complete_snapshot_refresh(&completion_state);
+                            });
+                            return;
                         } else if let Some(message) = message.as_deref()
                             && show_toast
                         {
@@ -1462,8 +1562,8 @@ fn refresh_repository(
     })
 }
 
-fn queue_snapshot_refresh(state: &Rc<AppState>, request: QueuedRepositoryRefresh) {
-    let mut queued = state.queued_snapshot_refresh.borrow_mut();
+fn queue_workspace_refresh(state: &Rc<AppState>, request: QueuedWorkspaceRefresh) {
+    let mut queued = state.queued_workspace_refresh.borrow_mut();
     let already_queued = queued.is_some();
     match queued.as_mut() {
         Some(existing) => {
@@ -1478,22 +1578,53 @@ fn queue_snapshot_refresh(state: &Rc<AppState>, request: QueuedRepositoryRefresh
         }
     }
     if already_queued {
-        log::trace!("coalesced repository refresh while snapshot is running");
+        log::trace!("coalesced workspace refresh while snapshot is running");
     } else {
-        log::debug!("queued repository refresh while snapshot is running");
+        log::debug!("queued workspace refresh while snapshot is running");
     }
 }
 
 fn complete_snapshot_refresh(state: &Rc<AppState>) {
     state.snapshot_refresh_running.set(false);
-    let queued = state.queued_snapshot_refresh.borrow_mut().take();
+    let queued = state.queued_workspace_refresh.borrow_mut().take();
     if let Some(queued) = queued {
-        log::debug!("running queued repository refresh after snapshot completion");
-        refresh_repository(
+        log::debug!("running queued workspace refresh after snapshot completion");
+        refresh_workspace(
             state,
             queued.message,
             queued.show_toast,
             queued.force_update,
+        );
+    }
+}
+
+fn refresh_pages<F>(pages: &[pages::PageRef], snapshot: &git::WorkspaceSnapshot, completion: F)
+where
+    F: Fn() + 'static,
+{
+    if pages.is_empty() {
+        completion();
+        return;
+    }
+
+    let remaining = Rc::new(Cell::new(pages.len()));
+    let completion = Rc::new(completion);
+    for page in pages {
+        let remaining = remaining.clone();
+        let completion = completion.clone();
+        page.refresh(
+            snapshot,
+            Rc::new(move || {
+                let previous = remaining.get();
+                if previous == 0 {
+                    return;
+                }
+
+                remaining.set(previous - 1);
+                if previous == 1 {
+                    completion();
+                }
+            }),
         );
     }
 }
@@ -1539,8 +1670,8 @@ fn refresh_active_page(state: &Rc<AppState>) {
         });
 
         match refresh_page.refresh_page(completion) {
-            PageRefreshRequest::RepositorySnapshot => {
-                refresh_repository_page(&state, index, generation, refresh_page);
+            PageRefreshRequest::WorkspaceSnapshot => {
+                refresh_workspace_page(&state, index, generation, refresh_page);
             }
             PageRefreshRequest::Custom => {
                 log::debug!("page refresh delegated to page index={index} label={label}");
@@ -1549,7 +1680,7 @@ fn refresh_active_page(state: &Rc<AppState>) {
     }));
 }
 
-fn refresh_repository_page(
+fn refresh_workspace_page(
     state: &Rc<AppState>,
     index: usize,
     generation: u64,
@@ -1561,24 +1692,29 @@ fn refresh_repository_page(
     let workspace_ref = state.workspace_ref.borrow().clone();
     let label = page.label();
     log::debug!(
-        "page repository snapshot refresh queued index={} label={} repo={}",
+        "page workspace snapshot refresh queued index={} label={} repo={}",
         index,
         label,
         repo_path.display()
     );
 
     let Some(git_handle) = git_handle_for_workspace(state, &system_id, &workspace_ref) else {
-        let err = format!(
-            "Git is unavailable for workspace {}.",
-            workspace_ref.display_name
+        let snapshot = git::WorkspaceSnapshot::NonRepository {
+            name: workspace_ref.display_name,
+        };
+        let state_weak = Rc::downgrade(state);
+        page.refresh(
+            &snapshot,
+            Rc::new(move || {
+                if let Some(state) = state_weak.upgrade() {
+                    complete_page_refresh(&state, index, generation);
+                }
+            }),
         );
-        page.set_error(&err);
-        show_error_dialog(&state.window, "Refresh Failed", &err);
-        complete_page_refresh(state, index, generation);
         return;
     };
 
-    request_provider_git_snapshot(workspace_key.clone(), git_handle, {
+    request_provider_workspace_snapshot(workspace_key.clone(), git_handle, {
         let state = state.clone();
         move |response_workspace_key, result| {
             if !page_refresh_generation_is_current(&state, index, generation) {
@@ -1613,7 +1749,16 @@ fn refresh_repository_page(
             match result {
                 Ok(snapshot) => {
                     log::info!("page refresh completed index={index} label={label}");
-                    page.refresh(&snapshot);
+                    let state_weak = Rc::downgrade(&state);
+                    page.refresh(
+                        &snapshot,
+                        Rc::new(move || {
+                            if let Some(state) = state_weak.upgrade() {
+                                complete_page_refresh(&state, index, generation);
+                            }
+                        }),
+                    );
+                    return;
                 }
                 Err(err) => {
                     log::warn!("page refresh failed index={index} label={label}: {err}");

@@ -9,7 +9,7 @@ use super::{
     Page, PageBadge, PageCommand, PageCommandResult, PageContext, PageInitializeComplete,
     PageRefreshComplete, PageRefreshRequest,
 };
-use crate::git::RepositorySnapshot;
+use crate::git::WorkspaceSnapshot;
 use crate::ui::agent_history;
 use adw::prelude::*;
 use gtk::gio;
@@ -29,7 +29,6 @@ pub(super) struct AgentPage {
     state: Rc<RefCell<Option<AgentPageState>>>,
     initializing: Rc<Cell<bool>>,
     init_callbacks: Rc<RefCell<Vec<PageInitializeComplete>>>,
-    pending_snapshot: Rc<RefCell<Option<RepositorySnapshot>>>,
     pending_commands: Rc<RefCell<Vec<PageCommand>>>,
 }
 
@@ -46,7 +45,6 @@ impl AgentPage {
             state: Rc::new(RefCell::new(None)),
             initializing: Rc::new(Cell::new(false)),
             init_callbacks: Rc::new(RefCell::new(Vec::new())),
-            pending_snapshot: Rc::new(RefCell::new(None)),
             pending_commands: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -71,10 +69,6 @@ impl AgentPage {
         self.connect_session_lifecycle(&state);
         state.chat.connect_prompt_bar();
         self.state.replace(Some(state));
-
-        if let Some(snapshot) = self.pending_snapshot.borrow_mut().take() {
-            self.refresh(&snapshot);
-        }
 
         for command in self
             .pending_commands
@@ -739,17 +733,14 @@ impl Page for AgentPage {
         self.initialize(Box::new(move |_, _| page.activate()));
     }
 
-    fn refresh(&self, snapshot: &RepositorySnapshot) {
-        let Some(state) = self.state.borrow().clone() else {
-            self.pending_snapshot.replace(Some(snapshot.clone()));
-            return;
-        };
+    fn refresh(&self, _snapshot: &WorkspaceSnapshot, completion: PageRefreshComplete) {
+        completion();
+    }
 
-        state.chat.set_workspace_from_context();
-        let workspace = self.ctx.workspace_ref();
-        state
-            .list
-            .set_workspace_key(self.ctx.workspace_key(), workspace.root.absolute);
+    fn workspace_changed(&self) {
+        if let Some(state) = self.state.borrow().clone() {
+            refresh_agent_workspace(&self.ctx, &state);
+        }
     }
 
     fn refresh_page(&self, completion: PageRefreshComplete) -> PageRefreshRequest {
@@ -829,4 +820,12 @@ impl Page for AgentPage {
             _ => PageCommandResult::Ignored,
         }
     }
+}
+
+fn refresh_agent_workspace(ctx: &PageContext, state: &AgentPageState) {
+    state.chat.set_workspace_from_context();
+    let workspace = ctx.workspace_ref();
+    state
+        .list
+        .set_workspace_key(ctx.workspace_key(), workspace.root.absolute);
 }
