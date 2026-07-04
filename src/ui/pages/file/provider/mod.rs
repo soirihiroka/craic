@@ -1,5 +1,6 @@
 mod folder;
 mod font;
+mod image_viewer;
 pub(in crate::ui::pages::file) mod markdown;
 pub(in crate::ui::pages::file) mod media;
 pub(in crate::ui::pages::file) mod notebook;

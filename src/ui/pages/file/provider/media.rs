@@ -1,3 +1,4 @@
+use super::image_viewer;
 use super::{DiskSignature, PreviewMatchRequest, PreviewRequest, disk_signature};
 use crate::system::materialize::MaterializedFile;
 use crate::ui::widgets;
@@ -36,7 +37,7 @@ struct MediaPreviewState {
 pub(in crate::ui::pages::file) struct MediaPreview {
     pub(in crate::ui::pages::file) root: gtk::Box,
     stack: gtk::Stack,
-    picture: gtk::Picture,
+    image_viewer: Rc<image_viewer::ImageViewer>,
     video: gtk::Video,
     audio_controls: gtk::MediaControls,
     loading_label: gtk::Label,
@@ -63,25 +64,7 @@ impl MediaPreviewLoad {
 
 impl MediaPreview {
     pub(in crate::ui::pages::file) fn new() -> Rc<Self> {
-        let picture = gtk::Picture::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .can_shrink(true)
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .margin_top(18)
-            .margin_bottom(18)
-            .margin_start(18)
-            .margin_end(18)
-            .build();
-        picture.set_content_fit(gtk::ContentFit::Contain);
-
-        let image_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .hexpand(true)
-            .vexpand(true)
-            .build();
-        image_box.append(&picture);
+        let image_viewer = image_viewer::ImageViewer::new();
 
         let video = gtk::Video::builder()
             .hexpand(true)
@@ -140,7 +123,7 @@ impl MediaPreview {
             .build();
         let loading = super::super::right::loading_screen_with_label(&loading_label);
         stack.add_named(&loading, Some("loading"));
-        stack.add_named(&image_box, Some("image"));
+        stack.add_named(&image_viewer.root, Some("image"));
         stack.add_named(&video, Some("video"));
         stack.add_named(&audio_clamp, Some("audio"));
         stack.set_visible_child_name("loading");
@@ -164,7 +147,7 @@ impl MediaPreview {
         Rc::new(Self {
             root,
             stack,
-            picture,
+            image_viewer,
             video,
             audio_controls,
             loading_label,
@@ -189,7 +172,7 @@ impl MediaPreview {
 
         self.audio_controls.set_media_stream(gtk::MediaStream::NONE);
         self.video.set_media_stream(gtk::MediaStream::NONE);
-        self.picture.set_file(Option::<&gio::File>::None);
+        self.image_viewer.clear();
         self.message.set_visible(false);
         self.audio_stream.borrow_mut().take();
         self.video_stream.borrow_mut().take();
@@ -220,8 +203,7 @@ impl MediaPreview {
     }
 
     fn set_image_file(&self, file_path: &str, file: &gio::File) {
-        self.picture.set_alternative_text(Some(file_path));
-        self.picture.set_file(Some(file));
+        self.image_viewer.set_file(file_path, file);
         self.stack.set_visible_child_name("image");
     }
 

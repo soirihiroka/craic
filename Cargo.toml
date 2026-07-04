@@ -64,3 +64,4 @@ syntect = "5"
 craic-diff-ui = { path = "crates/craic-diff-ui" }
 sourceview5 = "0.11.0"
 safetensors = "0.8.0"
+glycin = { version = "3.1.0", features = ["gdk4"] }
