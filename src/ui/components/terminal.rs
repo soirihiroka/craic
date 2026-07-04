@@ -1,9 +1,13 @@
+use gtk::gio::prelude::*;
 use gtk::prelude::*;
-use gtk::{gdk, pango};
+use gtk::{gdk, gio, glib, pango};
+use std::path::PathBuf;
 use vte4::prelude::*;
 
 use super::context_menu;
 
+const TERMINAL_FILE_DROP_MIME_TYPES: &[&str] = &["text/uri-list"];
+const MAX_TERMINAL_URI_LIST_BYTES: usize = 1024 * 1024;
 const TERMINAL_URL_MATCH_PATTERN: &str = r#"https?://[^\s<>"'`]+"#;
 const TERMINAL_PATH_MATCH_PATTERN: &str = r#"(?x)
     (?:
@@ -55,6 +59,7 @@ pub(crate) fn configured_terminal(font_size: f64, columns: i64, rows: i64) -> vt
     terminal.set_color_highlight(Some(&rgba(38, 79, 120)));
     terminal.set_color_highlight_foreground(Some(&rgba(255, 255, 255)));
     install_matches(&terminal);
+    install_file_drop(&terminal);
     context_menu::install_terminal_context_menu(&terminal);
     terminal
 }
@@ -162,6 +167,141 @@ fn install_matches(terminal: &vte4::Terminal) {
             Err(err) => log::warn!("terminal match regex failed kind={name}: {err}"),
         }
     }
+}
+
+fn install_file_drop(terminal: &vte4::Terminal) {
+    let file_target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+    file_target.connect_drop({
+        let terminal = terminal.clone();
+
+        move |_, value, _, _| {
+            let Some(paths) = file_list_value_paths(value) else {
+                return false;
+            };
+            paste_dropped_paths(&terminal, paths)
+        }
+    });
+    terminal.add_controller(file_target);
+
+    let uri_target = gtk::DropTargetAsync::new(
+        Some(gdk::ContentFormats::new(TERMINAL_FILE_DROP_MIME_TYPES)),
+        gdk::DragAction::COPY,
+    );
+    uri_target.connect_drag_enter(|_, drop, _, _| uri_drop_action(drop));
+    uri_target.connect_drag_motion(|_, drop, _, _| uri_drop_action(drop));
+    uri_target.connect_drop({
+        let terminal = terminal.clone();
+
+        move |_, drop, _, _| {
+            if uri_drop_action(drop).is_empty() {
+                return false;
+            }
+            read_uri_list_drop(&terminal, drop);
+            true
+        }
+    });
+    terminal.add_controller(uri_target);
+}
+
+fn file_list_value_paths(value: &glib::Value) -> Option<Vec<PathBuf>> {
+    let file_list = value.get::<gdk::FileList>().ok()?;
+    let paths = file_list
+        .files()
+        .into_iter()
+        .filter_map(|file| file.path())
+        .collect::<Vec<_>>();
+    (!paths.is_empty()).then_some(paths)
+}
+
+fn uri_drop_action(drop: &gdk::Drop) -> gdk::DragAction {
+    let formats = drop.formats();
+    if formats.contains_type(gdk::FileList::static_type())
+        || !formats.contain_mime_type(TERMINAL_FILE_DROP_MIME_TYPES[0])
+    {
+        gdk::DragAction::empty()
+    } else {
+        gdk::DragAction::COPY
+    }
+}
+
+fn read_uri_list_drop(terminal: &vte4::Terminal, drop: &gdk::Drop) {
+    let terminal = terminal.clone();
+    let drop = drop.clone();
+    let finish_drop = drop.clone();
+    drop.read_async(
+        TERMINAL_FILE_DROP_MIME_TYPES,
+        glib::Priority::default(),
+        None::<&gio::Cancellable>,
+        move |result| {
+            let (stream, _) = match result {
+                Ok(result) => result,
+                Err(err) => {
+                    log::warn!("terminal file drop uri-list read failed: {err}");
+                    finish_drop.finish(gdk::DragAction::empty());
+                    return;
+                }
+            };
+
+            let finish_drop = finish_drop.clone();
+            stream.read_all_async(
+                vec![0; MAX_TERMINAL_URI_LIST_BYTES],
+                glib::Priority::default(),
+                None::<&gio::Cancellable>,
+                move |result| {
+                    let (buffer, bytes_read, partial_error) = match result {
+                        Ok(result) => result,
+                        Err((_, err)) => {
+                            log::warn!("terminal file drop uri-list stream read failed: {err}");
+                            finish_drop.finish(gdk::DragAction::empty());
+                            return;
+                        }
+                    };
+                    if let Some(err) = partial_error {
+                        log::warn!("terminal file drop uri-list stream read partial: {err}");
+                    }
+
+                    let text = String::from_utf8_lossy(&buffer[..bytes_read]);
+                    let paths = uri_list_paths(&text);
+                    if paste_dropped_paths(&terminal, paths) {
+                        finish_drop.finish(gdk::DragAction::COPY);
+                    } else {
+                        log::warn!("terminal file drop uri-list contained no local paths");
+                        finish_drop.finish(gdk::DragAction::empty());
+                    }
+                },
+            );
+        },
+    );
+}
+
+fn uri_list_paths(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|uri| gio::File::for_uri(uri).path())
+        .collect()
+}
+
+fn paste_dropped_paths(terminal: &vte4::Terminal, paths: Vec<PathBuf>) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let text = paths
+        .iter()
+        .map(|path| shell_quote(&path.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    terminal.paste_text(&text);
+    terminal.grab_focus();
+    log::info!("terminal file drop pasted paths count={}", paths.len());
+    true
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn ansi_palette() -> [gdk::RGBA; 16] {
