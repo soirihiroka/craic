@@ -39,7 +39,7 @@ impl SshGitHubAccess {
         args: &[String],
     ) -> Result<ShellCommandOutput, String> {
         let gh = self.gh_path()?;
-        let script = github::ssh_gh_with_account_script(&gh, &account.host, &account.login, args);
+        let script = github::gh_with_account_script(&gh, &account.host, &account.login, args);
         let request = ShellRunRequest::new(operation, self.workspace.root.clone(), script);
         let output = self.run_script(request)?;
         if output.status_success(&[0]) {
@@ -216,7 +216,7 @@ impl GitHubAccess for SshGitHubAccess {
             "name".to_string(),
         ];
         let gh = self.gh_path()?;
-        let script = github::ssh_gh_with_account_script(&gh, &account.host, &account.login, &args);
+        let script = github::gh_with_account_script(&gh, &account.host, &account.login, &args);
         let output = self.run_script(ShellRunRequest::new(
             "gh repo exists",
             self.workspace.root.clone(),

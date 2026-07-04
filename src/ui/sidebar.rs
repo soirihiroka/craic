@@ -26,6 +26,7 @@ pub struct SidebarPane {
     page_slot: gtk::Box,
     repo_loading: Rc<Cell<bool>>,
     repo_icon_loading: Rc<Cell<bool>>,
+    repo_metadata_loading: Rc<Cell<bool>>,
 }
 
 pub fn build(
@@ -81,6 +82,7 @@ pub fn build(
         page_slot,
         repo_loading: Rc::new(Cell::new(false)),
         repo_icon_loading: Rc::new(Cell::new(false)),
+        repo_metadata_loading: Rc::new(Cell::new(false)),
     };
 
     if let Some(snapshot) = snapshot {
@@ -107,7 +109,7 @@ impl SidebarPane {
         repositories::load_repos_async(
             self.repository_picker.clone(),
             self.repo_loading.clone(),
-            self.repo_icon_loading.clone(),
+            self.repo_metadata_loading.clone(),
         );
     }
 

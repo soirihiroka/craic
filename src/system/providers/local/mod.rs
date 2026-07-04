@@ -147,21 +147,13 @@ impl SystemProvider for LocalProvider {
     }
 
     fn github(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn GitHubAccess>> {
-        if !command_exists("gh") {
-            log::debug!(
-                "local github capability unavailable workspace={} root={} reason=missing-gh",
-                workspace.display_name,
-                workspace.root.absolute
-            );
-            return None;
-        }
-
+        let shell = Arc::new(LocalShellAccess::new(workspace.clone()));
         log::debug!(
             "creating local github capability workspace={} root={}",
             workspace.display_name,
             workspace.root.absolute
         );
-        Some(Arc::new(LocalGitHubAccess::new(workspace.clone())))
+        Some(Arc::new(LocalGitHubAccess::new(workspace.clone(), shell)))
     }
 
     fn shell(&self, workspace: &WorkspaceRef) -> Option<Arc<dyn ShellAccess>> {

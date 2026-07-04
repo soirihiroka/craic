@@ -1,6 +1,6 @@
 const GH_WITH_ACCOUNT_SCRIPT: &str = include_str!("scripts/gh_with_account.sh");
 
-pub(crate) fn ssh_gh_with_account_script(
+pub(crate) fn gh_with_account_script(
     gh_path: &str,
     host: &str,
     login: &str,

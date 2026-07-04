@@ -259,6 +259,8 @@ pub enum RepoMetadata {
     Fork,
     Private,
     Public,
+    Local,
+    Unknown,
     Folder,
 }
 

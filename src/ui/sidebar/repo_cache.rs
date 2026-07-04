@@ -9,7 +9,8 @@ pub(super) enum RepoIconKind {
     Private,
     Public,
     Fork,
-    Git,
+    Local,
+    Unknown,
     Folder,
 }
 
@@ -19,9 +20,14 @@ impl RepoIconKind {
             RepoIconKind::Private => "padlock2-symbolic",
             RepoIconKind::Fork => "branch-fork-symbolic",
             RepoIconKind::Public => "earth-symbolic",
-            RepoIconKind::Git => "folder-git-symbolic",
+            RepoIconKind::Local => "folder-git-symbolic",
+            RepoIconKind::Unknown => "dialog-question-symbolic",
             RepoIconKind::Folder => "folder-symbolic",
         }
+    }
+
+    fn is_remote_metadata(self) -> bool {
+        matches!(self, Self::Private | Self::Public | Self::Fork)
     }
 
     fn cache_value(self) -> &'static str {
@@ -29,7 +35,8 @@ impl RepoIconKind {
             RepoIconKind::Private => "private",
             RepoIconKind::Public => "public",
             RepoIconKind::Fork => "fork",
-            RepoIconKind::Git => "git",
+            RepoIconKind::Local => "local",
+            RepoIconKind::Unknown => "unknown",
             RepoIconKind::Folder => "folder",
         }
     }
@@ -40,6 +47,8 @@ pub(super) fn kind_from_metadata(metadata: crate::git::RepoMetadata) -> RepoIcon
         crate::git::RepoMetadata::Fork => RepoIconKind::Fork,
         crate::git::RepoMetadata::Private => RepoIconKind::Private,
         crate::git::RepoMetadata::Public => RepoIconKind::Public,
+        crate::git::RepoMetadata::Local => RepoIconKind::Local,
+        crate::git::RepoMetadata::Unknown => RepoIconKind::Unknown,
         crate::git::RepoMetadata::Folder => RepoIconKind::Folder,
     }
 }
@@ -55,12 +64,34 @@ pub(super) fn cache_repo_icon_kind(workspace_key: String, kind: RepoIconKind) {
     repo_icon_disk_cache_set(&workspace_key, kind);
 }
 
+pub(super) fn cache_background_repo_icon_kind(
+    workspace_key: String,
+    kind: RepoIconKind,
+) -> RepoIconKind {
+    if let Some(cached) = cached_repo_icon_kind(&workspace_key)
+        && cached.is_remote_metadata()
+        && !kind.is_remote_metadata()
+    {
+        log::debug!(
+            "repo metadata background refresh preserving cached remote state workspace={} cached={:?} resolved={:?}",
+            workspace_key,
+            cached,
+            kind
+        );
+        return cached;
+    }
+
+    cache_repo_icon_kind(workspace_key, kind);
+    kind
+}
+
 fn repo_icon_kind_from_cache_value(value: &str) -> Option<RepoIconKind> {
     match value {
         "private" => Some(RepoIconKind::Private),
         "public" => Some(RepoIconKind::Public),
         "fork" => Some(RepoIconKind::Fork),
-        "git" => Some(RepoIconKind::Git),
+        "local" => Some(RepoIconKind::Local),
+        "unknown" => Some(RepoIconKind::Unknown),
         "folder" => Some(RepoIconKind::Folder),
         _ => None,
     }
