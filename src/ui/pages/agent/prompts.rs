@@ -9,9 +9,7 @@ use std::time::Duration;
 
 const PROMPT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
 const PROMPT_MONITOR_RATE_LIMIT_MS: i32 = 250;
-const PROMPT_BUTTON_MIN_LABEL_CHARS: usize = 8;
-const PROMPT_BUTTON_MAX_LABEL_CHARS: usize = 24;
-const PROMPT_BUTTON_SIDE_MARGIN: i32 = 2;
+const PROMPT_BUTTON_SIDE_MARGIN: i32 = 6;
 
 type PromptSelectedCallback = Rc<dyn Fn(Result<PromptSelection, String>)>;
 
@@ -230,17 +228,11 @@ fn add_prompt_button(
     let icon = gtk::Image::from_icon_name("clipboard-symbolic");
     icon.set_pixel_size(16);
 
-    let label_width_chars = prompt_file
-        .label
-        .chars()
-        .count()
-        .clamp(PROMPT_BUTTON_MIN_LABEL_CHARS, PROMPT_BUTTON_MAX_LABEL_CHARS)
-        as i32;
+    let label_width_chars = prompt_file.label.chars().count() as i32;
     let label = gtk::Label::builder()
         .label(&prompt_file.label)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .width_chars(label_width_chars)
-        .max_width_chars(PROMPT_BUTTON_MAX_LABEL_CHARS as i32)
         .build();
 
     let content = gtk::Box::builder()
