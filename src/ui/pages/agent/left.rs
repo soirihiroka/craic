@@ -291,7 +291,6 @@ impl AgentList {
             return;
         }
 
-        log::debug!("agent workspace history refresh started");
         self.spawn_history_load(true);
     }
 
