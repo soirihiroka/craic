@@ -556,7 +556,11 @@ fn progress_widget(
     area.add_controller(motion);
 
     let click = gtk::GestureClick::builder().button(0).build();
-    click.connect_released(move |_, _, _, _| on_activate());
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    click.connect_pressed(move |gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        on_activate();
+    });
     area.add_controller(click);
 
     update_progress_widget(&area, progress);

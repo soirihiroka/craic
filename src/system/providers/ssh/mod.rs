@@ -25,12 +25,13 @@ use crate::system::path::{
 use crate::system::provider::{
     ProviderWorkspaceEntry, ProviderWorkspaceListRequest, ProviderWorkspaceSource, SystemProvider,
 };
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 const SSH_WORKSPACE_LIST_SCRIPT: &str = include_str!("scripts/list_workspaces.sh");
 const SSH_RESOLVE_PATH_SCRIPT: &str = include_str!("scripts/resolve_path.sh");
+const SSH_STDIN_CHUNK_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SshProviderConfig {
@@ -301,6 +302,19 @@ impl SshCommandRunner {
         script: &str,
         stdin: Option<&[u8]>,
     ) -> Result<ShellCommandOutput, String> {
+        self.run_script_output_with_stdin_progress(operation, script, stdin, |_, _| Ok(()))
+    }
+
+    pub(crate) fn run_script_output_with_stdin_progress<F>(
+        &self,
+        operation: &str,
+        script: &str,
+        stdin: Option<&[u8]>,
+        mut progress: F,
+    ) -> Result<ShellCommandOutput, String>
+    where
+        F: FnMut(u64, u64) -> Result<(), String>,
+    {
         let remote_command = format!("sh -lc {}", shell_quote(script));
         log::info!(
             "ssh command start provider={} operation={} script_bytes={}",
@@ -335,9 +349,24 @@ impl SshCommandRunner {
         if let Some(stdin_bytes) = stdin
             && let Some(mut child_stdin) = child.stdin.take()
         {
-            child_stdin
-                .write_all(stdin_bytes)
-                .map_err(|err| format!("Failed to write ssh stdin for {operation}: {err}"))?;
+            let total_bytes = stdin_bytes.len() as u64;
+            if let Err(err) = progress(0, total_bytes) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err);
+            }
+            let mut completed_bytes = 0u64;
+            for chunk in stdin_bytes.chunks(SSH_STDIN_CHUNK_BYTES) {
+                child_stdin
+                    .write_all(chunk)
+                    .map_err(|err| format!("Failed to write ssh stdin for {operation}: {err}"))?;
+                completed_bytes = completed_bytes.saturating_add(chunk.len() as u64);
+                if let Err(err) = progress(completed_bytes, total_bytes) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(err);
+                }
+            }
         }
 
         let output = child
@@ -374,23 +403,106 @@ impl SshCommandRunner {
         stdin: Option<&[u8]>,
     ) -> Result<SshOutput, String> {
         let output = self.run_script_output_with_stdin(operation, script, stdin)?;
-        let stderr = output.stderr_text_trimmed();
+        ssh_output_or_error(operation, output)
+    }
 
-        if output.status_success(&[0]) {
-            Ok(SshOutput {
-                stdout: output.stdout,
-                stderr,
-            })
-        } else {
-            Err(if stderr.is_empty() {
-                format!(
-                    "ssh {operation} failed with status {:?}",
-                    output.status_code
-                )
-            } else {
-                stderr
-            })
+    pub(crate) fn run_script_with_stdin_progress<F>(
+        &self,
+        operation: &str,
+        script: &str,
+        stdin: &[u8],
+        progress: F,
+    ) -> Result<SshOutput, String>
+    where
+        F: FnMut(u64, u64) -> Result<(), String>,
+    {
+        let output =
+            self.run_script_output_with_stdin_progress(operation, script, Some(stdin), progress)?;
+        ssh_output_or_error(operation, output)
+    }
+
+    pub(crate) fn run_script_with_stdout_progress<F>(
+        &self,
+        operation: &str,
+        script: &str,
+        mut progress: F,
+    ) -> Result<SshOutput, String>
+    where
+        F: FnMut(&[u8]) -> Result<(), String>,
+    {
+        let remote_command = format!("sh -lc {}", shell_quote(script));
+        log::info!(
+            "ssh command start provider={} operation={} script_bytes={}",
+            self.label,
+            operation,
+            script.len()
+        );
+
+        let mut child = Command::new("ssh")
+            .arg("-o")
+            .arg("ControlMaster=auto")
+            .arg("-o")
+            .arg("ControlPersist=5m")
+            .arg("-o")
+            .arg(format!(
+                "ControlPath=/tmp/craic-ssh-{}-%r@%h:%p",
+                sanitize_id(&self.host)
+            ))
+            .arg("--")
+            .arg(&self.host)
+            .arg(remote_command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("Failed to start ssh for {operation}: {err}"))?;
+
+        let mut stdout = Vec::new();
+        if let Some(mut child_stdout) = child.stdout.take() {
+            let mut buffer = vec![0u8; SSH_STDIN_CHUNK_BYTES];
+            loop {
+                let read = child_stdout
+                    .read(&mut buffer)
+                    .map_err(|err| format!("Failed to read ssh stdout for {operation}: {err}"))?;
+                if read == 0 {
+                    break;
+                }
+                stdout.extend_from_slice(&buffer[..read]);
+                if let Err(err) = progress(&stdout) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(err);
+                }
+            }
         }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|err| format!("Failed to wait for ssh {operation}: {err}"))?;
+        if output.status.success() {
+            log::info!(
+                "ssh command complete provider={} operation={} stdout_bytes={}",
+                self.label,
+                operation,
+                stdout.len()
+            );
+        } else {
+            log::warn!(
+                "ssh command failed provider={} operation={} status={} stderr={}",
+                self.label,
+                operation,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        ssh_output_or_error(
+            operation,
+            ShellCommandOutput {
+                stdout,
+                stderr: output.stderr,
+                status_code: output.status.code(),
+            },
+        )
     }
 
     pub(crate) fn run_text(&self, operation: &str, script: &str) -> Result<String, String> {
@@ -409,6 +521,26 @@ impl SshCommandRunner {
             resolved
         );
         Ok(resolved)
+    }
+}
+
+fn ssh_output_or_error(operation: &str, output: ShellCommandOutput) -> Result<SshOutput, String> {
+    let stderr = output.stderr_text_trimmed();
+
+    if output.status_success(&[0]) {
+        Ok(SshOutput {
+            stdout: output.stdout,
+            stderr,
+        })
+    } else {
+        Err(if stderr.is_empty() {
+            format!(
+                "ssh {operation} failed with status {:?}",
+                output.status_code
+            )
+        } else {
+            stderr
+        })
     }
 }
 

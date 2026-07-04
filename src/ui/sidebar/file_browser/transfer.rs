@@ -465,23 +465,36 @@ impl FileBrowser {
         });
     }
 
-    fn cancel_transfers(&self, transfer_ids: &[u64]) {
+    fn cancel_transfers(self: &Rc<Self>, transfer_ids: &[u64]) {
+        let mut selected_was_canceled = false;
+        let selected_path = self.selected_node_path.borrow().clone();
         for transfer_id in transfer_ids {
-            if let Some(transfer) = self.active_transfers.borrow().get(transfer_id) {
+            if let Some(transfer) = self.active_transfers.borrow_mut().remove(transfer_id) {
                 transfer.cancel_requested.store(true, Ordering::Relaxed);
+                selected_was_canceled |= selected_path
+                    .as_ref()
+                    .is_some_and(|path| transfer.current_path.as_ref() == Some(path));
                 log::info!("file transfer cancel requested id={transfer_id}");
             }
+        }
+        if selected_was_canceled {
+            self.set_selected_node_path(None);
+        } else {
+            self.refresh_transfer_progress_rows();
         }
     }
 
     pub(super) fn cancel_transfers_for_workspace_change(self: &Rc<Self>) {
-        let transfer_ids = self.active_transfers.borrow().keys().copied().collect::<Vec<_>>();
+        let transfer_ids = self
+            .active_transfers
+            .borrow()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
         if transfer_ids.is_empty() {
             return;
         }
         self.cancel_transfers(&transfer_ids);
-        self.active_transfers.borrow_mut().clear();
-        self.refresh_transfer_progress_rows();
         log::info!(
             "file transfers canceled for workspace change count={}",
             transfer_ids.len()
