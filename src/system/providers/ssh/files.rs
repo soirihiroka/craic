@@ -25,6 +25,7 @@ const MOVE_PATH_SCRIPT: &str = include_str!("scripts/move_path.sh");
 const READ_WITH_INFO_SCRIPT: &str = include_str!("scripts/read_with_info.sh");
 const WRITE_CREATE_NEW_SCRIPT: &str = include_str!("scripts/write_create_new.sh");
 const WRITE_REPLACE_SCRIPT: &str = include_str!("scripts/write_replace.sh");
+const WRITE_APPEND_SCRIPT: &str = include_str!("scripts/write_append.sh");
 
 #[derive(Clone, Debug)]
 pub(crate) struct SshFileAccess {
@@ -359,6 +360,10 @@ impl SshFileAccess {
             ),
             FileWriteMode::Replace => shell_script_with_args(
                 WRITE_REPLACE_SCRIPT,
+                std::slice::from_ref(&resolved.remote_path),
+            ),
+            FileWriteMode::Append => shell_script_with_args(
+                WRITE_APPEND_SCRIPT,
                 std::slice::from_ref(&resolved.remote_path),
             ),
         };

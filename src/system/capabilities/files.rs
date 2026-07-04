@@ -367,6 +367,7 @@ pub(crate) struct FileReadRequest {
 pub(crate) enum FileWriteMode {
     CreateNew,
     Replace,
+    Append,
 }
 
 #[derive(Clone, Debug)]

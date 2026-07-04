@@ -332,6 +332,10 @@ impl ContentPane {
         }
     }
 
+    pub(super) fn active_terminal_task_count(&self) -> usize {
+        self.terminal.active_task_count()
+    }
+
     fn load_quick_action_config(&self, repo_path: &Path) {
         if self
             .quick_action_config_repo

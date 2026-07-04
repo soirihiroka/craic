@@ -1,15 +1,20 @@
+use super::rows;
 use super::{BrowserTarget, FileBrowser, should_skip};
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{
-    FileAccess, FileCopyRequest, FileKind, FileMoveRequest, FileOperationEvent,
-    FileOperationProgress,
+    FileAccess, FileCopyRequest, FileDeleteRequest, FileKind, FileMoveRequest, FileOperation,
+    FileOperationEvent, FileOperationProgress, FileRead, FileReadRequest, FileWriteMode,
+    FileWritePayload, FileWriteRequest,
 };
 use crate::system::capabilities::open::{DesktopOpenActivation, DesktopOpenTargetKind};
 use adw::prelude::*;
 use gtk::gdk;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{
-    Arc,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, TryRecvError},
 };
@@ -17,25 +22,33 @@ use std::thread;
 use std::time::Duration;
 
 const TRANSFER_CANCELED_MESSAGE: &str = "Transfer canceled.";
+const LOCAL_FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
+
+static FILE_CLIPBOARD: OnceLock<Mutex<Option<FileClipboard>>> = OnceLock::new();
+static DRAG_CLIPBOARD: OnceLock<Mutex<Option<FileClipboard>>> = OnceLock::new();
 
 impl FileBrowser {
     pub(super) fn set_internal_drag_paths(&self, paths: Vec<FileNodePath>) {
-        self.internal_drag_paths.replace(Some(paths));
+        self.internal_drag_paths.replace(Some(paths.clone()));
+        set_shared_drag_clipboard(Some(FileClipboard {
+            source_access: self.file_access.borrow().clone(),
+            paths,
+            operation: TransferOperation::Copy,
+        }));
     }
 
     pub(super) fn clear_internal_drag_paths(self: &Rc<Self>) {
         self.internal_drag_paths.borrow_mut().take();
+        set_shared_drag_clipboard(None);
         self.clear_drop_target_folder();
     }
 
-    pub(super) fn handle_drop_hover(
+    pub(super) fn handle_external_drop_hover(
         self: &Rc<Self>,
-        _external_sources_available: bool,
         target: FileNodePath,
         available_actions: gdk::DragAction,
-        modifiers: gdk::ModifierType,
     ) -> gdk::DragAction {
-        let Some(operation) = self.drop_operation_for_target(&target, available_actions, modifiers)
+        let Some(operation) = self.drop_operation_for_external_target(&target, available_actions)
         else {
             self.clear_drop_target_folder();
             return gdk::DragAction::empty();
@@ -45,47 +58,95 @@ impl FileBrowser {
         operation.drag_action()
     }
 
-    pub(super) fn handle_dropped_paths(
+    pub(super) fn handle_internal_drop_hover(
         self: &Rc<Self>,
-        external_sources_available: bool,
         target: FileNodePath,
         available_actions: gdk::DragAction,
         modifiers: gdk::ModifierType,
-    ) -> bool {
-        let Some(operation) = self.drop_operation_for_target(&target, available_actions, modifiers)
+    ) -> gdk::DragAction {
+        let Some(operation) =
+            self.drop_operation_for_internal_target(&target, available_actions, modifiers)
         else {
             self.clear_drop_target_folder();
-            if external_sources_available {
+            return gdk::DragAction::empty();
+        };
+
+        self.set_drop_target_folder(Some(target));
+        operation.drag_action()
+    }
+
+    pub(super) fn handle_external_dropped_paths(
+        self: &Rc<Self>,
+        external_sources: Vec<PathBuf>,
+        target: FileNodePath,
+        available_actions: gdk::DragAction,
+    ) -> bool {
+        if self
+            .drop_operation_for_external_target(&target, available_actions)
+            .is_none()
+        {
+            self.clear_drop_target_folder();
+            if !external_sources.is_empty() {
                 self.show_error(
                     "Drop Unavailable",
                     "Dropping local files into this workspace is not available.",
                 );
             }
             return false;
-        };
+        }
         self.clear_drop_target_folder();
-
-        let Some(paths) = self.internal_drag_paths.borrow().clone() else {
-            self.show_error(
-                "Drop Unavailable",
-                "Dropping local files into this workspace is not available.",
-            );
-            return false;
-        };
-        self.transfer_workspace_paths_to_folder(paths, target, operation, false);
+        self.transfer_local_paths_to_folder(external_sources, target, false);
         true
     }
 
-    fn drop_operation_for_target(
+    pub(super) fn handle_internal_dropped_paths(
+        self: &Rc<Self>,
+        target: FileNodePath,
+        available_actions: gdk::DragAction,
+        modifiers: gdk::ModifierType,
+    ) -> bool {
+        let Some(operation) =
+            self.drop_operation_for_internal_target(&target, available_actions, modifiers)
+        else {
+            self.clear_drop_target_folder();
+            return false;
+        };
+        self.clear_drop_target_folder();
+
+        let internal_paths = self.internal_drag_paths.borrow().clone();
+        let Some(mut clipboard) = internal_paths
+            .map(|paths| FileClipboard {
+                source_access: self.file_access.borrow().clone(),
+                paths,
+                operation,
+            })
+            .or_else(shared_drag_clipboard)
+        else {
+            self.show_error("Drop Unavailable", "No file transfer source was available.");
+            return false;
+        };
+        clipboard.operation = operation;
+        self.transfer_workspace_paths_to_folder(clipboard, target, operation, false);
+        true
+    }
+
+    fn drop_operation_for_external_target(
         &self,
-        target: &FileNodePath,
+        _target: &FileNodePath,
+        available_actions: gdk::DragAction,
+    ) -> Option<TransferOperation> {
+        TransferOperation::Copy
+            .action_allowed(available_actions)
+            .then_some(TransferOperation::Copy)
+    }
+
+    fn drop_operation_for_internal_target(
+        &self,
+        _target: &FileNodePath,
         available_actions: gdk::DragAction,
         modifiers: gdk::ModifierType,
     ) -> Option<TransferOperation> {
-        if self.internal_drag_paths.borrow().is_none() {
-            return None;
-        }
-        if !self.workspace_is_directory(target) {
+        if self.internal_drag_paths.borrow().is_none() && shared_drag_clipboard().is_none() {
             return None;
         }
 
@@ -122,7 +183,6 @@ impl FileBrowser {
         if target.is_root()
             || !self.search_query.borrow().is_empty()
             || self.expanded_dirs.borrow().contains(&target)
-            || !self.workspace_is_directory(&target)
         {
             return;
         }
@@ -135,7 +195,6 @@ impl FileBrowser {
                 if browser.drop_hover_generation.get() != generation
                     || browser.drop_target_folder.borrow().as_ref() != Some(&target)
                     || !browser.search_query.borrow().is_empty()
-                    || !browser.workspace_is_directory(&target)
                     || browser.expanded_dirs.borrow().contains(&target)
                 {
                     return;
@@ -149,31 +208,16 @@ impl FileBrowser {
         });
     }
 
-    pub(super) fn current_drop_target_folder(&self) -> Option<FileNodePath> {
-        self.drop_target_folder.borrow().clone()
-    }
-
-    fn workspace_is_directory(&self, path: &FileNodePath) -> bool {
-        self.file_access
-            .borrow()
-            .info(path)
-            .is_ok_and(|info| info.kind == FileKind::Directory)
-    }
-
-    fn transfer_workspace_paths_to_folder(
+    fn transfer_local_paths_to_folder(
         self: &Rc<Self>,
-        sources: Vec<FileNodePath>,
+        sources: Vec<PathBuf>,
         target_folder: FileNodePath,
-        operation: TransferOperation,
         auto_focus: bool,
     ) {
         if sources.is_empty() {
             return;
         }
-        if !self.workspace_is_directory(&target_folder) {
-            self.show_error(operation.failure_heading(), "Drop target is not a folder.");
-            return;
-        }
+        let operation = TransferOperation::Copy;
 
         let workspace = self.workspace.borrow().clone();
         let file_access = self.file_access.borrow().clone();
@@ -195,14 +239,118 @@ impl FileBrowser {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             log::info!(
-                "file transfer start workspace={} operation={operation:?} count={}",
+                "local file drop transfer start destination_workspace={} operation={operation:?} count={}",
                 workspace.display_name,
                 sources.len()
             );
             let progress_sender = sender.clone();
-            let result = transfer_workspace_paths(
+            let result = transfer_local_paths(
                 file_access,
                 sources,
+                target_folder,
+                cancel_requested,
+                move |progress| {
+                    let _ = progress_sender.send(TransferEvent::Progress(progress));
+                },
+            );
+            let _ = sender.send(TransferEvent::Finished(result));
+        });
+
+        gtk::glib::timeout_add_local(Duration::from_millis(super::SEARCH_POLL_MS), {
+            let browser = self.clone();
+
+            move || loop {
+                match receiver.try_recv() {
+                    Ok(TransferEvent::Progress(progress)) => {
+                        let progress_path_changed =
+                            browser.set_transfer_progress(transfer_id, progress);
+                        if progress_path_changed {
+                            browser.invalidate_tree_rows_cache();
+                            browser.rebuild_if_changed();
+                        } else {
+                            browser.refresh_transfer_progress_rows();
+                        }
+                    }
+                    Ok(TransferEvent::Finished(result)) => {
+                        browser.finish_transfer(transfer_id, operation, result);
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                    Err(TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                    Err(TryRecvError::Disconnected) => {
+                        browser.finish_disconnected_transfer(transfer_id, operation);
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                }
+            }
+        });
+    }
+
+    pub(super) fn active_transfer_rows(&self) -> Vec<rows::TransferPlaceholderRow> {
+        self.active_transfers
+            .borrow()
+            .values()
+            .filter_map(|transfer| {
+                let path = transfer.current_path.clone()?;
+                Some(rows::TransferPlaceholderRow {
+                    name: path.file_name().unwrap_or("Copying...").to_string(),
+                    depth: file_row_depth(&path),
+                    path,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn current_drop_target_folder(&self) -> Option<FileNodePath> {
+        self.drop_target_folder.borrow().clone()
+    }
+
+    fn workspace_is_directory(&self, path: &FileNodePath) -> bool {
+        self.file_access
+            .borrow()
+            .info(path)
+            .is_ok_and(|info| info.kind == FileKind::Directory)
+    }
+
+    fn transfer_workspace_paths_to_folder(
+        self: &Rc<Self>,
+        clipboard: FileClipboard,
+        target_folder: FileNodePath,
+        operation: TransferOperation,
+        auto_focus: bool,
+    ) {
+        if clipboard.paths.is_empty() {
+            return;
+        }
+
+        let workspace = self.workspace.borrow().clone();
+        let file_access = self.file_access.borrow().clone();
+        let transfer_id = self.next_transfer_id.get();
+        self.next_transfer_id
+            .set(transfer_id.wrapping_add(1).max(1));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        self.active_transfers.borrow_mut().insert(
+            transfer_id,
+            ActiveTransfer::new(
+                operation,
+                clipboard.paths.len() as u64,
+                auto_focus,
+                cancel_requested.clone(),
+            ),
+        );
+        self.refresh_transfer_progress_rows();
+
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            log::info!(
+                "file transfer start destination_workspace={} operation={operation:?} count={}",
+                workspace.display_name,
+                clipboard.paths.len()
+            );
+            let progress_sender = sender.clone();
+            let result = transfer_workspace_paths(
+                clipboard.source_access,
+                file_access,
+                clipboard.paths,
                 target_folder,
                 operation,
                 cancel_requested,
@@ -456,10 +604,19 @@ impl FileBrowser {
 
     pub(super) fn paste_into_folder(self: &Rc<Self>, target_folder: FileNodePath) {
         let Some(clipboard) = self.file_clipboard.borrow().clone() else {
+            let Some(clipboard) = shared_file_clipboard() else {
+                return;
+            };
+            self.transfer_workspace_paths_to_folder(
+                clipboard.clone(),
+                target_folder,
+                clipboard.operation,
+                true,
+            );
             return;
         };
         self.transfer_workspace_paths_to_folder(
-            clipboard.paths,
+            clipboard.clone(),
             target_folder,
             clipboard.operation,
             true,
@@ -483,10 +640,13 @@ impl FileBrowser {
     }
 
     pub(super) fn copy_target(&self, target: &BrowserTarget, operation: TransferOperation) {
-        self.file_clipboard.replace(Some(FileClipboard {
+        let clipboard = FileClipboard {
+            source_access: self.file_access.borrow().clone(),
             paths: vec![target.node_path.clone()],
             operation,
-        }));
+        };
+        self.file_clipboard.replace(Some(clipboard.clone()));
+        set_shared_file_clipboard(Some(clipboard));
         set_clipboard_text(&target.path);
     }
 
@@ -500,12 +660,14 @@ impl FileBrowser {
 
     pub(super) fn copy_absolute_path(&self, target: &BrowserTarget) {
         self.file_clipboard.borrow_mut().take();
+        set_shared_file_clipboard(None);
         let text = self.file_access.borrow().copy_path(&target.node_path);
         set_clipboard_text(&text);
     }
 
     pub(super) fn copy_relative_path(&self, target: &BrowserTarget) {
         self.file_clipboard.borrow_mut().take();
+        set_shared_file_clipboard(None);
         set_clipboard_text(&target.path);
     }
 
@@ -598,6 +760,7 @@ impl FileBrowser {
 
 #[derive(Clone)]
 pub(super) struct FileClipboard {
+    source_access: Arc<dyn FileAccess>,
     paths: Vec<FileNodePath>,
     operation: TransferOperation,
 }
@@ -687,8 +850,312 @@ enum TransferEvent {
     Finished(Result<Vec<FileNodePath>, String>),
 }
 
-fn transfer_workspace_paths(
+#[derive(Clone, Copy, Debug, Default)]
+struct LocalTransferTotals {
+    bytes: u64,
+    files: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LocalTransferProgress {
+    completed_bytes: u64,
+    total_bytes: u64,
+    completed_files: u64,
+    total_files: u64,
+}
+
+impl LocalTransferProgress {
+    fn from_totals(totals: LocalTransferTotals) -> Self {
+        Self {
+            completed_bytes: 0,
+            total_bytes: totals.bytes.saturating_mul(2),
+            completed_files: 0,
+            total_files: totals.files,
+        }
+    }
+
+    fn add_bytes(&mut self, bytes: u64) {
+        self.completed_bytes = self.completed_bytes.saturating_add(bytes);
+    }
+
+    fn complete_file(&mut self) {
+        self.completed_files = self.completed_files.saturating_add(1);
+    }
+
+    fn to_update(self, current_path: &FileNodePath) -> TransferProgressUpdate {
+        TransferProgressUpdate {
+            current_path: Some(current_path.clone()),
+            copied_bytes: self.completed_bytes,
+            total_bytes: self.total_bytes,
+            copied_files: self.completed_files,
+            total_files: self.total_files,
+        }
+    }
+}
+
+fn transfer_local_paths(
+    destination_access: Arc<dyn FileAccess>,
+    sources: Vec<PathBuf>,
+    target_folder: FileNodePath,
+    cancel_requested: Arc<AtomicBool>,
+    mut progress: impl FnMut(TransferProgressUpdate),
+) -> Result<Vec<FileNodePath>, String> {
+    let mut roots = Vec::new();
+    for source in &sources {
+        check_transfer_canceled(cancel_requested.as_ref())?;
+        let name = file_name_for_local_transfer(&source)?;
+        let destination = target_folder.join_child(&name);
+        if destination_access.info(&destination).is_ok() {
+            return Err(format!("{} already exists.", destination.display()));
+        }
+        roots.push((source.clone(), destination));
+    }
+    if let Some((_, destination)) = roots.first() {
+        progress(TransferProgressUpdate {
+            current_path: Some(destination.clone()),
+            copied_bytes: 0,
+            total_bytes: 0,
+            copied_files: 0,
+            total_files: sources.len() as u64,
+        });
+    }
+
+    let mut totals = LocalTransferTotals::default();
+    for (source, _) in &roots {
+        check_transfer_canceled(cancel_requested.as_ref())?;
+        let source_totals = local_transfer_totals(source, cancel_requested.as_ref())?;
+        totals.bytes = totals.bytes.saturating_add(source_totals.bytes);
+        totals.files = totals.files.saturating_add(source_totals.files);
+    }
+
+    let mut destinations = Vec::new();
+    let mut local_progress = LocalTransferProgress::from_totals(totals);
+    for (source, destination) in roots {
+        check_transfer_canceled(cancel_requested.as_ref())?;
+        copy_local_path_to_file_access(
+            destination_access.clone(),
+            &source,
+            destination.clone(),
+            destination.clone(),
+            cancel_requested.clone(),
+            &mut local_progress,
+            &mut progress,
+        )?;
+        progress(local_progress.to_update(&destination));
+        destinations.push(destination);
+    }
+    Ok(destinations)
+}
+
+fn local_transfer_totals(
+    source: &Path,
+    cancel_requested: &AtomicBool,
+) -> Result<LocalTransferTotals, String> {
+    check_transfer_canceled(cancel_requested)?;
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|err| format!("Unable to inspect {}: {err}", source.display()))?;
+    if metadata.is_dir() {
+        let mut totals = LocalTransferTotals { bytes: 0, files: 1 };
+        for entry in fs::read_dir(source)
+            .map_err(|err| format!("Unable to list {}: {err}", source.display()))?
+        {
+            let entry = entry.map_err(|err| format!("Unable to read directory entry: {err}"))?;
+            let child_totals = local_transfer_totals(&entry.path(), cancel_requested)?;
+            totals.bytes = totals.bytes.saturating_add(child_totals.bytes);
+            totals.files = totals.files.saturating_add(child_totals.files);
+        }
+        return Ok(totals);
+    }
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Copying symlinks from local file drops is unsupported: {}",
+            source.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "Only files and folders can be dropped into the file browser: {}",
+            source.display()
+        ));
+    }
+    Ok(LocalTransferTotals {
+        bytes: metadata.len(),
+        files: 1,
+    })
+}
+
+fn copy_local_path_to_file_access(
+    destination_access: Arc<dyn FileAccess>,
+    source: &Path,
+    destination: FileNodePath,
+    display_path: FileNodePath,
+    cancel_requested: Arc<AtomicBool>,
+    local_progress: &mut LocalTransferProgress,
+    progress: &mut impl FnMut(TransferProgressUpdate),
+) -> Result<(), String> {
+    check_transfer_canceled(cancel_requested.as_ref())?;
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|err| format!("Unable to inspect {}: {err}", source.display()))?;
+    if destination_access.info(&destination).is_ok() {
+        return Err(format!("{} already exists.", destination.display()));
+    }
+    if metadata.is_dir() {
+        write_with_progress(
+            destination_access.clone(),
+            FileWriteRequest {
+                path: destination.clone(),
+                mode: FileWriteMode::CreateNew,
+                payload: FileWritePayload::Directory,
+                cancel_requested: Some(cancel_requested.clone()),
+            },
+            &destination,
+            &display_path,
+            local_progress,
+            progress,
+        )?;
+        local_progress.complete_file();
+        progress(local_progress.to_update(&display_path));
+        for entry in fs::read_dir(source)
+            .map_err(|err| format!("Unable to list {}: {err}", source.display()))?
+        {
+            let entry = entry.map_err(|err| format!("Unable to read directory entry: {err}"))?;
+            let child_source = entry.path();
+            let name = file_name_for_local_transfer(&child_source)?;
+            copy_local_path_to_file_access(
+                destination_access.clone(),
+                &child_source,
+                destination.join_child(name),
+                display_path.clone(),
+                cancel_requested.clone(),
+                local_progress,
+                progress,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Copying symlinks from local file drops is unsupported: {}",
+            source.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "Only files and folders can be dropped into the file browser: {}",
+            source.display()
+        ));
+    }
+
+    write_local_file_chunks(
+        destination_access,
+        source,
+        metadata.len(),
+        destination,
+        display_path,
+        cancel_requested,
+        local_progress,
+        progress,
+    )
+}
+
+fn write_local_file_chunks(
+    destination_access: Arc<dyn FileAccess>,
+    source: &Path,
+    total_bytes: u64,
+    destination: FileNodePath,
+    display_path: FileNodePath,
+    cancel_requested: Arc<AtomicBool>,
+    local_progress: &mut LocalTransferProgress,
+    progress: &mut impl FnMut(TransferProgressUpdate),
+) -> Result<(), String> {
+    let mut file = fs::File::open(source)
+        .map_err(|err| format!("Unable to read {}: {err}", source.display()))?;
+    let mut buffer = vec![0u8; LOCAL_FILE_TRANSFER_CHUNK_BYTES];
+    let mut mode = FileWriteMode::CreateNew;
+    let mut wrote_anything = false;
+    loop {
+        check_transfer_canceled(cancel_requested.as_ref())?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|err| format!("Unable to read {}: {err}", source.display()))?;
+        if read == 0 {
+            break;
+        }
+        local_progress.add_bytes(read as u64);
+        progress(local_progress.to_update(&display_path));
+        write_with_progress(
+            destination_access.clone(),
+            FileWriteRequest {
+                path: destination.clone(),
+                mode,
+                payload: FileWritePayload::File(buffer[..read].to_vec()),
+                cancel_requested: Some(cancel_requested.clone()),
+            },
+            &destination,
+            &display_path,
+            local_progress,
+            progress,
+        )?;
+        mode = FileWriteMode::Append;
+        wrote_anything = true;
+    }
+    if !wrote_anything {
+        debug_assert_eq!(total_bytes, 0);
+        write_with_progress(
+            destination_access,
+            FileWriteRequest {
+                path: destination.clone(),
+                mode: FileWriteMode::CreateNew,
+                payload: FileWritePayload::File(Vec::new()),
+                cancel_requested: Some(cancel_requested),
+            },
+            &destination,
+            &display_path,
+            local_progress,
+            progress,
+        )?;
+    }
+    local_progress.complete_file();
+    progress(local_progress.to_update(&display_path));
+    Ok(())
+}
+
+fn write_with_progress(
     file_access: Arc<dyn FileAccess>,
+    request: FileWriteRequest,
+    _destination: &FileNodePath,
+    display_path: &FileNodePath,
+    local_progress: &mut LocalTransferProgress,
+    progress: &mut impl FnMut(TransferProgressUpdate),
+) -> Result<(), String> {
+    let (sender, receiver) = mpsc::channel();
+    file_access.write_node(
+        request,
+        Box::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    );
+    let mut last_completed_bytes = 0u64;
+    loop {
+        match receiver.recv() {
+            Ok(FileOperationEvent::Progress(update)) => {
+                let delta = update.completed_bytes.saturating_sub(last_completed_bytes);
+                last_completed_bytes = update.completed_bytes;
+                local_progress.add_bytes(delta);
+                progress(local_progress.to_update(display_path));
+            }
+            Ok(FileOperationEvent::Finished(result)) => {
+                return result.map_err(|err| err.to_string());
+            }
+            Err(_) => return Err("write operation did not return a result.".to_string()),
+        }
+    }
+}
+
+fn transfer_workspace_paths(
+    source_access: Arc<dyn FileAccess>,
+    destination_access: Arc<dyn FileAccess>,
     sources: Vec<FileNodePath>,
     target_folder: FileNodePath,
     operation: TransferOperation,
@@ -705,11 +1172,12 @@ fn transfer_workspace_paths(
         if source == destination {
             continue;
         }
-        if file_access.info(&destination).is_ok() {
+        if destination_access.info(&destination).is_ok() {
             return Err(format!("{} already exists.", destination.display()));
         }
         run_transfer_file_operation(
-            file_access.clone(),
+            source_access.clone(),
+            destination_access.clone(),
             operation,
             source.clone(),
             target_folder.clone(),
@@ -734,7 +1202,8 @@ fn transfer_workspace_paths(
 }
 
 fn run_transfer_file_operation(
-    file_access: Arc<dyn FileAccess>,
+    source_access: Arc<dyn FileAccess>,
+    destination_access: Arc<dyn FileAccess>,
     operation: TransferOperation,
     source: FileNodePath,
     target_folder: FileNodePath,
@@ -746,9 +1215,38 @@ fn run_transfer_file_operation(
     progress: &mut impl FnMut(TransferProgressUpdate),
 ) -> Result<FileNodePath, String> {
     check_transfer_canceled(cancel_requested.as_ref())?;
+    if !Arc::ptr_eq(&source_access, &destination_access) {
+        return match operation {
+            TransferOperation::Copy => copy_between_file_accesses(
+                source_access,
+                destination_access,
+                source,
+                destination,
+                cancel_requested,
+                completed_before,
+                total_files,
+                progress,
+            ),
+            TransferOperation::Move => {
+                copy_between_file_accesses(
+                    source_access.clone(),
+                    destination_access,
+                    source.clone(),
+                    destination.clone(),
+                    cancel_requested.clone(),
+                    completed_before,
+                    total_files,
+                    progress,
+                )?;
+                delete_file_access_node(source_access, source, cancel_requested)?;
+                Ok(destination)
+            }
+        };
+    }
+
     let (sender, receiver) = mpsc::channel();
     match operation {
-        TransferOperation::Copy => file_access.copy_node(
+        TransferOperation::Copy => destination_access.copy_node(
             FileCopyRequest {
                 source: source.clone(),
                 destination: destination.clone(),
@@ -758,7 +1256,7 @@ fn run_transfer_file_operation(
                 let _ = sender.send(event);
             }),
         ),
-        TransferOperation::Move => file_access.move_node(
+        TransferOperation::Move => destination_access.move_node(
             FileMoveRequest {
                 source: source.clone(),
                 destination_parent: target_folder,
@@ -794,6 +1292,196 @@ fn run_transfer_file_operation(
     }
 }
 
+fn copy_between_file_accesses(
+    source_access: Arc<dyn FileAccess>,
+    destination_access: Arc<dyn FileAccess>,
+    source: FileNodePath,
+    destination: FileNodePath,
+    cancel_requested: Arc<AtomicBool>,
+    completed_before: u64,
+    total_files: u64,
+    progress: &mut impl FnMut(TransferProgressUpdate),
+) -> Result<FileNodePath, String> {
+    check_transfer_canceled(cancel_requested.as_ref())?;
+    let info = source_access.info(&source)?;
+    match info.kind {
+        FileKind::Directory => {
+            write_file_access_node(
+                destination_access.clone(),
+                FileWriteRequest {
+                    path: destination.clone(),
+                    mode: FileWriteMode::CreateNew,
+                    payload: FileWritePayload::Directory,
+                    cancel_requested: Some(cancel_requested.clone()),
+                },
+                completed_before,
+                total_files,
+                &destination,
+                progress,
+            )?;
+            let listings = source_access.list_dirs(std::slice::from_ref(&source))?;
+            let Some(listing) = listings.into_iter().next() else {
+                return Err(format!("Unable to list {}.", source.display()));
+            };
+            for child in listing.entries {
+                check_transfer_canceled(cancel_requested.as_ref())?;
+                let name = file_name_for_transfer(&child)?;
+                copy_between_file_accesses(
+                    source_access.clone(),
+                    destination_access.clone(),
+                    child,
+                    destination.join_child(name),
+                    cancel_requested.clone(),
+                    completed_before,
+                    total_files,
+                    progress,
+                )?;
+            }
+            Ok(destination)
+        }
+        FileKind::File | FileKind::Archive { .. } => {
+            let read = read_file_access_node(
+                source_access,
+                FileReadRequest {
+                    path: source.clone(),
+                    max_bytes: None,
+                    cancel_requested: Some(cancel_requested.clone()),
+                },
+                completed_before,
+                total_files,
+                &destination,
+                progress,
+            )?;
+            let bytes = read.into_bytes()?;
+            write_file_access_node(
+                destination_access,
+                FileWriteRequest {
+                    path: destination.clone(),
+                    mode: FileWriteMode::CreateNew,
+                    payload: FileWritePayload::File(bytes),
+                    cancel_requested: Some(cancel_requested),
+                },
+                completed_before,
+                total_files,
+                &destination,
+                progress,
+            )?;
+            Ok(destination)
+        }
+        FileKind::Symlink | FileKind::Other => Err(format!(
+            "Copying {} between different providers is unsupported.",
+            source.display()
+        )),
+    }
+}
+
+fn read_file_access_node(
+    file_access: Arc<dyn FileAccess>,
+    request: FileReadRequest,
+    completed_before: u64,
+    total_files: u64,
+    destination: &FileNodePath,
+    progress: &mut impl FnMut(TransferProgressUpdate),
+) -> Result<FileRead, String> {
+    let (sender, receiver) = mpsc::channel();
+    file_access.read_with_info(
+        request,
+        Box::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    );
+    wait_for_file_operation(
+        receiver,
+        FileOperation::Read,
+        completed_before,
+        total_files,
+        destination,
+        progress,
+    )
+}
+
+fn write_file_access_node(
+    file_access: Arc<dyn FileAccess>,
+    request: FileWriteRequest,
+    completed_before: u64,
+    total_files: u64,
+    destination: &FileNodePath,
+    progress: &mut impl FnMut(TransferProgressUpdate),
+) -> Result<(), String> {
+    let (sender, receiver) = mpsc::channel();
+    file_access.write_node(
+        request,
+        Box::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    );
+    wait_for_file_operation(
+        receiver,
+        FileOperation::Write,
+        completed_before,
+        total_files,
+        destination,
+        progress,
+    )
+}
+
+fn delete_file_access_node(
+    file_access: Arc<dyn FileAccess>,
+    path: FileNodePath,
+    cancel_requested: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let (sender, receiver) = mpsc::channel();
+    file_access.delete(
+        FileDeleteRequest {
+            path,
+            cancel_requested: Some(cancel_requested),
+        },
+        Box::new(move |event| {
+            let _ = sender.send(event);
+        }),
+    );
+    loop {
+        match receiver.recv() {
+            Ok(FileOperationEvent::Progress(_)) => {}
+            Ok(FileOperationEvent::Finished(result)) => {
+                return result.map_err(|err| err.to_string());
+            }
+            Err(_) => return Err("Delete operation did not return a result.".to_string()),
+        }
+    }
+}
+
+fn wait_for_file_operation<T>(
+    receiver: mpsc::Receiver<FileOperationEvent<T>>,
+    operation: FileOperation,
+    completed_before: u64,
+    total_files: u64,
+    destination: &FileNodePath,
+    progress: &mut impl FnMut(TransferProgressUpdate),
+) -> Result<T, String> {
+    loop {
+        match receiver.recv() {
+            Ok(FileOperationEvent::Progress(update)) => {
+                progress(transfer_progress_update(
+                    update,
+                    completed_before,
+                    total_files,
+                    destination,
+                ));
+            }
+            Ok(FileOperationEvent::Finished(result)) => {
+                return result.map_err(|err| err.to_string());
+            }
+            Err(_) => {
+                return Err(format!(
+                    "{} operation did not return a result.",
+                    operation.label()
+                ));
+            }
+        }
+    }
+}
+
 fn transfer_progress_update(
     update: FileOperationProgress,
     completed_before: u64,
@@ -819,6 +1507,30 @@ fn file_name_for_transfer(path: &FileNodePath) -> Result<String, String> {
     Ok(name.to_string())
 }
 
+fn file_name_for_local_transfer(path: &Path) -> Result<String, String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("Cannot transfer {}.", path.display()))?;
+    if should_skip(name) {
+        return Err("That name is hidden by the file browser.".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn file_row_depth(path: &FileNodePath) -> usize {
+    let parent = path.parent().unwrap_or_else(|| path.clone());
+    let display = parent.display();
+    if display.is_empty() {
+        0
+    } else {
+        display
+            .split('/')
+            .filter(|segment| !segment.is_empty() && *segment != "!")
+            .count()
+    }
+}
+
 fn check_transfer_canceled(cancel_requested: &AtomicBool) -> Result<(), String> {
     if cancel_requested.load(Ordering::Relaxed) {
         Err(TRANSFER_CANCELED_MESSAGE.to_string())
@@ -840,5 +1552,33 @@ fn copy_drag_modifier(modifiers: gdk::ModifierType) -> bool {
 fn set_clipboard_text(text: &str) {
     if let Some(display) = gdk::Display::default() {
         display.clipboard().set_text(text);
+    }
+}
+
+fn shared_file_clipboard() -> Option<FileClipboard> {
+    FILE_CLIPBOARD
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|clipboard| clipboard.clone())
+}
+
+fn set_shared_file_clipboard(clipboard: Option<FileClipboard>) {
+    if let Ok(mut shared) = FILE_CLIPBOARD.get_or_init(|| Mutex::new(None)).lock() {
+        *shared = clipboard;
+    }
+}
+
+fn shared_drag_clipboard() -> Option<FileClipboard> {
+    DRAG_CLIPBOARD
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|clipboard| clipboard.clone())
+}
+
+fn set_shared_drag_clipboard(clipboard: Option<FileClipboard>) {
+    if let Ok(mut shared) = DRAG_CLIPBOARD.get_or_init(|| Mutex::new(None)).lock() {
+        *shared = clipboard;
     }
 }
