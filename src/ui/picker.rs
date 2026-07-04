@@ -6,7 +6,9 @@ use std::rc::Rc;
 pub struct PickerItem {
     pub id: String,
     pub label: String,
+    pub fallback_label: String,
     pub icon_name: Option<String>,
+    pub color: Option<String>,
 }
 
 #[derive(Clone)]
@@ -203,15 +205,32 @@ impl Picker {
         self.popover.connect_show(move |_| callback());
     }
 
-    pub fn update_item_icon(&self, id: &str, icon_name: &str) {
+    pub fn update_item_metadata(&self, id: &str, remote_label: Option<&str>, icon_name: &str) {
         let icon_name = icon_name.to_string();
+        let mut label_changed = false;
         for item in self.items.borrow_mut().iter_mut() {
             if item.id == id {
+                let next_label = remote_label
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| item.fallback_label.clone());
+                if item.label != next_label {
+                    item.label = next_label;
+                    label_changed = true;
+                }
                 item.icon_name = Some(icon_name.clone());
                 break;
             }
         }
 
+        if label_changed {
+            self.refresh();
+            return;
+        }
+
+        self.update_visible_item_icon(id, &icon_name);
+    }
+
+    fn update_visible_item_icon(&self, id: &str, icon_name: &str) {
         let mut child = self.list.first_child();
         while let Some(widget) = child {
             let next = widget.next_sibling();
@@ -219,7 +238,7 @@ impl Picker {
             if let Ok(row) = widget.downcast::<gtk::ListBoxRow>() {
                 if row.widget_name() == id {
                     if let Some(image) = find_image(row.upcast_ref()) {
-                        image.set_icon_name(Some(icon_name.as_str()));
+                        image.set_icon_name(Some(icon_name));
                     }
                     if let Some(stack) = find_stack(row.upcast_ref()) {
                         stack.set_visible_child_name("icon");
@@ -299,11 +318,77 @@ fn item_row(item: &PickerItem) -> gtk::ListBoxRow {
         .margin_end(0)
         .build();
     content.append(&icon_stack);
+    if let Some(color) = item.color.as_deref().and_then(parse_hex_color) {
+        content.append(&color_dot(color));
+    }
     content.append(&label);
 
     let row = gtk::ListBoxRow::builder().child(&content).build();
     row.set_widget_name(&item.id);
     row
+}
+
+fn color_dot((red, green, blue, alpha): (f64, f64, f64, f64)) -> gtk::DrawingArea {
+    let dot = gtk::DrawingArea::builder()
+        .width_request(8)
+        .height_request(8)
+        .valign(gtk::Align::Center)
+        .build();
+    dot.set_draw_func(move |_, context, width, height| {
+        let radius = (width.min(height) as f64 / 2.0 - 0.5).max(1.0);
+        context.arc(
+            width as f64 / 2.0,
+            height as f64 / 2.0,
+            radius,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        context.set_source_rgba(red, green, blue, alpha);
+        let _ = context.fill();
+    });
+    dot
+}
+
+fn parse_hex_color(color: &str) -> Option<(f64, f64, f64, f64)> {
+    let hex = color.strip_prefix('#')?;
+    let (red, green, blue, alpha) = match hex.len() {
+        3 | 4 => {
+            let mut chars = hex.chars();
+            let red = doubled_hex(chars.next()?)?;
+            let green = doubled_hex(chars.next()?)?;
+            let blue = doubled_hex(chars.next()?)?;
+            let alpha = if let Some(ch) = chars.next() {
+                doubled_hex(ch)?
+            } else {
+                255
+            };
+            (red, green, blue, alpha)
+        }
+        6 | 8 => {
+            let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            let alpha = if hex.len() == 8 {
+                u8::from_str_radix(&hex[6..8], 16).ok()?
+            } else {
+                255
+            };
+            (red, green, blue, alpha)
+        }
+        _ => return None,
+    };
+
+    Some((
+        f64::from(red) / 255.0,
+        f64::from(green) / 255.0,
+        f64::from(blue) / 255.0,
+        f64::from(alpha) / 255.0,
+    ))
+}
+
+fn doubled_hex(ch: char) -> Option<u8> {
+    let value = ch.to_digit(16)? as u8;
+    Some(value * 16 + value)
 }
 
 fn find_stack(widget: &gtk::Widget) -> Option<gtk::Stack> {
