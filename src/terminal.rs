@@ -748,6 +748,11 @@ fn install_terminal_shortcuts(
                 return glib::Propagation::Stop;
             }
 
+            if let Some(sequence) = terminal_component::modified_enter_sequence(key, modifiers) {
+                terminal.feed_child(sequence.as_bytes());
+                return glib::Propagation::Stop;
+            }
+
             glib::Propagation::Proceed
         }
     });

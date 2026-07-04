@@ -71,6 +71,31 @@ pub(crate) fn set_font(terminal: &vte4::Terminal, font_size: f64) {
     ))));
 }
 
+pub(crate) fn modified_enter_sequence(
+    key: gdk::Key,
+    modifiers: gdk::ModifierType,
+) -> Option<String> {
+    if !matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) {
+        return None;
+    }
+
+    let mut mask = 1;
+    if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+        mask += 1;
+    }
+    if modifiers.contains(gdk::ModifierType::ALT_MASK) {
+        mask += 2;
+    }
+    if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+        mask += 4;
+    }
+    if modifiers.contains(gdk::ModifierType::SUPER_MASK) {
+        mask += 8;
+    }
+
+    (mask != 1).then(|| format!("\x1b[13;{mask}:1u"))
+}
+
 pub(crate) fn install_activation<F>(terminal: &vte4::Terminal, launch_dir: String, activate: F)
 where
     F: Fn(TerminalActivation) + 'static,
