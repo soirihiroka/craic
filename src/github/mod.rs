@@ -1,15 +1,18 @@
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use moka::sync::Cache;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 
+use crate::git::{GitOperationHook, GitOperationPostHook};
+use crate::system::WorkspacePath;
+use crate::system::capabilities::shell::{ShellAccess, ShellCommandOutput, ShellCommandRunRequest};
+
 mod cli;
 pub(crate) use cli::ssh_gh_with_account_script;
-pub(crate) use cli::{ssh_checkout_pull_request_script, ssh_switch_auth_account_script};
 
 const GITHUB_AVATAR_URL_CACHE_TTL_SECS: i64 = 60 * 60 * 24 * 30;
 const GITHUB_AVATAR_BYTES_CACHE_TTL_SECS: i64 = 60 * 60 * 24 * 30;
@@ -54,6 +57,21 @@ pub struct GitHubPublishRepositoryRequest {
     pub private: bool,
 }
 
+#[derive(Clone)]
+struct GitHubAuthGitHook {
+    shell: Arc<dyn ShellAccess>,
+    working_dir: WorkspacePath,
+    account: GitHubAuthAccount,
+}
+
+struct GitHubAuthRestoreHook {
+    shell: Arc<dyn ShellAccess>,
+    working_dir: WorkspacePath,
+    gh_path: String,
+    previous: Option<GitHubAuthAccount>,
+    switched: bool,
+}
+
 #[derive(Deserialize)]
 struct GhPullRequestRow {
     number: u32,
@@ -84,6 +102,86 @@ impl GitHubRepoMetadata {
             Self::Private => "private",
             Self::Public => "public",
         }
+    }
+}
+
+pub(crate) fn git_auth_hook(
+    shell: Arc<dyn ShellAccess>,
+    working_dir: WorkspacePath,
+    account: Option<GitHubAuthAccount>,
+) -> Option<Arc<dyn GitOperationHook>> {
+    account.map(|account| {
+        Arc::new(GitHubAuthGitHook {
+            shell,
+            working_dir,
+            account,
+        }) as Arc<dyn GitOperationHook>
+    })
+}
+
+impl GitOperationHook for GitHubAuthGitHook {
+    fn pre(&self) -> Result<Box<dyn GitOperationPostHook>, String> {
+        let gh_path = resolve_gh_for_hook(self.shell.as_ref())?;
+        let previous = active_gh_account_for_host(
+            self.shell.as_ref(),
+            &self.working_dir,
+            &gh_path,
+            &self.account.host,
+        )?;
+        let switched = previous.as_ref() != Some(&self.account);
+        if switched {
+            log::info!(
+                "github auth hook switching account host={} target={} previous={:?}",
+                self.account.host,
+                self.account.login,
+                previous.as_ref().map(|account| account.login.as_str())
+            );
+            switch_gh_account(
+                self.shell.as_ref(),
+                &self.working_dir,
+                &gh_path,
+                &self.account,
+            )?;
+        } else {
+            log::debug!(
+                "github auth hook target account already active host={} account={}",
+                self.account.host,
+                self.account.login
+            );
+        }
+
+        Ok(Box::new(GitHubAuthRestoreHook {
+            shell: self.shell.clone(),
+            working_dir: self.working_dir.clone(),
+            gh_path,
+            previous,
+            switched,
+        }))
+    }
+}
+
+impl GitOperationPostHook for GitHubAuthRestoreHook {
+    fn post(self: Box<Self>) -> Result<(), String> {
+        if !self.switched {
+            return Ok(());
+        }
+        let Some(previous) = self.previous else {
+            log::warn!(
+                "github auth hook cannot restore because no previous active account existed"
+            );
+            return Ok(());
+        };
+        log::info!(
+            "github auth hook restoring account host={} account={}",
+            previous.host,
+            previous.login
+        );
+        switch_gh_account(
+            self.shell.as_ref(),
+            &self.working_dir,
+            &self.gh_path,
+            &previous,
+        )
     }
 }
 
@@ -312,6 +410,119 @@ pub fn parse_authenticated_accounts(bytes: &[u8]) -> Result<Vec<GitHubAuthAccoun
             })
             .collect()
     })
+}
+
+fn active_gh_account_for_host(
+    shell: &dyn ShellAccess,
+    working_dir: &WorkspacePath,
+    gh_path: &str,
+    host: &str,
+) -> Result<Option<GitHubAuthAccount>, String> {
+    let output = run_gh_hook_command(
+        shell,
+        working_dir,
+        "gh auth status",
+        gh_path,
+        &[
+            "auth".into(),
+            "status".into(),
+            "--json".into(),
+            "hosts".into(),
+        ],
+    )?;
+    parse_active_auth_account_for_host(&output.stdout, host)
+}
+
+fn parse_active_auth_account_for_host(
+    bytes: &[u8],
+    host: &str,
+) -> Result<Option<GitHubAuthAccount>, String> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes)
+        .map_err(|err| format!("Failed to parse gh auth status output: {err}"))?;
+    let Some(rows) = value
+        .get("hosts")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|hosts| hosts.get(host))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(None);
+    };
+
+    Ok(rows.iter().find_map(|row| {
+        let object = row.as_object()?;
+        object
+            .get("active")
+            .and_then(serde_json::Value::as_bool)
+            .filter(|active| *active)?;
+        let login = object
+            .get("login")
+            .and_then(serde_json::Value::as_str)?
+            .trim();
+        (!login.is_empty()).then(|| GitHubAuthAccount {
+            host: host.to_string(),
+            login: login.to_string(),
+        })
+    }))
+}
+
+fn resolve_gh_for_hook(shell: &dyn ShellAccess) -> Result<String, String> {
+    let Some(path) = shell.which("gh")? else {
+        return Err("gh was not found on the user shell path.".to_string());
+    };
+    log::debug!("github auth hook resolved gh path={path}");
+    Ok(path)
+}
+
+fn switch_gh_account(
+    shell: &dyn ShellAccess,
+    working_dir: &WorkspacePath,
+    gh_path: &str,
+    account: &GitHubAuthAccount,
+) -> Result<(), String> {
+    run_gh_hook_command(
+        shell,
+        working_dir,
+        "gh auth switch",
+        gh_path,
+        &[
+            "auth".into(),
+            "switch".into(),
+            "--hostname".into(),
+            account.host.clone(),
+            "--user".into(),
+            account.login.clone(),
+        ],
+    )
+    .map(|_| ())
+}
+
+fn run_gh_hook_command(
+    shell: &dyn ShellAccess,
+    working_dir: &WorkspacePath,
+    operation: &str,
+    gh_path: &str,
+    args: &[String],
+) -> Result<ShellCommandOutput, String> {
+    let (sender, receiver) = mpsc::channel();
+    shell.run_fast_command(
+        ShellCommandRunRequest::new(operation, working_dir.clone(), gh_path).args(args.to_vec()),
+        Box::new(move |result| {
+            let _ = sender.send(result);
+        }),
+    );
+    let output = receiver
+        .recv()
+        .map_err(|_| format!("{operation} command did not return a result."))??;
+    if output.status_success(&[0]) {
+        Ok(output)
+    } else {
+        let message = output.failure_message();
+        Err(if message.is_empty() {
+            format!("{operation} failed with status {:?}", output.status_code)
+        } else {
+            message
+        })
+    }
 }
 
 fn collect_authenticated_accounts(

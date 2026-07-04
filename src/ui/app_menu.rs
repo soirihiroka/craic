@@ -174,14 +174,6 @@ fn new_instance_executable_candidates() -> Vec<PathBuf> {
         );
     }
 
-    for dir in &[
-        "/home/linuxbrew/.linuxbrew/bin",
-        "/usr/local/bin",
-        "/usr/bin",
-    ] {
-        push_candidate(&mut candidates, PathBuf::from(dir).join(BIN_NAME));
-    }
-
     candidates
 }
 

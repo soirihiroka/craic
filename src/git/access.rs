@@ -36,6 +36,14 @@ pub(crate) type OperationCallback<T> = Box<dyn FnOnce(Result<T, String>) + Send 
 pub(crate) type ProgressCallback = Box<dyn FnMut(String) + Send + 'static>;
 pub(crate) type ChangeListener = Arc<dyn Fn() + Send + Sync + 'static>;
 
+pub(crate) trait GitOperationHook: Send + Sync {
+    fn pre(&self) -> Result<Box<dyn GitOperationPostHook>, String>;
+}
+
+pub(crate) trait GitOperationPostHook: Send {
+    fn post(self: Box<Self>) -> Result<(), String>;
+}
+
 pub(crate) fn clone_repository_with_shell(
     shell: Arc<dyn ShellAccess>,
     working_dir: crate::system::path::WorkspacePath,
@@ -307,6 +315,7 @@ pub(crate) struct GitRepoHandle {
     workspace: WorkspaceRef,
     shell: Arc<dyn ShellAccess>,
     files: Arc<dyn FileAccess>,
+    hooks: Vec<Arc<dyn GitOperationHook>>,
 }
 
 struct CommitTargetPlan {
@@ -324,7 +333,13 @@ impl GitRepoHandle {
             workspace,
             shell,
             files,
+            hooks: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_hook(mut self, hook: Arc<dyn GitOperationHook>) -> Self {
+        self.hooks.push(hook);
+        self
     }
 
     fn git(&self, args: &[String]) -> Result<String, String> {
@@ -448,16 +463,49 @@ impl GitRepoHandle {
             .map_err(|err| format!("{operation} returned invalid JSON: {err}"))
     }
 
-    fn switch_github_auth(&self) -> Result<(), String> {
-        let Some(account) = self.settings_blocking().github_auth_account else {
-            return Ok(());
-        };
-        let script = crate::github::ssh_switch_auth_account_script(
-            &shell_quote(&account.host),
-            &shell_quote(&account.login),
-        );
-        self.run_script_text("gh auth switch", &script, None, &[0])
-            .map(|_| ())
+    fn run_with_hooks<T, F>(&self, operation: &str, run: F) -> Result<T, String>
+    where
+        F: FnOnce() -> Result<T, String>,
+    {
+        let mut post_hooks = Vec::new();
+        for hook in &self.hooks {
+            match hook.pre() {
+                Ok(post_hook) => post_hooks.push(post_hook),
+                Err(err) => {
+                    for post_hook in post_hooks.into_iter().rev() {
+                        if let Err(post_err) = post_hook.post() {
+                            log::warn!(
+                                "git operation hook cleanup failed operation={} error={}",
+                                operation,
+                                post_err
+                            );
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        let result = run();
+        let mut post_error = None;
+        for post_hook in post_hooks.into_iter().rev() {
+            if let Err(err) = post_hook.post() {
+                log::warn!(
+                    "git operation post hook failed operation={} error={}",
+                    operation,
+                    err
+                );
+                if post_error.is_none() {
+                    post_error = Some(err);
+                }
+            }
+        }
+
+        match (result, post_error) {
+            (Ok(value), None) => Ok(value),
+            (Ok(_), Some(err)) => Err(err),
+            (Err(err), _) => Err(err),
+        }
     }
 }
 
@@ -1329,24 +1377,25 @@ impl GitRepoHandle {
     }
 
     fn push_blocking(&self) -> Result<String, String> {
-        self.switch_github_auth()?;
-        self.git(&["push".into()])
+        self.run_with_hooks("git push", || self.git(&["push".into()]))
     }
 
     fn pull_blocking(&self) -> Result<String, String> {
-        self.switch_github_auth()?;
-        self.git(&[
-            "-c".into(),
-            "rebase.backend=merge".into(),
-            "pull".into(),
-            "--ff".into(),
-            "--recurse-submodules".into(),
-        ])
+        self.run_with_hooks("git pull", || {
+            self.git(&[
+                "-c".into(),
+                "rebase.backend=merge".into(),
+                "pull".into(),
+                "--ff".into(),
+                "--recurse-submodules".into(),
+            ])
+        })
     }
 
     fn publish_blocking(&self, remote: &str, branch: &str) -> Result<String, String> {
-        self.switch_github_auth()?;
-        self.git(&["push".into(), "-u".into(), remote.into(), branch.into()])
+        self.run_with_hooks("git publish", || {
+            self.git(&["push".into(), "-u".into(), remote.into(), branch.into()])
+        })
     }
 
     fn fetch_with_progress_blocking(
@@ -1359,8 +1408,7 @@ impl GitRepoHandle {
         if let Some(remote) = remote {
             args.push(remote.to_string());
         }
-        self.switch_github_auth()?;
-        self.git(&args)
+        self.run_with_hooks("git fetch", || self.git(&args))
     }
 
     fn checkout_branch_blocking(&self, branch: &str) -> Result<String, String> {
@@ -1393,12 +1441,19 @@ impl GitRepoHandle {
             self.workspace.display_name,
             number
         );
-        self.switch_github_auth()?;
-        let script = crate::github::ssh_checkout_pull_request_script(
-            &shell_quote(&self.workspace.root.absolute),
-            &shell_quote(&number.to_string()),
-        );
-        self.run_script_text("gh pr checkout", &script, None, &[0])
+        self.run_with_hooks("gh pr checkout", || {
+            let gh = self
+                .shell
+                .which("gh")?
+                .ok_or_else(|| "gh was not found on the user shell path.".to_string())?;
+            self.run_command_text(
+                "gh pr checkout",
+                &gh,
+                &["pr".to_string(), "checkout".to_string(), number.to_string()],
+                None,
+                &[0],
+            )
+        })
     }
 
     fn create_branch_blocking(&self, branch: &str) -> Result<String, String> {

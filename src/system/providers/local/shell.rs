@@ -6,10 +6,10 @@ use crate::system::path::{WorkspacePath, WorkspaceRef};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalShellAccess {
@@ -167,19 +167,42 @@ impl ShellAccess for LocalShellAccess {
             return Ok(cached);
         }
 
-        let resolved = std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths).find_map(|dir| {
-                let path = dir.join(program);
-                let metadata = std::fs::metadata(&path).ok()?;
-                (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-                    .then(|| path.to_string_lossy().to_string())
-            })
-        });
+        let shell = default_shell();
+        let start = Instant::now();
         log::debug!(
-            "local fast which workspace={} program={} resolved={:?}",
+            "local shell which start workspace={} program={} shell={} working_dir={}",
             self.workspace.display_name,
             program,
-            resolved
+            shell.to_string_lossy(),
+            self.workspace.root.absolute
+        );
+        let script = format!("command -v {}", shell_quote(program));
+        let output = Command::new(&shell)
+            .arg("-i")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(&self.workspace.root.absolute)
+            .output()
+            .map_err(|err| {
+                format!(
+                    "Failed to start default shell {} for command lookup: {err}",
+                    shell.to_string_lossy()
+                )
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let resolved = if output.status.success() {
+            shell_which_output(&stdout)
+        } else {
+            None
+        };
+        log::debug!(
+            "local shell which complete workspace={} program={} status={} elapsed_ms={} resolved={:?} stderr={}",
+            self.workspace.display_name,
+            program,
+            output.status,
+            start.elapsed().as_millis(),
+            resolved,
+            String::from_utf8_lossy(&output.stderr).trim()
         );
 
         self.command_lookup
@@ -343,6 +366,15 @@ fn command_name_can_use_path(program: &str) -> bool {
         && program
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn shell_which_output(output: &str) -> Option<String> {
+    output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToString::to_string)
 }
 
 fn shell_quote(value: &str) -> String {

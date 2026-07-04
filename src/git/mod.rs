@@ -4,8 +4,8 @@ mod remote;
 mod types;
 
 pub(crate) use access::{
-    BackgroundPullSubscription, ChangeListener, ChangeListenerSubscription, GitRepoHandle,
-    OperationCallback, clone_repository_with_shell,
+    BackgroundPullSubscription, ChangeListener, ChangeListenerSubscription, GitOperationHook,
+    GitOperationPostHook, GitRepoHandle, OperationCallback, clone_repository_with_shell,
 };
 pub(crate) use diff::*;
 pub(crate) use remote::*;
