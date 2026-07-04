@@ -48,7 +48,6 @@ static QUICK_ACTION_CSS_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 pub struct ContentPane {
     pub root: adw::ToolbarView,
-    pub toast_overlay: adw::ToastOverlay,
     pub push_button: gtk::Button,
     pub terminal_toggle_button: gtk::ToggleButton,
     pub branch_picker: TabbedPicker,
@@ -173,10 +172,14 @@ pub fn build(_menu: &gio::Menu, snapshot: Option<&RepositorySnapshot>) -> Conten
     header.pack_end(&terminal_toggle_button);
     header.pack_end(&quick_actions_box);
 
-    let main = MainContent::new();
+    let page_slot = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
     let terminal = terminal::TerminalPanel::new();
     let work_area = gtk::Paned::new(gtk::Orientation::Vertical);
-    work_area.set_start_child(Some(&main.root));
+    work_area.set_start_child(Some(&page_slot));
     work_area.set_end_child(Some(&terminal.root));
     work_area.set_resize_start_child(true);
     work_area.set_shrink_start_child(true);
@@ -190,7 +193,6 @@ pub fn build(_menu: &gio::Menu, snapshot: Option<&RepositorySnapshot>) -> Conten
 
     let pane = ContentPane {
         root,
-        toast_overlay: main.root,
         push_button,
         terminal_toggle_button,
         branch_picker,
@@ -213,11 +215,11 @@ pub fn build(_menu: &gio::Menu, snapshot: Option<&RepositorySnapshot>) -> Conten
         push_ahead_label,
         push_behind_label,
         git_action_progress: RefCell::new(None),
-        page_slot: main.page_slot,
+        page_slot,
     };
 
     if let Some(snapshot) = snapshot {
-        pane.update(snapshot, None, false, false);
+        pane.update(snapshot, false);
     }
 
     pane
@@ -251,24 +253,10 @@ impl ContentPane {
         }
     }
 
-    pub fn update(
-        &self,
-        snapshot: &RepositorySnapshot,
-        message: Option<&str>,
-        action_running: bool,
-        show_toast: bool,
-    ) {
+    pub fn update(&self, snapshot: &RepositorySnapshot, action_running: bool) {
         self.branch_picker.set_button_label(&snapshot.branch);
         self.update_branch_picker(snapshot);
         self.configure_git_action(snapshot, action_running);
-
-        if show_toast && let Some(msg) = message {
-            self.toast_overlay.add_toast(adw::Toast::new(msg));
-        }
-    }
-
-    pub(super) fn show_toast(&self, message: &str) {
-        self.toast_overlay.add_toast(adw::Toast::new(message));
     }
 
     pub fn set_error(&self, message: &str) {
@@ -1668,28 +1656,6 @@ fn show_error_dialog(window: &adw::ApplicationWindow, heading: &str, message: &s
     dialog.set_default_response(Some("ok"));
     dialog.set_close_response("ok");
     dialog.present(Some(window));
-}
-
-struct MainContent {
-    root: adw::ToastOverlay,
-    page_slot: gtk::Box,
-}
-
-impl MainContent {
-    fn new() -> Self {
-        let toast_overlay = adw::ToastOverlay::new();
-        let page_slot = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .hexpand(true)
-            .vexpand(true)
-            .build();
-        toast_overlay.set_child(Some(&page_slot));
-
-        Self {
-            root: toast_overlay,
-            page_slot,
-        }
-    }
 }
 
 pub(in crate::ui) fn centered_page(content: gtk::Box) -> gtk::ScrolledWindow {

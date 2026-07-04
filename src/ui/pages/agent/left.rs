@@ -287,11 +287,11 @@ impl AgentList {
     }
 
     pub(in crate::ui) fn reload_workspace_history(&self) {
-        log::debug!("agent workspace history refresh requested");
         if self.loading.replace(true) {
             return;
         }
 
+        log::debug!("agent workspace history refresh started");
         self.spawn_history_load(true);
     }
 
