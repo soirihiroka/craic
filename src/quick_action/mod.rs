@@ -12,7 +12,7 @@ mod makefile;
 
 const MAKEFILE_ICON_NAME: &str = "text-makefile-symbolic";
 const BUN_ICON_NAME: &str = "devicon-bun-symbolic";
-const GRADLE_ICON_NAME: &str = "devicon-groovy-symbolic";
+const GRADLE_ICON_NAME: &str = "devicon-gradle-symbolic";
 const CUSTOM_ICON_NAME: &str = "utilities-terminal-symbolic";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
