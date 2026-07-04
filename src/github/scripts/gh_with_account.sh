@@ -1,16 +1,7 @@
-host=$1
-login=$2
-shift 2
-
-gh_cmd=$(command -v gh 2>/dev/null || {
-  if [ -x /home/linuxbrew/.linuxbrew/bin/gh ]; then
-    printf '%s\n' /home/linuxbrew/.linuxbrew/bin/gh
-  elif [ -x "$HOME/.local/bin/gh" ]; then
-    printf '%s\n' "$HOME/.local/bin/gh"
-  else
-    printf '%s\n' gh
-  fi
-})
+gh_cmd=$1
+host=$2
+login=$3
+shift 3
 
 token=$("$gh_cmd" auth token --hostname "$host" --user "$login") || exit $?
 export GH_TOKEN="$token"

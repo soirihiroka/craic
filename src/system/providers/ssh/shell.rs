@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SshShellAccess {
@@ -192,29 +193,45 @@ impl ShellAccess for SshShellAccess {
             return Ok(cached);
         }
 
+        let lookup = format!("command -v {}", shell_quote(program));
+        let script = format!(
+            "exec \"${{SHELL:-/bin/sh}}\" -i -c {}",
+            shell_quote(&lookup)
+        );
+        let start = Instant::now();
+        log::debug!(
+            "ssh shell which start host={} workspace={} program={}",
+            self.host,
+            self.workspace.display_name,
+            program
+        );
         let output = SshCommandRunner::new(self.host.clone()).run_script_output_with_stdin(
             "fast ssh command lookup",
-            &format!("command -v {}", shell_quote(program)),
+            &script,
             None,
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let resolved = if output.status_success(&[0]) {
             let resolved = shell_which_output(&stdout);
             log::debug!(
-                "ssh fast which host={} workspace={} program={} resolved={:?}",
-                self.host,
-                self.workspace.display_name,
-                program,
-                resolved
-            );
-            resolved
-        } else {
-            log::debug!(
-                "ssh fast which missing host={} workspace={} program={} status={:?} stderr={}",
+                "ssh shell which complete host={} workspace={} program={} status={:?} elapsed_ms={} resolved={:?} stderr={}",
                 self.host,
                 self.workspace.display_name,
                 program,
                 output.status_code,
+                start.elapsed().as_millis(),
+                resolved,
+                output.stderr_text_trimmed()
+            );
+            resolved
+        } else {
+            log::debug!(
+                "ssh shell which complete host={} workspace={} program={} status={:?} elapsed_ms={} resolved=None stderr={}",
+                self.host,
+                self.workspace.display_name,
+                program,
+                output.status_code,
+                start.elapsed().as_millis(),
                 output.stderr_text_trimmed()
             );
             None

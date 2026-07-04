@@ -11,7 +11,7 @@ const PROMPT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
 const PROMPT_MONITOR_RATE_LIMIT_MS: i32 = 250;
 const PROMPT_BUTTON_MIN_LABEL_CHARS: usize = 8;
 const PROMPT_BUTTON_MAX_LABEL_CHARS: usize = 24;
-const PROMPT_BUTTON_SIDE_MARGIN: i32 = 4;
+const PROMPT_BUTTON_SIDE_MARGIN: i32 = 2;
 
 type PromptSelectedCallback = Rc<dyn Fn(Result<PromptSelection, String>)>;
 

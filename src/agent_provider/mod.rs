@@ -637,17 +637,6 @@ fn command_path(name: &str) -> PathBuf {
         }
     }
 
-    for dir in &[
-        "/home/linuxbrew/.linuxbrew/bin",
-        "/usr/local/bin",
-        "/usr/bin",
-    ] {
-        let p = PathBuf::from(dir).join(name);
-        if p.is_file() {
-            return p;
-        }
-    }
-
     PathBuf::from(name)
 }
 

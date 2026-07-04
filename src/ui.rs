@@ -552,11 +552,14 @@ fn git_handle_for_workspace(
 ) -> Option<Arc<crate::git::GitRepoHandle>> {
     let files = state.providers.files(system_id, workspace)?;
     let shell = state.providers.shell(system_id, workspace)?;
-    Some(Arc::new(crate::git::GitRepoHandle::new(
-        workspace.clone(),
-        shell,
-        files,
-    )))
+    let mut handle =
+        crate::git::GitRepoHandle::new(workspace.clone(), shell.clone(), files.clone());
+    let account =
+        crate::workspace_config::git_config_from_file_access(files.as_ref()).github_auth_account;
+    if let Some(hook) = crate::github::git_auth_hook(shell, workspace.root.clone(), account) {
+        handle = handle.with_hook(hook);
+    }
+    Some(Arc::new(handle))
 }
 
 #[derive(Clone)]

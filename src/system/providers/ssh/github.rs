@@ -21,8 +21,9 @@ impl SshGitHubAccess {
     }
 
     fn run_gh(&self, operation: &str, args: Vec<String>) -> Result<ShellCommandOutput, String> {
+        let gh = self.gh_path()?;
         let request =
-            ShellCommandRunRequest::new(operation, self.workspace.root.clone(), "gh").args(args);
+            ShellCommandRunRequest::new(operation, self.workspace.root.clone(), gh).args(args);
         let output = self.run_command(request)?;
         if output.status_success(&[0]) {
             Ok(output)
@@ -37,7 +38,8 @@ impl SshGitHubAccess {
         account: &GitHubAuthAccount,
         args: &[String],
     ) -> Result<ShellCommandOutput, String> {
-        let script = github::ssh_gh_with_account_script(&account.host, &account.login, args);
+        let gh = self.gh_path()?;
+        let script = github::ssh_gh_with_account_script(&gh, &account.host, &account.login, args);
         let request = ShellRunRequest::new(operation, self.workspace.root.clone(), script);
         let output = self.run_script(request)?;
         if output.status_success(&[0]) {
@@ -71,6 +73,12 @@ impl SshGitHubAccess {
         receiver
             .recv()
             .map_err(|_| "Remote gh script did not return a result.".to_string())?
+    }
+
+    fn gh_path(&self) -> Result<String, String> {
+        self.shell
+            .which("gh")?
+            .ok_or_else(|| "gh was not found on the remote user shell path.".to_string())
     }
 }
 
@@ -207,7 +215,8 @@ impl GitHubAccess for SshGitHubAccess {
             "--json".to_string(),
             "name".to_string(),
         ];
-        let script = github::ssh_gh_with_account_script(&account.host, &account.login, &args);
+        let gh = self.gh_path()?;
+        let script = github::ssh_gh_with_account_script(&gh, &account.host, &account.login, &args);
         let output = self.run_script(ShellRunRequest::new(
             "gh repo exists",
             self.workspace.root.clone(),
