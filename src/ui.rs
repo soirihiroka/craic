@@ -254,7 +254,7 @@ pub fn build_ui(
             let state_slot = state_slot.clone();
             move |message| {
                 if let Some(state) = state_slot.borrow().upgrade() {
-                    state.content.show_toast(message);
+                    state.show_toast(message);
                 }
             }
         }),
@@ -359,12 +359,15 @@ pub fn build_ui(
     main_paned.set_shrink_end_child(false);
     main_paned.set_position(400);
 
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&main_paned));
+
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Craic")
         .default_width(1440)
         .default_height(920)
-        .content(&main_paned)
+        .content(&toast_overlay)
         .build();
     *window_cell.borrow_mut() = Some(window.clone());
     startup.mark("build-window");
@@ -375,6 +378,7 @@ pub fn build_ui(
         workspace_ref: workspace_ref_cell,
         providers: provider_registry,
         window: window.clone(),
+        toast_overlay,
         sidebar,
         content,
         pages,
@@ -827,6 +831,7 @@ struct AppState {
     workspace_ref: Rc<RefCell<crate::system::WorkspaceRef>>,
     providers: crate::system::SystemProviderRegistry,
     window: adw::ApplicationWindow,
+    toast_overlay: adw::ToastOverlay,
     sidebar: sidebar::SidebarPane,
     content: content::ContentPane,
     pages: Vec<pages::PageRef>,
@@ -842,6 +847,12 @@ struct AppState {
     queued_snapshot_refresh: RefCell<Option<QueuedRepositoryRefresh>>,
     repository_monitor: RepositoryMonitor,
     workspace_color_provider: gtk::CssProvider,
+}
+
+impl AppState {
+    fn show_toast(&self, message: &str) {
+        self.toast_overlay.add_toast(adw::Toast::new(message));
+    }
 }
 
 fn apply_workspace_color(state: &Rc<AppState>) {
@@ -1098,7 +1109,7 @@ impl content::RepositoryActionContext for Rc<AppState> {
     }
 
     fn show_toast(&self, message: &str) {
-        self.content.show_toast(message);
+        self.as_ref().show_toast(message);
     }
 
     fn run_git_action(&self) {
@@ -1282,12 +1293,14 @@ fn refresh_repository(
             let workspace_key = state.workspace_ref.borrow().id.to_string();
             let system = state.system_ref.borrow().clone();
             state.sidebar.update(&snapshot, &workspace_key, &system);
-            state.content.update(
-                &snapshot,
-                message.as_deref(),
-                state.git_action_running.get(),
-                show_toast,
-            );
+            state
+                .content
+                .update(&snapshot, state.git_action_running.get());
+            if let Some(message) = message.as_deref()
+                && show_toast
+            {
+                state.show_toast(message);
+            }
             for page in &state.pages {
                 page.refresh(&snapshot);
             }
@@ -1299,7 +1312,7 @@ fn refresh_repository(
         } else if let Some(message) = message.as_deref()
             && show_toast
         {
-            state.content.show_toast(message);
+            state.show_toast(message);
         }
 
         complete_snapshot_refresh(state);
@@ -1349,19 +1362,21 @@ fn refresh_repository(
                             let workspace_key = state.workspace_ref.borrow().id.to_string();
                             let system = state.system_ref.borrow().clone();
                             state.sidebar.update(&snapshot, &workspace_key, &system);
-                            state.content.update(
-                                &snapshot,
-                                message.as_deref(),
-                                state.git_action_running.get(),
-                                show_toast,
-                            );
+                            state
+                                .content
+                                .update(&snapshot, state.git_action_running.get());
+                            if let Some(message) = message.as_deref()
+                                && show_toast
+                            {
+                                state.show_toast(message);
+                            }
                             for page in &state.pages {
                                 page.refresh(&snapshot);
                             }
                         } else if let Some(message) = message.as_deref()
                             && show_toast
                         {
-                            state.content.show_toast(message);
+                            state.show_toast(message);
                         }
                     }
                     Err(err) => {

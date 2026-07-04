@@ -139,7 +139,7 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
 
     state.git_action_running.set(true);
     state.content.clear_git_action_progress();
-    state.content.update(&snapshot, None, true, false);
+    state.content.update(&snapshot, true);
 
     let dialog = adw::PreferencesDialog::builder()
         .title("Publish Repository")
@@ -449,7 +449,7 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
             if state.git_action_running.get() {
                 state.git_action_running.set(false);
                 state.content.clear_git_action_progress();
-                state.content.update(&snapshot, None, false, false);
+                state.content.update(&snapshot, false);
             }
         }
     });
@@ -481,7 +481,7 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
             Ok(Ok((accounts, owners))) => {
                 state.git_action_running.set(false);
                 state.content.clear_git_action_progress();
-                state.content.update(&snapshot, None, false, false);
+                state.content.update(&snapshot, false);
                 status_spinner.set_visible(false);
                 status_row.set_title("Ready");
                 status_row.set_subtitle("Choose a destination.");
@@ -518,7 +518,7 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
             Ok(Err(err)) => {
                 state.git_action_running.set(false);
                 state.content.clear_git_action_progress();
-                state.content.update(&snapshot, None, false, false);
+                state.content.update(&snapshot, false);
                 status_spinner.set_visible(false);
                 status_row.set_title("GitHub loading failed");
                 status_row.set_subtitle(&err);
@@ -528,7 +528,7 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
             Err(TryRecvError::Disconnected) => {
                 state.git_action_running.set(false);
                 state.content.clear_git_action_progress();
-                state.content.update(&snapshot, None, false, false);
+                state.content.update(&snapshot, false);
                 status_spinner.set_visible(false);
                 status_row.set_title("GitHub loading failed");
                 status_row.set_subtitle("Loading stopped unexpectedly.");
@@ -602,7 +602,7 @@ fn execute_publish_repository_action(
     let (sender, receiver) = mpsc::channel();
     state.git_action_running.set(true);
     state.content.clear_git_action_progress();
-    state.content.update(&snapshot, None, true, false);
+    state.content.update(&snapshot, true);
     log::info!(
         "starting github repository publish owner={} name={}",
         request.owner,
@@ -704,7 +704,7 @@ fn execute_git_action_with_snapshot(
 
     state.git_action_running.set(true);
     state.content.clear_git_action_progress();
-    state.content.update(&snapshot, None, true, false);
+    state.content.update(&snapshot, true);
     log::debug!(
         "starting git action {:?} in workspace {}",
         action,
@@ -836,7 +836,7 @@ fn execute_git_action_with_snapshot(
                         if matches!(action, GitAction::Pull | GitAction::PullPush)
                             && is_local_changes_overwritten_error(&err)
                         {
-                            state.content.update(&snapshot, None, false, false);
+                            state.content.update(&snapshot, false);
                             let files = parse_files_to_be_overwritten(&err);
                             log::info!(
                                 "git pull blocked by local changes action={:?} overwritten_files={}",
@@ -951,7 +951,7 @@ fn stash_changes_and_retry_git_action(
     let (sender, receiver) = mpsc::channel();
     state.git_action_running.set(true);
     state.content.clear_git_action_progress();
-    state.content.update(&snapshot, None, true, false);
+    state.content.update(&snapshot, true);
     state.content.set_git_action_progress("Stashing changes...");
     log::info!(
         "stashing local changes before retrying git action {:?}",
@@ -975,7 +975,7 @@ fn stash_changes_and_retry_git_action(
             Ok(GitActionEvent::Finished(Ok(message))) => {
                 state.git_action_running.set(false);
                 state.content.clear_git_action_progress();
-                state.content.update(&snapshot, None, false, false);
+                state.content.update(&snapshot, false);
                 log::info!("stash before retry completed: {message}");
                 execute_git_action(&state, action.clone());
                 gtk::glib::ControlFlow::Break
@@ -983,7 +983,7 @@ fn stash_changes_and_retry_git_action(
             Ok(GitActionEvent::Finished(Err(err))) => {
                 state.git_action_running.set(false);
                 state.content.clear_git_action_progress();
-                state.content.update(&snapshot, None, false, false);
+                state.content.update(&snapshot, false);
                 log::warn!("stash before retry failed: {err}");
                 show_error_dialog(&state.window, "Stash Failed", &err);
                 refresh(&state, None);
@@ -997,7 +997,7 @@ fn stash_changes_and_retry_git_action(
             Err(TryRecvError::Disconnected) => {
                 state.git_action_running.set(false);
                 state.content.clear_git_action_progress();
-                state.content.update(&snapshot, None, false, false);
+                state.content.update(&snapshot, false);
                 show_error_dialog(
                     &state.window,
                     "Stash Failed",
