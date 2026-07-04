@@ -48,7 +48,6 @@ impl FileDropTarget {
         W: IsA<gtk::Widget>,
     {
         let target = gtk::DropTarget::new(gdk::FileList::static_type(), self.actions);
-        target.set_preload(true);
         target.connect_enter({
             let on_file_hover = self.on_file_hover.clone();
 
@@ -57,7 +56,7 @@ impl FileDropTarget {
                     .as_ref()
                     .map(|callback| {
                         callback(
-                            drop_target_paths(target),
+                            Some(Vec::new()),
                             y,
                             available_drop_actions(
                                 target.current_drop().as_ref(),
@@ -77,7 +76,7 @@ impl FileDropTarget {
                     .as_ref()
                     .map(|callback| {
                         callback(
-                            drop_target_paths(target),
+                            Some(Vec::new()),
                             y,
                             available_drop_actions(
                                 target.current_drop().as_ref(),
@@ -371,12 +370,6 @@ fn file_list_value_paths(value: &gtk::glib::Value) -> Option<Vec<PathBuf>> {
         .filter_map(|file| file.path())
         .collect::<Vec<_>>();
     (!paths.is_empty()).then_some(paths)
-}
-
-fn drop_target_paths(target: &gtk::DropTarget) -> Option<Vec<PathBuf>> {
-    target
-        .value()
-        .and_then(|value| file_list_value_paths(&value))
 }
 
 fn available_drop_actions(

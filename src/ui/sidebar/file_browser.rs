@@ -41,11 +41,11 @@ const MAX_SEARCH_RESULTS: usize = 250;
 const MAX_SEARCH_FILE_BYTES: u64 = 1024 * 1024;
 const SEARCH_POLL_MS: u64 = 75;
 const SEARCH_DEBOUNCE_MS: u64 = 250;
+const APP_FILE_TRANSFER_MIME_TYPE: &str = "application/x-craic-file-transfer";
 const FILE_TRANSFER_MIME_TYPES: &[&str] = &[
+    APP_FILE_TRANSFER_MIME_TYPE,
     "x-special/gnome-copied-files",
     "text/uri-list",
-    "text/plain;charset=utf-8",
-    "text/plain",
 ];
 
 type SelectionCallback = Rc<dyn Fn(FileNodePath)>;
@@ -104,7 +104,7 @@ pub(in crate::ui) struct FileBrowser {
     file_watch_generation: Rc<Cell<u64>>,
     file_watch_signature: RefCell<Option<FileBrowserWatchSignature>>,
     file_watch_subscriptions: RefCell<Vec<FileWatchSubscription>>,
-    file_watch_event_source: RefCell<Option<gtk::glib::SourceId>>,
+    file_watch_handler_id: Cell<Option<u64>>,
     git_ignore_cache: RefCell<GitIgnoreCache>,
     git_ignore_generation: Rc<Cell<u64>>,
     git_ignore_rules_signature: RefCell<Option<Vec<GitIgnoreRuleFileSignature>>>,
@@ -201,7 +201,7 @@ impl FileBrowser {
             file_watch_generation: Rc::new(Cell::new(0)),
             file_watch_signature: RefCell::new(None),
             file_watch_subscriptions: RefCell::new(Vec::new()),
-            file_watch_event_source: RefCell::new(None),
+            file_watch_handler_id: Cell::new(None),
             git_ignore_cache: RefCell::new(GitIgnoreCache::default()),
             git_ignore_generation: Rc::new(Cell::new(0)),
             git_ignore_rules_signature: RefCell::new(None),
@@ -250,6 +250,7 @@ impl FileBrowser {
         };
         if workspace_changed || file_access_changed {
             self.stop_file_watch_scope();
+            self.cancel_transfers_for_workspace_change();
         }
         self.file_access.replace(file_access);
         self.spellcheck_allowlist
@@ -548,7 +549,7 @@ impl FileBrowser {
 
         while index >= 0 && (index as usize) < rows.len() {
             let row = rows[index as usize].clone();
-            if row_is_selectable(&row) {
+            if self.row_is_selectable(&row) {
                 drop(rows);
                 self.select_browser_row(&row);
                 self.scroll_row_into_view(&row, index as usize);
@@ -574,8 +575,12 @@ impl FileBrowser {
             }
             rows::BrowserListRow::NewEntry(_)
             | rows::BrowserListRow::RenameEntry(_)
-            | rows::BrowserListRow::Loading(_)
-            | rows::BrowserListRow::Transfer(_) => {}
+            | rows::BrowserListRow::Loading(_) => {}
+            rows::BrowserListRow::Transfer(row) => {
+                self.active_folder
+                    .replace(row.path.parent().unwrap_or_else(|| self.root_node_path()));
+                self.set_selected_node_path(Some(row.path.clone()));
+            }
             rows::BrowserListRow::Search(search_match) => {
                 self.set_selected_search_match(search_match.clone());
             }
@@ -712,11 +717,15 @@ impl FileBrowser {
         self.selected_node_path.replace(selected);
         self.selected_search_match.borrow_mut().take();
         self.refresh_browser_row_state();
+        self.emit_selected_node_path(callback_path);
+        self.focus_selected_row();
+    }
+
+    pub(super) fn emit_selected_node_path(&self, node_path: FileNodePath) {
         let callbacks = self.callbacks.borrow().clone();
         for callback in callbacks {
-            callback(callback_path.clone());
+            callback(node_path.clone());
         }
-        self.focus_selected_row();
     }
 
     pub(super) fn rebuild_if_changed(self: &Rc<Self>) {
@@ -1178,8 +1187,10 @@ fn row_matches_selection(
         }
         rows::BrowserListRow::NewEntry(_)
         | rows::BrowserListRow::RenameEntry(_)
-        | rows::BrowserListRow::Loading(_)
-        | rows::BrowserListRow::Transfer(_) => false,
+        | rows::BrowserListRow::Loading(_) => false,
+        rows::BrowserListRow::Transfer(row) => {
+            selected_search_match.is_none() && selected == Some(&row.path)
+        }
         rows::BrowserListRow::Search(search_match) => {
             selected_search_match == Some(&search_match.selection_key())
         }
@@ -1187,15 +1198,19 @@ fn row_matches_selection(
     }
 }
 
-fn row_is_selectable(row: &rows::BrowserListRow) -> bool {
-    !matches!(
-        row,
-        rows::BrowserListRow::NewEntry(_)
+impl FileBrowser {
+    fn row_is_selectable(&self, row: &rows::BrowserListRow) -> bool {
+        match row {
+            rows::BrowserListRow::Tree(_)
+            | rows::BrowserListRow::Transfer(_)
+            | rows::BrowserListRow::Search(_) => true,
+            rows::BrowserListRow::NewEntry(_)
             | rows::BrowserListRow::RenameEntry(_)
             | rows::BrowserListRow::Loading(_)
             | rows::BrowserListRow::Status(_)
-            | rows::BrowserListRow::RootGap
-    )
+            | rows::BrowserListRow::RootGap => false,
+        }
+    }
 }
 
 pub(super) fn set_scroll_value(adjustment: &gtk::Adjustment, value: f64) {

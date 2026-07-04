@@ -5,8 +5,8 @@ use super::{
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::FileNodeKind;
 use crate::ui::{canvas_scrollbar, components::tree_view, file_status, file_type};
-use gtk::gdk;
 use gtk::prelude::*;
+use gtk::{gdk, gio};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -20,7 +20,7 @@ pub(super) enum BrowserListRow {
     NewEntry(NewEntryRow),
     RenameEntry(RenameEntryRow),
     Loading(LoadingRow),
-    Transfer(TransferPlaceholderRow),
+    Transfer(TransferRow),
     Search(SearchMatch),
     Status(String),
     RootGap,
@@ -62,7 +62,7 @@ pub(super) struct LoadingRow {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub(super) struct TransferPlaceholderRow {
+pub(super) struct TransferRow {
     pub(super) path: FileNodePath,
     pub(super) name: String,
     pub(super) depth: usize,
@@ -116,7 +116,7 @@ impl FileBrowser {
 
                 move |paths, y, actions, modifiers| {
                     let target_path = browser.drop_target_folder_at_y(y);
-                    if paths.as_ref().is_some_and(|paths| !paths.is_empty()) {
+                    if paths.is_some() {
                         browser.handle_external_drop_hover(target_path, actions)
                     } else {
                         browser.handle_internal_drop_hover(target_path, actions, modifiers)
@@ -342,7 +342,10 @@ impl FileBrowser {
                 update_status_row_widget(widget, previous, next);
             }
             (BrowserListRowRenderState::Loading(_), BrowserListRowRenderState::Loading(_)) => {}
-            (BrowserListRowRenderState::Transfer(_), BrowserListRowRenderState::Transfer(_)) => {
+            (
+                BrowserListRowRenderState::Transfer { .. },
+                BrowserListRowRenderState::Transfer { .. },
+            ) => {
                 replace_row_widget(widget, self.row_widget(index, next));
             }
             (BrowserListRowRenderState::RootGap, BrowserListRowRenderState::RootGap) => {}
@@ -435,7 +438,11 @@ impl FileBrowser {
                 self.rename_entry_row_widget(row, *expanded)
             }
             BrowserListRowRenderState::Loading(row) => self.loading_row_widget(row),
-            BrowserListRowRenderState::Transfer(row) => self.transfer_row_widget(row),
+            BrowserListRowRenderState::Transfer {
+                row,
+                selected,
+                progress,
+            } => self.transfer_row_widget(row, *selected, progress.as_ref()),
             BrowserListRowRenderState::Search {
                 search_match,
                 selected,
@@ -586,15 +593,33 @@ impl FileBrowser {
         icon_row.root
     }
 
-    fn transfer_row_widget(self: &Rc<Self>, row: &TransferPlaceholderRow) -> gtk::Box {
+    fn transfer_row_widget(
+        self: &Rc<Self>,
+        row: &TransferRow,
+        selected: bool,
+        progress: Option<&TransferRowProgress>,
+    ) -> gtk::Box {
         let mut builder = tree_view::IconRow::builder(&row.name)
-            .set_icon(file_row_icon(&row.name, false))
+            .set_icon(loading_disclosure_spinner())
             .depth(row.depth)
+            .selected(selected)
+            .on_primary_click({
+                let browser = self.clone();
+                let path = row.path.clone();
+
+                move |_, _, _, _| {
+                    browser.queue_cancel_pending_new_entry();
+                    browser
+                        .active_folder
+                        .replace(path.parent().unwrap_or_else(|| browser.root_node_path()));
+                    browser.set_selected_node_path(Some(path.clone()));
+                }
+            })
             .end_padding(row_end_padding());
-        if let Some(progress) = self.transfer_progress_for_path(&row.path) {
+        if let Some(progress) = progress {
             let browser = self.clone();
             let row_path = row.path.clone();
-            builder = builder.progress(icon_row_progress(&progress), move || {
+            builder = builder.progress(icon_row_progress(progress), move || {
                 if let Some(progress) = browser.transfer_progress_for_path(&row_path) {
                     browser.confirm_cancel_transfers(progress.transfer_ids);
                 }
@@ -698,7 +723,7 @@ impl FileBrowser {
                 let folder = folder.clone();
 
                 move |paths, _, actions, modifiers| {
-                    if paths.as_ref().is_some_and(|paths| !paths.is_empty()) {
+                    if paths.is_some() {
                         browser.handle_external_drop_hover(folder.clone(), actions)
                     } else {
                         browser.handle_internal_drop_hover(folder.clone(), actions, modifiers)
@@ -831,7 +856,7 @@ impl FileBrowser {
                 (row.row.depth, false, false, false)
             }
             BrowserListRowRenderState::Loading(row) => (row.depth, false, false, false),
-            BrowserListRowRenderState::Transfer(row) => (row.depth, false, false, false),
+            BrowserListRowRenderState::Transfer { row, .. } => (row.depth, false, false, false),
             BrowserListRowRenderState::Search { search_match, .. } => {
                 (search_match.depth, false, false, false)
             }
@@ -873,7 +898,11 @@ impl FileBrowser {
                 expanded: self.tree_row_expanded(&row.row),
             },
             BrowserListRow::Loading(row) => BrowserListRowRenderState::Loading(row.clone()),
-            BrowserListRow::Transfer(row) => BrowserListRowRenderState::Transfer(row.clone()),
+            BrowserListRow::Transfer(row) => BrowserListRowRenderState::Transfer {
+                row: row.clone(),
+                selected: selected_search_match.is_none() && selected.as_ref() == Some(&row.path),
+                progress: self.transfer_progress_for_path(&row.path),
+            },
             BrowserListRow::Search(search_match) => BrowserListRowRenderState::Search {
                 search_match: search_match.clone(),
                 selected: selected_search_match.as_ref() == Some(&search_match.selection_key()),
@@ -967,7 +996,11 @@ pub(super) enum BrowserListRowRenderState {
         expanded: bool,
     },
     Loading(LoadingRow),
-    Transfer(TransferPlaceholderRow),
+    Transfer {
+        row: TransferRow,
+        selected: bool,
+        progress: Option<TransferRowProgress>,
+    },
     Search {
         search_match: SearchMatch,
         selected: bool,
@@ -983,7 +1016,7 @@ impl BrowserListRowRenderState {
             Self::NewEntry(row) => BrowserListRow::NewEntry(row.clone()),
             Self::RenameEntry { row, .. } => BrowserListRow::RenameEntry(row.clone()),
             Self::Loading(row) => BrowserListRow::Loading(row.clone()),
-            Self::Transfer(row) => BrowserListRow::Transfer(row.clone()),
+            Self::Transfer { row, .. } => BrowserListRow::Transfer(row.clone()),
             Self::Search { search_match, .. } => BrowserListRow::Search(search_match.clone()),
             Self::Status(message) => BrowserListRow::Status(message.clone()),
             Self::RootGap => BrowserListRow::RootGap,
@@ -1187,7 +1220,22 @@ fn file_drag_source(browser: &Rc<FileBrowser>, path: FileNodePath) -> tree_view:
 
                 browser.set_internal_drag_paths(vec![path.clone()]);
                 let bytes = gtk::glib::Bytes::from_owned(path.display().into_bytes());
-                Some(gdk::ContentProvider::for_bytes("text/plain", &bytes))
+                let app_provider =
+                    gdk::ContentProvider::for_bytes(super::APP_FILE_TRANSFER_MIME_TYPE, &bytes);
+                if browser.desktop_opener.borrow().is_none() || !path.is_native() {
+                    return Some(app_provider);
+                }
+
+                let workspace = browser.workspace.borrow().clone();
+                let Some(workspace_path) = path.to_workspace_path(&workspace) else {
+                    return Some(app_provider);
+                };
+                let file_list =
+                    gdk::FileList::from_array(&[gio::File::for_path(workspace_path.absolute)]);
+                Some(gdk::ContentProvider::new_union(&[
+                    app_provider,
+                    gdk::ContentProvider::for_value(&file_list.to_value()),
+                ]))
             }
         })
         .on_begin({

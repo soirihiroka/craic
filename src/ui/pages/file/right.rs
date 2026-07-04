@@ -292,6 +292,20 @@ impl RightPane {
         self.status_label.set_text(message);
     }
 
+    pub(super) fn show_transfer_in_progress(&self, file_path: &str) {
+        self.cancel_preview_load();
+        self.set_title(file_path, file_path);
+        self.provider_loading_label
+            .set_text("File transfer in progress...");
+        self.stack.set_visible_child_name("provider-loading");
+        self.clear_file_state();
+        self.file_view_split
+            .set_start_child(Some(&self.file_editor.root));
+        self.file_view_split.set_end_child(None::<&gtk::Widget>);
+        self.clear_auxiliary_previews();
+        self.status_label.set_text("");
+    }
+
     pub(super) fn show_folder_info(
         &self,
         workspace_root: &str,

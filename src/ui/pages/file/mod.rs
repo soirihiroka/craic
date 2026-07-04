@@ -16,7 +16,7 @@ use crate::system::{FileNodePath, WorkspacePath, WorkspaceRef};
 use crate::ui::components::markdown_preview::MarkdownPreviewDocument;
 use crate::ui::content::code_editor;
 use crate::ui::file_type;
-use crate::ui::sidebar::file_browser::ContainerFileAction;
+use crate::ui::sidebar::file_browser::{ContainerFileAction, FileBrowser};
 use adw::prelude::*;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
@@ -339,13 +339,16 @@ impl FilePage {
                 let file_monitor = file_monitor.clone();
                 let displayed_preview = displayed_preview.clone();
 
+                let file_browser = file_browser.clone();
+
                 move |node_path| {
-                    show_repository_node_path(
+                    show_file_browser_node_path(
                         &ctx,
                         &right,
                         &pending_save,
                         &file_monitor,
                         &displayed_preview,
+                        &file_browser,
                         node_path,
                         None,
                     );
@@ -565,12 +568,13 @@ impl FilePage {
             return;
         }
         if let Some(file_browser) = &self.left.file_browser {
-            show_repository_node_path(
+            show_file_browser_node_path(
                 &self.ctx,
                 &self.right,
                 &self.pending_save,
                 &self.file_monitor,
                 &self.displayed_preview,
+                file_browser,
                 file_browser.selected_node_path(),
                 None,
             );
@@ -782,6 +786,57 @@ fn show_repository_file_match(
         node_path.clone(),
         Some((start, end)),
     );
+}
+
+fn show_file_browser_node_path(
+    ctx: &PageContext,
+    right: &Rc<right::RightPane>,
+    pending_save: &PendingSaveState,
+    file_monitor: &OpenedFileMonitorState,
+    displayed_preview: &DisplayedPreviewState,
+    file_browser: &Rc<FileBrowser>,
+    node_path: FileNodePath,
+    selection: Option<(usize, usize)>,
+) {
+    if file_browser.path_has_active_transfer(&node_path) {
+        show_transfer_node_path(
+            ctx,
+            right,
+            pending_save,
+            file_monitor,
+            displayed_preview,
+            node_path,
+        );
+        return;
+    }
+
+    show_repository_node_path(
+        ctx,
+        right,
+        pending_save,
+        file_monitor,
+        displayed_preview,
+        node_path,
+        selection,
+    );
+}
+
+fn show_transfer_node_path(
+    ctx: &PageContext,
+    right: &Rc<right::RightPane>,
+    pending_save: &PendingSaveState,
+    file_monitor: &OpenedFileMonitorState,
+    displayed_preview: &DisplayedPreviewState,
+    node_path: FileNodePath,
+) {
+    let file_path = node_path.display();
+    if !flush_pending_save(ctx, right, pending_save) {
+        return;
+    }
+
+    file_monitor.stop();
+    displayed_preview.borrow_mut().take();
+    right.show_transfer_in_progress(&file_path);
 }
 
 fn show_repository_node_path(
