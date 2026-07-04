@@ -9,10 +9,12 @@ use std::time::SystemTime;
 mod bun;
 mod gradle;
 mod makefile;
+mod pyrefly;
 
 const MAKEFILE_ICON_NAME: &str = "text-makefile-symbolic";
 const BUN_ICON_NAME: &str = "devicon-bun-symbolic";
 const GRADLE_ICON_NAME: &str = "devicon-gradle-symbolic";
+const PYREFLY_ICON_NAME: &str = "devicon-python-symbolic";
 const CUSTOM_ICON_NAME: &str = "utilities-terminal-symbolic";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +39,7 @@ pub struct RunTargetsSignature {
     bun_lock: FileSignature,
     gradle: FileSignature,
     android_manifest: FileSignature,
+    pyproject: FileSignature,
     local_config: FileSignature,
 }
 
@@ -54,6 +57,7 @@ pub fn targets_signature(repo_path: &Path) -> RunTargetsSignature {
         bun_lock: file_signature(bun::bun_lock_path(repo_path)),
         gradle: file_signature(gradle::gradle_project_path(repo_path)),
         android_manifest: file_signature(gradle::android_manifest_path(repo_path)),
+        pyproject: file_signature(pyrefly::pyproject_path(repo_path)),
         local_config: file_signature(local_config_path(repo_path)),
     }
 }
@@ -67,6 +71,7 @@ pub fn discover(repo_path: &Path) -> Vec<RunItem> {
     let mut targets = makefile::discover_makefile_targets(repo_path);
     targets.extend(bun::discover_bun_scripts(repo_path));
     targets.extend(gradle::discover_gradle_targets(repo_path));
+    targets.extend(pyrefly::discover_pyrefly_targets(repo_path));
     targets
 }
 
