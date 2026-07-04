@@ -11,6 +11,7 @@ const PROMPT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
 const PROMPT_MONITOR_RATE_LIMIT_MS: i32 = 250;
 const PROMPT_BUTTON_MIN_LABEL_CHARS: usize = 8;
 const PROMPT_BUTTON_MAX_LABEL_CHARS: usize = 24;
+const PROMPT_BUTTON_SIDE_MARGIN: i32 = 4;
 
 type PromptSelectedCallback = Rc<dyn Fn(Result<PromptSelection, String>)>;
 
@@ -47,8 +48,8 @@ impl PromptBar {
             .spacing(6)
             .margin_top(6)
             .margin_bottom(6)
-            .margin_start(8)
-            .margin_end(8)
+            .margin_start(PROMPT_BUTTON_SIDE_MARGIN)
+            .margin_end(PROMPT_BUTTON_SIDE_MARGIN)
             .build();
 
         let scroller = gtk::ScrolledWindow::builder()
