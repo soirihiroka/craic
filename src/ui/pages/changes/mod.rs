@@ -43,6 +43,7 @@ pub(super) struct ChangesPage {
     right: Rc<ChangesRight>,
     changed_count: Cell<usize>,
     active_preview_signature: Rc<RefCell<Option<WorktreePreviewSignature>>>,
+    active_preview_subscription: Rc<RefCell<Option<git::FileDiffSubscription>>>,
     preview_signatures: Rc<RefCell<HashMap<String, WorktreePreviewSignature>>>,
     preview_cache: Rc<RefCell<BoundedPreviewCache<WorktreePreviewSignature, WorktreePreview>>>,
     preview_workspace_key: Rc<RefCell<Option<String>>>,
@@ -81,6 +82,7 @@ struct WorktreePreviewWorkerResult {
     signature: WorktreePreviewSignature,
     result: Result<WorktreePreview, String>,
     duration: Duration,
+    cacheable: bool,
 }
 
 struct BoundedPreviewCache<K, V> {
@@ -144,6 +146,7 @@ impl ChangesPage {
             right: Rc::new(ChangesRight::new()),
             changed_count: Cell::new(0),
             active_preview_signature: Rc::new(RefCell::new(None)),
+            active_preview_subscription: Rc::new(RefCell::new(None)),
             preview_signatures: Rc::new(RefCell::new(HashMap::new())),
             preview_cache: Rc::new(RefCell::new(BoundedPreviewCache::new(
                 WORKTREE_PREVIEW_CACHE_LIMIT,
@@ -165,6 +168,7 @@ impl ChangesPage {
             let ctx = self.ctx.clone();
             let right = self.right.clone();
             let active_preview_signature = self.active_preview_signature.clone();
+            let active_preview_subscription = self.active_preview_subscription.clone();
             let preview_signatures = self.preview_signatures.clone();
             let preview_cache = self.preview_cache.clone();
 
@@ -174,6 +178,7 @@ impl ChangesPage {
                     .filter(|path| !path.is_empty())
                 else {
                     active_preview_signature.borrow_mut().take();
+                    active_preview_subscription.borrow_mut().take();
                     log::info!(
                         "changes preview selection cleared workspace={}",
                         ctx.workspace_key()
@@ -183,6 +188,7 @@ impl ChangesPage {
                 };
                 let Some(signature) = preview_signatures.borrow().get(&file_path).cloned() else {
                     active_preview_signature.borrow_mut().take();
+                    active_preview_subscription.borrow_mut().take();
                     log::warn!(
                         "changes preview signature missing workspace={} path={}",
                         ctx.workspace_key(),
@@ -204,6 +210,7 @@ impl ChangesPage {
                     &ctx,
                     &right,
                     &active_preview_signature,
+                    &active_preview_subscription,
                     &preview_cache,
                     signature,
                 );
@@ -509,6 +516,7 @@ impl Page for ChangesPage {
             &self.preview_signatures,
             &self.preview_cache,
             &self.active_preview_signature,
+            &self.active_preview_subscription,
             &self.ctx.workspace_key(),
         );
 
@@ -533,11 +541,13 @@ impl Page for ChangesPage {
                 &self.ctx,
                 &self.right,
                 &self.active_preview_signature,
+                &self.active_preview_subscription,
                 &self.preview_cache,
                 signature,
             );
         } else {
             self.active_preview_signature.borrow_mut().take();
+            self.active_preview_subscription.borrow_mut().take();
             self.right.show_home();
         }
         completion();
@@ -550,6 +560,7 @@ impl Page for ChangesPage {
         self.commit_form.clear();
         self.panel.clear();
         self.active_preview_signature.borrow_mut().take();
+        self.active_preview_subscription.borrow_mut().take();
         self.preview_signatures.borrow_mut().clear();
         clear_worktree_preview_cache(
             &self.preview_cache,
@@ -587,6 +598,7 @@ impl Page for ChangesPage {
             PageCommand::ClearSelection => {
                 self.panel.files_list.unselect_all();
                 self.active_preview_signature.borrow_mut().take();
+                self.active_preview_subscription.borrow_mut().take();
                 log::info!(
                     "changes preview selection cleared workspace={}",
                     self.ctx.workspace_key()
@@ -615,6 +627,7 @@ fn sync_worktree_preview_workspace(
     preview_signatures: &Rc<RefCell<HashMap<String, WorktreePreviewSignature>>>,
     preview_cache: &Rc<RefCell<BoundedPreviewCache<WorktreePreviewSignature, WorktreePreview>>>,
     active_preview_signature: &Rc<RefCell<Option<WorktreePreviewSignature>>>,
+    active_preview_subscription: &Rc<RefCell<Option<git::FileDiffSubscription>>>,
     workspace_key: &str,
 ) {
     if preview_workspace_key.borrow().as_deref() == Some(workspace_key) {
@@ -623,6 +636,7 @@ fn sync_worktree_preview_workspace(
 
     let previous = preview_workspace_key.replace(Some(workspace_key.to_string()));
     active_preview_signature.borrow_mut().take();
+    active_preview_subscription.borrow_mut().take();
     preview_signatures.borrow_mut().clear();
     let invalidated = preview_cache.borrow_mut().clear();
     log::info!(
@@ -725,11 +739,13 @@ fn show_worktree_preview(
     ctx: &PageContext,
     right: &Rc<ChangesRight>,
     active_preview_signature: &Rc<RefCell<Option<WorktreePreviewSignature>>>,
+    active_preview_subscription: &Rc<RefCell<Option<git::FileDiffSubscription>>>,
     preview_cache: &Rc<RefCell<BoundedPreviewCache<WorktreePreviewSignature, WorktreePreview>>>,
     signature: WorktreePreviewSignature,
 ) {
     let file_path = signature.path.clone();
     active_preview_signature.replace(Some(signature.clone()));
+    active_preview_subscription.borrow_mut().take();
 
     if let Some(preview) = preview_cache.borrow_mut().get(&signature) {
         log::info!(
@@ -740,16 +756,15 @@ fn show_worktree_preview(
             worktree_preview_summary(&preview)
         );
         show_worktree_preview_outcome(right, &file_path, &preview);
-        return;
+    } else {
+        log::info!(
+            "changes preview cache miss workspace={} path={} kind={:?}",
+            ctx.workspace_key(),
+            file_path,
+            signature.kind
+        );
+        right.show_loading(&file_path);
     }
-
-    log::info!(
-        "changes preview cache miss workspace={} path={} kind={:?}",
-        ctx.workspace_key(),
-        file_path,
-        signature.kind
-    );
-    right.show_loading(&file_path);
 
     let Some(git_handle) = ctx.git() else {
         active_preview_signature.borrow_mut().take();
@@ -760,12 +775,14 @@ fn show_worktree_preview(
     let (sender, receiver) = mpsc::channel();
     let workspace_key = ctx.workspace_key();
 
-    start_worktree_preview_load(git_handle, signature.clone(), sender);
+    let subscription = start_worktree_preview_watch(git_handle, signature.clone(), sender);
+    active_preview_subscription.replace(Some(subscription));
 
     gtk::glib::timeout_add_local(Duration::from_millis(75), {
         let ctx = ctx.clone();
         let right = right.clone();
         let active_preview_signature = active_preview_signature.clone();
+        let active_preview_subscription = active_preview_subscription.clone();
         let preview_cache = preview_cache.clone();
 
         move || match receiver.try_recv() {
@@ -793,20 +810,23 @@ fn show_worktree_preview(
                             result.duration.as_millis(),
                             worktree_preview_summary(&preview)
                         );
-                        let evicted = preview_cache
-                            .borrow_mut()
-                            .insert(result.signature.clone(), preview.clone());
-                        if evicted > 0 {
-                            log::info!(
-                                "changes preview cache invalidation workspace={} reason=evict count={}",
-                                workspace_key,
-                                evicted
-                            );
+                        if result.cacheable {
+                            let evicted = preview_cache
+                                .borrow_mut()
+                                .insert(result.signature.clone(), preview.clone());
+                            if evicted > 0 {
+                                log::info!(
+                                    "changes preview cache invalidation workspace={} reason=evict count={}",
+                                    workspace_key,
+                                    evicted
+                                );
+                            }
                         }
                         show_worktree_preview_outcome(&right, &result.signature.path, &preview);
                     }
                     Err(err) => {
                         active_preview_signature.borrow_mut().take();
+                        active_preview_subscription.borrow_mut().take();
                         right.show_home();
                         log::warn!(
                             "changes preview load failed workspace={} path={} kind={:?} duration_ms={} err={}",
@@ -817,9 +837,10 @@ fn show_worktree_preview(
                             err
                         );
                         ctx.show_error("Diff Failed", &err);
+                        return gtk::glib::ControlFlow::Break;
                     }
                 }
-                gtk::glib::ControlFlow::Break
+                gtk::glib::ControlFlow::Continue
             }
             Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
             Err(TryRecvError::Disconnected) => {
@@ -827,6 +848,7 @@ fn show_worktree_preview(
                     && active_preview_signature.borrow().as_ref() == Some(&signature)
                 {
                     active_preview_signature.borrow_mut().take();
+                    active_preview_subscription.borrow_mut().take();
                     right.show_home();
                     ctx.show_error("Diff Failed", "Diff loading did not return a result.");
                 }
@@ -836,19 +858,20 @@ fn show_worktree_preview(
     });
 }
 
-fn start_worktree_preview_load(
+fn start_worktree_preview_watch(
     git_handle: Arc<GitRepoHandle>,
     signature: WorktreePreviewSignature,
     sender: mpsc::Sender<WorktreePreviewWorkerResult>,
-) {
-    let start = Instant::now();
+) -> git::FileDiffSubscription {
+    let mut start = Instant::now();
+    let mut cacheable = true;
     let path = signature.path.clone();
     match signature.kind {
         PreviewKind::Image
         | PreviewKind::Audio
         | PreviewKind::Video
         | PreviewKind::Font
-        | PreviewKind::Pdf => git_handle.bytes_comparison(
+        | PreviewKind::Pdf => git_handle.watch_bytes_comparison(
             &path,
             Box::new(move |result| {
                 let result = match result.map(WorktreePreview::Bytes) {
@@ -859,13 +882,16 @@ fn start_worktree_preview_load(
                     Err(err) => Err(err),
                 };
                 let _ = sender.send(WorktreePreviewWorkerResult {
-                    signature,
+                    signature: signature.clone(),
                     result,
                     duration: start.elapsed(),
+                    cacheable,
                 });
+                start = Instant::now();
+                cacheable = false;
             }),
         ),
-        _ => git_handle.comparison(
+        _ => git_handle.watch_comparison(
             &path,
             Box::new(move |result| {
                 let result = match result.map(WorktreePreview::Diff) {
@@ -876,10 +902,13 @@ fn start_worktree_preview_load(
                     Err(err) => Err(err),
                 };
                 let _ = sender.send(WorktreePreviewWorkerResult {
-                    signature,
+                    signature: signature.clone(),
                     result,
                     duration: start.elapsed(),
+                    cacheable,
                 });
+                start = Instant::now();
+                cacheable = false;
             }),
         ),
     }

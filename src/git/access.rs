@@ -35,6 +35,7 @@ const PYTHON_HISTORY_PAGE_SCRIPT: &str = include_str!("scripts/history_page.py")
 const PYTHON_WATCH_SCRIPT: &str = include_str!("scripts/watch.py");
 
 pub(crate) type OperationCallback<T> = Box<dyn FnOnce(Result<T, String>) + Send + 'static>;
+pub(crate) type WatchCallback<T> = Box<dyn FnMut(Result<T, String>) + Send + 'static>;
 pub(crate) type ProgressCallback = Box<dyn FnMut(String) + Send + 'static>;
 pub(crate) type ChangeListener = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -187,6 +188,70 @@ impl Drop for ChangeListenerSubscription {
             && let Some(child) = child.as_mut()
         {
             let _ = child.kill();
+        }
+    }
+}
+
+pub(crate) struct FileDiffSubscription {
+    stop_sender: Option<mpsc::Sender<()>>,
+    _listener: ChangeListenerSubscription,
+    _thread: Option<thread::JoinHandle<()>>,
+}
+
+impl FileDiffSubscription {
+    fn spawn<T, F>(
+        label: impl Into<String>,
+        git: GitRepoHandle,
+        file_path: String,
+        listener: ChangeListenerSubscription,
+        events: mpsc::Receiver<()>,
+        mut callback: WatchCallback<T>,
+        mut load: F,
+    ) -> Self
+    where
+        T: Send + 'static,
+        F: FnMut(&GitRepoHandle, &str) -> Result<T, String> + Send + 'static,
+    {
+        let label = label.into();
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let thread_label = label.clone();
+        let thread = thread::spawn(move || {
+            log::info!("git file diff watcher started label={thread_label} path={file_path}");
+            callback(load(&git, &file_path));
+
+            loop {
+                if stop_receiver.try_recv().is_ok() {
+                    break;
+                }
+
+                match events.recv_timeout(Duration::from_millis(200)) {
+                    Ok(()) => {
+                        while events.try_recv().is_ok() {}
+                        if stop_receiver.try_recv().is_ok() {
+                            break;
+                        }
+                        callback(load(&git, &file_path));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            log::info!("git file diff watcher stopped label={thread_label}");
+        });
+
+        Self {
+            stop_sender: Some(stop_sender),
+            _listener: listener,
+            _thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for FileDiffSubscription {
+    fn drop(&mut self) {
+        if let Some(stop_sender) = self.stop_sender.take() {
+            let _ = stop_sender.send(());
         }
     }
 }
@@ -921,16 +986,24 @@ impl GitRepoHandle {
         });
     }
 
-    pub(crate) fn bytes_comparison(
+    pub(crate) fn watch_comparison(
         &self,
         file_path: &str,
-        callback: OperationCallback<git::BytesComparison>,
-    ) {
-        let handle = self.clone();
-        let file_path = file_path.to_string();
-        run_operation("git bytes comparison", callback, move || {
-            handle.bytes_comparison_blocking(&file_path)
-        });
+        callback: WatchCallback<git::FileComparison>,
+    ) -> FileDiffSubscription {
+        self.watch_file_diff(file_path, callback, |handle, file_path| {
+            handle.comparison_blocking(file_path)
+        })
+    }
+
+    pub(crate) fn watch_bytes_comparison(
+        &self,
+        file_path: &str,
+        callback: WatchCallback<git::BytesComparison>,
+    ) -> FileDiffSubscription {
+        self.watch_file_diff(file_path, callback, |handle, file_path| {
+            handle.bytes_comparison_blocking(file_path)
+        })
     }
 
     pub(crate) fn commit_comparison(
@@ -959,6 +1032,35 @@ impl GitRepoHandle {
         run_operation("git commit bytes comparison", callback, move || {
             handle.commit_bytes_comparison_blocking(&hash, &file_path)
         });
+    }
+
+    fn watch_file_diff<T, F>(
+        &self,
+        file_path: &str,
+        callback: WatchCallback<T>,
+        load: F,
+    ) -> FileDiffSubscription
+    where
+        T: Send + 'static,
+        F: FnMut(&GitRepoHandle, &str) -> Result<T, String> + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::channel();
+        let sender = Arc::new(Mutex::new(sender));
+        let listener: ChangeListener = Arc::new(move || {
+            if let Ok(sender) = sender.lock() {
+                let _ = sender.send(());
+            }
+        });
+        let subscription = self.add_on_change_listener(listener);
+        FileDiffSubscription::spawn(
+            format!("shell:{}:{file_path}", self.workspace.display_name),
+            self.clone(),
+            file_path.to_string(),
+            subscription,
+            receiver,
+            callback,
+            load,
+        )
     }
 
     fn workspace_snapshot_blocking(&self) -> Result<WorkspaceSnapshot, String> {
@@ -2058,12 +2160,28 @@ impl GitRepoHandle {
             .filter(git::status_entry_visible)
             .map(|entry| git::changed_file_from_porcelain_entry(&entry))
             .collect::<Vec<_>>();
+        self.populate_worktree_signatures(&mut files);
         files.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
                 .then_with(|| left.status.cmp(&right.status))
         });
         Ok(files)
+    }
+
+    fn populate_worktree_signatures(&self, files: &mut [ChangedFile]) {
+        for file in files {
+            let node_path = self.files.root().join_child(&file.path);
+            file.worktree_signature =
+                self.files
+                    .info(&node_path)
+                    .ok()
+                    .map(|info| git::ChangedFileSignature {
+                        is_dir: info.kind.is_directory(),
+                        len: info.len.unwrap_or(0),
+                        modified: info.modified,
+                    });
+        }
     }
 
     fn commit_target_plan(&self, selected_files: &[String]) -> Result<CommitTargetPlan, String> {
