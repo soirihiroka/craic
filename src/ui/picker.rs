@@ -275,48 +275,112 @@ fn fill_items(list: &gtk::ListBox, items: &[PickerItem], filter: &str) {
         .filter(|term| !term.is_empty())
         .collect::<Vec<_>>();
 
-    for item in items {
-        if !terms.is_empty() && !item_matches_terms(item, &terms) {
-            continue;
+    if terms.is_empty() {
+        for item in items {
+            list.append(&item_row(item));
         }
+        return;
+    }
 
+    let mut ranked = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            item_match_score(item, &terms).map(|score| (score, index, item))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    for (_, _, item) in ranked {
         list.append(&item_row(item));
     }
 }
 
-fn item_matches_terms(item: &PickerItem, terms: &[&str]) -> bool {
+fn item_match_score(item: &PickerItem, terms: &[&str]) -> Option<usize> {
     let label = item.label.to_lowercase();
     let fallback_label = item.fallback_label.to_lowercase();
     let id = item.id.to_lowercase();
+    let fields = [
+        (label.as_str(), 0usize),
+        (fallback_label.as_str(), 12usize),
+        (id.as_str(), 32usize),
+    ];
+    let mut total = 0;
 
-    terms.iter().all(|term| {
-        fuzzy_text_matches(&label, term)
-            || fuzzy_text_matches(&fallback_label, term)
-            || fuzzy_text_matches(&id, term)
-    })
+    for term in terms {
+        let mut best = None;
+        for (text, field_penalty) in fields {
+            if let Some(score) = fuzzy_text_score(text, term) {
+                let score = score + field_penalty;
+                best = Some(best.map_or(score, |best: usize| best.min(score)));
+            }
+        }
+        total += best?;
+    }
+
+    Some(total)
 }
 
-fn fuzzy_text_matches(text: &str, term: &str) -> bool {
-    text.contains(term) || ordered_chars_match(text, term)
+fn fuzzy_text_score(text: &str, term: &str) -> Option<usize> {
+    if text == term {
+        return Some(0);
+    }
+    if text.starts_with(term) {
+        return Some(10 + text.len().saturating_sub(term.len()).min(30));
+    }
+    if let Some(index) = boundary_match_index(text, term) {
+        return Some(45 + index);
+    }
+    if let Some(index) = text.find(term) {
+        return Some(70 + index);
+    }
+
+    ordered_chars_score(text, term)
 }
 
-fn ordered_chars_match(text: &str, term: &str) -> bool {
+fn boundary_match_index(text: &str, term: &str) -> Option<usize> {
+    text.match_indices(term)
+        .filter_map(|(index, _)| {
+            (index > 0
+                && text[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|ch| !ch.is_alphanumeric()))
+            .then_some(index)
+        })
+        .min()
+}
+
+fn ordered_chars_score(text: &str, term: &str) -> Option<usize> {
     let mut term_chars = term.chars();
     let Some(mut target) = term_chars.next() else {
-        return true;
+        return Some(0);
     };
+    let mut first_index = None;
+    let mut previous_index = None;
+    let mut gap_penalty = 0;
 
-    for ch in text.chars() {
+    for (index, ch) in text.chars().enumerate() {
         if ch != target {
             continue;
         }
+        if first_index.is_none() {
+            first_index = Some(index);
+        }
+        if let Some(previous_index) = previous_index {
+            gap_penalty += index.saturating_sub(previous_index + 1);
+        }
+        previous_index = Some(index);
+
         let Some(next) = term_chars.next() else {
-            return true;
+            let first_index = first_index.unwrap_or(index);
+            let spread = index.saturating_sub(first_index);
+            return Some(100 + first_index * 2 + gap_penalty * 4 + spread);
         };
         target = next;
     }
 
-    false
+    None
 }
 
 fn item_row(item: &PickerItem) -> gtk::ListBoxRow {
