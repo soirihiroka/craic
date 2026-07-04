@@ -31,6 +31,16 @@ pub struct QuickActionConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct QuickActionAdditionalConfig {
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct LocalWorkspaceConfig {
     #[serde(default)]
     git: LocalGitConfig,
@@ -62,6 +72,8 @@ struct LocalGitHubConfig {
 struct LocalQuickActionConfig {
     #[serde(default)]
     actions: Vec<QuickActionConfig>,
+    #[serde(default)]
+    additional_actions: Vec<QuickActionAdditionalConfig>,
 }
 
 pub(crate) fn git_config(path: &Path) -> GitConfig {
@@ -106,12 +118,22 @@ pub(crate) fn quick_action_config(path: &Path) -> Option<Vec<QuickActionConfig>>
     load(path).quick_action.map(|config| config.actions)
 }
 
+pub(crate) fn quick_action_additional_commands(path: &Path) -> Vec<QuickActionAdditionalConfig> {
+    load(path)
+        .quick_action
+        .map_or_else(Vec::new, |config| config.additional_actions)
+}
+
 pub(crate) fn save_quick_action_config(
     path: &Path,
     actions: Vec<QuickActionConfig>,
 ) -> Result<(), String> {
     let mut config = load(path);
-    config.quick_action = Some(LocalQuickActionConfig { actions });
+    let existing = config.quick_action.unwrap_or_default();
+    config.quick_action = Some(LocalQuickActionConfig {
+        actions,
+        additional_actions: existing.additional_actions,
+    });
     save(path, &config)
 }
 

@@ -300,6 +300,12 @@ impl ContentPane {
         }
 
         let targets = quick_action::discover(repo_path);
+        let additional_actions =
+            crate::workspace_config::quick_action_additional_commands(repo_path);
+        let mut targets = targets;
+        targets.extend(quick_action::discover_additional_quick_actions(
+            &additional_actions,
+        ));
         log::debug!(
             "quick action target refresh for {} found {} target(s)",
             repo_path.display(),
@@ -933,7 +939,7 @@ type QuickActionTargetReconciler =
 enum QuickActionTargetRenderState {
     Target {
         label: String,
-        icon_name: &'static str,
+        icon_name: String,
         selected: bool,
     },
     Empty {
@@ -1337,7 +1343,7 @@ fn select_quick_action_target(
     target: RunItem,
 ) {
     label.set_label(&target.label);
-    file_type::set_icon_for_name(run_icon, target.icon_name);
+    file_type::set_icon_for_name(run_icon, target.icon_name.as_str());
     run_icon.set_visible(true);
     run_content.set_sensitive(true);
     button.set_tooltip_text(Some(&format!("Run quick action: {}", target.label)));
@@ -1401,7 +1407,7 @@ fn fill_quick_action_targets(
             target.id.clone(),
             QuickActionTargetRenderState::Target {
                 label: target.label.clone(),
-                icon_name: target.icon_name,
+                icon_name: target.icon_name.clone(),
                 selected,
             },
         ));
@@ -1430,7 +1436,8 @@ fn fill_quick_action_targets(
                 label,
                 icon_name,
                 selected,
-            } => quick_action_target_row(key, label, icon_name, *selected).upcast::<gtk::Widget>(),
+            } => quick_action_target_row(key, label, icon_name.as_str(), *selected)
+                .upcast::<gtk::Widget>(),
             QuickActionTargetRenderState::Empty { label } => {
                 quick_action_empty_row(label).upcast::<gtk::Widget>()
             }
@@ -1531,7 +1538,7 @@ fn update_quick_action_target_row(widget: &gtk::Widget, state: &QuickActionTarge
                 }
 
                 if let Some(iw) = icon_widget {
-                    file_type::set_icon_for_name(&iw, icon_name);
+                    file_type::set_icon_for_name(&iw, icon_name.as_str());
                 }
                 if let Some(lw) = label_widget {
                     lw.set_label(label);
@@ -1591,10 +1598,15 @@ fn run_target<C: RepositoryActionContext>(
         return;
     };
     let (program, args) = match &target.command {
-        RunCommand::MakeTarget { target } => ("make", vec![target.clone()]),
-        RunCommand::BunScript { script } => ("bun", vec!["run".to_string(), script.clone()]),
+        RunCommand::MakeTarget { target } => ("make".to_string(), vec![target.clone()]),
+        RunCommand::BunScript { script } => {
+            ("bun".to_string(), vec!["run".to_string(), script.clone()])
+        }
+        RunCommand::ShellCommand { command } => {
+            ("sh".to_string(), vec!["-c".to_string(), command.clone()])
+        }
     };
-    let command = match shell.command(&context.workspace_root(), program, &args) {
+    let command = match shell.command(&context.workspace_root(), &program, &args) {
         Ok(command) => command,
         Err(err) => {
             show_error_dialog(&context.window(), "Run Failed", &err);
