@@ -53,6 +53,7 @@ impl ChangesRight {
             .height_request(24)
             .halign(gtk::Align::Center)
             .build();
+        let loading_title = crate::ui::widgets::title("Loading diff");
         let loading_content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(14)
@@ -62,6 +63,7 @@ impl ChangesRight {
             .vexpand(true)
             .build();
         loading_content.append(&loading_spinner);
+        loading_content.append(&loading_title);
 
         let root = gtk::Stack::builder().hexpand(true).vexpand(true).build();
         root.add_named(&suggestions_content, Some("suggestions"));
