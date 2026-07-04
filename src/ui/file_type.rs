@@ -336,7 +336,7 @@ fn icon_name_from_name_extension(file_name: &str, extension: &str) -> &'static s
         name if name == ".env" || name.starts_with(".env.") => return "text-x-script-symbolic",
         ".node-version" | ".nvmrc" => return "devicon-nodejs-symbolic",
         ".python-version" => return "text-x-python-symbolic",
-        "build.gradle" | "build.gradle.kts" => return "text-makefile-symbolic",
+        "build.gradle" | "build.gradle.kts" => return "devicon-gradle-symbolic",
         "bun.lock" | "bun.lockb" => return "devicon-bun-symbolic",
         "bunfig.toml" => return "text-x-toml-symbolic",
         "cargo.lock" => return "text-rust-symbolic",
