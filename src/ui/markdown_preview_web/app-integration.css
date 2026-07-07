@@ -30,6 +30,13 @@ body.markdown-body {
   height: auto;
 }
 
+.markdown-body .craic-markdown-video {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 8px 0;
+}
+
 .markdown-body .source-anchor {
   display: block;
   position: relative;

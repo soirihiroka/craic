@@ -1,8 +1,10 @@
 use crate::language_support::SyntaxHighlighter;
 use pulldown_cmark::{
-    BlockQuoteKind, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, html,
+    BlockQuoteKind, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd, html,
 };
+use regex::Regex;
 use std::ops::Range;
+use std::sync::OnceLock;
 
 const GITHUB_MARKDOWN_CSS: &str = include_str!("github-markdown.css");
 
@@ -81,17 +83,185 @@ pub(crate) fn markdown_fragment_html(markdown: &str) -> String {
 fn push_html_with_source_anchors<'a>(html_body: &mut String, events: &[(Event<'a>, Range<usize>)]) {
     let mut anchored_events = Vec::with_capacity(events.len() * 2);
     let mut last_anchor = None;
+    let mut link_or_image_depth = 0usize;
+    let mut i = 0;
 
-    for (event, range) in events {
+    while i < events.len() {
+        let (event, range) = &events[i];
         if should_anchor_event(event) && last_anchor != Some(range.start) {
             anchored_events.push(Event::Html(CowStr::from(source_anchor(range.start))));
             last_anchor = Some(range.start);
         }
 
-        push_alert_aware_event(&mut anchored_events, event);
+        if link_or_image_depth == 0 {
+            if let Event::Start(Tag::Link { dest_url, .. }) = event {
+                if is_video_url(dest_url) {
+                    anchored_events.push(Event::Html(CowStr::from(video_html(dest_url))));
+                    i = skip_link_events(events, i + 1);
+                    continue;
+                }
+            }
+        }
+
+        match event {
+            Event::Start(Tag::Link { .. }) | Event::Start(Tag::Image { .. }) => {
+                link_or_image_depth += 1;
+                push_alert_aware_event(&mut anchored_events, event);
+            }
+            Event::End(TagEnd::Link | TagEnd::Image) => {
+                push_alert_aware_event(&mut anchored_events, event);
+                link_or_image_depth = link_or_image_depth.saturating_sub(1);
+            }
+            Event::Text(text) if link_or_image_depth == 0 => {
+                push_text_with_auto_links(&mut anchored_events, text);
+            }
+            _ => push_alert_aware_event(&mut anchored_events, event),
+        }
+        i += 1;
     }
 
     html::push_html(html_body, anchored_events.into_iter());
+}
+
+fn skip_link_events<'a>(events: &[(Event<'a>, Range<usize>)], start: usize) -> usize {
+    let mut depth = 1usize;
+
+    for (index, (event, _)) in events.iter().enumerate().skip(start) {
+        match event {
+            Event::Start(Tag::Link { .. }) => depth += 1,
+            Event::End(TagEnd::Link) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return index + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    events.len()
+}
+
+fn push_text_with_auto_links<'a>(events: &mut Vec<Event<'a>>, text: &CowStr<'a>) {
+    let text = text.as_ref();
+    let mut cursor = 0;
+    let mut found_url = false;
+
+    for matched in auto_link_url_regex().find_iter(text) {
+        let start = matched.start();
+        let end = matched.end();
+        let trimmed_len = trimmed_auto_link_len(&text[start..end]);
+        let url_end = start + trimmed_len;
+
+        if url_end <= start {
+            continue;
+        }
+
+        found_url = true;
+        if cursor < start {
+            events.push(Event::Text(CowStr::from(text[cursor..start].to_string())));
+        }
+
+        push_auto_link_url(events, &text[start..url_end]);
+        cursor = url_end;
+    }
+
+    if !found_url {
+        events.push(Event::Text(CowStr::from(text.to_string())));
+    } else if cursor < text.len() {
+        events.push(Event::Text(CowStr::from(text[cursor..].to_string())));
+    }
+}
+
+fn push_auto_link_url<'a>(events: &mut Vec<Event<'a>>, url: &str) {
+    if is_video_url(url) {
+        events.push(Event::Html(CowStr::from(video_html(url))));
+        return;
+    }
+
+    events.push(Event::Start(Tag::Link {
+        link_type: LinkType::Autolink,
+        dest_url: CowStr::from(url.to_string()),
+        title: CowStr::from(String::new()),
+        id: CowStr::from(String::new()),
+    }));
+    events.push(Event::Text(CowStr::from(url.to_string())));
+    events.push(Event::End(TagEnd::Link));
+}
+
+fn auto_link_url_regex() -> &'static Regex {
+    static URL_REGEX: OnceLock<Regex> = OnceLock::new();
+    URL_REGEX.get_or_init(|| {
+        Regex::new(r#"https?://[^\s<>"']+"#).expect("markdown auto-link regex should compile")
+    })
+}
+
+fn trimmed_auto_link_len(url: &str) -> usize {
+    let mut end = url.len();
+
+    while end > 0 {
+        let candidate = &url[..end];
+        let Some(ch) = candidate.chars().last() else {
+            break;
+        };
+
+        if matches!(ch, '.' | ',' | ';' | ':' | '!' | '?') {
+            end -= ch.len_utf8();
+            continue;
+        }
+
+        if matches!(ch, ')' | ']' | '}') && has_unbalanced_closing_delimiter(candidate, ch) {
+            end -= ch.len_utf8();
+            continue;
+        }
+
+        break;
+    }
+
+    end
+}
+
+fn has_unbalanced_closing_delimiter(text: &str, closing: char) -> bool {
+    let opening = match closing {
+        ')' => '(',
+        ']' => '[',
+        '}' => '{',
+        _ => return false,
+    };
+    text.chars().filter(|ch| *ch == closing).count()
+        > text.chars().filter(|ch| *ch == opening).count()
+}
+
+fn is_video_url(url: &str) -> bool {
+    video_mime_type(url).is_some()
+}
+
+fn video_mime_type(url: &str) -> Option<&'static str> {
+    let path_end = url
+        .find('?')
+        .unwrap_or(url.len())
+        .min(url.find('#').unwrap_or(url.len()));
+    let path = url[..path_end].trim_end_matches('/').to_ascii_lowercase();
+
+    if path.ends_with(".mp4") || path.ends_with(".m4v") {
+        Some("video/mp4")
+    } else if path.ends_with(".webm") {
+        Some("video/webm")
+    } else if path.ends_with(".ogv") || path.ends_with(".ogg") {
+        Some("video/ogg")
+    } else if path.ends_with(".mov") {
+        Some("video/quicktime")
+    } else {
+        None
+    }
+}
+
+fn video_html(url: &str) -> String {
+    let escaped_url = escape_html(url);
+    let mime_type = video_mime_type(url).unwrap_or("video/mp4");
+    format!(
+        r#"<video class="craic-markdown-video" controls preload="metadata" playsinline><source src="{escaped_url}" type="{mime_type}"><a href="{escaped_url}">{escaped_url}</a></video>"#
+    )
 }
 
 fn push_alert_aware_event<'a>(events: &mut Vec<Event<'a>>, event: &Event<'a>) {
