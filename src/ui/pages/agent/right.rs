@@ -222,18 +222,61 @@ impl AgentChat {
         chat
     }
 
-    pub fn set_workspace_from_context(&self) {
+    pub fn set_workspace_from_context(&self) -> usize {
         let workspace = self.ctx.workspace_ref();
+        let next_workspace_key = self.ctx.workspace_key();
+        let current_workspace_key = self.workspace_history.borrow().key().to_string();
+        let closed_sessions = if current_workspace_key != next_workspace_key {
+            self.close_sessions_for_workspace_change(&current_workspace_key, &next_workspace_key)
+        } else {
+            0
+        };
+
         self.working_directory
             .replace(PathBuf::from(&workspace.root.absolute));
         self.workspace_history
             .replace(agent_history::workspace_for_system_path(
-                self.ctx.workspace_key(),
+                next_workspace_key,
                 workspace.root.absolute,
             ));
         let local_workspace_path = self.ctx.local_workspace_path();
         self.prompt_bar
             .set_local_repo_path(local_workspace_path.as_deref());
+        closed_sessions
+    }
+
+    fn close_sessions_for_workspace_change(
+        &self,
+        current_workspace_key: &str,
+        next_workspace_key: &str,
+    ) -> usize {
+        let session_ids = self
+            .sessions
+            .borrow()
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+
+        if session_ids.is_empty() {
+            return 0;
+        }
+
+        log::info!(
+            "agent workspace changed; closing active sessions current_workspace={} next_workspace={} count={}",
+            current_workspace_key,
+            next_workspace_key,
+            session_ids.len()
+        );
+        for session_id in &session_ids {
+            close_session(
+                *session_id,
+                &self.sessions,
+                &self.notebook,
+                &self.close_callback,
+                &self.history_callback,
+            );
+        }
+        session_ids.len()
     }
 
     pub fn show(&self) {

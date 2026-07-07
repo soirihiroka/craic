@@ -823,9 +823,16 @@ impl Page for AgentPage {
 }
 
 fn refresh_agent_workspace(ctx: &PageContext, state: &AgentPageState) {
-    state.chat.set_workspace_from_context();
+    let workspace_key = ctx.workspace_key();
+    let closed_sessions = state.chat.set_workspace_from_context();
     let workspace = ctx.workspace_ref();
+    log::info!(
+        "agent page workspace refreshed workspace={} root={} closed_sessions={}",
+        workspace_key,
+        workspace.root.absolute,
+        closed_sessions
+    );
     state
         .list
-        .set_workspace_key(ctx.workspace_key(), workspace.root.absolute);
+        .set_workspace_key(workspace_key, workspace.root.absolute);
 }

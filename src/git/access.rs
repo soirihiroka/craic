@@ -737,11 +737,17 @@ impl GitRepoHandle {
         });
     }
 
-    pub(crate) fn save_author_email(&self, email: &str, callback: OperationCallback<()>) {
+    pub(crate) fn save_author_identity(
+        &self,
+        name: &str,
+        email: &str,
+        callback: OperationCallback<()>,
+    ) {
         let handle = self.clone();
+        let name = name.to_string();
         let email = email.to_string();
-        run_operation("git save author email", callback, move || {
-            handle.save_author_email_blocking(&email)
+        run_operation("git save author identity", callback, move || {
+            handle.save_author_identity_blocking(&name, &email)
         });
     }
 
@@ -1579,7 +1585,15 @@ impl GitRepoHandle {
         )
     }
 
-    fn save_author_email_blocking(&self, email: &str) -> Result<(), String> {
+    fn save_author_identity_blocking(&self, name: &str, email: &str) -> Result<(), String> {
+        let mut name = name.trim().to_string();
+        if name.is_empty() {
+            name = crate::github::login_from_noreply_email(email).unwrap_or_default();
+        }
+        if !name.is_empty() {
+            self.git(&["config".into(), "--local".into(), "user.name".into(), name])?;
+        }
+
         self.git(&[
             "config".into(),
             "--local".into(),
