@@ -52,6 +52,7 @@ pub(super) struct ChangesPage {
 }
 
 const WORKTREE_PREVIEW_CACHE_LIMIT: usize = 24;
+const COMMIT_EMAIL_ROW_DATA_KEY: &str = "commit-email-option";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WorktreePreviewSignature {
@@ -1207,19 +1208,19 @@ fn show_commit_author_email_selector(
         let popover = popover.clone();
 
         move |_, row| {
-            let email = row.widget_name().to_string();
-            if email.is_empty() {
+            let Some(option) = commit_email_option_from_row(row) else {
                 return;
-            }
+            };
 
             let Some(git_handle) = ctx.git() else {
-                ctx.show_error("Email Selection Failed", &ctx.git_unavailable_message());
+                ctx.show_error("Author Selection Failed", &ctx.git_unavailable_message());
                 return;
             };
 
             let (sender, receiver) = mpsc::channel();
-            git_handle.save_author_email(
-                &email,
+            git_handle.save_author_identity(
+                &option.name,
+                &option.email,
                 Box::new(move |result| {
                     let _ = sender.send(result);
                 }),
@@ -1230,20 +1231,20 @@ fn show_commit_author_email_selector(
 
                 move || match receiver.try_recv() {
                     Ok(Ok(())) => {
-                        log::info!("commit author email updated from selector");
+                        log::info!("commit author updated from selector");
                         popover.popdown();
-                        ctx.refresh(Some("Commit author email updated.".to_string()));
+                        ctx.refresh(Some("Commit author updated.".to_string()));
                         gtk::glib::ControlFlow::Break
                     }
                     Ok(Err(err)) => {
-                        ctx.show_error("Email Selection Failed", &err);
+                        ctx.show_error("Author Selection Failed", &err);
                         gtk::glib::ControlFlow::Break
                     }
                     Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
                     Err(TryRecvError::Disconnected) => {
                         ctx.show_error(
-                            "Email Selection Failed",
-                            "Email selection did not return a result.",
+                            "Author Selection Failed",
+                            "Author selection did not return a result.",
                         );
                         gtk::glib::ControlFlow::Break
                     }
@@ -1426,7 +1427,15 @@ fn commit_email_row(option: &CommitEmailOption) -> gtk::ListBoxRow {
 
     let row = gtk::ListBoxRow::builder().child(&content).build();
     row.set_widget_name(&option.email);
+    unsafe {
+        row.set_data(COMMIT_EMAIL_ROW_DATA_KEY, option.clone());
+    }
     row
+}
+
+fn commit_email_option_from_row(row: &gtk::ListBoxRow) -> Option<CommitEmailOption> {
+    let option = unsafe { row.data::<CommitEmailOption>(COMMIT_EMAIL_ROW_DATA_KEY) }?;
+    Some(unsafe { option.as_ref().clone() })
 }
 
 fn commit_email_status_row(title: &str, subtitle: &str) -> gtk::ListBoxRow {
