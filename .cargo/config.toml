@@ -1,0 +1,5 @@
+[env]
+# Keep gtk-rs build scripts on distro packages when a shell puts Homebrew first.
+PKG_CONFIG = { value = "/usr/bin/pkg-config", force = true }
+PKG_CONFIG_PATH = { value = "/usr/lib64/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig", force = true }
+PKG_CONFIG_LIBDIR = { value = "/usr/lib64/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig", force = true }
