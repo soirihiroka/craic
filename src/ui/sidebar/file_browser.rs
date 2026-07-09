@@ -957,8 +957,8 @@ pub(super) fn should_skip(name: &str) -> bool {
     skipped_names().contains(&name)
 }
 
-pub(super) fn skipped_names() -> [&'static str; 6] {
-    [".git", "target", "node_modules", ".next", "dist", "build"]
+pub(super) fn skipped_names() -> [&'static str; 1] {
+    [".git"]
 }
 
 fn show_row_context_menu<W: IsA<gtk::Widget>>(
