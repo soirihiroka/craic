@@ -19,8 +19,8 @@ Documentation
 -------------
 
 The wiki follows the GNOME Human Interface Guidelines documentation setup: it
-uses reStructuredText, Sphinx, and the Furo theme with a small GNOME-inspired
-style layer. Python dependencies are isolated and locked with uv.
+uses reStructuredText, Sphinx, and the HIG's Furo layout and theme styles.
+Python and theme dependencies are isolated and locked with uv.
 
 Install or update the documentation environment:
 
