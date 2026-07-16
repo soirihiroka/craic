@@ -36,7 +36,7 @@ fn connect_app_actions(state: &Rc<AppState>) {
             move |_, parameter| {
                 if let Some(val) = parameter.and_then(|v| v.str()) {
                     let workspace = crate::workspace::workspace_from_selection_id(val);
-                    prompt_workspace_open(&state, workspace);
+                    prompt_workspace_open(&state, workspace, None);
                 }
             }
         });
@@ -170,7 +170,7 @@ fn connect_repository_picker(state: &Rc<AppState>) {
         let state = state.clone();
         move |id| {
             let workspace = crate::workspace::workspace_from_selection_id(&id);
-            prompt_workspace_open(&state, workspace);
+            prompt_workspace_open(&state, workspace, None);
         }
     });
 
@@ -212,7 +212,11 @@ fn set_active_workspace(state: &Rc<AppState>, workspace: ConfiguredWorkspace) {
     refresh_active_repo_metadata(state, Some(item_id));
 }
 
-fn prompt_workspace_open(state: &Rc<AppState>, workspace: ConfiguredWorkspace) {
+fn prompt_workspace_open(
+    state: &Rc<AppState>,
+    workspace: ConfiguredWorkspace,
+    message: Option<String>,
+) {
     let label = workspace.label();
     let dialog = adw::AlertDialog::builder()
         .heading("Open Workspace")
@@ -230,7 +234,7 @@ fn prompt_workspace_open(state: &Rc<AppState>, workspace: ConfiguredWorkspace) {
         move |response| match response.as_str() {
             "current" => {
                 log::info!("workspace open selected target=current label={label}");
-                open_workspace_here(&state, workspace.clone(), None);
+                open_workspace_here(&state, workspace.clone(), message.clone());
             }
             "new" => {
                 log::info!("workspace open selected target=new-window label={label}");
@@ -511,7 +515,7 @@ fn show_create_workspace_dialog(state: &Rc<AppState>) {
                 move || match receiver.try_recv() {
                     Ok(Ok((path, message))) => {
                         dialog.close();
-                        open_workspace_here(
+                        prompt_workspace_open(
                             &state,
                             ConfiguredWorkspace::local(path.to_string_lossy().to_string()),
                             Some(message),
