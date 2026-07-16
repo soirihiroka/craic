@@ -1,0 +1,40 @@
+/* GNOME-inspired presentation layered on the Furo Sphinx theme. */
+@font-face {
+  font-family: InterVariable;
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("https://static.gnome.org/fonts/InterVariable.woff2") format("woff2");
+}
+
+:root {
+  font-feature-settings: "liga" 1, "calt" 1, "cv05" 1;
+  --gnome-blue: #1c71d8;
+}
+
+html,
+body {
+  font-family: InterVariable, sans-serif;
+  line-height: 1.6;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-weight: 800;
+  letter-spacing: -0.015em;
+}
+
+.sidebar-brand-text {
+  font-weight: 800;
+}
+
+.admonition,
+div[class*="highlight-"] {
+  border-radius: 12px;
+}
+
+.toctree-wrapper li.toctree-l1 {
+  margin-block: 0.75rem;
+}

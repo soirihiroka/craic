@@ -1,4 +1,5 @@
 CARGO ?= cargo
+UV ?= uv
 INSTALL ?= install
 SED ?= sed
 GTK_UPDATE_ICON_CACHE ?= gtk-update-icon-cache
@@ -23,8 +24,11 @@ DESKTOP_TEMPLATE := data/$(APP_ID).desktop.in
 APP_ICON := data/icons/hicolor/scalable/apps/$(APP_ID).svg
 ASSET_FILES := $(wildcard src/assets/*.svg)
 FONT_FILES := $(wildcard src/fonts/JetBrainsMono/*.ttf)
+DOCS_DIR := docs
+DOCS_SOURCE_DIR := $(DOCS_DIR)/source
+DOCS_BUILD_DIR := $(DOCS_DIR)/build
 
-.PHONY: dev run build release check test clean install uninstall
+.PHONY: dev run build release check test doc clean install uninstall
 
 dev:
 	RUST_LOG=$(RUST_LOG) $(CARGO) run
@@ -42,6 +46,9 @@ check:
 
 test:
 	$(CARGO) test
+
+doc:
+	$(UV) run --project "$(DOCS_DIR)" sphinx-build -b html -j auto -W --keep-going "$(DOCS_SOURCE_DIR)" "$(DOCS_BUILD_DIR)"
 
 clean:
 	$(CARGO) clean
