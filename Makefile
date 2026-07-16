@@ -48,7 +48,7 @@ test:
 	$(CARGO) test
 
 doc:
-	$(UV) run --project "$(DOCS_DIR)" sphinx-build -b html -j auto -W --keep-going "$(DOCS_SOURCE_DIR)" "$(DOCS_BUILD_DIR)"
+	$(UV) run --locked --project "$(DOCS_DIR)" sphinx-build -b html -j auto -W --keep-going "$(DOCS_SOURCE_DIR)" "$(DOCS_BUILD_DIR)"
 
 clean:
 	$(CARGO) clean
