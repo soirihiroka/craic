@@ -54,13 +54,19 @@ struct FileSignature {
 }
 
 pub fn targets_signature(repo_path: &Path) -> RunTargetsSignature {
+    let gradle = file_signature(gradle::gradle_project_path(repo_path));
+    let android_manifest = if gradle.path.is_some() {
+        file_signature(gradle::android_manifest_path(repo_path))
+    } else {
+        file_signature(None)
+    };
     RunTargetsSignature {
         cargo: file_signature(cargo::cargo_manifest_path(repo_path)),
         makefile: file_signature(makefile::makefile_path(repo_path)),
         package_json: file_signature(bun::package_json_path(repo_path)),
         bun_lock: file_signature(bun::bun_lock_path(repo_path)),
-        gradle: file_signature(gradle::gradle_project_path(repo_path)),
-        android_manifest: file_signature(gradle::android_manifest_path(repo_path)),
+        gradle,
+        android_manifest,
         pyproject: file_signature(pyrefly::pyproject_path(repo_path)),
         local_config: file_signature(local_config_path(repo_path)),
     }
