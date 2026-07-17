@@ -1,0 +1,14 @@
+[package]
+name = "craic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+adw.workspace = true
+craic-config.workspace = true
+craic-ui.workspace = true
+env_logger.workspace = true
+gtk.workspace = true
+libpanel.workspace = true
+log.workspace = true

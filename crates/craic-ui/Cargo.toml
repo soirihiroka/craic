@@ -1,0 +1,26 @@
+[package]
+name = "craic-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+adw.workspace = true
+craic-agent.workspace = true
+craic-config.workspace = true
+craic-project.workspace = true
+craic-system.workspace = true
+craic-vcs.workspace = true
+craic-ui-agent.workspace = true
+craic-ui-containers.workspace = true
+craic-ui-core.workspace = true
+craic-ui-file.workspace = true
+craic-ui-terminal.workspace = true
+craic-ui-vcs.workspace = true
+gtk.workspace = true
+libc.workspace = true
+log.workspace = true
+moka.workspace = true
+pango.workspace = true
+pangocairo.workspace = true
+rusqlite.workspace = true

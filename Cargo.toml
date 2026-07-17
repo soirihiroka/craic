@@ -1,67 +1,87 @@
-[package]
-name = "craic"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/craic"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
 
-[dependencies]
+[workspace.dependencies]
 adw = { package = "libadwaita", version = "0.9", features = ["v1_9"] }
-gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
+base64 = "0.22.1"
 cairo = { package = "cairo-rs", version = "0.22", features = ["freetype"] }
+craic-agent = { path = "crates/craic-agent" }
+craic-config = { path = "crates/craic-config" }
+craic-language = { path = "crates/craic-language" }
+craic-project = { path = "crates/craic-project" }
+craic-system = { path = "crates/craic-system" }
+craic-vcs = { path = "crates/craic-vcs" }
+craic-ui-core = { path = "crates/craic-ui-core" }
+craic-ui-agent = { path = "crates/craic-ui-agent" }
+craic-ui-containers = { path = "crates/craic-ui-containers" }
+craic-ui-editor = { path = "crates/craic-ui-editor" }
+craic-ui-file = { path = "crates/craic-ui-file" }
+craic-ui-preview = { path = "crates/craic-ui-preview" }
+craic-ui-terminal = { path = "crates/craic-ui-terminal" }
+craic-ui-vcs = { path = "crates/craic-ui-vcs" }
+craic-ui = { path = "crates/craic-ui" }
+env_logger = "0.11"
 freetype = { package = "freetype-rs", version = "0.38" }
-libpanel = "0.7"
+glycin = { version = "3.1.0", features = ["gdk4"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
+gtk4 = { version = "0.11", features = ["v4_10"] }
 libc = "0.2"
-poppler = { package = "poppler-rs", version = "0.26", features = ["v26_1"] }
+libpanel = "0.7"
+log = "0.4"
 moka = { version = "0.12", default-features = false, features = ["sync"] }
 nbformat = "3.0.0"
 pango = { version = "0.22", features = ["v1_56"] }
 pangocairo = "0.22"
-reqwest = { version = "0.13.4", features = ["blocking"] }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1" }
-uuid = { version = "1", features = ["v4"] }
-toml = "1"
-typos = "0.10.43"
-typos-dict = "0.13.31"
-unicase = "2.9.0"
+poppler = { package = "poppler-rs", version = "0.26", features = ["v26_1"] }
 pulldown-cmark = "0.13"
 regex = "1"
+reqwest = { version = "0.13.4", features = ["blocking"] }
 rumdl = { version = "0.2.27", default-features = false }
-unicode-segmentation = "1.13"
-walkdir = "2"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+safetensors = "0.8.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sourceview5 = "0.11.0"
+syntect = "5"
+toml = "1"
 tree-sitter = "0.26"
 tree-sitter-bash = "0.25"
 tree-sitter-c = "0.24"
-tree-sitter-cpp = "0.23"
 tree-sitter-caddy = "0.1"
+tree-sitter-cpp = "0.23"
 tree-sitter-css = "0.25"
+tree-sitter-cuda = "0.21"
 tree-sitter-go = "0.25"
+tree-sitter-hlsl = "0.2"
 tree-sitter-html = "0.23"
+tree-sitter-ini = "1"
 tree-sitter-java = "0.23"
 tree-sitter-javascript = "0.25"
 tree-sitter-json = "0.24"
-tree-sitter-make = "1"
-tree-sitter-ini = "1"
-tree-sitter-cuda = "0.21"
-tree-sitter-hlsl = "0.2"
-tree-sitter-powershell = "0.26"
-tree-sitter-slang = "0.3"
 tree-sitter-kotlin-ng = "1"
+tree-sitter-make = "1"
 tree-sitter-md = "0.5"
+tree-sitter-powershell = "0.26"
 tree-sitter-python = "0.25"
 tree-sitter-ruby = "0.23"
 tree-sitter-rust = "0.24"
+tree-sitter-slang = "0.3"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-typescript = "0.23"
 tree-sitter-xml = "0.7"
 tree-sitter-yaml = "0.7"
+typos = "0.10.43"
+typos-dict = "0.13.31"
+unicase = "2.9.0"
+unicode-segmentation = "1.13"
+uuid = { version = "1", features = ["v4"] }
 vte4 = { version = "0.10", features = ["v0_84"] }
-webkit6 = { version = "0.6" }
-log = "0.4"
-env_logger = "0.11"
-base64 = "0.22.1"
-syntect = "5"
-craic-diff-ui = { path = "crates/craic-diff-ui" }
-sourceview5 = "0.11.0"
-safetensors = "0.8.0"
-glycin = { version = "3.1.0", features = ["gdk4"] }
+walkdir = "2"
+webkit6 = "0.6"
