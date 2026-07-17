@@ -1,0 +1,15 @@
+[package]
+name = "craic-ui-containers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+adw.workspace = true
+craic-system.workspace = true
+craic-vcs.workspace = true
+craic-ui-core.workspace = true
+craic-ui-editor.workspace = true
+gtk.workspace = true
+log.workspace = true
+serde_json.workspace = true

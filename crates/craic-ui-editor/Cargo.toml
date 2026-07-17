@@ -1,0 +1,18 @@
+[package]
+name = "craic-ui-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+adw.workspace = true
+cairo.workspace = true
+craic-config.workspace = true
+craic-language.workspace = true
+craic-ui-core.workspace = true
+craic-vcs.workspace = true
+gtk.workspace = true
+log.workspace = true
+pango.workspace = true
+pangocairo.workspace = true
+unicode-segmentation.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "craic-ui-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+adw.workspace = true
+craic-config.workspace = true
+craic-system.workspace = true
+craic-ui-core.workspace = true
+gtk.workspace = true
+libc.workspace = true
+libpanel.workspace = true
+log.workspace = true
+regex.workspace = true
+vte4.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "craic-ui-file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+adw.workspace = true
+craic-config.workspace = true
+craic-language.workspace = true
+craic-project.workspace = true
+craic-system.workspace = true
+craic-vcs.workspace = true
+craic-ui-core.workspace = true
+craic-ui-editor.workspace = true
+craic-ui-preview.workspace = true
+glycin.workspace = true
+gtk.workspace = true
+log.workspace = true
+nbformat.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+webkit6.workspace = true

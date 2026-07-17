@@ -22,8 +22,8 @@ FONTDIR ?= $(DATADIR)/fonts/$(BIN_NAME)/JetBrainsMono
 
 DESKTOP_TEMPLATE := data/$(APP_ID).desktop.in
 APP_ICON := data/icons/hicolor/scalable/apps/$(APP_ID).svg
-ASSET_FILES := $(wildcard src/assets/*.svg)
-FONT_FILES := $(wildcard src/fonts/JetBrainsMono/*.ttf)
+ASSET_FILES := $(wildcard crates/craic-ui-core/assets/icons/*.svg)
+FONT_FILES := $(wildcard crates/craic-ui-core/assets/fonts/JetBrainsMono/*.ttf)
 DOCS_DIR := docs
 DOCS_SOURCE_DIR := $(DOCS_DIR)/source
 DOCS_BUILD_DIR := $(DOCS_DIR)/build

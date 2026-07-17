@@ -1,0 +1,19 @@
+[package]
+name = "craic-ui-preview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+adw.workspace = true
+craic-language.workspace = true
+craic-ui-core.workspace = true
+craic-vcs.workspace = true
+freetype.workspace = true
+gtk.workspace = true
+libc.workspace = true
+log.workspace = true
+poppler.workspace = true
+pulldown-cmark.workspace = true
+regex.workspace = true
+webkit6.workspace = true
