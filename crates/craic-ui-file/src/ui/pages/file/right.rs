@@ -29,6 +29,7 @@ pub struct RightPane {
     pub file_editor_writable: Rc<Cell<bool>>,
     pub file_view_split: gtk::Paned,
     pub file_svg_preview: Rc<super::provider::svg::SvgPreview>,
+    pub file_html_preview: Rc<super::provider::html::HtmlPreview>,
     pub file_markdown_preview: Rc<AdwMarkdownPreview>,
     pub file_markdown_status: gtk::Box,
     pub file_media_preview: Rc<super::provider::media::MediaPreview>,
@@ -70,6 +71,7 @@ impl RightPane {
         let editor_loading = loading_screen("Loading file preview...");
 
         let file_svg_preview = super::provider::svg::SvgPreview::new();
+        let file_html_preview = super::provider::html::HtmlPreview::new();
         let file_markdown_preview = AdwMarkdownPreview::new();
         let markdown_status_label = gtk::Label::builder()
             .label("No markdown preview.")
@@ -197,6 +199,7 @@ impl RightPane {
             file_editor_writable: Rc::new(Cell::new(false)),
             file_view_split,
             file_svg_preview,
+            file_html_preview,
             file_markdown_preview,
             file_markdown_status,
             file_media_preview,

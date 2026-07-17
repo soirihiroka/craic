@@ -14,6 +14,7 @@ pub enum PreviewKind {
     Text,
     Notebook,
     Markdown,
+    Html,
     Svg,
     Safetensors,
     Image,
@@ -93,6 +94,9 @@ fn preview_kind(file_type: &FileType) -> PreviewKind {
     }
     if file_type.mime == MIME_MARKDOWN {
         return PreviewKind::Markdown;
+    }
+    if file_type.mime == "text/html" {
+        return PreviewKind::Html;
     }
     if file_type.mime == MIME_SVG {
         return PreviewKind::Svg;

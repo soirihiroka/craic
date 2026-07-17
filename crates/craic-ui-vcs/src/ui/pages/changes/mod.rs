@@ -1560,7 +1560,8 @@ fn changed_file_menu(
     let mut menu = context_menu::builder("changed_file")
         .target_item("Open With Default Program", "open-default", file_path)
         .target_item("Open in Visual Studio Code", "open-code", file_path)
-        .target_item("Show in File Manager", "show-folder", file_path);
+        .target_item("Show in File Manager", "show-folder", file_path)
+        .target_item("Show in File View", "show-file-view", file_path);
 
     if include_local_actions {
         menu = menu.separator();
@@ -1635,6 +1636,16 @@ fn changed_file_action_group(ctx: &PageContext, local_workspace: bool) -> gio::S
         }
     });
     show_folder.set_enabled(desktop_open_available);
+    context_menu::add_string_menu_action(&actions, "show-file-view", {
+        let ctx = ctx.clone();
+        move |file_path| {
+            ctx.dispatch_command(PageCommand::OpenFileLocation {
+                path: file_path.to_string(),
+                line: None,
+                column: None,
+            });
+        }
+    });
     context_menu::add_string_menu_action(&actions, "copy-path", {
         let ctx = ctx.clone();
         move |file_path| {
