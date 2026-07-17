@@ -23,8 +23,10 @@ use std::rc::Rc;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
-use std::time::{Duration, SystemTime};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 const TERMINAL_CONFLICTING_ACCELS: &[(&str, &[&str])] = &[
     ("app.pull", &["<Control>p"]),
@@ -51,7 +53,8 @@ pub struct ContentPane {
     quick_action_runner: Rc<RefCell<Option<Rc<dyn Fn(RunItem)>>>>,
     quick_action_state_changed: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     run_targets: Rc<RefCell<Vec<RunItem>>>,
-    run_targets_signature: RefCell<Option<RunTargetsSignature>>,
+    run_targets_signature: Rc<RefCell<Option<RunTargetsSignature>>>,
+    run_target_refresh_generation: Rc<Cell<u64>>,
     terminal: terminal::TerminalPanel,
     push_icon: gtk::Image,
     push_spinner: adw::Spinner,
@@ -126,6 +129,8 @@ pub fn build(_menu: &gio::Menu, snapshot: Option<&RepositorySnapshot>) -> Conten
     let quick_action_config_repo = Rc::new(RefCell::new(None));
     let quick_action_runner = Rc::new(RefCell::new(None));
     let quick_action_state_changed = Rc::new(RefCell::new(None));
+    let run_targets_signature = Rc::new(RefCell::new(None));
+    let run_target_refresh_generation = Rc::new(Cell::new(0));
     let quick_action_add_button = gtk::Button::builder()
         .icon_name("list-add-symbolic")
         .tooltip_text("Add quick action")
@@ -196,7 +201,8 @@ pub fn build(_menu: &gio::Menu, snapshot: Option<&RepositorySnapshot>) -> Conten
         quick_action_runner,
         quick_action_state_changed,
         run_targets,
-        run_targets_signature: RefCell::new(None),
+        run_targets_signature,
+        run_target_refresh_generation,
         terminal,
         push_icon,
         push_spinner,
@@ -291,39 +297,97 @@ impl ContentPane {
     pub fn refresh_run_targets(&self, repo_path: &Path) {
         self.load_quick_action_config(repo_path);
 
-        let signature = quick_action::targets_signature(repo_path);
         let previous_signature = self.run_targets_signature.borrow().clone();
-        if previous_signature.as_ref() == Some(&signature) {
-            return;
-        }
+        let generation = self
+            .run_target_refresh_generation
+            .get()
+            .wrapping_add(1)
+            .max(1);
+        self.run_target_refresh_generation.set(generation);
 
-        let targets = quick_action::discover(repo_path);
-        let additional_actions =
-            crate::workspace_config::quick_action_additional_commands(repo_path);
-        let mut targets = targets;
-        targets.extend(quick_action::discover_additional_quick_actions(
-            &additional_actions,
-        ));
+        let repo_path = repo_path.to_path_buf();
+        let worker_path = repo_path.clone();
+        let (sender, receiver) = mpsc::channel();
         log::debug!(
-            "quick action target refresh for {} found {} target(s)",
-            repo_path.display(),
-            targets.len()
+            "quick action target refresh queued repo={} generation={generation}",
+            repo_path.display()
         );
-        *self.run_targets_signature.borrow_mut() = Some(signature);
-        if previous_signature.is_some()
-            && self.run_targets.borrow().as_slice() == targets.as_slice()
-        {
-            return;
-        }
+        thread::spawn(move || {
+            let started = Instant::now();
+            let signature = quick_action::targets_signature(&worker_path);
+            let targets = if previous_signature.as_ref() == Some(&signature) {
+                None
+            } else {
+                let mut targets = quick_action::discover(&worker_path);
+                let additional_actions =
+                    crate::workspace_config::quick_action_additional_commands(&worker_path);
+                targets.extend(quick_action::discover_additional_quick_actions(
+                    &additional_actions,
+                ));
+                Some((signature, targets))
+            };
+            let _ = sender.send((targets, started.elapsed()));
+        });
 
-        *self.run_targets.borrow_mut() = targets;
+        let refresh_generation = self.run_target_refresh_generation.clone();
+        let run_targets_signature = self.run_targets_signature.clone();
+        let run_targets = self.run_targets.clone();
+        let quick_actions = self.quick_actions.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(30), move || {
+            match receiver.try_recv() {
+                Ok((result, elapsed)) => {
+                    if refresh_generation.get() != generation {
+                        log::debug!(
+                            "quick action target refresh ignored stale result repo={} generation={generation}",
+                            repo_path.display()
+                        );
+                        return gtk::glib::ControlFlow::Break;
+                    }
 
-        for quick_action in self.quick_actions.borrow().iter() {
-            quick_action.refresh();
-        }
+                    let Some((signature, targets)) = result else {
+                        log::debug!(
+                            "quick action target refresh unchanged repo={} generation={generation} elapsed_ms={}",
+                            repo_path.display(),
+                            elapsed.as_millis()
+                        );
+                        return gtk::glib::ControlFlow::Break;
+                    };
+                    log::info!(
+                        "quick action target refresh completed repo={} generation={generation} targets={} elapsed_ms={}",
+                        repo_path.display(),
+                        targets.len(),
+                        elapsed.as_millis()
+                    );
+                    *run_targets_signature.borrow_mut() = Some(signature);
+                    if run_targets.borrow().as_slice() != targets.as_slice() {
+                        *run_targets.borrow_mut() = targets;
+                        for quick_action in quick_actions.borrow().iter() {
+                            quick_action.refresh();
+                        }
+                    }
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if refresh_generation.get() == generation {
+                        log::warn!(
+                            "quick action target refresh worker disconnected repo={} generation={generation}",
+                            repo_path.display()
+                        );
+                    }
+                    gtk::glib::ControlFlow::Break
+                }
+            }
+        });
     }
 
     pub fn clear_run_targets(&self) {
+        self.run_target_refresh_generation.set(
+            self.run_target_refresh_generation
+                .get()
+                .wrapping_add(1)
+                .max(1),
+        );
         self.quick_action_config_repo.borrow_mut().take();
         if self.run_targets.borrow().is_empty() && self.run_targets_signature.borrow().is_none() {
             return;

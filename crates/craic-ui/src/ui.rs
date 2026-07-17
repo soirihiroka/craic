@@ -313,22 +313,6 @@ pub fn build_ui(
     );
     startup.mark("build-content");
 
-    if system_ref_cell.borrow().provider_kind == crate::system::path::ProviderKind::Local {
-        let step_start = Instant::now();
-        content.refresh_run_targets(&repo_path);
-        log::info!(
-            "startup run targets refreshed repo={} elapsed_ms={}",
-            repo_path.display(),
-            step_start.elapsed().as_millis()
-        );
-    } else {
-        log::info!(
-            "startup run targets skipped provider_kind={}",
-            system_ref_cell.borrow().provider_kind
-        );
-    }
-    startup.mark("refresh-run-targets");
-
     let page_host = pages::PageHost::new(&sidebar.page_slot(), &content.page_slot());
     let page_refresh_generations = (0..pages.len()).map(|_| Cell::new(0)).collect();
     startup.mark("build-page-host");
@@ -381,26 +365,14 @@ pub fn build_ui(
     *state_slot.borrow_mut() = Rc::downgrade(&state);
     startup.mark("build-app-state");
 
-    state.sidebar.load_repos_async();
-    startup.mark("queue-workspace-list-load");
-
     apply_workspace_color(&state);
     startup.mark("apply-workspace-color");
 
     activate_page(&state, 0);
     startup.mark("activate-initial-page");
 
-    refresh_active_repo_metadata(&state, None);
-    startup.mark("queue-repo-metadata-refresh");
-
     connect_git_actions(&state);
     startup.mark("connect-actions");
-
-    start_repository_monitor(&state);
-    startup.mark("start-repository-monitor");
-
-    refresh(&state, None);
-    startup.mark("queue-initial-refresh");
 
     connect_window_close_confirmation(&state);
     startup.mark("connect-close-confirmation");
@@ -408,8 +380,27 @@ pub fn build_ui(
     window.present();
     startup.mark("present-window");
 
-    pages::warm_pages_in_background(&state.pages);
-    startup.mark("queue-page-background-initialization");
+    let state_weak = Rc::downgrade(&state);
+    window.add_tick_callback(move |_, _| {
+        let state_weak = state_weak.clone();
+        gtk::glib::idle_add_local_once(move || {
+            let Some(state) = state_weak.upgrade() else {
+                log::debug!("startup deferred work skipped because application state was dropped");
+                return;
+            };
+
+            let started = Instant::now();
+            refresh_active_repo_metadata(&state, None);
+            start_repository_monitor(&state);
+            refresh(&state, None);
+            log::info!(
+                "startup deferred work queued elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+        });
+        gtk::glib::ControlFlow::Break
+    });
+    startup.mark("queue-post-present-work");
 
     if let Some(notice) = crate::crash_log::take_latest_crash_notice() {
         log::warn!(
