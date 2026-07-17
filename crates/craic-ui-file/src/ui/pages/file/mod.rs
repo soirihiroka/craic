@@ -967,6 +967,17 @@ fn refresh_live_file_preview(
             }
             log::debug!("refreshed live markdown preview file_path={file_path}");
         }
+        file_type::PreviewKind::Html => {
+            let local_path = local_workspace_path(ctx, node_path);
+            right
+                .file_html_preview
+                .set_html(text, local_path.as_deref());
+            right
+                .file_view_split
+                .set_end_child(Some(&right.file_html_preview.root));
+            set_live_displayed_preview(displayed_preview, node_path, signature);
+            log::debug!("refreshed live html preview file_path={file_path}");
+        }
         file_type::PreviewKind::Svg => {
             right.file_svg_preview.set_svg(text.as_bytes(), signature);
             right
