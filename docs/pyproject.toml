@@ -2,10 +2,10 @@
 name = "craic-docs"
 version = "0.1.0"
 description = "Documentation for Craic"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.14,<3.15"
 dependencies = [
-    "furo==2024.1.29",
-    "sphinx==6.2.1",
+    "furo==2025.12.19",
+    "sphinx==9.1.0",
 ]
 
 [tool.uv]
