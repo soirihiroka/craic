@@ -11,7 +11,7 @@ use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config as TermConfig, TermMode};
 use alacritty_terminal::tty::{self, Options, Shell};
 use alacritty_terminal::vte::ansi::Processor;
-use craic_ui_core::ui::canvas_scroll;
+use craic_ui_core::ui::{canvas_scroll, components::context_menu};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use renderer::{GlRenderer, TerminalSize};
@@ -26,6 +26,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::ui::components::terminal::{TerminalActivation, TerminalFileActivation};
 
@@ -39,6 +40,27 @@ const SCROLL_LINES_PER_WHEEL_STEP: i32 = 3;
 type ExitHandlers = Rc<RefCell<Vec<Box<dyn Fn(ExitStatus)>>>>;
 type TitleHandlers = Rc<RefCell<Vec<Box<dyn Fn(String)>>>>;
 type ActivationHandlers = Rc<RefCell<Vec<Box<dyn Fn(TerminalActivation)>>>>;
+
+#[derive(Clone, Copy)]
+enum TerminalContextAction {
+    Copy,
+    CopyScreen,
+    CopyAll,
+    SelectAll,
+    Paste,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LinkRange {
+    start: Point,
+    end: Point,
+}
+
+impl LinkRange {
+    pub(super) fn contains(self, point: Point) -> bool {
+        point >= self.start && point <= self.end
+    }
+}
 
 #[derive(Clone)]
 pub struct AlacrittyTerminal {
@@ -85,6 +107,7 @@ struct UiState {
     launch_dir: String,
     mouse_buttons: u8,
     last_mouse_point: Option<Point>,
+    hovered_link: Option<LinkRange>,
     scroll_remainder: f64,
     scrollbar_adjustment: gtk::Adjustment,
     syncing_scrollbar: bool,
@@ -379,6 +402,7 @@ impl AlacrittyTerminal {
             launch_dir: String::new(),
             mouse_buttons: 0,
             last_mouse_point: None,
+            hovered_link: None,
             scroll_remainder: 0.0,
             scrollbar_adjustment: scrollbar_adjustment.clone(),
             syncing_scrollbar: false,
@@ -389,7 +413,7 @@ impl AlacrittyTerminal {
         install_input(&area, &state);
         install_selection(&area, &state);
         install_scroll(&area, &state);
-        install_scrollbar(&scrollbar_adjustment, &state);
+        install_scrollbar(&area, &scrollbar_adjustment, &state);
         install_middle_autoscroll(&area, &autoscroll_marker, &state);
         install_focus(&area, &state);
         install_context_menu(&area, &state);
@@ -735,6 +759,7 @@ fn install_gl_lifecycle(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 }
             }
             let focused = state.focused;
+            let hovered_link = state.hovered_link;
             let Some(engine) = state.engine.as_ref() else {
                 return glib::Propagation::Proceed;
             };
@@ -742,7 +767,7 @@ fn install_gl_lifecycle(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
             let Some(renderer) = state.renderer.as_mut() else {
                 return glib::Propagation::Proceed;
             };
-            renderer.draw(&term.lock(), focused);
+            renderer.draw(&term.lock(), focused, hovered_link);
             glib::Propagation::Stop
         }
     });
@@ -859,10 +884,21 @@ fn input_bytes(state: &Rc<RefCell<UiState>>, bytes: Vec<u8>) {
 }
 
 fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
+    let selection_drag_active = Rc::new(Cell::new(false));
+    let drag_autoscroll_generation = Rc::new(Cell::new(0_u64));
+    let drag_autoscroll_active = Rc::new(Cell::new(false));
+    let drag_autoscroll_pointer = Rc::new(Cell::new(None::<(f64, f64)>));
     let click = gtk::GestureClick::builder().button(1).build();
     click.connect_pressed({
+        let drag_autoscroll_generation = drag_autoscroll_generation.clone();
+        let drag_autoscroll_active = drag_autoscroll_active.clone();
+        let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
         let state = state.clone();
         move |gesture, count, x, y| {
+            if drag_autoscroll_active.replace(false) {
+                drag_autoscroll_generation.set(drag_autoscroll_generation.get().wrapping_add(1));
+            }
+            drag_autoscroll_pointer.set(None);
             let Some(point) = point_at(&state, x, y) else {
                 return;
             };
@@ -889,8 +925,18 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
         }
     });
     click.connect_released({
+        let selection_drag_active = selection_drag_active.clone();
+        let drag_autoscroll_generation = drag_autoscroll_generation.clone();
+        let drag_autoscroll_active = drag_autoscroll_active.clone();
+        let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
         let state = state.clone();
         move |gesture, _, x, y| {
+            selection_drag_active.set(false);
+            if drag_autoscroll_active.replace(false) {
+                drag_autoscroll_generation.set(drag_autoscroll_generation.get().wrapping_add(1));
+                log::debug!("terminal selection edge autoscroll stopped");
+            }
+            drag_autoscroll_pointer.set(None);
             if let Some(point) = point_at(&state, x, y) {
                 report_mouse_button(&state, point, 0, 1, false, gesture.current_event_state());
             }
@@ -901,10 +947,18 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
     let drag = gtk::GestureDrag::builder().button(1).build();
     let start = Rc::new(Cell::new((0.0, 0.0)));
     drag.connect_drag_begin({
+        let selection_drag_active = selection_drag_active.clone();
         let start = start.clone();
-        move |_, x, y| start.set((x, y))
+        move |_, x, y| {
+            selection_drag_active.set(true);
+            start.set((x, y));
+        }
     });
     drag.connect_drag_update({
+        let area = area.clone();
+        let drag_autoscroll_generation = drag_autoscroll_generation.clone();
+        let drag_autoscroll_active = drag_autoscroll_active.clone();
+        let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
         let state = state.clone();
         let start = start.clone();
         move |gesture, dx, dy| {
@@ -917,30 +971,117 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                     .current_event_state()
                     .contains(gdk::ModifierType::SHIFT_MASK)
             {
+                if drag_autoscroll_active.replace(false) {
+                    drag_autoscroll_generation
+                        .set(drag_autoscroll_generation.get().wrapping_add(1));
+                }
+                drag_autoscroll_pointer.set(None);
                 return;
             }
             let (x, y) = start.get();
-            let Some(point) = point_at(&state, x + dx, y + dy) else {
+            let pointer_x = x + dx;
+            let pointer_y = y + dy;
+            let Some(point) = point_at(&state, pointer_x, pointer_y) else {
                 return;
             };
-            let state = state.borrow();
-            if let Some(engine) = state.engine.as_ref() {
-                if let Some(selection) = engine.term.lock().selection.as_mut() {
+            {
+                let mut state = state.borrow_mut();
+                if let Some(engine) = state.engine.as_ref()
+                    && let Some(selection) = engine.term.lock().selection.as_mut()
+                {
                     selection.update(point, Side::Right);
                 }
+                state.hovered_link = None;
+                state.proxy.dirty.store(true, Ordering::Release);
             }
-            state.proxy.dirty.store(true, Ordering::Release);
+            area.set_cursor_from_name(Some("text"));
+            schedule_selection_autoscroll(
+                &area,
+                &state,
+                &drag_autoscroll_generation,
+                &drag_autoscroll_active,
+                &drag_autoscroll_pointer,
+                pointer_x,
+                pointer_y,
+            );
+        }
+    });
+    drag.connect_drag_end({
+        let selection_drag_active = selection_drag_active.clone();
+        let drag_autoscroll_generation = drag_autoscroll_generation.clone();
+        let drag_autoscroll_active = drag_autoscroll_active.clone();
+        let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
+        move |_, _, _| {
+            selection_drag_active.set(false);
+            if drag_autoscroll_active.replace(false) {
+                drag_autoscroll_generation.set(drag_autoscroll_generation.get().wrapping_add(1));
+                log::debug!("terminal selection edge autoscroll stopped");
+            }
+            drag_autoscroll_pointer.set(None);
+        }
+    });
+    drag.connect_cancel({
+        let selection_drag_active = selection_drag_active.clone();
+        let drag_autoscroll_generation = drag_autoscroll_generation.clone();
+        let drag_autoscroll_active = drag_autoscroll_active.clone();
+        let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
+        move |_, _| {
+            selection_drag_active.set(false);
+            if drag_autoscroll_active.replace(false) {
+                drag_autoscroll_generation.set(drag_autoscroll_generation.get().wrapping_add(1));
+                log::debug!("terminal selection edge autoscroll cancelled");
+            }
+            drag_autoscroll_pointer.set(None);
         }
     });
     area.add_controller(drag);
 
+    area.connect_unmap({
+        let selection_drag_active = selection_drag_active.clone();
+        let drag_autoscroll_generation = drag_autoscroll_generation.clone();
+        let drag_autoscroll_active = drag_autoscroll_active.clone();
+        let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
+        move |_| {
+            selection_drag_active.set(false);
+            if drag_autoscroll_active.replace(false) {
+                drag_autoscroll_generation.set(drag_autoscroll_generation.get().wrapping_add(1));
+                log::debug!("terminal selection edge autoscroll stopped on unmap");
+            }
+            drag_autoscroll_pointer.set(None);
+        }
+    });
+
     let motion = gtk::EventControllerMotion::new();
     motion.connect_motion({
+        let area = area.clone();
+        let selection_drag_active = selection_drag_active.clone();
         let state = state.clone();
         move |controller, x, y| {
             let Some(point) = point_at(&state, x, y) else {
                 return;
             };
+            let hovered_link = if selection_drag_active.get() {
+                None
+            } else {
+                let state = state.borrow();
+                state.engine.as_ref().and_then(|engine| {
+                    let term = engine.term.lock();
+                    link_at(&term, point).map(|(_, range)| range)
+                })
+            };
+            {
+                let mut state = state.borrow_mut();
+                if state.hovered_link != hovered_link {
+                    state.hovered_link = hovered_link;
+                    state.proxy.dirty.store(true, Ordering::Release);
+                }
+            }
+            area.set_cursor_from_name(Some(if hovered_link.is_some() {
+                "pointer"
+            } else {
+                "text"
+            }));
+
             let modifiers = controller.current_event_state();
             if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
                 return;
@@ -973,6 +1114,17 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
             }
         }
     });
+    motion.connect_leave({
+        let area = area.clone();
+        let state = state.clone();
+        move |_| {
+            let mut state = state.borrow_mut();
+            if state.hovered_link.take().is_some() {
+                state.proxy.dirty.store(true, Ordering::Release);
+            }
+            area.set_cursor_from_name(None);
+        }
+    });
     area.add_controller(motion);
 
     let middle = gtk::GestureClick::builder().button(2).build();
@@ -995,6 +1147,106 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
         }
     });
     area.add_controller(middle);
+}
+
+fn schedule_selection_autoscroll(
+    area: &gtk::GLArea,
+    state: &Rc<RefCell<UiState>>,
+    drag_autoscroll_generation: &Rc<Cell<u64>>,
+    drag_autoscroll_active: &Rc<Cell<bool>>,
+    drag_autoscroll_pointer: &Rc<Cell<Option<(f64, f64)>>>,
+    pointer_x: f64,
+    pointer_y: f64,
+) {
+    let height = area.allocated_height().max(1) as f64;
+    if (0.0..=height).contains(&pointer_y) {
+        if drag_autoscroll_active.replace(false) {
+            drag_autoscroll_generation.set(drag_autoscroll_generation.get().wrapping_add(1));
+            log::debug!("terminal selection edge autoscroll stopped");
+        }
+        drag_autoscroll_pointer.set(None);
+        return;
+    }
+
+    drag_autoscroll_pointer.set(Some((pointer_x, pointer_y)));
+    if drag_autoscroll_active.get() {
+        return;
+    }
+
+    let generation = drag_autoscroll_generation.get().wrapping_add(1);
+    drag_autoscroll_generation.set(generation);
+    drag_autoscroll_active.set(true);
+    log::debug!(
+        "terminal selection edge autoscroll started direction={}",
+        if pointer_y < 0.0 { "up" } else { "down" }
+    );
+
+    let area = area.downgrade();
+    let state = state.clone();
+    let drag_autoscroll_generation = drag_autoscroll_generation.clone();
+    let drag_autoscroll_active = drag_autoscroll_active.clone();
+    let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        if !drag_autoscroll_active.get() || drag_autoscroll_generation.get() != generation {
+            return glib::ControlFlow::Break;
+        }
+        let Some(area) = area.upgrade() else {
+            drag_autoscroll_active.set(false);
+            drag_autoscroll_pointer.set(None);
+            return glib::ControlFlow::Break;
+        };
+        let Some((pointer_x, pointer_y)) = drag_autoscroll_pointer.get() else {
+            drag_autoscroll_active.set(false);
+            return glib::ControlFlow::Break;
+        };
+        let height = area.allocated_height().max(1) as f64;
+        if (0.0..=height).contains(&pointer_y) {
+            drag_autoscroll_active.set(false);
+            drag_autoscroll_pointer.set(None);
+            return glib::ControlFlow::Break;
+        }
+
+        let state = state.borrow();
+        let (Some(renderer), Some(engine)) = (state.renderer.as_ref(), state.engine.as_ref())
+        else {
+            drag_autoscroll_active.set(false);
+            drag_autoscroll_pointer.set(None);
+            return glib::ControlFlow::Break;
+        };
+        let size = renderer.size();
+        let scale = renderer.scale() as f64;
+        let logical_cell_height = (size.cell_height as f64 / scale).max(1.0);
+        let overflow = if pointer_y < 0.0 {
+            -pointer_y
+        } else {
+            pointer_y - height
+        };
+        let lines = (1 + (overflow / logical_cell_height).floor() as i32).min(8);
+        let mut term = engine.term.lock();
+        let previous_offset = term.grid().display_offset();
+        term.scroll_display(Scroll::Delta(if pointer_y < 0.0 { lines } else { -lines }));
+        let display_offset = term.grid().display_offset();
+        if display_offset == previous_offset {
+            drag_autoscroll_active.set(false);
+            drag_autoscroll_pointer.set(None);
+            return glib::ControlFlow::Break;
+        }
+
+        let column = ((pointer_x.max(0.0) * scale) / size.cell_width as f64).floor() as usize;
+        let viewport_line = ((pointer_y.max(0.0) * scale) / size.cell_height as f64).floor() as i32;
+        let point = Point::new(
+            Line(
+                viewport_line.min(term.screen_lines().saturating_sub(1) as i32)
+                    - display_offset as i32,
+            ),
+            Column(column.min(term.columns().saturating_sub(1))),
+        );
+        if let Some(selection) = term.selection.as_mut() {
+            selection.update(point, Side::Right);
+        }
+        state.proxy.dirty.store(true, Ordering::Release);
+        glib::ControlFlow::Continue
+    });
 }
 
 fn report_mouse_button(
@@ -1049,13 +1301,7 @@ fn activate_at(state: &Rc<RefCell<UiState>>, point: Point) {
             return;
         };
         let term = engine.term.lock();
-        let cell = &term.grid()[point];
-        let target = if let Some(link) = cell.hyperlink() {
-            Some(link.uri().to_string())
-        } else {
-            token_at(&term, point)
-        };
-        let Some(target) = target else {
+        let Some((target, _)) = link_at(&term, point) else {
             return;
         };
         let activation = if target.starts_with("http://") || target.starts_with("https://") {
@@ -1073,16 +1319,43 @@ fn activate_at(state: &Rc<RefCell<UiState>>, point: Point) {
     }
 }
 
-fn token_at(term: &Term<TerminalEventProxy>, point: Point) -> Option<String> {
+fn link_at(term: &Term<TerminalEventProxy>, point: Point) -> Option<(String, LinkRange)> {
+    if let Some(hyperlink) = term.grid()[point].hyperlink() {
+        let uri = hyperlink.uri().to_string();
+        let mut start = point.column.0;
+        while start > 0
+            && term.grid()[Point::new(point.line, Column(start - 1))]
+                .hyperlink()
+                .is_some_and(|link| link.uri() == uri)
+        {
+            start -= 1;
+        }
+        let mut end = point.column.0;
+        while end + 1 < term.columns()
+            && term.grid()[Point::new(point.line, Column(end + 1))]
+                .hyperlink()
+                .is_some_and(|link| link.uri() == uri)
+        {
+            end += 1;
+        }
+        return Some((
+            uri,
+            LinkRange {
+                start: Point::new(point.line, Column(start)),
+                end: Point::new(point.line, Column(end)),
+            },
+        ));
+    }
+
     let end = Point::new(point.line, Column(term.columns().saturating_sub(1)));
     let line = term.bounds_to_string(Point::new(point.line, Column(0)), end);
     let chars = line.char_indices().collect::<Vec<_>>();
-    let byte = chars
-        .get(point.column.0)
-        .map(|(index, _)| *index)
-        .unwrap_or(line.len());
     let is_delimiter =
         |character: char| character.is_whitespace() || matches!(character, '<' | '>' | '"' | '\'');
+    let (byte, character) = chars.get(point.column.0).copied()?;
+    if is_delimiter(character) {
+        return None;
+    }
     let start = line[..byte]
         .char_indices()
         .rev()
@@ -1096,17 +1369,29 @@ fn token_at(term: &Term<TerminalEventProxy>, point: Point) -> Option<String> {
         .unwrap_or(line.len());
     let token = line[start..end]
         .trim_end_matches(|character: char| matches!(character, '.' | ',' | ';' | ')' | ']' | '}'));
-    (!token.is_empty()
-        && (token.contains('/')
+    if token.is_empty()
+        || !(token.contains('/')
             || token.contains('.')
             || token.starts_with("http://")
-            || token.starts_with("https://")))
-    .then(|| token.to_string())
+            || token.starts_with("https://"))
+    {
+        return None;
+    }
+    let start_column = line[..start].chars().count();
+    let end_column = start_column + token.chars().count().saturating_sub(1);
+    Some((
+        token.to_string(),
+        LinkRange {
+            start: Point::new(point.line, Column(start_column)),
+            end: Point::new(point.line, Column(end_column)),
+        },
+    ))
 }
 
 fn install_scroll(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
     scroll.connect_scroll({
+        let area = area.clone();
         let state = state.clone();
         move |controller, _, dy| {
             let mut state = state.borrow_mut();
@@ -1140,6 +1425,8 @@ fn install_scroll(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                         engine.scroll(-steps * SCROLL_LINES_PER_WHEEL_STEP);
                     }
                 }
+                state.hovered_link = None;
+                area.set_cursor_from_name(Some("text"));
                 state.proxy.dirty.store(true, Ordering::Release);
             }
             glib::Propagation::Stop
@@ -1194,9 +1481,10 @@ fn install_middle_autoscroll(
                 if lines == 0 {
                     return;
                 }
-                let state = state.borrow();
+                let mut state = state.borrow_mut();
                 if let Some(engine) = state.engine.as_ref() {
                     engine.scroll(-lines);
+                    state.hovered_link = None;
                     state.proxy.dirty.store(true, Ordering::Release);
                 }
             }
@@ -1211,7 +1499,7 @@ fn install_middle_autoscroll(
         },
         {
             let area = area.clone();
-            move |cursor| area.set_cursor_from_name(cursor)
+            move |cursor| area.set_cursor_from_name(cursor.or(Some("text")))
         },
         {
             let marker = marker.clone();
@@ -1220,13 +1508,18 @@ fn install_middle_autoscroll(
     );
 }
 
-fn install_scrollbar(adjustment: &gtk::Adjustment, state: &Rc<RefCell<UiState>>) {
+fn install_scrollbar(
+    area: &gtk::GLArea,
+    adjustment: &gtk::Adjustment,
+    state: &Rc<RefCell<UiState>>,
+) {
+    let area = area.clone();
     let state = Rc::downgrade(state);
     adjustment.connect_value_changed(move |adjustment| {
         let Some(state) = state.upgrade() else {
             return;
         };
-        let state = state.borrow_mut();
+        let mut state = state.borrow_mut();
         if state.syncing_scrollbar {
             return;
         }
@@ -1243,6 +1536,9 @@ fn install_scrollbar(adjustment: &gtk::Adjustment, state: &Rc<RefCell<UiState>>)
             term.scroll_display(Scroll::Delta(
                 requested_offset as i32 - current_offset as i32,
             ));
+            drop(term);
+            state.hovered_link = None;
+            area.set_cursor_from_name(None);
             state.proxy.dirty.store(true, Ordering::Release);
         }
     });
@@ -1332,6 +1628,7 @@ fn set_focused(state: &Rc<RefCell<UiState>>, focused: bool) {
 fn install_context_menu(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
     let click = gtk::GestureClick::builder().button(3).build();
     click.connect_pressed({
+        let area = area.clone();
         let state = state.clone();
         move |gesture, _, x, y| {
             if let Some(point) = point_at(&state, x, y)
@@ -1340,104 +1637,102 @@ fn install_context_menu(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 return;
             }
-            let Some(widget) = gesture.widget() else {
+            let (has_engine, has_selection) = {
+                let state = state.borrow();
+                (
+                    state.engine.is_some(),
+                    state
+                        .engine
+                        .as_ref()
+                        .is_some_and(TerminalEngine::has_selection),
+                )
+            };
+            let Some(parent) = area.parent() else {
                 return;
             };
-            let popover = gtk::Popover::new();
-            popover.set_parent(&widget);
-            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            content.set_margin_top(4);
-            content.set_margin_bottom(4);
-            content.set_margin_start(4);
-            content.set_margin_end(4);
-            let copy = gtk::Button::with_label("Copy");
-            copy.set_sensitive(
-                state
-                    .borrow()
-                    .engine
-                    .as_ref()
-                    .is_some_and(TerminalEngine::has_selection),
+            let Some((popup_x, popup_y)) = area.translate_coordinates(&parent, x, y) else {
+                log::debug!("terminal context menu skipped; GLArea coordinates did not translate");
+                return;
+            };
+            let popover = context_menu::popup_action_menu(
+                &parent,
+                popup_x,
+                popup_y,
+                vec![
+                    context_menu::ActionMenuSection::new(vec![
+                        context_menu::ActionMenuItem::new(
+                            "Copy",
+                            TerminalContextAction::Copy,
+                            has_selection,
+                        ),
+                        context_menu::ActionMenuItem::new(
+                            "Copy Screen",
+                            TerminalContextAction::CopyScreen,
+                            has_engine,
+                        ),
+                        context_menu::ActionMenuItem::new(
+                            "Copy All",
+                            TerminalContextAction::CopyAll,
+                            has_engine,
+                        ),
+                    ]),
+                    context_menu::ActionMenuSection::new(vec![
+                        context_menu::ActionMenuItem::new(
+                            "Select All",
+                            TerminalContextAction::SelectAll,
+                            has_engine,
+                        ),
+                        context_menu::ActionMenuItem::new(
+                            "Paste",
+                            TerminalContextAction::Paste,
+                            has_engine,
+                        ),
+                    ]),
+                ],
+                {
+                    let area = area.clone();
+                    let state = state.clone();
+
+                    move |action| match action {
+                        TerminalContextAction::Copy => {
+                            if let Some(text) = state
+                                .borrow()
+                                .engine
+                                .as_ref()
+                                .and_then(TerminalEngine::selection_text)
+                            {
+                                area.clipboard().set_text(&text);
+                            }
+                        }
+                        TerminalContextAction::CopyScreen => {
+                            if let Some(text) = state
+                                .borrow()
+                                .engine
+                                .as_ref()
+                                .map(TerminalEngine::visible_text)
+                            {
+                                area.clipboard().set_text(&text);
+                            }
+                        }
+                        TerminalContextAction::CopyAll => {
+                            if let Some(text) =
+                                state.borrow().engine.as_ref().map(TerminalEngine::all_text)
+                            {
+                                area.clipboard().set_text(&text);
+                            }
+                        }
+                        TerminalContextAction::SelectAll => {
+                            let state = state.borrow();
+                            if let Some(engine) = state.engine.as_ref() {
+                                engine.select_all();
+                                state.proxy.dirty.store(true, Ordering::Release);
+                            }
+                        }
+                        TerminalContextAction::Paste => paste_clipboard(&area, &state),
+                    }
+                },
             );
-            copy.connect_clicked({
-                let state = state.clone();
-                let popover = popover.clone();
-                move |_| {
-                    if let Some(text) = state
-                        .borrow()
-                        .engine
-                        .as_ref()
-                        .and_then(TerminalEngine::selection_text)
-                    {
-                        popover.clipboard().set_text(&text);
-                    }
-                    popover.popdown();
-                }
-            });
-            let copy_screen = gtk::Button::with_label("Copy Screen");
-            copy_screen.set_sensitive(state.borrow().engine.is_some());
-            copy_screen.connect_clicked({
-                let state = state.clone();
-                let widget = widget.clone();
-                let popover = popover.clone();
-                move |_| {
-                    if let Some(text) = state
-                        .borrow()
-                        .engine
-                        .as_ref()
-                        .map(TerminalEngine::visible_text)
-                    {
-                        widget.clipboard().set_text(&text);
-                    }
-                    popover.popdown();
-                }
-            });
-            let copy_all = gtk::Button::with_label("Copy All");
-            copy_all.set_sensitive(state.borrow().engine.is_some());
-            copy_all.connect_clicked({
-                let state = state.clone();
-                let widget = widget.clone();
-                let popover = popover.clone();
-                move |_| {
-                    if let Some(text) = state.borrow().engine.as_ref().map(TerminalEngine::all_text)
-                    {
-                        widget.clipboard().set_text(&text);
-                    }
-                    popover.popdown();
-                }
-            });
-            let select_all = gtk::Button::with_label("Select All");
-            select_all.set_sensitive(state.borrow().engine.is_some());
-            select_all.connect_clicked({
-                let state = state.clone();
-                let popover = popover.clone();
-                move |_| {
-                    let state = state.borrow();
-                    if let Some(engine) = state.engine.as_ref() {
-                        engine.select_all();
-                        state.proxy.dirty.store(true, Ordering::Release);
-                    }
-                    popover.popdown();
-                }
-            });
-            let paste = gtk::Button::with_label("Paste");
-            paste.connect_clicked({
-                let state = state.clone();
-                let widget = widget.clone();
-                let popover = popover.clone();
-                move |_| {
-                    paste_clipboard(&widget, &state);
-                    popover.popdown();
-                }
-            });
-            content.append(&copy);
-            content.append(&copy_screen);
-            content.append(&copy_all);
-            content.append(&select_all);
-            content.append(&paste);
-            popover.set_child(Some(&content));
             popover.connect_closed(|popover| popover.unparent());
-            popover.popup();
             gesture.set_state(gtk::EventSequenceState::Claimed);
         }
     });

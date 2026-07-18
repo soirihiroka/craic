@@ -13,7 +13,7 @@ use std::ffi::{CStr, CString, c_void};
 use std::mem::size_of;
 use std::ptr;
 
-use super::TerminalEventProxy;
+use super::{LinkRange, TerminalEventProxy};
 
 const ATLAS_SIZE: i32 = 1024;
 const DEFAULT_FOREGROUND: Rgb = Rgb {
@@ -253,6 +253,15 @@ struct Vertex {
     uv: [f32; 2],
     color: [u8; 4],
     multicolor: f32,
+}
+
+#[derive(Clone, Copy)]
+struct SolidRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    color: Rgb,
 }
 
 #[derive(Clone, Copy)]
@@ -683,7 +692,12 @@ impl GlRenderer {
         self.scale
     }
 
-    pub fn draw(&mut self, term: &Term<TerminalEventProxy>, focused: bool) {
+    pub fn draw(
+        &mut self,
+        term: &Term<TerminalEventProxy>,
+        focused: bool,
+        hovered_link: Option<LinkRange>,
+    ) {
         let background = color_for_index(term.colors(), NamedColor::Background as usize);
         unsafe {
             gl::Viewport(0, 0, self.size.width as i32, self.size.height as i32);
@@ -700,22 +714,30 @@ impl GlRenderer {
 
         let mut batches: HashMap<GLuint, Vec<Vertex>> = HashMap::new();
         let mut backgrounds = Vec::new();
+        let mut overlays = Vec::new();
         let content = term.renderable_content();
-        self.collect_cells(content, focused, &mut backgrounds, &mut batches);
+        self.collect_cells(
+            content,
+            focused,
+            hovered_link,
+            &mut backgrounds,
+            &mut batches,
+            &mut overlays,
+        );
 
         let white_uv = 0.5 / ATLAS_SIZE as f32;
         self.draw_vertices(
             self.font.atlases[0].texture,
             backgrounds
                 .into_iter()
-                .flat_map(|(point, color)| {
+                .flat_map(|rect| {
                     quad(
-                        point.column.0 as f32 * self.size.cell_width,
-                        point.line as f32 * self.size.cell_height,
-                        self.size.cell_width,
-                        self.size.cell_height,
+                        rect.x,
+                        rect.y,
+                        rect.width,
+                        rect.height,
                         [white_uv, white_uv, 0.0, 0.0],
-                        color,
+                        rect.color,
                         false,
                     )
                 })
@@ -724,6 +746,23 @@ impl GlRenderer {
         for (texture, vertices) in batches {
             self.draw_vertices(texture, vertices);
         }
+        self.draw_vertices(
+            self.font.atlases[0].texture,
+            overlays
+                .into_iter()
+                .flat_map(|rect| {
+                    quad(
+                        rect.x,
+                        rect.y,
+                        rect.width,
+                        rect.height,
+                        [white_uv, white_uv, 0.0, 0.0],
+                        rect.color,
+                        false,
+                    )
+                })
+                .collect(),
+        );
 
         unsafe {
             gl::BindTexture(gl::TEXTURE_2D, 0);
@@ -737,8 +776,10 @@ impl GlRenderer {
         &mut self,
         content: RenderableContent<'_>,
         focused: bool,
-        backgrounds: &mut Vec<(Point<usize>, Rgb)>,
+        hovered_link: Option<LinkRange>,
+        backgrounds: &mut Vec<SolidRect>,
         batches: &mut HashMap<GLuint, Vec<Vertex>>,
+        overlays: &mut Vec<SolidRect>,
     ) {
         let RenderableContent {
             display_iter,
@@ -750,6 +791,14 @@ impl GlRenderer {
         } = content;
         let cursor_point =
             alacritty_terminal::term::point_to_viewport(display_offset, cursor.point);
+        let cursor_shape = if focused || cursor.shape == CursorShape::Hidden {
+            cursor.shape
+        } else {
+            CursorShape::HollowBlock
+        };
+        let cursor_color = color_for_index(colors, NamedColor::Cursor as usize);
+        let cursor_thickness = (self.size.cell_width * 0.15).round().max(1.0);
+        let underline_thickness = self.scale.round().max(1.0);
         for indexed in display_iter {
             let Some(viewport_point) =
                 alacritty_terminal::term::point_to_viewport(display_offset, indexed.point)
@@ -768,13 +817,89 @@ impl GlRenderer {
                 fg = SELECTION_FOREGROUND;
                 bg = SELECTION_BACKGROUND;
             }
-            if focused && cursor.shape == CursorShape::Block && cursor_point == Some(viewport_point)
-            {
+            let cursor_here = cursor_point == Some(viewport_point);
+            let columns = if indexed.cell.flags.contains(Flags::WIDE_CHAR) {
+                2.0
+            } else {
+                1.0
+            };
+            let x = viewport_point.column.0 as f32 * self.size.cell_width;
+            let y = viewport_point.line as f32 * self.size.cell_height;
+            let width = self.size.cell_width * columns;
+            if cursor_here && cursor_shape == CursorShape::Block {
                 fg = bg;
-                bg = color_for_index(colors, NamedColor::Cursor as usize);
+                bg = cursor_color;
             }
 
-            backgrounds.push((viewport_point, bg));
+            backgrounds.push(SolidRect {
+                x,
+                y,
+                width,
+                height: self.size.cell_height,
+                color: bg,
+            });
+            if hovered_link.is_some_and(|range| range.contains(indexed.point)) {
+                overlays.push(SolidRect {
+                    x,
+                    y: y + self.size.cell_height - underline_thickness,
+                    width,
+                    height: underline_thickness,
+                    color: fg,
+                });
+            }
+            if cursor_here {
+                match cursor_shape {
+                    CursorShape::Beam => overlays.push(SolidRect {
+                        x,
+                        y,
+                        width: cursor_thickness,
+                        height: self.size.cell_height,
+                        color: cursor_color,
+                    }),
+                    CursorShape::Underline => overlays.push(SolidRect {
+                        x,
+                        y: y + self.size.cell_height - cursor_thickness,
+                        width,
+                        height: cursor_thickness,
+                        color: cursor_color,
+                    }),
+                    CursorShape::HollowBlock => {
+                        let vertical_height =
+                            (self.size.cell_height - 2.0 * cursor_thickness).max(0.0);
+                        overlays.extend([
+                            SolidRect {
+                                x,
+                                y,
+                                width,
+                                height: cursor_thickness,
+                                color: cursor_color,
+                            },
+                            SolidRect {
+                                x,
+                                y: y + self.size.cell_height - cursor_thickness,
+                                width,
+                                height: cursor_thickness,
+                                color: cursor_color,
+                            },
+                            SolidRect {
+                                x,
+                                y: y + cursor_thickness,
+                                width: cursor_thickness,
+                                height: vertical_height,
+                                color: cursor_color,
+                            },
+                            SolidRect {
+                                x: x + width - cursor_thickness,
+                                y: y + cursor_thickness,
+                                width: cursor_thickness,
+                                height: vertical_height,
+                                color: cursor_color,
+                            },
+                        ]);
+                    }
+                    CursorShape::Block | CursorShape::Hidden => {}
+                }
+            }
             if indexed.cell.flags.contains(Flags::HIDDEN) || indexed.cell.c == ' ' {
                 continue;
             }
