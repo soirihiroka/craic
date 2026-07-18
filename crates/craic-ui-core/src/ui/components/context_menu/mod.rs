@@ -317,10 +317,9 @@ where
     W: IsA<gtk::Widget>,
 {
     let (parent, x, y) = normalized_popup_anchor(parent, x, y);
-    let popover = gtk::PopoverMenu::from_model(None::<&gio::Menu>);
+    let popover = gtk::PopoverMenu::from_model(Some(menu));
     popover.set_has_arrow(false);
     popover.set_halign(gtk::Align::Start);
-    popover.set_menu_model(Some(menu));
     popover.set_parent(&parent);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
     popover
