@@ -12,10 +12,7 @@ pub struct TerminalFileActivation {
     pub launch_dir: String,
 }
 
-pub fn modified_enter_sequence(
-    key: gdk::Key,
-    modifiers: gdk::ModifierType,
-) -> Option<String> {
+pub fn modified_enter_sequence(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<String> {
     if !matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) {
         return None;
     }

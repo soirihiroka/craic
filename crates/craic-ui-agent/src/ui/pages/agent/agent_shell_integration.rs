@@ -1,5 +1,5 @@
-use gtk::glib;
 use craic_ui_terminal::alacritty::AlacrittyTerminal;
+use gtk::glib;
 use std::cell::RefCell;
 use std::process::ExitStatus;
 use std::rc::Rc;
@@ -170,9 +170,7 @@ fn recent_terminal_text(terminal: &AlacrittyTerminal) -> Option<TerminalTextScan
     })
 }
 
-fn recent_terminal_active_state_text(
-    terminal: &AlacrittyTerminal,
-) -> Option<ActiveStateTextScan> {
+fn recent_terminal_active_state_text(terminal: &AlacrittyTerminal) -> Option<ActiveStateTextScan> {
     let text = terminal
         .recent_text(TITLE_SCAN_ROWS as usize)?
         .trim_start_matches(|ch| matches!(ch, '\n' | '\r'))

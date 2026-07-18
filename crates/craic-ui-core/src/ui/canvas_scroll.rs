@@ -279,7 +279,6 @@ pub fn install_middle_autoscroll<
 
                 if !(can_scroll)() {
                     middle_press.set(None);
-                    gesture.set_state(gtk::EventSequenceState::Claimed);
                     return;
                 }
 
