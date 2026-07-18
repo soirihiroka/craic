@@ -342,7 +342,7 @@ impl Drop for TerminalEngine {
 impl AlacrittyTerminal {
     pub fn new(font_size: f64) -> Self {
         let area = gtk::GLArea::builder()
-            .auto_render(false)
+            .auto_render(true)
             .focusable(true)
             .hexpand(true)
             .vexpand(true)
@@ -725,6 +725,14 @@ fn install_gl_lifecycle(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                     size.screen_lines()
                 );
             }
+        }
+    });
+    area.connect_map({
+        let state = state.clone();
+        move |area| {
+            state.borrow().proxy.dirty.store(true, Ordering::Release);
+            area.queue_render();
+            log::debug!("alacritty GL terminal mapped; fresh frame requested");
         }
     });
     area.connect_render({
@@ -1663,6 +1671,7 @@ fn install_focus(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
     click.connect_pressed({
         let area = area.clone();
         move |_, _, _, _| {
+            area.queue_render();
             area.grab_focus();
         }
     });

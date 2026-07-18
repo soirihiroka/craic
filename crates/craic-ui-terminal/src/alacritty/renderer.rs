@@ -700,6 +700,11 @@ impl GlRenderer {
     ) {
         let background = color_for_index(term.colors(), NamedColor::Background as usize);
         unsafe {
+            gl::Disable(gl::SCISSOR_TEST);
+            gl::Disable(gl::DEPTH_TEST);
+            gl::Disable(gl::STENCIL_TEST);
+            gl::Disable(gl::CULL_FACE);
+            gl::ColorMask(gl::TRUE, gl::TRUE, gl::TRUE, gl::TRUE);
             gl::Viewport(0, 0, self.size.width as i32, self.size.height as i32);
             gl::ClearColor(
                 background.r as f32 / 255.0,
