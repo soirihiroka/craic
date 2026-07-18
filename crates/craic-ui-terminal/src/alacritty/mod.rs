@@ -784,7 +784,16 @@ fn install_gl_lifecycle(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
 fn install_input(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
     let keys = gtk::EventControllerKey::new();
     let im = gtk::IMMulticontext::new();
+    im.set_use_preedit(false);
     keys.set_im_context(Some(&im));
+    area.connect_realize({
+        let im = im.clone();
+        move |area| im.set_client_widget(Some(area))
+    });
+    area.connect_unrealize({
+        let im = im.clone();
+        move |_| im.set_client_widget(None::<&gtk::Widget>)
+    });
     im.connect_commit({
         let state = state.clone();
         move |_, text| input_bytes(&state, text.as_bytes().to_vec())
@@ -814,51 +823,118 @@ fn key_sequence(
         return None;
     }
 
-    let app_cursor = state
+    let mode = state
         .borrow()
         .engine
         .as_ref()
-        .is_some_and(|engine| engine.term.lock().mode().contains(TermMode::APP_CURSOR));
+        .map(|engine| *engine.term.lock().mode())
+        .unwrap_or_default();
+    let mut modifier_parameter = 1;
+    if shift {
+        modifier_parameter += 1;
+    }
+    if alt {
+        modifier_parameter += 2;
+    }
+    if ctrl {
+        modifier_parameter += 4;
+    }
+    if modifiers.contains(gdk::ModifierType::SUPER_MASK) {
+        modifier_parameter += 8;
+    }
+    let cursor_key = |final_byte: char| {
+        if modifier_parameter != 1 {
+            format!("\x1b[1;{modifier_parameter}{final_byte}").into_bytes()
+        } else if mode.contains(TermMode::APP_CURSOR) {
+            format!("\x1bO{final_byte}").into_bytes()
+        } else {
+            format!("\x1b[{final_byte}").into_bytes()
+        }
+    };
+    let tilde_key = |number: u8| {
+        if modifier_parameter == 1 {
+            format!("\x1b[{number}~").into_bytes()
+        } else {
+            format!("\x1b[{number};{modifier_parameter}~").into_bytes()
+        }
+    };
+    let function_key = |final_byte: char| {
+        if modifier_parameter == 1 {
+            format!("\x1bO{final_byte}").into_bytes()
+        } else {
+            format!("\x1b[1;{modifier_parameter}{final_byte}").into_bytes()
+        }
+    };
+
+    let mut prefix_alt = false;
     let sequence = match key {
-        gdk::Key::Return | gdk::Key::KP_Enter => Some(b"\r".to_vec()),
-        gdk::Key::BackSpace => Some(vec![0x7f]),
-        gdk::Key::Tab if shift => Some(b"\x1b[Z".to_vec()),
-        gdk::Key::Tab => Some(b"\t".to_vec()),
-        gdk::Key::Escape => Some(vec![0x1b]),
-        gdk::Key::Up => Some(if app_cursor { b"\x1bOA" } else { b"\x1b[A" }.to_vec()),
-        gdk::Key::Down => Some(if app_cursor { b"\x1bOB" } else { b"\x1b[B" }.to_vec()),
-        gdk::Key::Right => Some(if app_cursor { b"\x1bOC" } else { b"\x1b[C" }.to_vec()),
-        gdk::Key::Left => Some(if app_cursor { b"\x1bOD" } else { b"\x1b[D" }.to_vec()),
-        gdk::Key::Home => Some(b"\x1b[H".to_vec()),
-        gdk::Key::End => Some(b"\x1b[F".to_vec()),
-        gdk::Key::Insert => Some(b"\x1b[2~".to_vec()),
-        gdk::Key::Delete => Some(b"\x1b[3~".to_vec()),
-        gdk::Key::Page_Up => Some(b"\x1b[5~".to_vec()),
-        gdk::Key::Page_Down => Some(b"\x1b[6~".to_vec()),
-        gdk::Key::F1 => Some(b"\x1bOP".to_vec()),
-        gdk::Key::F2 => Some(b"\x1bOQ".to_vec()),
-        gdk::Key::F3 => Some(b"\x1bOR".to_vec()),
-        gdk::Key::F4 => Some(b"\x1bOS".to_vec()),
-        gdk::Key::F5 => Some(b"\x1b[15~".to_vec()),
-        gdk::Key::F6 => Some(b"\x1b[17~".to_vec()),
-        gdk::Key::F7 => Some(b"\x1b[18~".to_vec()),
-        gdk::Key::F8 => Some(b"\x1b[19~".to_vec()),
-        gdk::Key::F9 => Some(b"\x1b[20~".to_vec()),
-        gdk::Key::F10 => Some(b"\x1b[21~".to_vec()),
-        gdk::Key::F11 => Some(b"\x1b[23~".to_vec()),
-        gdk::Key::F12 => Some(b"\x1b[24~".to_vec()),
+        gdk::Key::Return | gdk::Key::ISO_Enter => {
+            prefix_alt = alt;
+            Some(b"\r".to_vec())
+        }
+        gdk::Key::KP_Enter => {
+            prefix_alt = alt;
+            Some(b"\n".to_vec())
+        }
+        gdk::Key::BackSpace => {
+            prefix_alt = alt;
+            Some(vec![0x7f])
+        }
+        gdk::Key::Tab | gdk::Key::ISO_Left_Tab if shift => {
+            prefix_alt = alt;
+            Some(b"\x1b[Z".to_vec())
+        }
+        gdk::Key::Tab | gdk::Key::KP_Tab => {
+            prefix_alt = alt;
+            Some(b"\t".to_vec())
+        }
+        gdk::Key::Escape => {
+            prefix_alt = alt;
+            Some(vec![0x1b])
+        }
+        gdk::Key::Up | gdk::Key::KP_Up => Some(cursor_key('A')),
+        gdk::Key::Down | gdk::Key::KP_Down => Some(cursor_key('B')),
+        gdk::Key::Right | gdk::Key::KP_Right => Some(cursor_key('C')),
+        gdk::Key::Left | gdk::Key::KP_Left => Some(cursor_key('D')),
+        gdk::Key::Home | gdk::Key::KP_Home => Some(cursor_key('H')),
+        gdk::Key::End | gdk::Key::KP_End => Some(cursor_key('F')),
+        gdk::Key::Insert | gdk::Key::KP_Insert => Some(tilde_key(2)),
+        gdk::Key::Delete | gdk::Key::KP_Delete => Some(tilde_key(3)),
+        gdk::Key::Page_Up | gdk::Key::KP_Page_Up => Some(tilde_key(5)),
+        gdk::Key::Page_Down | gdk::Key::KP_Page_Down => Some(tilde_key(6)),
+        gdk::Key::F1 | gdk::Key::KP_F1 => Some(function_key('P')),
+        gdk::Key::F2 | gdk::Key::KP_F2 => Some(function_key('Q')),
+        gdk::Key::F3 | gdk::Key::KP_F3 => Some(function_key('R')),
+        gdk::Key::F4 | gdk::Key::KP_F4 => Some(function_key('S')),
+        gdk::Key::F5 => Some(tilde_key(15)),
+        gdk::Key::F6 => Some(tilde_key(17)),
+        gdk::Key::F7 => Some(tilde_key(18)),
+        gdk::Key::F8 => Some(tilde_key(19)),
+        gdk::Key::F9 => Some(tilde_key(20)),
+        gdk::Key::F10 => Some(tilde_key(21)),
+        gdk::Key::F11 => Some(tilde_key(23)),
+        gdk::Key::F12 => Some(tilde_key(24)),
+        gdk::Key::F13 => Some(tilde_key(25)),
+        gdk::Key::F14 => Some(tilde_key(26)),
+        gdk::Key::F15 => Some(tilde_key(28)),
+        gdk::Key::F16 => Some(tilde_key(29)),
+        gdk::Key::F17 => Some(tilde_key(31)),
+        gdk::Key::F18 => Some(tilde_key(32)),
+        gdk::Key::F19 => Some(tilde_key(33)),
+        gdk::Key::F20 => Some(tilde_key(34)),
         _ => key.to_unicode().map(|character| {
+            prefix_alt = alt;
             if ctrl {
                 let lower = character.to_ascii_lowercase();
                 match lower {
-                    '@' | ' ' => vec![0],
+                    '@' | ' ' | '2' => vec![0],
                     'a'..='z' => vec![lower as u8 - b'a' + 1],
-                    '[' => vec![0x1b],
-                    '\\' => vec![0x1c],
-                    ']' => vec![0x1d],
-                    '^' => vec![0x1e],
-                    '_' => vec![0x1f],
-                    '?' => vec![0x7f],
+                    '[' | '3' => vec![0x1b],
+                    '\\' | '4' => vec![0x1c],
+                    ']' | '5' => vec![0x1d],
+                    '^' | '6' => vec![0x1e],
+                    '_' | '7' | '/' => vec![0x1f],
+                    '?' | '8' => vec![0x7f],
                     _ => character.to_string().into_bytes(),
                 }
             } else {
@@ -866,7 +942,7 @@ fn key_sequence(
             }
         }),
     }?;
-    if alt {
+    if prefix_alt {
         let mut prefixed = Vec::with_capacity(sequence.len() + 1);
         prefixed.push(0x1b);
         prefixed.extend(sequence);
