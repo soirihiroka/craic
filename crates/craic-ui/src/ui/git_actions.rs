@@ -332,6 +332,7 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
                 owner: owner.owner,
                 name,
                 private: private_switch.is_active(),
+                has_commits: snapshot.history_head.is_some(),
             };
 
             set_publish_button_loading(
