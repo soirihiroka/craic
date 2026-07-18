@@ -2,7 +2,6 @@ use adw::prelude::*;
 use gtk::{gdk, gio};
 use std::cell::RefCell;
 use std::rc::Rc;
-use vte4::prelude::*;
 
 #[derive(Clone)]
 pub struct ActionMenuItem<A> {
@@ -313,92 +312,6 @@ pub fn text_context_menu_sections(
         .collect()
 }
 
-pub fn install_terminal_context_menu(terminal: &vte4::Terminal) {
-    let click = gtk::GestureClick::builder().button(0).build();
-    click.set_propagation_phase(gtk::PropagationPhase::Capture);
-    click.connect_pressed({
-        let terminal = terminal.clone();
-
-        move |gesture, _, x, y| {
-            if gesture.current_button() != 3 {
-                return;
-            }
-
-            show_terminal_context_menu(&terminal, x, y);
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-        }
-    });
-    terminal.add_controller(click);
-}
-
-pub fn copy_terminal_selection(terminal: &vte4::Terminal) {
-    let Some(text) = terminal.text_selected(vte4::Format::Text) else {
-        return;
-    };
-    if text.is_empty() {
-        return;
-    }
-
-    terminal.clipboard().set_text(&text);
-}
-
-pub fn copy_terminal_all(terminal: &vte4::Terminal) {
-    let (_cursor_column, cursor_row) = terminal.cursor_position();
-    let visible_end_row = terminal.row_count().saturating_sub(1);
-    let end_row = cursor_row.max(visible_end_row);
-    let end_col = terminal.column_count().max(1);
-    let (text, _) = terminal.text_range_format(vte4::Format::Text, 0, 0, end_row, end_col);
-    let Some(text) = text else {
-        log::debug!("terminal copy-all skipped reason=no-text");
-        return;
-    };
-    if text.is_empty() {
-        log::debug!("terminal copy-all skipped reason=empty");
-        return;
-    }
-
-    terminal.clipboard().set_text(&text);
-    log::info!(
-        "terminal copy-all copied rows=0..{} chars={}",
-        end_row,
-        text.chars().count()
-    );
-}
-
-pub fn copy_terminal_screen(terminal: &vte4::Terminal) {
-    let Some(scroller) = terminal
-        .ancestor(gtk::ScrolledWindow::static_type())
-        .and_then(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())
-    else {
-        log::warn!("terminal copy-screen failed reason=no-scrolled-window");
-        return;
-    };
-
-    let adjustment = scroller.vadjustment();
-    let char_height = terminal.char_height().max(1) as f64;
-    let start_row = (adjustment.value() / char_height).floor().max(0.0) as libc::c_long;
-    let visible_rows = (adjustment.page_size() / char_height).ceil().max(1.0) as libc::c_long;
-    let end_row = start_row + visible_rows;
-    let end_col = terminal.column_count().max(1);
-    let (text, _) = terminal.text_range_format(vte4::Format::Text, start_row, 0, end_row, end_col);
-    let Some(text) = text else {
-        log::debug!("terminal copy-screen skipped reason=no-text");
-        return;
-    };
-    if text.is_empty() {
-        log::debug!("terminal copy-screen skipped reason=empty");
-        return;
-    }
-
-    terminal.clipboard().set_text(&text);
-    log::info!(
-        "terminal copy-screen copied rows={}..{} chars={}",
-        start_row,
-        end_row,
-        text.chars().count()
-    );
-}
-
 pub fn popover_menu_for_model<W>(parent: &W, menu: &gio::Menu, x: f64, y: f64) -> gtk::PopoverMenu
 where
     W: IsA<gtk::Widget>,
@@ -467,48 +380,6 @@ pub fn string_target_item(label: &str, action: &str, target: &str) -> gio::MenuI
     let item = gio::MenuItem::new(Some(label), None);
     item.set_action_and_target_value(Some(action), Some(&target.to_variant()));
     item
-}
-
-fn show_terminal_context_menu(terminal: &vte4::Terminal, x: f64, y: f64) {
-    #[derive(Clone, Copy)]
-    enum TerminalAction {
-        Copy,
-        Paste,
-        SelectAll,
-        CopyAll,
-        CopyScreen,
-    }
-
-    popup_action_menu(
-        terminal,
-        x,
-        y,
-        vec![
-            ActionMenuSection::new(vec![
-                ActionMenuItem::new("Copy", TerminalAction::Copy, terminal.has_selection()),
-                ActionMenuItem::new("Paste", TerminalAction::Paste, true),
-                ActionMenuItem::new("Select All", TerminalAction::SelectAll, true),
-            ]),
-            ActionMenuSection::new(vec![
-                ActionMenuItem::new("Copy All", TerminalAction::CopyAll, true),
-                ActionMenuItem::new("Copy Screen", TerminalAction::CopyScreen, true),
-            ]),
-        ],
-        {
-            let terminal = terminal.clone();
-
-            move |action| {
-                match action {
-                    TerminalAction::Copy => copy_terminal_selection(&terminal),
-                    TerminalAction::Paste => terminal.paste_clipboard(),
-                    TerminalAction::SelectAll => terminal.select_all(),
-                    TerminalAction::CopyAll => copy_terminal_all(&terminal),
-                    TerminalAction::CopyScreen => copy_terminal_screen(&terminal),
-                }
-                terminal.grab_focus();
-            }
-        },
-    );
 }
 
 fn text_item(

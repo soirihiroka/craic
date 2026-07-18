@@ -1,33 +1,25 @@
+use crate::alacritty::{AlacrittyTerminal, SpawnSpec, terminal_environment};
 use crate::config;
 use crate::system::capabilities::shell::ShellCommandSpec;
-use crate::ui::{
-    canvas_scroll,
-    components::{
-        context_menu,
-        search::{SearchOption, SearchPanel},
-        terminal as terminal_component,
-    },
+use crate::ui::components::{
+    search::{SearchOption, SearchPanel},
+    terminal as terminal_component,
 };
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::fs;
-use std::os::fd::AsRawFd;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::rc::Rc;
-use vte4::prelude::*;
 
 pub use crate::ui::components::terminal::{TerminalActivation, TerminalFileActivation};
 
-const DEFAULT_COLUMNS: i64 = 100;
-const DEFAULT_ROWS: i64 = 34;
 const SESSION_RAIL_WIDTH: i32 = 120;
 const SESSION_RAIL_PANEL_WIDTH: i32 = 132;
 const TERMINAL_AUTO_CLOSE_IDLE_SECONDS: u64 = 60;
-const TERM_NAME: &str = "xterm-256color";
-const COLORTERM_NAME: &str = "truecolor";
-const VTE_VERSION: &str = "8400";
 const CTRL_BACKSPACE_SEQUENCE: &[u8] = b"\x17";
 type EmptyHandlers = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 type FocusHandlers = Rc<RefCell<Vec<Box<dyn Fn(bool)>>>>;
@@ -60,7 +52,7 @@ struct TerminalSession {
     id: u64,
     root: gtk::Overlay,
     row: gtk::ListBoxRow,
-    terminal: vte4::Terminal,
+    terminal: AlacrittyTerminal,
     child_pid: Rc<Cell<Option<glib::Pid>>>,
     launch_kind: TerminalLaunchKind,
     state: Rc<Cell<TerminalSessionState>>,
@@ -340,7 +332,7 @@ impl TerminalPanel {
 
             move || {
                 if let Some(terminal) = active_terminal(&sessions, &session_rail) {
-                    terminal.search_set_regex(None, 0);
+                    let _ = terminal.search(None, false);
                     search_panel.set_status("");
                     log::debug!("terminal search cleared on close");
                 }
@@ -419,40 +411,9 @@ impl TerminalPanel {
         let terminal = configured_terminal(config::load().font_sizes.shell);
         install_terminal_shortcuts(&terminal, &self.sessions, &self.search_panel);
         install_focus_tracking(&terminal, &self.focus_handlers);
-        install_terminal_activation(&terminal, &self.activation_handlers, launch_dir.to_string());
-        let scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .hexpand(true)
-            .vexpand(true)
-            .child(&terminal)
-            .build();
-        let autoscroll_marker = gtk::DrawingArea::builder()
-            .halign(gtk::Align::Fill)
-            .valign(gtk::Align::Fill)
-            .hexpand(true)
-            .vexpand(true)
-            .can_target(false)
-            .build();
+        install_terminal_activation(&terminal, &self.activation_handlers);
         let root = gtk::Overlay::builder().hexpand(true).vexpand(true).build();
-        root.set_child(Some(&scroller));
-        root.add_overlay(&autoscroll_marker);
-        let autoscroll = Rc::new(canvas_scroll::MiddleAutoscroll::new());
-        canvas_scroll::install_scrolled_window_middle_autoscroll_with_state(
-            &scroller,
-            &autoscroll_marker,
-            &autoscroll,
-            canvas_scroll::AutoscrollAxes::Vertical,
-            "terminal",
-            {
-                let scroller = scroller.clone();
-                let terminal = terminal.clone();
-                move |cursor| {
-                    scroller.set_cursor_from_name(cursor);
-                    terminal.set_cursor_from_name(cursor);
-                }
-            },
-        );
+        root.set_child(Some(&terminal.widget()));
 
         let session_name = session_id.to_string();
         root.set_widget_name(&session_name);
@@ -562,7 +523,11 @@ impl TerminalPanel {
             &self.empty_handlers,
             &auto_close_source,
         );
-        spawn_command(&terminal, command, &child_pid, &state)?;
+        if let Err(err) = spawn_command(&terminal, command, launch_dir, &child_pid, &state) {
+            self.session_stack.remove(&root);
+            self.session_rail.remove(&row);
+            return Err(err);
+        }
         start_title_poll(&terminal, &label, title, &state);
 
         let session = TerminalSession {
@@ -664,16 +629,16 @@ fn reorder_session_rows(
     true
 }
 
-fn configured_terminal(font_size: f64) -> vte4::Terminal {
-    terminal_component::configured_terminal(font_size, DEFAULT_COLUMNS, DEFAULT_ROWS)
+fn configured_terminal(font_size: f64) -> AlacrittyTerminal {
+    AlacrittyTerminal::new(font_size)
 }
 
-fn set_terminal_font(terminal: &vte4::Terminal, font_size: f64) {
-    terminal_component::set_font(terminal, font_size);
+fn set_terminal_font(terminal: &AlacrittyTerminal, font_size: f64) {
+    terminal.set_font_size(font_size);
 }
 
 fn install_terminal_shortcuts(
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     sessions: &Rc<RefCell<Vec<TerminalSession>>>,
     search_panel: &SearchPanel,
 ) {
@@ -696,8 +661,6 @@ fn install_terminal_shortcuts(
                 return glib::Propagation::Stop;
             }
 
-            reset_kinetic_scroll_if_needed(&terminal, key);
-
             let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
 
@@ -715,12 +678,12 @@ fn install_terminal_shortcuts(
                 && matches!(key, gdk::Key::c | gdk::Key::C)
                 && terminal.has_selection()
             {
-                copy_terminal_selection(&terminal);
+                terminal.copy_clipboard();
                 return glib::Propagation::Stop;
             }
 
             if ctrl && shift && matches!(key, gdk::Key::c | gdk::Key::C) {
-                copy_terminal_selection(&terminal);
+                terminal.copy_clipboard();
                 return glib::Propagation::Stop;
             }
 
@@ -730,7 +693,7 @@ fn install_terminal_shortcuts(
             }
 
             if ctrl && shift && key == gdk::Key::Insert {
-                copy_terminal_selection(&terminal);
+                terminal.copy_clipboard();
                 return glib::Propagation::Stop;
             }
 
@@ -752,11 +715,11 @@ fn install_terminal_shortcuts(
             glib::Propagation::Proceed
         }
     });
-    terminal.add_controller(keys);
+    terminal.area().add_controller(keys);
 }
 
 fn set_terminal_font_for_sessions(
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     sessions: &Rc<RefCell<Vec<TerminalSession>>>,
     font_size: f64,
 ) {
@@ -783,60 +746,11 @@ fn font_size_delta_for_key(key: gdk::Key, modifiers: gdk::ModifierType) -> Optio
     None
 }
 
-fn copy_terminal_selection(terminal: &vte4::Terminal) {
-    context_menu::copy_terminal_selection(terminal);
-}
-
-fn reset_kinetic_scroll_if_needed(terminal: &vte4::Terminal, key: gdk::Key) {
-    if is_modifier_key(key) || !terminal.is_scroll_on_keystroke() {
-        return;
-    }
-
-    let Some(scroller) = terminal
-        .ancestor(gtk::ScrolledWindow::static_type())
-        .and_then(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())
-    else {
-        return;
-    };
-    if !scroller.is_kinetic_scrolling() {
-        return;
-    }
-
-    let adjustment = scroller.vadjustment();
-    if adjustment.upper() - adjustment.page_size() > adjustment.value() {
-        scroller.set_kinetic_scrolling(false);
-        scroller.set_kinetic_scrolling(true);
-    }
-}
-
-fn is_modifier_key(key: gdk::Key) -> bool {
-    matches!(
-        key,
-        gdk::Key::Shift_L
-            | gdk::Key::Shift_R
-            | gdk::Key::Control_L
-            | gdk::Key::Control_R
-            | gdk::Key::Alt_L
-            | gdk::Key::Alt_R
-            | gdk::Key::Meta_L
-            | gdk::Key::Meta_R
-            | gdk::Key::Super_L
-            | gdk::Key::Super_R
-            | gdk::Key::Hyper_L
-            | gdk::Key::Hyper_R
-            | gdk::Key::ISO_Level3_Shift
-            | gdk::Key::ISO_Level5_Shift
-            | gdk::Key::Caps_Lock
-            | gdk::Key::Num_Lock
-    )
-}
-
 fn install_terminal_activation(
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     activation_handlers: &ActivationHandlers,
-    launch_dir: String,
 ) {
-    terminal_component::install_activation(terminal, launch_dir, {
+    terminal.connect_activation({
         let activation_handlers = activation_handlers.clone();
 
         move |activation| {
@@ -875,7 +789,7 @@ fn connect_terminal_search_option(
 fn active_terminal(
     sessions: &Rc<RefCell<Vec<TerminalSession>>>,
     session_rail: &gtk::ListBox,
-) -> Option<vte4::Terminal> {
+) -> Option<AlacrittyTerminal> {
     session_rail
         .selected_row()
         .and_then(|row| session_by_row(sessions, &row))
@@ -883,23 +797,24 @@ fn active_terminal(
 }
 
 fn apply_terminal_search(
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     search_panel: &SearchPanel,
     options: &TerminalSearchOptions,
     search_move: TerminalSearchMove,
 ) {
     let query = search_panel.query();
     if query.is_empty() {
-        terminal.search_set_regex(None, 0);
+        let _ = terminal.search(None, false);
         search_panel.set_status("");
         return;
     }
 
     let pattern = terminal_search_pattern(&query, options);
-    let regex = match vte4::Regex::for_search(&pattern, 0) {
-        Ok(regex) => regex,
+    let backwards = matches!(search_move, TerminalSearchMove::Previous);
+    let found = match terminal.search(Some(&pattern), backwards) {
+        Ok(found) => found,
         Err(err) => {
-            terminal.search_set_regex(None, 0);
+            let _ = terminal.search(None, false);
             search_panel.set_status("Invalid");
             log::warn!(
                 "terminal search regex invalid query_len={} regex_mode={}: {err}",
@@ -908,13 +823,6 @@ fn apply_terminal_search(
             );
             return;
         }
-    };
-
-    terminal.search_set_regex(Some(&regex), 0);
-    terminal.search_set_wrap_around(true);
-    let found = match search_move {
-        TerminalSearchMove::Previous => terminal.search_find_previous(),
-        TerminalSearchMove::Keep | TerminalSearchMove::Next => terminal.search_find_next(),
     };
     search_panel.set_status(if found { "Found" } else { "No Results" });
     log::debug!(
@@ -940,7 +848,7 @@ fn terminal_search_pattern(query: &str, options: &TerminalSearchOptions) -> Stri
     pattern
 }
 
-fn install_focus_tracking(terminal: &vte4::Terminal, focus_handlers: &FocusHandlers) {
+fn install_focus_tracking(terminal: &AlacrittyTerminal, focus_handlers: &FocusHandlers) {
     let focus = gtk::EventControllerFocus::new();
     focus.connect_enter({
         let focus_handlers = focus_handlers.clone();
@@ -952,7 +860,7 @@ fn install_focus_tracking(terminal: &vte4::Terminal, focus_handlers: &FocusHandl
 
         move |_| notify_focus_handlers(&focus_handlers, false)
     });
-    terminal.add_controller(focus);
+    terminal.area().add_controller(focus);
 }
 
 fn notify_focus_handlers(focus_handlers: &FocusHandlers, focused: bool) {
@@ -963,7 +871,7 @@ fn notify_focus_handlers(focus_handlers: &FocusHandlers, focused: bool) {
 
 fn install_terminal_interaction_trackers(
     session_id: u64,
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     state: &Rc<Cell<TerminalSessionState>>,
     exit_success: &Rc<Cell<bool>>,
     root: &gtk::Box,
@@ -1006,7 +914,7 @@ fn install_terminal_interaction_trackers(
             reset_auto_close();
         }
     });
-    terminal.add_controller(click);
+    terminal.area().add_controller(click);
 
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
     scroll.connect_scroll({
@@ -1017,7 +925,7 @@ fn install_terminal_interaction_trackers(
             gtk::glib::Propagation::Proceed
         }
     });
-    terminal.add_controller(scroll);
+    terminal.area().add_controller(scroll);
 }
 
 fn queue_terminal_auto_close(
@@ -1101,7 +1009,7 @@ fn clear_terminal_auto_close_timer(auto_close_source: &Rc<RefCell<Option<glib::S
 fn install_exit_key_handler(
     session_id: u64,
     root: &gtk::Box,
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     state: &Rc<Cell<TerminalSessionState>>,
     exit_success: &Rc<Cell<bool>>,
     sessions: &Rc<RefCell<Vec<TerminalSession>>>,
@@ -1158,66 +1066,33 @@ fn install_exit_key_handler(
             glib::Propagation::Proceed
         }
     });
-    terminal.add_controller(keys);
+    terminal.area().add_controller(keys);
 }
 
 fn spawn_command(
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     command: &CommandSpec,
+    launch_dir: &str,
     child_pid: &Rc<Cell<Option<glib::Pid>>>,
     state: &Rc<Cell<TerminalSessionState>>,
 ) -> Result<(), String> {
     let argv = command_argv(command)?;
-    let argv_refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
     let env = terminal_environment();
-    let env_refs = env.iter().map(String::as_str).collect::<Vec<_>>();
-    let working_dir = command.working_dir.to_str().ok_or_else(|| {
-        format!(
-            "Cannot start {}: working directory is not valid UTF-8.",
-            command.display()
-        )
-    })?;
-
-    terminal.spawn_async(
-        vte4::PtyFlags::DEFAULT,
-        Some(working_dir),
-        &argv_refs,
-        &env_refs,
-        glib::SpawnFlags::SEARCH_PATH,
-        || {},
-        -1,
-        None::<&gio::Cancellable>,
-        {
-            let terminal = terminal.clone();
-            let child_pid = child_pid.clone();
-            let state = state.clone();
-            let display = command.display();
-
-            move |result| match result {
-                Ok(pid) => {
-                    if state.get() == TerminalSessionState::Closing {
-                        terminate_child(Some(pid));
-                        return;
-                    }
-
-                    child_pid.set(Some(pid));
-                    state.set(TerminalSessionState::Running);
-                }
-                Err(err) => {
-                    if state.get() == TerminalSessionState::Closing {
-                        return;
-                    }
-
-                    child_pid.set(None);
-                    state.set(TerminalSessionState::Exited);
-                    let message = format!(
-                        "Failed to start {display}: {err}\r\n\r\nPress Enter to close the terminal.\r\n"
-                    );
-                    terminal.feed(message.as_bytes());
-                }
-            }
+    let mut argv = argv.into_iter();
+    let program = argv
+        .next()
+        .ok_or_else(|| "Cannot start an empty terminal command.".to_string())?;
+    let pid = terminal.spawn(
+        SpawnSpec {
+            program,
+            args: argv.collect(),
+            working_directory: command.working_dir.clone(),
+            env,
         },
-    );
+        launch_dir.to_string(),
+    )?;
+    child_pid.set(Some(glib::Pid(pid)));
+    state.set(TerminalSessionState::Running);
     Ok(())
 }
 
@@ -1248,53 +1123,23 @@ fn command_argv(command: &CommandSpec) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn terminal_environment() -> Vec<String> {
-    let mut env = std::env::vars().collect::<Vec<_>>();
-    set_env(&mut env, "TERM", TERM_NAME);
-    set_env(&mut env, "COLORTERM", COLORTERM_NAME);
-    set_env(&mut env, "TERM_PROGRAM", "VTE");
-    set_env(&mut env, "TERM_PROGRAM_VERSION", VTE_VERSION);
-    set_env(&mut env, "VTE_VERSION", VTE_VERSION);
-
-    if !has_utf8_locale(&env) {
-        set_env(&mut env, "LC_CTYPE", "C.UTF-8");
-    }
-
-    env.into_iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect()
-}
-
-fn set_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
-    env.retain(|(existing, _)| existing != key);
-    env.push((key.to_string(), value.to_string()));
-}
-
-fn has_utf8_locale(env: &[(String, String)]) -> bool {
-    ["LC_ALL", "LC_CTYPE", "LANG"].into_iter().any(|key| {
-        env.iter().any(|(existing_key, value)| {
-            existing_key == key && {
-                let value = value.to_ascii_lowercase();
-                value.contains("utf-8") || value.contains("utf8")
-            }
-        })
-    })
-}
-
 fn start_title_poll(
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     label: &gtk::Label,
     fallback_title: &str,
     state: &Rc<Cell<TerminalSessionState>>,
 ) {
     update_session_title(label, &short_terminal_title(terminal, fallback_title));
 
-    terminal.connect_termprop_changed(None, {
+    terminal.connect_title_changed({
         let label = label.clone();
         let fallback_title = fallback_title.to_string();
 
-        move |terminal, _| {
-            update_session_title(&label, &short_terminal_title(terminal, &fallback_title));
+        move |title| {
+            update_session_title(
+                &label,
+                &terminal_title_text(&title).unwrap_or_else(|| fallback_title.clone()),
+            );
         }
     });
 
@@ -1320,7 +1165,7 @@ fn start_title_poll(
 
 fn connect_child_exit(
     session_id: u64,
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     label: &gtk::Label,
     fallback_title: &str,
     child_pid: &Rc<Cell<Option<glib::Pid>>>,
@@ -1334,6 +1179,7 @@ fn connect_child_exit(
     auto_close_source: &Rc<RefCell<Option<glib::SourceId>>>,
 ) {
     terminal.connect_child_exited({
+        let terminal = terminal.clone();
         let label = label.clone();
         let fallback_title = fallback_title.to_string();
         let child_pid = child_pid.clone();
@@ -1346,14 +1192,14 @@ fn connect_child_exit(
         let empty_handlers = empty_handlers.clone();
         let auto_close_source = auto_close_source.clone();
 
-        move |terminal, status| {
+        move |status| {
             child_pid.set(None);
             if state.get() == TerminalSessionState::Closing {
                 return;
             }
 
             state.set(TerminalSessionState::Exited);
-            let success = status_exit_succeeded(status);
+            let success = status.success();
             exit_success.set(success);
             let summary = child_exit_summary(status);
             terminal.feed(
@@ -1386,39 +1232,26 @@ fn connect_child_exit(
     });
 }
 
-fn status_exit_succeeded(status: i32) -> bool {
-    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
-}
-
 struct ChildExitSummary {
     message: String,
     label: String,
 }
 
-fn child_exit_summary(status: i32) -> ChildExitSummary {
-    if libc::WIFEXITED(status) {
-        let code = libc::WEXITSTATUS(status);
-        return ChildExitSummary {
-            message: format!("exited with code {code}"),
-            label: format!("exited {code}"),
-        };
-    }
-
-    if libc::WIFSIGNALED(status) {
-        let signal = libc::WTERMSIG(status);
+fn child_exit_summary(status: ExitStatus) -> ChildExitSummary {
+    if let Some(signal) = status.signal() {
         return ChildExitSummary {
             message: format!("terminated by signal {signal}"),
             label: format!("signal {signal}"),
         };
     }
-
+    let status = status.code().unwrap_or_default();
     ChildExitSummary {
-        message: format!("exited with status {status}"),
-        label: "exited".to_string(),
+        message: format!("exited with code {status}"),
+        label: format!("exited {status}"),
     }
 }
 
-fn short_terminal_title(terminal: &vte4::Terminal, fallback_title: &str) -> String {
+fn short_terminal_title(terminal: &AlacrittyTerminal, fallback_title: &str) -> String {
     terminal_window_title(terminal)
         .or_else(|| foreground_process_name(terminal))
         .unwrap_or_else(|| fallback_title.to_string())
@@ -1428,9 +1261,10 @@ fn update_session_title(label: &gtk::Label, title: &str) {
     label.set_label(title);
 }
 
-fn terminal_window_title(terminal: &vte4::Terminal) -> Option<String> {
-    let title = terminal.property::<Option<glib::GString>>("window-title")?;
-    terminal_title_text(title.as_str())
+fn terminal_window_title(terminal: &AlacrittyTerminal) -> Option<String> {
+    terminal
+        .title()
+        .and_then(|title| terminal_title_text(&title))
 }
 
 fn terminal_title_text(title: &str) -> Option<String> {
@@ -1438,18 +1272,13 @@ fn terminal_title_text(title: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-fn foreground_process_name(terminal: &vte4::Terminal) -> Option<String> {
+fn foreground_process_name(terminal: &AlacrittyTerminal) -> Option<String> {
     let foreground_pgid = foreground_process_group(terminal)?;
     process_name_for_group(foreground_pgid)
 }
 
-fn foreground_process_group(terminal: &vte4::Terminal) -> Option<libc::pid_t> {
-    let fd = terminal.pty()?.fd().as_raw_fd();
-    let foreground_pgid = unsafe { libc::tcgetpgrp(fd) };
-    if foreground_pgid <= 0 {
-        return None;
-    }
-    Some(foreground_pgid)
+fn foreground_process_group(terminal: &AlacrittyTerminal) -> Option<libc::pid_t> {
+    terminal.foreground_process_group()
 }
 
 fn process_name_for_group(foreground_pgid: libc::pid_t) -> Option<String> {
@@ -1602,7 +1431,7 @@ fn active_task_name(session: &TerminalSession) -> Option<String> {
     }
 }
 
-fn active_shell_task_name(terminal: &vte4::Terminal, shell_pid: glib::Pid) -> Option<String> {
+fn active_shell_task_name(terminal: &AlacrittyTerminal, shell_pid: glib::Pid) -> Option<String> {
     let foreground_pgid = foreground_process_group(terminal)?;
     let shell_pid = shell_pid.0 as libc::pid_t;
     let shell_pgid = process_group(shell_pid).unwrap_or(shell_pid);
