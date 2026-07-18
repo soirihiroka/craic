@@ -250,7 +250,7 @@ impl GitHubAccess for LocalGitHubAccess {
             login: auth_login.to_string(),
         };
         let repo_slug = format!("{owner}/{name}");
-        let args = vec![
+        let mut args = vec![
             "repo".to_string(),
             "create".to_string(),
             repo_slug.clone(),
@@ -258,13 +258,20 @@ impl GitHubAccess for LocalGitHubAccess {
             self.workspace.root.absolute.clone(),
             "--remote".to_string(),
             "origin".to_string(),
-            "--push".to_string(),
-            if request.private {
-                "--private".to_string()
-            } else {
-                "--public".to_string()
-            },
         ];
+        if request.has_commits {
+            args.push("--push".to_string());
+        } else {
+            log::info!(
+                "creating empty github repository without initial push workspace={} repo={repo_slug}",
+                self.workspace.display_name
+            );
+        }
+        args.push(if request.private {
+            "--private".to_string()
+        } else {
+            "--public".to_string()
+        });
         let output = self.run_gh_with_account("gh repo create", &account, &args)?;
         let stdout = output.stdout_text_trimmed();
         let stderr = output.stderr_text_trimmed();

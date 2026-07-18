@@ -52,6 +52,7 @@ pub struct GitHubPublishRepositoryRequest {
     pub owner: String,
     pub name: String,
     pub private: bool,
+    pub has_commits: bool,
 }
 
 #[derive(Clone)]
