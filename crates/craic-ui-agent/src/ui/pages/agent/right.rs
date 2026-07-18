@@ -22,9 +22,9 @@ use crate::system::capabilities::terminal_link::TerminalLinkTarget;
 use crate::ui::agent_history::{self, AgentSessionRow, RestoreState};
 use crate::ui::agent_status::{AgentActiveState, AgentInactiveState, AgentSessionState};
 use crate::ui::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsageTracker};
+use crate::ui::components::search::{SearchOption, SearchPanel};
 use crate::ui::pages::PageCommand;
 use crate::ui::{AGENT_SESSION_NOTIFICATION_DETAILED_ACTION, agent_session_notification_id};
-use crate::ui::components::search::{SearchOption, SearchPanel};
 use craic_ui_terminal::alacritty::{AlacrittyTerminal, SpawnSpec, terminal_environment};
 use craic_ui_terminal::ui::components::terminal as terminal_component;
 

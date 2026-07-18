@@ -11,6 +11,7 @@ use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config as TermConfig, TermMode};
 use alacritty_terminal::tty::{self, Options, Shell};
 use alacritty_terminal::vte::ansi::Processor;
+use craic_ui_core::ui::canvas_scroll;
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use renderer::{GlRenderer, TerminalSize};
@@ -325,10 +326,8 @@ impl AlacrittyTerminal {
             .build();
         area.set_required_version(3, 0);
         let scrollbar_adjustment = gtk::Adjustment::new(0.0, 0.0, 1.0, 1.0, 1.0, 1.0);
-        let scrollbar = gtk::Scrollbar::new(
-            gtk::Orientation::Vertical,
-            Some(&scrollbar_adjustment),
-        );
+        let scrollbar =
+            gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scrollbar_adjustment));
         scrollbar.set_focusable(false);
         scrollbar.set_halign(gtk::Align::End);
         scrollbar.set_valign(gtk::Align::Fill);
@@ -350,6 +349,12 @@ impl AlacrittyTerminal {
         root.set_hexpand(true);
         root.set_vexpand(true);
         root.set_child(Some(&area));
+        let autoscroll_marker = gtk::DrawingArea::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .can_target(false)
+            .build();
+        root.add_overlay(&autoscroll_marker);
         root.add_overlay(&scrollbar);
 
         let (sender, receiver) = mpsc::channel();
@@ -385,6 +390,7 @@ impl AlacrittyTerminal {
         install_selection(&area, &state);
         install_scroll(&area, &state);
         install_scrollbar(&scrollbar_adjustment, &state);
+        install_middle_autoscroll(&area, &autoscroll_marker, &state);
         install_focus(&area, &state);
         install_context_menu(&area, &state);
         install_file_drop(&area, &state);
@@ -875,7 +881,7 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 3.. => SelectionType::Lines,
                 _ => SelectionType::Simple,
             };
-            let mut state = state.borrow_mut();
+            let state = state.borrow();
             if let Some(engine) = state.engine.as_ref() {
                 engine.term.lock().selection = Some(Selection::new(kind, point, Side::Left));
             }
@@ -1142,6 +1148,78 @@ fn install_scroll(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
     area.add_controller(scroll);
 }
 
+fn install_middle_autoscroll(
+    area: &gtk::GLArea,
+    marker: &gtk::DrawingArea,
+    state: &Rc<RefCell<UiState>>,
+) {
+    let autoscroll = Rc::new(canvas_scroll::MiddleAutoscroll::new());
+    canvas_scroll::install_middle_autoscroll_marker(
+        marker,
+        &autoscroll,
+        canvas_scroll::AutoscrollAxes::Vertical,
+    );
+    let line_remainder = Rc::new(Cell::new(0.0));
+    canvas_scroll::install_middle_autoscroll(
+        area,
+        &autoscroll,
+        canvas_scroll::AutoscrollAxes::Vertical,
+        "terminal",
+        {
+            let state = state.clone();
+            move || {
+                state.borrow().engine.as_ref().is_some_and(|engine| {
+                    let term = engine.term.lock();
+                    term.grid().history_size() > 0
+                })
+            }
+        },
+        {
+            let state = state.clone();
+            let line_remainder = line_remainder.clone();
+            move |autoscroll_state| {
+                let logical_cell_height = {
+                    let state = state.borrow();
+                    let Some(renderer) = state.renderer.as_ref() else {
+                        return;
+                    };
+                    renderer.size().cell_height as f64 / renderer.scale() as f64
+                };
+                let delta = canvas_scroll::middle_autoscroll_delta(
+                    autoscroll_state.pointer.y - autoscroll_state.origin.y,
+                ) / logical_cell_height.max(1.0);
+                let accumulated = line_remainder.get() + delta;
+                let lines = accumulated.trunc() as i32;
+                line_remainder.set(accumulated - lines as f64);
+                if lines == 0 {
+                    return;
+                }
+                let state = state.borrow();
+                if let Some(engine) = state.engine.as_ref() {
+                    engine.scroll(-lines);
+                    state.proxy.dirty.store(true, Ordering::Release);
+                }
+            }
+        },
+        {
+            let line_remainder = line_remainder.clone();
+            move || line_remainder.set(0.0)
+        },
+        {
+            let line_remainder = line_remainder.clone();
+            move || line_remainder.set(0.0)
+        },
+        {
+            let area = area.clone();
+            move |cursor| area.set_cursor_from_name(cursor)
+        },
+        {
+            let marker = marker.clone();
+            move || marker.queue_draw()
+        },
+    );
+}
+
 fn install_scrollbar(adjustment: &gtk::Adjustment, state: &Rc<RefCell<UiState>>) {
     let state = Rc::downgrade(state);
     adjustment.connect_value_changed(move |adjustment| {
@@ -1162,7 +1240,9 @@ fn install_scrollbar(adjustment: &gtk::Adjustment, state: &Rc<RefCell<UiState>>)
             .round()
             .clamp(0.0, history_size as f64) as usize;
         if requested_offset != current_offset {
-            term.scroll_display(Scroll::Delta(requested_offset as i32 - current_offset as i32));
+            term.scroll_display(Scroll::Delta(
+                requested_offset as i32 - current_offset as i32,
+            ));
             state.proxy.dirty.store(true, Ordering::Release);
         }
     });
@@ -1319,11 +1399,7 @@ fn install_context_menu(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 let widget = widget.clone();
                 let popover = popover.clone();
                 move |_| {
-                    if let Some(text) = state
-                        .borrow()
-                        .engine
-                        .as_ref()
-                        .map(TerminalEngine::all_text)
+                    if let Some(text) = state.borrow().engine.as_ref().map(TerminalEngine::all_text)
                     {
                         widget.clipboard().set_text(&text);
                     }

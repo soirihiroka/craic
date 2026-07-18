@@ -581,7 +581,11 @@ impl GlRenderer {
 
         let vertex = compile_shader(
             gl::VERTEX_SHADER,
-            if uses_es { GLES_VERTEX_SHADER } else { VERTEX_SHADER },
+            if uses_es {
+                GLES_VERTEX_SHADER
+            } else {
+                VERTEX_SHADER
+            },
         )?;
         let fragment = compile_shader(
             gl::FRAGMENT_SHADER,
@@ -764,9 +768,7 @@ impl GlRenderer {
                 fg = SELECTION_FOREGROUND;
                 bg = SELECTION_BACKGROUND;
             }
-            if focused
-                && cursor.shape == CursorShape::Block
-                && cursor_point == Some(viewport_point)
+            if focused && cursor.shape == CursorShape::Block && cursor_point == Some(viewport_point)
             {
                 fg = bg;
                 bg = color_for_index(colors, NamedColor::Cursor as usize);
@@ -881,10 +883,7 @@ fn foreground_color(
     }
 }
 
-fn background_color(
-    colors: &alacritty_terminal::term::color::Colors,
-    color: Color,
-) -> Rgb {
+fn background_color(colors: &alacritty_terminal::term::color::Colors, color: Color) -> Rgb {
     match color {
         Color::Spec(rgb) => rgb,
         Color::Indexed(index) => color_for_index(colors, index as usize),
