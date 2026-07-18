@@ -1,7 +1,8 @@
 use gtk::glib;
+use craic_ui_terminal::alacritty::AlacrittyTerminal;
 use std::cell::RefCell;
+use std::process::ExitStatus;
 use std::rc::Rc;
-use vte4::prelude::*;
 
 use super::provider::{AgentProvider, is_default_agent_title, normalize_title_text};
 use crate::ui::agent_status::AgentActiveState;
@@ -99,28 +100,16 @@ pub trait AgentShellIntegration: Sync {
         log::info!("agent command spawned pid={} command={}", pid.0, command);
     }
 
-    fn log_spawn_completed_after_close(&self, pid: glib::Pid, command: &str) {
-        log::debug!(
-            "agent command spawn completed after close pid={} command={}",
-            pid.0,
-            command
-        );
-    }
-
-    fn log_spawn_failed(&self, command: &str, err: &glib::Error) {
+    fn log_spawn_failed(&self, command: &str, err: &str) {
         log::warn!("agent command spawn failed command={command}: {err}");
     }
 
-    fn log_spawn_failed_after_close(&self, command: &str, err: &glib::Error) {
-        log::debug!("agent command spawn failed after close command={command}: {err}");
+    fn log_child_exited(&self, status: ExitStatus, message: &str) {
+        log::info!("agent child exited status={status:?} message={message}");
     }
 
-    fn log_child_exited(&self, status: i32, message: &str) {
-        log::info!("agent child exited status={} message={}", status, message);
-    }
-
-    fn log_child_exit_ignored_while_closing(&self, status: i32) {
-        log::debug!("agent child exit ignored while closing status={status}");
+    fn log_child_exit_ignored_while_closing(&self, status: ExitStatus) {
+        log::debug!("agent child exit ignored while closing status={status:?}");
     }
 }
 
@@ -131,7 +120,7 @@ fn notification_title(title: &str) -> Option<String> {
 
 pub fn session_title(
     provider: &'static dyn AgentProvider,
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     _log_scan: bool,
 ) -> Option<String> {
     let scan = recent_terminal_text(terminal)?;
@@ -142,7 +131,7 @@ pub fn session_title(
 pub fn active_state(
     _session_id: u64,
     provider: &'static dyn AgentProvider,
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     _log_scan: bool,
 ) -> AgentActiveState {
     let window_title = terminal_window_title(terminal);
@@ -165,21 +154,13 @@ pub fn active_state(
     active_state
 }
 
-fn terminal_window_title(terminal: &vte4::Terminal) -> Option<glib::GString> {
-    terminal.property::<Option<glib::GString>>("window-title")
+fn terminal_window_title(terminal: &AlacrittyTerminal) -> Option<String> {
+    terminal.title()
 }
 
-fn recent_terminal_text(terminal: &vte4::Terminal) -> Option<TerminalTextScan> {
-    let (_cursor_column, cursor_row) = terminal.cursor_position();
-    if cursor_row <= 0 {
-        return None;
-    }
-
-    let end_row = cursor_row - 1;
-    let start_row = (end_row - TITLE_SCAN_ROWS).max(0);
-    let end_col = terminal.column_count().max(1);
-    let (text, _) = terminal.text_range_format(vte4::Format::Text, start_row, 0, end_row, end_col);
-    let text = text?
+fn recent_terminal_text(terminal: &AlacrittyTerminal) -> Option<TerminalTextScan> {
+    let text = terminal
+        .text_before_cursor(TITLE_SCAN_ROWS as usize)?
         .trim_start_matches(|ch| matches!(ch, '\n' | '\r'))
         .to_string();
     let trimmed_empty = text.trim().is_empty();
@@ -189,15 +170,11 @@ fn recent_terminal_text(terminal: &vte4::Terminal) -> Option<TerminalTextScan> {
     })
 }
 
-fn recent_terminal_active_state_text(terminal: &vte4::Terminal) -> Option<ActiveStateTextScan> {
-    let (_cursor_column, cursor_row) = terminal.cursor_position();
-    let visible_end_row = terminal.row_count().saturating_sub(1);
-    let cursor_end_row = cursor_row.saturating_sub(1);
-    let end_row = visible_end_row.max(cursor_end_row);
-    let start_row = (end_row - TITLE_SCAN_ROWS).max(0);
-    let end_col = terminal.column_count().max(1);
-    let (text, _) = terminal.text_range_format(vte4::Format::Text, start_row, 0, end_row, end_col);
-    let text = text?
+fn recent_terminal_active_state_text(
+    terminal: &AlacrittyTerminal,
+) -> Option<ActiveStateTextScan> {
+    let text = terminal
+        .recent_text(TITLE_SCAN_ROWS as usize)?
         .trim_start_matches(|ch| matches!(ch, '\n' | '\r'))
         .to_string();
     let trimmed_empty = text.trim().is_empty();

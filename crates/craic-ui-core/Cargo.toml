@@ -16,4 +16,3 @@ libc.workspace = true
 log.workspace = true
 moka.workspace = true
 regex.workspace = true
-vte4.workspace = true

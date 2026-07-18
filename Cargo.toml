@@ -10,6 +10,7 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 adw = { package = "libadwaita", version = "0.9", features = ["v1_9"] }
+alacritty_terminal = { path = "../alacritty/alacritty_terminal" }
 base64 = "0.22.1"
 cairo = { package = "cairo-rs", version = "0.22", features = ["freetype"] }
 craic-agent = { path = "crates/craic-agent" }
@@ -28,6 +29,7 @@ craic-ui-terminal = { path = "crates/craic-ui-terminal" }
 craic-ui-vcs = { path = "crates/craic-ui-vcs" }
 craic-ui = { path = "crates/craic-ui" }
 env_logger = "0.11"
+epoxy = "0.1.0"
 freetype = { package = "freetype-rs", version = "0.38" }
 glycin = { version = "3.1.0", features = ["gdk4"] }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
@@ -82,6 +84,5 @@ typos-dict = "0.13.31"
 unicase = "2.9.0"
 unicode-segmentation = "1.13"
 uuid = { version = "1", features = ["v4"] }
-vte4 = { version = "0.10", features = ["v0_84"] }
 walkdir = "2"
 webkit6 = "0.6"

@@ -2,11 +2,11 @@ use adw::prelude::*;
 use gtk::glib::prelude::ToVariant;
 use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
-use vte4::prelude::*;
 
 use super::super::PageContext;
 use super::agent_shell_integration::{self, AgentNotification, AgentShellIntegration};
@@ -24,23 +24,13 @@ use crate::ui::agent_status::{AgentActiveState, AgentInactiveState, AgentSession
 use crate::ui::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsageTracker};
 use crate::ui::pages::PageCommand;
 use crate::ui::{AGENT_SESSION_NOTIFICATION_DETAILED_ACTION, agent_session_notification_id};
-use crate::ui::{
-    canvas_scroll,
-    components::{
-        context_menu,
-        search::{SearchOption, SearchPanel},
-    },
-};
+use crate::ui::components::search::{SearchOption, SearchPanel};
+use craic_ui_terminal::alacritty::{AlacrittyTerminal, SpawnSpec, terminal_environment};
 use craic_ui_terminal::ui::components::terminal as terminal_component;
 
 #[cfg(test)]
 use super::provider::agy::terminal_text_active_state as agy_terminal_text_active_state;
 
-const DEFAULT_COLUMNS: i64 = 100;
-const DEFAULT_ROWS: i64 = 34;
-const TERM_NAME: &str = "xterm-256color";
-const COLORTERM_NAME: &str = "truecolor";
-const VTE_VERSION: &str = "8400";
 const CTRL_BACKSPACE_SEQUENCE: &[u8] = b"\x17";
 const NOTIFICATION_APP_NAME: &str = "Craic";
 const NOTIFICATION_TIMEOUT_MS: &str = "5000";
@@ -64,7 +54,7 @@ struct AgentSession {
     session_uuid: String,
     provider: &'static dyn AgentProvider,
     root: gtk::Overlay,
-    terminal: vte4::Terminal,
+    terminal: AlacrittyTerminal,
     child_pid: Rc<Cell<Option<glib::Pid>>>,
     state: Rc<Cell<TerminalSessionState>>,
     active_state: Rc<Cell<AgentActiveState>>,
@@ -743,7 +733,7 @@ impl AgentChat {
 
             move || {
                 if let Some(terminal) = active_terminal(&sessions, &notebook) {
-                    terminal.search_set_regex(None, 0);
+                    let _ = terminal.search(None, false);
                     search_panel.set_status("");
                     log::debug!("agent terminal search cleared on close");
                 }
@@ -825,49 +815,12 @@ impl AgentChat {
             &self.search_panel,
         );
         install_focus_tracking(&terminal, &self.focus_handlers);
-        terminal_component::install_activation(
-            &terminal,
-            command.target_working_dir().to_string(),
-            {
-                let ctx = self.ctx.clone();
-
-                move |activation| handle_agent_terminal_activation(&ctx, activation)
-            },
-        );
-        let scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .kinetic_scrolling(false)
-            .hexpand(true)
-            .vexpand(true)
-            .child(&terminal)
-            .build();
-        let autoscroll_marker = gtk::DrawingArea::builder()
-            .halign(gtk::Align::Fill)
-            .valign(gtk::Align::Fill)
-            .hexpand(true)
-            .vexpand(true)
-            .can_target(false)
-            .build();
+        terminal.connect_activation({
+            let ctx = self.ctx.clone();
+            move |activation| handle_agent_terminal_activation(&ctx, activation)
+        });
         let root = gtk::Overlay::builder().hexpand(true).vexpand(true).build();
-        root.set_child(Some(&scroller));
-        root.add_overlay(&autoscroll_marker);
-        let autoscroll = Rc::new(canvas_scroll::MiddleAutoscroll::new());
-        canvas_scroll::install_scrolled_window_middle_autoscroll_with_state(
-            &scroller,
-            &autoscroll_marker,
-            &autoscroll,
-            canvas_scroll::AutoscrollAxes::Vertical,
-            "agent_terminal",
-            {
-                let scroller = scroller.clone();
-                let terminal = terminal.clone();
-                move |cursor| {
-                    scroller.set_cursor_from_name(cursor);
-                    terminal.set_cursor_from_name(cursor);
-                }
-            },
-        );
+        root.set_child(Some(&terminal.widget()));
 
         let session_name = session_id.to_string();
         root.set_widget_name(&session_name);
@@ -988,7 +941,7 @@ impl AgentChat {
             &self.title_callback,
             &self.history_callback,
         );
-        spawn_command(
+        if let Err(err) = spawn_command(
             &terminal,
             command,
             &child_pid,
@@ -997,7 +950,10 @@ impl AgentChat {
             session_id,
             provider,
             &self.state_callback,
-        )?;
+        ) {
+            self.notebook.remove_page(Some(page_num));
+            return Err(err);
+        }
 
         let session = AgentSession {
             id: session_id,
@@ -1260,7 +1216,7 @@ fn maybe_start_smart_summary(
         return;
     }
 
-    let (_cursor_column, cursor_row) = session.terminal.cursor_position();
+    let cursor_row = session.terminal.cursor_row().unwrap_or_default();
     if cursor_row < SMART_SUMMARY_TRIGGER_ROWS {
         return;
     }
@@ -1335,7 +1291,7 @@ fn start_smart_summary(
 
     let terminal_text = terminal_full_text(&session.terminal)
         .ok_or_else(|| "The session terminal has no transcript to summarize.".to_string())?;
-    let (_cursor_column, cursor_row) = session.terminal.cursor_position();
+    let cursor_row = session.terminal.cursor_row().unwrap_or_default();
     let title = session.label.text().to_string();
     let shell_provider_id = session.provider.provider_id().to_string();
     session.summary_in_flight.set(true);
@@ -1394,16 +1350,9 @@ fn start_smart_summary(
     Ok(())
 }
 
-fn terminal_full_text(terminal: &vte4::Terminal) -> Option<String> {
-    let (_cursor_column, cursor_row) = terminal.cursor_position();
-    let visible_end_row = terminal.row_count().saturating_sub(1);
-    let end_row = visible_end_row.max(cursor_row.saturating_sub(1));
-    if end_row <= 0 {
-        return None;
-    }
-    let end_col = terminal.column_count().max(1);
-    let (text, _) = terminal.text_range_format(vte4::Format::Text, 0, 0, end_row, end_col);
-    let text = text?
+fn terminal_full_text(terminal: &AlacrittyTerminal) -> Option<String> {
+    let text = terminal
+        .all_text()?
         .trim_start_matches(|ch| matches!(ch, '\n' | '\r'))
         .to_string();
     (!text.trim().is_empty()).then_some(text)
@@ -1875,7 +1824,7 @@ fn connect_terminal_search_option(
 fn active_terminal(
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
     notebook: &gtk::Notebook,
-) -> Option<vte4::Terminal> {
+) -> Option<AlacrittyTerminal> {
     notebook
         .current_page()
         .and_then(|page_num| notebook.nth_page(Some(page_num)))
@@ -1884,23 +1833,24 @@ fn active_terminal(
 }
 
 fn apply_terminal_search(
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     search_panel: &SearchPanel,
     options: &TerminalSearchOptions,
     search_move: TerminalSearchMove,
 ) {
     let query = search_panel.query();
     if query.is_empty() {
-        terminal.search_set_regex(None, 0);
+        let _ = terminal.search(None, false);
         search_panel.set_status("");
         return;
     }
 
     let pattern = terminal_search_pattern(&query, options);
-    let regex = match vte4::Regex::for_search(&pattern, 0) {
-        Ok(regex) => regex,
+    let backwards = matches!(search_move, TerminalSearchMove::Previous);
+    let found = match terminal.search(Some(&pattern), backwards) {
+        Ok(found) => found,
         Err(err) => {
-            terminal.search_set_regex(None, 0);
+            let _ = terminal.search(None, false);
             search_panel.set_status("Invalid");
             log::warn!(
                 "agent terminal search regex invalid query_len={} regex_mode={}: {err}",
@@ -1911,12 +1861,6 @@ fn apply_terminal_search(
         }
     };
 
-    terminal.search_set_regex(Some(&regex), 0);
-    terminal.search_set_wrap_around(true);
-    let found = match search_move {
-        TerminalSearchMove::Previous => terminal.search_find_previous(),
-        TerminalSearchMove::Keep | TerminalSearchMove::Next => terminal.search_find_next(),
-    };
     search_panel.set_status(if found { "Found" } else { "No Results" });
     log::debug!(
         "agent terminal search applied query_len={} move={search_move:?} found={found}",
@@ -2139,19 +2083,18 @@ fn configured_terminal(
     font_size: f64,
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
     search_panel: &SearchPanel,
-) -> vte4::Terminal {
-    let terminal =
-        terminal_component::configured_terminal(font_size, DEFAULT_COLUMNS, DEFAULT_ROWS);
+) -> AlacrittyTerminal {
+    let terminal = AlacrittyTerminal::new(font_size);
     install_terminal_shortcuts(&terminal, sessions, search_panel);
     terminal
 }
 
-fn set_terminal_font(terminal: &vte4::Terminal, font_size: f64) {
-    terminal_component::set_font(terminal, font_size);
+fn set_terminal_font(terminal: &AlacrittyTerminal, font_size: f64) {
+    terminal.set_font_size(font_size);
 }
 
 fn install_terminal_shortcuts(
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
     search_panel: &SearchPanel,
 ) {
@@ -2174,8 +2117,6 @@ fn install_terminal_shortcuts(
                 return glib::Propagation::Stop;
             }
 
-            reset_kinetic_scroll_if_needed(&terminal, key);
-
             let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
 
@@ -2193,12 +2134,12 @@ fn install_terminal_shortcuts(
                 && matches!(key, gdk::Key::c | gdk::Key::C)
                 && terminal.has_selection()
             {
-                copy_terminal_selection(&terminal);
+                terminal.copy_clipboard();
                 return glib::Propagation::Stop;
             }
 
             if ctrl && shift && matches!(key, gdk::Key::c | gdk::Key::C) {
-                copy_terminal_selection(&terminal);
+                terminal.copy_clipboard();
                 return glib::Propagation::Stop;
             }
 
@@ -2208,7 +2149,7 @@ fn install_terminal_shortcuts(
             }
 
             if ctrl && shift && key == gdk::Key::Insert {
-                copy_terminal_selection(&terminal);
+                terminal.copy_clipboard();
                 return glib::Propagation::Stop;
             }
 
@@ -2230,11 +2171,11 @@ fn install_terminal_shortcuts(
             glib::Propagation::Proceed
         }
     });
-    terminal.add_controller(keys);
+    terminal.area().add_controller(keys);
 }
 
 fn set_terminal_font_for_sessions(
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
     font_size: f64,
 ) {
@@ -2261,55 +2202,7 @@ fn font_size_delta_for_key(key: gdk::Key, modifiers: gdk::ModifierType) -> Optio
     None
 }
 
-fn copy_terminal_selection(terminal: &vte4::Terminal) {
-    context_menu::copy_terminal_selection(terminal);
-}
-
-fn reset_kinetic_scroll_if_needed(terminal: &vte4::Terminal, key: gdk::Key) {
-    if is_modifier_key(key) || !terminal.is_scroll_on_keystroke() {
-        return;
-    }
-
-    let Some(scroller) = terminal
-        .ancestor(gtk::ScrolledWindow::static_type())
-        .and_then(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())
-    else {
-        return;
-    };
-    if !scroller.is_kinetic_scrolling() {
-        return;
-    }
-
-    let adjustment = scroller.vadjustment();
-    if adjustment.upper() - adjustment.page_size() > adjustment.value() {
-        scroller.set_kinetic_scrolling(false);
-        scroller.set_kinetic_scrolling(true);
-    }
-}
-
-fn is_modifier_key(key: gdk::Key) -> bool {
-    matches!(
-        key,
-        gdk::Key::Shift_L
-            | gdk::Key::Shift_R
-            | gdk::Key::Control_L
-            | gdk::Key::Control_R
-            | gdk::Key::Alt_L
-            | gdk::Key::Alt_R
-            | gdk::Key::Meta_L
-            | gdk::Key::Meta_R
-            | gdk::Key::Super_L
-            | gdk::Key::Super_R
-            | gdk::Key::Hyper_L
-            | gdk::Key::Hyper_R
-            | gdk::Key::ISO_Level3_Shift
-            | gdk::Key::ISO_Level5_Shift
-            | gdk::Key::Caps_Lock
-            | gdk::Key::Num_Lock
-    )
-}
-
-fn install_focus_tracking(terminal: &vte4::Terminal, focus_handlers: &FocusHandlers) {
+fn install_focus_tracking(terminal: &AlacrittyTerminal, focus_handlers: &FocusHandlers) {
     let focus = gtk::EventControllerFocus::new();
     focus.connect_enter({
         let focus_handlers = focus_handlers.clone();
@@ -2321,7 +2214,7 @@ fn install_focus_tracking(terminal: &vte4::Terminal, focus_handlers: &FocusHandl
 
         move |_| notify_focus_handlers(&focus_handlers, false)
     });
-    terminal.add_controller(focus);
+    terminal.area().add_controller(focus);
 }
 
 fn notify_focus_handlers(focus_handlers: &FocusHandlers, focused: bool) {
@@ -2342,7 +2235,7 @@ fn set_terminal_conflicting_accels_enabled(app: &gtk::Application, enabled: bool
 
 fn install_exit_key_handler(
     session_id: u64,
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     state: &Rc<Cell<TerminalSessionState>>,
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
     notebook: &gtk::Notebook,
@@ -2375,13 +2268,13 @@ fn install_exit_key_handler(
             glib::Propagation::Proceed
         }
     });
-    terminal.add_controller(keys);
+    terminal.area().add_controller(keys);
 }
 
 fn connect_child_exit(
     session_id: u64,
     provider: &'static dyn AgentProvider,
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     label: &gtk::Label,
     fallback_title: &str,
     child_pid: &Rc<Cell<Option<glib::Pid>>>,
@@ -2392,13 +2285,14 @@ fn connect_child_exit(
     >,
 ) {
     terminal.connect_child_exited({
+        let terminal = terminal.clone();
         let label = label.clone();
         let fallback_title = fallback_title.to_string();
         let child_pid = child_pid.clone();
         let state = state.clone();
         let state_callback = state_callback.clone();
 
-        move |terminal, status| {
+        move |status| {
             child_pid.set(None);
             if state.get() == TerminalSessionState::Closing {
                 shell_integration.log_child_exit_ignored_while_closing(status);
@@ -2412,7 +2306,7 @@ fn connect_child_exit(
                 provider,
                 AgentSessionState::Inactive(AgentInactiveState::Dead),
             );
-            let summary = child_exit_summary(status);
+            let summary = child_exit_summary(status.clone());
             shell_integration.log_child_exited(status, &summary.message);
             terminal.feed(
                 format!(
@@ -2430,7 +2324,7 @@ fn connect_title_updates(
     session_id: u64,
     session_uuid: &str,
     provider: &'static dyn AgentProvider,
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     label: &gtk::Label,
     state: &Rc<Cell<TerminalSessionState>>,
     title_locked: &Rc<Cell<bool>>,
@@ -2444,7 +2338,8 @@ fn connect_title_updates(
     title_callback: &Rc<RefCell<Option<Rc<dyn Fn(u64, String)>>>>,
     history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 ) {
-    terminal.connect_notify_local(Some("window-title"), {
+    terminal.connect_title_changed({
+        let terminal = terminal.clone();
         let label = label.clone();
         let state = state.clone();
         let title_locked = title_locked.clone();
@@ -2457,7 +2352,7 @@ fn connect_title_updates(
         let history_callback = history_callback.clone();
         let session_uuid = session_uuid.to_string();
 
-        move |terminal, _| {
+        move |_| {
             if state.get() == TerminalSessionState::Closing {
                 return;
             }
@@ -2466,7 +2361,8 @@ fn connect_title_updates(
             }
 
             let log_scan = selected_session_id(&notebook) == Some(session_id);
-            let Some(title) = agent_shell_integration::session_title(provider, terminal, log_scan)
+            let Some(title) =
+                agent_shell_integration::session_title(provider, &terminal, log_scan)
             else {
                 return;
             };
@@ -2482,7 +2378,7 @@ fn connect_title_updates(
                 let next_active_state = match state.get() {
                     TerminalSessionState::Running => {
                         agent_shell_integration::active_state(
-                            session_id, provider, terminal, log_scan,
+                            session_id, provider, &terminal, log_scan,
                         )
                     }
                     TerminalSessionState::Starting => AgentActiveState::NewChat,
@@ -2965,17 +2861,15 @@ struct ChildExitSummary {
     label: String,
 }
 
-fn child_exit_summary(status: i32) -> ChildExitSummary {
-    if libc::WIFEXITED(status) {
-        let code = libc::WEXITSTATUS(status);
+fn child_exit_summary(status: ExitStatus) -> ChildExitSummary {
+    if let Some(code) = status.code() {
         return ChildExitSummary {
             message: format!("exited with code {code}"),
             label: format!("exited {code}"),
         };
     }
 
-    if libc::WIFSIGNALED(status) {
-        let signal = libc::WTERMSIG(status);
+    if let Some(signal) = status.signal() {
         return ChildExitSummary {
             message: format!("terminated by signal {signal}"),
             label: format!("signal {signal}"),
@@ -2983,13 +2877,13 @@ fn child_exit_summary(status: i32) -> ChildExitSummary {
     }
 
     ChildExitSummary {
-        message: format!("exited with status {status}"),
+        message: format!("exited with status {status:?}"),
         label: "exited".to_string(),
     }
 }
 
 fn spawn_command(
-    terminal: &vte4::Terminal,
+    terminal: &AlacrittyTerminal,
     command: &CommandSpec,
     child_pid: &Rc<Cell<Option<glib::Pid>>>,
     state: &Rc<Cell<TerminalSessionState>>,
@@ -3001,63 +2895,41 @@ fn spawn_command(
     >,
 ) -> Result<(), String> {
     let argv = command_argv(command)?;
-    let argv_refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
     let env = terminal_environment();
-    let env_refs = env.iter().map(String::as_str).collect::<Vec<_>>();
     let working_dir = command.working_dir();
 
-    shell_integration.log_spawn_requested(working_dir, &command.display(), env_refs.len());
-    terminal.spawn_async(
-        vte4::PtyFlags::DEFAULT,
-        Some(working_dir),
-        &argv_refs,
-        &env_refs,
-        glib::SpawnFlags::SEARCH_PATH,
-        || {},
-        -1,
-        None::<&gio::Cancellable>,
-        {
-            let terminal = terminal.clone();
-            let child_pid = child_pid.clone();
-            let state = state.clone();
-            let display = command.display();
-            let state_callback = state_callback.clone();
-
-            move |result| match result {
-                Ok(pid) => {
-                    if state.get() == TerminalSessionState::Closing {
-                        shell_integration.log_spawn_completed_after_close(pid, &display);
-                        terminate_child(Some(pid));
-                        return;
-                    }
-
-                    child_pid.set(Some(pid));
-                    state.set(TerminalSessionState::Running);
-                    shell_integration.log_spawned(pid, &display);
-                }
-                Err(err) => {
-                    if state.get() == TerminalSessionState::Closing {
-                        shell_integration.log_spawn_failed_after_close(&display, &err);
-                        return;
-                    }
-
-                    child_pid.set(None);
-                    state.set(TerminalSessionState::Exited);
-                    notify_session_state_changed(
-                        &state_callback,
-                        session_id,
-                        provider,
-                        AgentSessionState::Inactive(AgentInactiveState::Dead),
-                    );
-                    shell_integration.log_spawn_failed(&display, &err);
-                    let message = format!(
-                        "Failed to start {display}: {err}\r\n\r\nPress Enter to close the terminal.\r\n"
-                    );
-                    terminal.feed(message.as_bytes());
-                }
-            }
+    shell_integration.log_spawn_requested(working_dir, &command.display(), env.len());
+    let mut argv = argv.into_iter();
+    let program = argv
+        .next()
+        .ok_or_else(|| "Cannot start an empty agent command.".to_string())?;
+    let display = command.display();
+    let pid = match terminal.spawn(
+        SpawnSpec {
+            program,
+            args: argv.collect(),
+            working_directory: PathBuf::from(working_dir),
+            env,
         },
-    );
+        command.target_working_dir().to_string(),
+    ) {
+        Ok(pid) => glib::Pid(pid),
+        Err(err) => {
+            child_pid.set(None);
+            state.set(TerminalSessionState::Exited);
+            notify_session_state_changed(
+                state_callback,
+                session_id,
+                provider,
+                AgentSessionState::Inactive(AgentInactiveState::Dead),
+            );
+            shell_integration.log_spawn_failed(&display, &err);
+            return Err(format!("Failed to start {display}: {err}"));
+        }
+    };
+    child_pid.set(Some(pid));
+    state.set(TerminalSessionState::Running);
+    shell_integration.log_spawned(pid, &display);
     Ok(())
 }
 
@@ -3075,39 +2947,6 @@ fn command_argv(command: &CommandSpec) -> Result<Vec<String>, String> {
             })
         })
         .collect()
-}
-
-fn terminal_environment() -> Vec<String> {
-    let mut env = std::env::vars().collect::<Vec<_>>();
-    set_env(&mut env, "TERM", TERM_NAME);
-    set_env(&mut env, "COLORTERM", COLORTERM_NAME);
-    set_env(&mut env, "TERM_PROGRAM", "VTE");
-    set_env(&mut env, "TERM_PROGRAM_VERSION", VTE_VERSION);
-    set_env(&mut env, "VTE_VERSION", VTE_VERSION);
-
-    if !has_utf8_locale(&env) {
-        set_env(&mut env, "LC_CTYPE", "C.UTF-8");
-    }
-
-    env.into_iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect()
-}
-
-fn set_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
-    env.retain(|(existing, _)| existing != key);
-    env.push((key.to_string(), value.to_string()));
-}
-
-fn has_utf8_locale(env: &[(String, String)]) -> bool {
-    ["LC_ALL", "LC_CTYPE", "LANG"].into_iter().any(|key| {
-        env.iter().any(|(existing_key, value)| {
-            existing_key == key && {
-                let value = value.to_ascii_lowercase();
-                value.contains("utf-8") || value.contains("utf8")
-            }
-        })
-    })
 }
 
 fn terminate_child(pid: Option<glib::Pid>) {

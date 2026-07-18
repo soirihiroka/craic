@@ -18,4 +18,3 @@ log.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-vte4.workspace = true
