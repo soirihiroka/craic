@@ -99,7 +99,7 @@ impl DockerAccess for SshDockerAccess {
             ComposeFileAction::Restart => {
                 let restart = shell_quote(compose_file);
                 format!(
-                    "cd {} && docker compose -f {restart} restart || docker compose -f {restart} up -d --build",
+                    "cd {} && (docker compose -f {restart} restart; docker compose -f {restart} up -d --build)",
                     shell_quote(&self.workspace.root.absolute)
                 )
             }
