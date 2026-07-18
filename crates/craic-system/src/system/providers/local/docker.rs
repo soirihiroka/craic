@@ -113,7 +113,7 @@ impl DockerAccess for LocalDockerAccess {
                 .arg("--build"),
             ComposeFileAction::Restart => {
                 let restart = format!(
-                    "docker compose -f {quoted_compose_file} restart || docker compose -f {quoted_compose_file} up -d --build"
+                    "docker compose -f {quoted_compose_file} restart; docker compose -f {quoted_compose_file} up -d --build"
                 );
                 ShellCommandSpec::new("sh", self.workspace.root.clone())
                     .arg("-lc")

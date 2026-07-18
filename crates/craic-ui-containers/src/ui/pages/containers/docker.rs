@@ -392,21 +392,27 @@ fn run_compose_restart_action(
         Some(working_dir),
     );
 
-    if restart_result.is_ok() {
-        return Ok(false);
+    let started_instead = match restart_result {
+        Ok(_) => false,
+        Err(error) if restart_action_should_fallback_to_up(&error) => {
+            log::info!(
+                "docker compose restart fallback action=up project={}",
+                compose.project
+            );
+            true
+        }
+        Err(error) => return Err(error),
+    };
+
+    if !started_instead {
+        log::debug!(
+            "docker compose restart ensure-running action=up project={}",
+            compose.project
+        );
     }
 
-    let error = restart_result.err().unwrap_or_default();
-    if !restart_action_should_fallback_to_up(&error) {
-        return Err(error);
-    }
-
-    log::info!(
-        "docker compose restart fallback action=up project={}",
-        compose.project
-    );
     access.run_docker(&compose_up_args(compose), Some(working_dir))?;
-    Ok(true)
+    Ok(started_instead)
 }
 
 fn compose_action_args(compose: &ComposeProject, action: ComposeAction) -> Vec<String> {
