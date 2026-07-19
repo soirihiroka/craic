@@ -1,7 +1,7 @@
 mod renderer;
 
 use alacritty_terminal::Term;
-use alacritty_terminal::event::{Event, EventListener, Notify, OnResize, WindowSize};
+use alacritty_terminal::event::{Event, EventListener, OnResize, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
@@ -18,7 +18,8 @@ use renderer::{GlRenderer, TerminalSize};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -26,7 +27,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ui::components::terminal::{TerminalActivation, TerminalFileActivation};
 
@@ -39,9 +40,8 @@ const SCROLL_LINES_PER_WHEEL_STEP: i32 = 3;
 type ExitHandlers = Rc<RefCell<Vec<Box<dyn Fn(ExitStatus)>>>>;
 type TitleHandlers = Rc<RefCell<Vec<Box<dyn Fn(String)>>>>;
 type ActivationHandlers = Rc<RefCell<Vec<Box<dyn Fn(TerminalActivation)>>>>;
-type CopyAllTextProvider = Rc<dyn Fn() -> Option<String>>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum TerminalContextAction {
     Copy,
     CopyScreen,
@@ -113,7 +113,7 @@ struct UiState {
     syncing_scrollbar: bool,
     exited: bool,
     event_subscription: Option<command_mailbox::UiCommandSubscription>,
-    copy_all_text_provider: Option<CopyAllTextProvider>,
+    last_selection_text: Option<String>,
 }
 
 struct TerminalEngine {
@@ -216,8 +216,21 @@ impl TerminalEngine {
         })
     }
 
-    fn input<B: Into<Cow<'static, [u8]>>>(&self, bytes: B) {
-        self.notifier.notify(bytes);
+    fn input<B: Into<Cow<'static, [u8]>>>(&self, bytes: B) -> bool {
+        let bytes = bytes.into();
+        if bytes.is_empty() {
+            return true;
+        }
+        match self.notifier.0.send(Msg::Input(bytes)) {
+            Ok(()) => true,
+            Err(err) => {
+                log::error!(
+                    "alacritty terminal PTY input enqueue failed pid={} error={err}",
+                    self.child_pid
+                );
+                false
+            }
+        }
     }
 
     fn resize(&mut self, size: TerminalSize) {
@@ -229,16 +242,31 @@ impl TerminalEngine {
         self.parser.advance(&mut *self.term.lock(), bytes);
     }
 
-    fn paste(&self, text: String) {
-        let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
-        if bracketed {
-            self.input(&b"\x1b[200~"[..]);
-            self.input(text.replace('\x1b', "").into_bytes());
-            self.input(&b"\x1b[201~"[..]);
+    fn paste(&self, text: String, source: &'static str) {
+        let bracketed = {
+            let mut term = self.term.lock();
+            let bracketed = term.mode().contains(TermMode::BRACKETED_PASTE);
+            term.selection = None;
+            term.scroll_display(Scroll::Bottom);
+            bracketed
+        };
+        let characters = text.chars().count();
+        let payload = if bracketed {
+            let filtered = text.replace(['\x1b', '\x03'], "");
+            let mut payload = Vec::with_capacity(filtered.len() + 12);
+            payload.extend_from_slice(b"\x1b[200~");
+            payload.extend_from_slice(filtered.as_bytes());
+            payload.extend_from_slice(b"\x1b[201~");
+            payload
         } else {
-            self.input(text.replace("\r\n", "\r").replace('\n', "\r").into_bytes());
-        }
-        self.term.lock().scroll_display(Scroll::Bottom);
+            text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+        };
+        let payload_bytes = payload.len();
+        let queued = self.input(payload);
+        record_clipboard_diagnostic(&format!(
+            "terminal paste PTY enqueue source={source} queued={queued} bracketed={bracketed} payload_bytes={payload_bytes} chars={characters} pid={}",
+            self.child_pid
+        ));
     }
 
     fn selection_text(&self) -> Option<String> {
@@ -246,7 +274,10 @@ impl TerminalEngine {
     }
 
     fn has_selection(&self) -> bool {
-        self.term.lock().selection_to_string().is_some()
+        self.term
+            .lock()
+            .selection_to_string()
+            .is_some_and(|text| !text.is_empty())
     }
 
     fn visible_text(&self) -> String {
@@ -263,35 +294,13 @@ impl TerminalEngine {
     fn all_text(&self) -> String {
         let term = self.term.lock();
         let grid = term.grid();
-        let mode = *term.mode();
-        let mut text = term.primary_buffer_to_string();
-        let primary_bytes = text.len();
-        let mut alternate_bytes = 0;
-        if mode.contains(TermMode::ALT_SCREEN) {
-            let alternate = term.bounds_to_string(
-                Point::new(Line(-(grid.display_offset() as i32)), Column(0)),
-                Point::new(
-                    Line(
-                        -(grid.display_offset() as i32)
-                            + grid.screen_lines().saturating_sub(1) as i32,
-                    ),
-                    Column(grid.columns().saturating_sub(1)),
-                ),
-            );
-            alternate_bytes = alternate.len();
-            if !text.is_empty() && !alternate.is_empty() && !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(&alternate);
-        }
-        log::debug!(
-            "terminal full text extracted alt_screen={} primary_bytes={} alternate_bytes={} total_bytes={}",
-            mode.contains(TermMode::ALT_SCREEN),
-            primary_bytes,
-            alternate_bytes,
-            text.len()
-        );
-        text
+        term.bounds_to_string(
+            Point::new(Line(-(grid.history_size() as i32)), Column(0)),
+            Point::new(
+                Line(grid.screen_lines().saturating_sub(1) as i32),
+                Column(grid.columns().saturating_sub(1)),
+            ),
+        )
     }
 
     fn select_all(&self) {
@@ -448,7 +457,7 @@ impl AlacrittyTerminal {
             syncing_scrollbar: false,
             exited: false,
             event_subscription: None,
-            copy_all_text_provider: None,
+            last_selection_text: None,
         }));
 
         install_gl_lifecycle(&area, &state);
@@ -539,10 +548,6 @@ impl AlacrittyTerminal {
             .push(Box::new(callback));
     }
 
-    pub fn set_copy_all_text_provider<F: Fn() -> Option<String> + 'static>(&self, provider: F) {
-        self.state.borrow_mut().copy_all_text_provider = Some(Rc::new(provider));
-    }
-
     pub fn title(&self) -> Option<String> {
         self.state
             .borrow()
@@ -566,33 +571,27 @@ impl AlacrittyTerminal {
     }
 
     pub fn has_selection(&self) -> bool {
-        self.state
-            .borrow()
+        let state = self.state.borrow();
+        state
             .engine
             .as_ref()
             .is_some_and(TerminalEngine::has_selection)
+            || state.last_selection_text.is_some()
     }
 
     pub fn copy_clipboard(&self) {
-        let Some(text) = self
-            .state
-            .borrow()
-            .engine
-            .as_ref()
-            .and_then(TerminalEngine::selection_text)
-        else {
-            return;
-        };
-        self.area.clipboard().set_text(&text);
+        copy_terminal_selection(&self.area, &self.state, "shortcut");
     }
 
     pub fn paste_clipboard(&self) {
-        paste_clipboard(&self.area, &self.state);
+        paste_clipboard(&self.area, &self.state, "shortcut");
     }
 
     pub fn paste_text(&self, text: &str) {
-        if let Some(engine) = self.state.borrow().engine.as_ref() {
-            engine.paste(text.to_string());
+        let mut state = self.state.borrow_mut();
+        state.last_selection_text = None;
+        if let Some(engine) = state.engine.as_ref() {
+            engine.paste(text.to_string(), "direct");
         }
     }
 
@@ -670,14 +669,9 @@ impl AlacrittyTerminal {
     }
 
     pub fn all_text(&self) -> Option<String> {
-        let provider = self.state.borrow().copy_all_text_provider.clone();
-        provider.and_then(|provider| provider()).or_else(|| {
-            self.state
-                .borrow()
-                .engine
-                .as_ref()
-                .map(TerminalEngine::all_text)
-        })
+        let state = self.state.borrow();
+        let engine = state.engine.as_ref()?;
+        Some(engine.all_text())
     }
 
     pub fn cursor_row(&self) -> Option<i64> {
@@ -893,8 +887,31 @@ fn install_input(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
         move |_, text| input_bytes(&state, text.as_bytes().to_vec())
     });
     keys.connect_key_pressed({
+        let area = area.clone();
         let state = state.clone();
         move |_, key, _, modifiers| {
+            let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+            let insert = matches!(key, gdk::Key::Insert | gdk::Key::KP_Insert);
+            let has_selection = {
+                let state = state.borrow();
+                state
+                    .engine
+                    .as_ref()
+                    .is_some_and(TerminalEngine::has_selection)
+                    || state.last_selection_text.is_some()
+            };
+            if ctrl
+                && ((matches!(key, gdk::Key::c | gdk::Key::C) && (shift || has_selection))
+                    || (!shift && insert))
+            {
+                copy_terminal_selection(&area, &state, "terminal-key-controller");
+                return glib::Propagation::Stop;
+            }
+            if (ctrl && matches!(key, gdk::Key::v | gdk::Key::V)) || (!ctrl && shift && insert) {
+                paste_clipboard(&area, &state, "terminal-key-controller");
+                return glib::Propagation::Stop;
+            }
             let Some(bytes) = key_sequence(key, modifiers, &state) else {
                 return glib::Propagation::Proceed;
             };
@@ -913,9 +930,6 @@ fn key_sequence(
     let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
     let alt = modifiers.contains(gdk::ModifierType::ALT_MASK);
     let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
-    if ctrl && shift && matches!(key, gdk::Key::v | gdk::Key::V) {
-        return None;
-    }
 
     let mode = state
         .borrow()
@@ -1053,8 +1067,154 @@ fn input_bytes(state: &Rc<RefCell<UiState>>, bytes: Vec<u8>) {
     }
 }
 
+fn copy_terminal_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>, source: &'static str) {
+    let (current, retained) = {
+        let state = state.borrow();
+        (
+            state
+                .engine
+                .as_ref()
+                .and_then(TerminalEngine::selection_text)
+                .filter(|text| !text.is_empty()),
+            state.last_selection_text.clone(),
+        )
+    };
+    if let Some(current) = current.as_ref() {
+        state.borrow_mut().last_selection_text = Some(current.clone());
+    }
+    let Some(text) = current.or(retained) else {
+        record_clipboard_diagnostic(&format!(
+            "terminal clipboard copy skipped source={source} reason=no-selection backend={}",
+            area.display().type_().name()
+        ));
+        return;
+    };
+    set_terminal_clipboard_text(area, &text, source, false, true);
+}
+
+fn finalize_terminal_selection(
+    area: &gtk::GLArea,
+    state: &Rc<RefCell<UiState>>,
+    source: &'static str,
+) {
+    let current = state
+        .borrow()
+        .engine
+        .as_ref()
+        .and_then(TerminalEngine::selection_text)
+        .filter(|text| !text.is_empty());
+    if let Some(current) = current {
+        state.borrow_mut().last_selection_text = Some(current);
+    }
+    let text = state.borrow().last_selection_text.clone();
+    let Some(text) = text else {
+        record_clipboard_diagnostic(&format!(
+            "terminal selection finalized source={source} bytes=0 backend={}",
+            area.display().type_().name()
+        ));
+        return;
+    };
+    record_clipboard_diagnostic(&format!(
+        "terminal selection finalized source={source} bytes={} backend={}",
+        text.len(),
+        area.display().type_().name()
+    ));
+    set_terminal_clipboard_text(area, &text, "primary-selection", true, false);
+}
+
+fn set_terminal_clipboard_text(
+    area: &gtk::GLArea,
+    text: &str,
+    source: &'static str,
+    primary: bool,
+    verify: bool,
+) {
+    let display = area.display();
+    let backend = display.type_().name().to_string();
+    let clipboard = if primary {
+        display.primary_clipboard()
+    } else {
+        display.clipboard()
+    };
+    let provider = gdk::ContentProvider::for_value(&text.to_value());
+    let bytes = text.len();
+    let characters = text.chars().count();
+    match clipboard.set_content(Some(&provider)) {
+        Ok(()) => {
+            display.flush();
+            record_clipboard_diagnostic(&format!(
+                "terminal clipboard GDK claim accepted source={source} primary={primary} bytes={bytes} chars={characters} backend={backend} local={}",
+                clipboard.is_local()
+            ));
+        }
+        Err(err) => {
+            record_clipboard_diagnostic(&format!(
+                "terminal clipboard claim failed source={source} primary={primary} bytes={bytes} chars={characters} backend={backend} error={err}"
+            ));
+            return;
+        }
+    }
+    if !verify {
+        return;
+    }
+
+    let expected = text.to_string();
+    glib::timeout_add_local_once(Duration::from_millis(150), move || {
+        if !clipboard.is_local() {
+            record_clipboard_diagnostic(&format!(
+                "terminal clipboard ownership lost source={source} expected_bytes={} backend={backend}",
+                expected.len()
+            ));
+            return;
+        }
+        clipboard.read_text_async(None::<&gio::Cancellable>, move |result| match result {
+            Ok(Some(actual)) if actual.as_str() == expected => {
+                record_clipboard_diagnostic(&format!(
+                    "terminal clipboard local-provider check succeeded source={source} bytes={} backend={backend}",
+                    actual.len()
+                ))
+            }
+            Ok(Some(actual)) => record_clipboard_diagnostic(&format!(
+                "terminal clipboard local-provider mismatch source={source} expected_bytes={} actual_bytes={} backend={backend}",
+                expected.len(),
+                actual.len()
+            )),
+            Ok(None) => record_clipboard_diagnostic(&format!(
+                "terminal clipboard local-provider empty source={source} expected_bytes={} backend={backend}",
+                expected.len()
+            )),
+            Err(err) => record_clipboard_diagnostic(&format!(
+                "terminal clipboard local-provider read failed source={source} expected_bytes={} backend={backend} error={err}",
+                expected.len()
+            )),
+        });
+    });
+}
+
+fn record_clipboard_diagnostic(message: &str) {
+    log::info!("{message}");
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(std::env::temp_dir);
+    let directory = base.join("craic");
+    if std::fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let path = directory.join("terminal-clipboard.log");
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let _ = writeln!(file, "{timestamp_ms} pid={} {message}", std::process::id());
+}
+
 fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
     let selection_drag_active = Rc::new(Cell::new(false));
+    let selection_finalize_pending = Rc::new(Cell::new(false));
     let drag_autoscroll_generation = Rc::new(Cell::new(0_u64));
     let drag_autoscroll_active = Rc::new(Cell::new(false));
     let drag_autoscroll_pointer = Rc::new(Cell::new(None::<(f64, f64)>));
@@ -1063,6 +1223,7 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
         let drag_autoscroll_generation = drag_autoscroll_generation.clone();
         let drag_autoscroll_active = drag_autoscroll_active.clone();
         let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
+        let selection_finalize_pending = selection_finalize_pending.clone();
         let state = state.clone();
         move |gesture, count, x, y| {
             if drag_autoscroll_active.replace(false) {
@@ -1073,10 +1234,7 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 return;
             };
             let modifiers = gesture.current_event_state();
-            if report_mouse_button(&state, point, 0, 1, true, modifiers) {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                return;
-            }
+            let mouse_reported = report_mouse_button(&state, point, 0, 1, true, modifiers);
             if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
                 activate_at(&state, point);
                 gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -1087,15 +1245,28 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 3.. => SelectionType::Lines,
                 _ => SelectionType::Simple,
             };
-            let state = state.borrow();
-            if let Some(engine) = state.engine.as_ref() {
-                engine.term.lock().selection = Some(Selection::new(kind, point, Side::Left));
+            selection_finalize_pending.set(true);
+            let mut state = state.borrow_mut();
+            state.last_selection_text = None;
+            let selection_text = state.engine.as_ref().and_then(|engine| {
+                let mut term = engine.term.lock();
+                term.selection = Some(Selection::new(kind, point, Side::Left));
+                term.selection_to_string().filter(|text| !text.is_empty())
+            });
+            if let Some(text) = selection_text {
+                state.last_selection_text = Some(text);
             }
             state.proxy.mark_dirty();
+            record_clipboard_diagnostic(&format!(
+                "terminal selection started mouse_reported={mouse_reported} shift={} click_count={count}",
+                modifiers.contains(gdk::ModifierType::SHIFT_MASK)
+            ));
         }
     });
     click.connect_released({
+        let area = area.clone();
         let selection_drag_active = selection_drag_active.clone();
+        let selection_finalize_pending = selection_finalize_pending.clone();
         let drag_autoscroll_generation = drag_autoscroll_generation.clone();
         let drag_autoscroll_active = drag_autoscroll_active.clone();
         let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
@@ -1110,6 +1281,9 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
             if let Some(point) = point_at(&state, x, y) {
                 report_mouse_button(&state, point, 0, 1, false, gesture.current_event_state());
             }
+            if selection_finalize_pending.replace(false) {
+                finalize_terminal_selection(&area, &state, "click-release");
+            }
         }
     });
     area.add_controller(click);
@@ -1118,9 +1292,11 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
     let start = Rc::new(Cell::new((0.0, 0.0)));
     drag.connect_drag_begin({
         let selection_drag_active = selection_drag_active.clone();
+        let selection_finalize_pending = selection_finalize_pending.clone();
         let start = start.clone();
         move |_, x, y| {
             selection_drag_active.set(true);
+            selection_finalize_pending.set(true);
             start.set((x, y));
         }
     });
@@ -1131,23 +1307,7 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
         let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
         let state = state.clone();
         let start = start.clone();
-        move |gesture, dx, dy| {
-            if state
-                .borrow()
-                .engine
-                .as_ref()
-                .is_some_and(TerminalEngine::mouse_mode)
-                && !gesture
-                    .current_event_state()
-                    .contains(gdk::ModifierType::SHIFT_MASK)
-            {
-                if drag_autoscroll_active.replace(false) {
-                    drag_autoscroll_generation
-                        .set(drag_autoscroll_generation.get().wrapping_add(1));
-                }
-                drag_autoscroll_pointer.set(None);
-                return;
-            }
+        move |_, dx, dy| {
             let (x, y) = start.get();
             let pointer_x = x + dx;
             let pointer_y = y + dy;
@@ -1156,10 +1316,15 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
             };
             {
                 let mut state = state.borrow_mut();
-                if let Some(engine) = state.engine.as_ref()
-                    && let Some(selection) = engine.term.lock().selection.as_mut()
-                {
-                    selection.update(point, Side::Right);
+                let selection_text = state.engine.as_ref().and_then(|engine| {
+                    let mut term = engine.term.lock();
+                    if let Some(selection) = term.selection.as_mut() {
+                        selection.update(point, Side::Right);
+                    }
+                    term.selection_to_string().filter(|text| !text.is_empty())
+                });
+                if let Some(text) = selection_text {
+                    state.last_selection_text = Some(text);
                 }
                 state.hovered_link = None;
                 state.proxy.mark_dirty();
@@ -1177,10 +1342,13 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
         }
     });
     drag.connect_drag_end({
+        let area = area.clone();
         let selection_drag_active = selection_drag_active.clone();
+        let selection_finalize_pending = selection_finalize_pending.clone();
         let drag_autoscroll_generation = drag_autoscroll_generation.clone();
         let drag_autoscroll_active = drag_autoscroll_active.clone();
         let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
+        let state = state.clone();
         move |_, _, _| {
             selection_drag_active.set(false);
             if drag_autoscroll_active.replace(false) {
@@ -1188,13 +1356,19 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 log::debug!("terminal selection edge autoscroll stopped");
             }
             drag_autoscroll_pointer.set(None);
+            if selection_finalize_pending.replace(false) {
+                finalize_terminal_selection(&area, &state, "drag-end");
+            }
         }
     });
     drag.connect_cancel({
+        let area = area.clone();
         let selection_drag_active = selection_drag_active.clone();
+        let selection_finalize_pending = selection_finalize_pending.clone();
         let drag_autoscroll_generation = drag_autoscroll_generation.clone();
         let drag_autoscroll_active = drag_autoscroll_active.clone();
         let drag_autoscroll_pointer = drag_autoscroll_pointer.clone();
+        let state = state.clone();
         move |_, _| {
             selection_drag_active.set(false);
             if drag_autoscroll_active.replace(false) {
@@ -1202,6 +1376,9 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 log::debug!("terminal selection edge autoscroll cancelled");
             }
             drag_autoscroll_pointer.set(None);
+            if selection_finalize_pending.replace(false) {
+                finalize_terminal_selection(&area, &state, "drag-cancel");
+            }
         }
     });
     area.add_controller(drag);
@@ -1252,6 +1429,9 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 "text"
             }));
 
+            if selection_drag_active.get() {
+                return;
+            }
             let modifiers = controller.current_event_state();
             if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
                 return;
@@ -1802,12 +1982,6 @@ fn install_context_menu(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
         let area = area.clone();
         let state = state.clone();
         move |gesture, _, x, y| {
-            if let Some(point) = point_at(&state, x, y)
-                && report_mouse_button(&state, point, 2, 4, true, gesture.current_event_state())
-            {
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                return;
-            }
             let (has_engine, has_selection) = {
                 let state = state.borrow();
                 (
@@ -1815,7 +1989,8 @@ fn install_context_menu(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                     state
                         .engine
                         .as_ref()
-                        .is_some_and(TerminalEngine::has_selection),
+                        .is_some_and(TerminalEngine::has_selection)
+                        || state.last_selection_text.is_some(),
                 )
             };
             let Some(parent) = area.parent() else {
@@ -1864,77 +2039,115 @@ fn install_context_menu(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                     let area = area.clone();
                     let state = state.clone();
 
-                    move |action| match action {
-                        TerminalContextAction::Copy => {
-                            if let Some(text) = state
-                                .borrow()
-                                .engine
-                                .as_ref()
-                                .and_then(TerminalEngine::selection_text)
-                            {
-                                area.clipboard().set_text(&text);
+                    move |action| {
+                        record_clipboard_diagnostic(&format!(
+                            "terminal context menu action activated action={action:?}"
+                        ));
+                        match action {
+                            TerminalContextAction::Copy => {
+                                copy_terminal_selection(&area, &state, "context-copy");
+                            }
+                            TerminalContextAction::CopyScreen => {
+                                if let Some(text) = state
+                                    .borrow()
+                                    .engine
+                                    .as_ref()
+                                    .map(TerminalEngine::visible_text)
+                                {
+                                    set_terminal_clipboard_text(
+                                        &area,
+                                        &text,
+                                        "context-copy-screen",
+                                        false,
+                                        true,
+                                    );
+                                }
+                            }
+                            TerminalContextAction::CopyAll => {
+                                if let Some(text) =
+                                    state.borrow().engine.as_ref().map(TerminalEngine::all_text)
+                                {
+                                    set_terminal_clipboard_text(
+                                        &area,
+                                        &text,
+                                        "context-copy-all",
+                                        false,
+                                        true,
+                                    );
+                                }
+                            }
+                            TerminalContextAction::SelectAll => {
+                                let mut state = state.borrow_mut();
+                                let selection_text = state.engine.as_ref().and_then(|engine| {
+                                    engine.select_all();
+                                    state.proxy.mark_dirty();
+                                    engine.selection_text().filter(|text| !text.is_empty())
+                                });
+                                if let Some(text) = selection_text {
+                                    state.last_selection_text = Some(text);
+                                }
+                            }
+                            TerminalContextAction::Paste => {
+                                area.grab_focus();
+                                paste_clipboard(&area, &state, "context-paste");
                             }
                         }
-                        TerminalContextAction::CopyScreen => {
-                            if let Some(text) = state
-                                .borrow()
-                                .engine
-                                .as_ref()
-                                .map(TerminalEngine::visible_text)
-                            {
-                                area.clipboard().set_text(&text);
-                            }
-                        }
-                        TerminalContextAction::CopyAll => {
-                            let provider = state.borrow().copy_all_text_provider.clone();
-                            let text = provider.and_then(|provider| provider()).or_else(|| {
-                                state.borrow().engine.as_ref().map(TerminalEngine::all_text)
-                            });
-                            if let Some(text) = text {
-                                area.clipboard().set_text(&text);
-                            }
-                        }
-                        TerminalContextAction::SelectAll => {
-                            let state = state.borrow();
-                            if let Some(engine) = state.engine.as_ref() {
-                                engine.select_all();
-                                state.proxy.mark_dirty();
-                            }
-                        }
-                        TerminalContextAction::Paste => paste_clipboard(&area, &state),
                     }
                 },
             );
-            popover.connect_closed(|popover| popover.unparent());
+            popover.connect_closed(|popover| {
+                let popover = popover.clone();
+                glib::idle_add_local_once(move || popover.unparent());
+            });
             gesture.set_state(gtk::EventSequenceState::Claimed);
-        }
-    });
-    click.connect_released({
-        let state = state.clone();
-        move |gesture, _, x, y| {
-            if let Some(point) = point_at(&state, x, y) {
-                report_mouse_button(&state, point, 2, 4, false, gesture.current_event_state());
-            }
+            record_clipboard_diagnostic(&format!(
+                "terminal context menu opened has_engine={has_engine} has_selection={has_selection} backend={}",
+                area.display().type_().name()
+            ));
         }
     });
     area.add_controller(click);
 }
 
-fn paste_clipboard(widget: &impl IsA<gtk::Widget>, state: &Rc<RefCell<UiState>>) {
-    widget
-        .clipboard()
-        .read_text_async(None::<&gio::Cancellable>, {
-            let state = state.clone();
-            move |result| match result {
-                Ok(Some(text)) => {
-                    if let Some(engine) = state.borrow().engine.as_ref() {
-                        engine.paste(text.to_string());
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => log::warn!("alacritty terminal clipboard read failed: {err}"),
+fn paste_clipboard(
+    widget: &impl IsA<gtk::Widget>,
+    state: &Rc<RefCell<UiState>>,
+    source: &'static str,
+) {
+    let clipboard = widget.clipboard();
+    let backend = widget.display().type_().name().to_string();
+    let formats = clipboard.formats().to_str().to_string();
+    record_clipboard_diagnostic(&format!(
+        "terminal clipboard paste requested source={source} backend={backend} local={} formats={formats}",
+        clipboard.is_local()
+    ));
+    clipboard.read_text_async(None::<&gio::Cancellable>, {
+        let state = state.clone();
+        move |result| match result {
+            Ok(Some(text)) => {
+                let bytes = text.len();
+                let characters = text.chars().count();
+                let mut state = state.borrow_mut();
+                state.last_selection_text = None;
+                let Some(engine) = state.engine.as_ref() else {
+                    record_clipboard_diagnostic(&format!(
+                        "terminal clipboard paste skipped source={source} reason=no-engine bytes={bytes} chars={characters} backend={backend}"
+                    ));
+                    return;
+                };
+                record_clipboard_diagnostic(&format!(
+                    "terminal clipboard text read source={source} bytes={bytes} chars={characters} backend={backend}"
+                ));
+                engine.paste(text.to_string(), source);
             }
-        });
+            Ok(None) => record_clipboard_diagnostic(&format!(
+                "terminal clipboard paste skipped source={source} reason=no-text backend={backend}"
+            )),
+            Err(err) => record_clipboard_diagnostic(&format!(
+                "terminal clipboard paste read failed source={source} backend={backend} error={err}"
+            )),
+        }
+    });
 }
 
 fn install_file_drop(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
@@ -1963,7 +2176,7 @@ fn install_file_drop(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 .collect::<Vec<_>>()
                 .join(" ");
             if let Some(engine) = state.borrow().engine.as_ref() {
-                engine.paste(text);
+                engine.paste(text, "file-drop");
             }
             area.grab_focus();
             log::info!(
@@ -1996,7 +2209,7 @@ fn drain_events(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 }
             }
             Event::ClipboardStore(_, text) if state.borrow().focused => {
-                area.clipboard().set_text(&text)
+                set_terminal_clipboard_text(area, &text, "osc52", false, true)
             }
             Event::ClipboardStore(_, _) => {}
             Event::ClipboardLoad(_, formatter) => {

@@ -687,17 +687,17 @@ fn install_terminal_shortcuts(
                 return glib::Propagation::Stop;
             }
 
-            if ctrl && shift && matches!(key, gdk::Key::v | gdk::Key::V) {
+            if ctrl && matches!(key, gdk::Key::v | gdk::Key::V) {
                 terminal.paste_clipboard();
                 return glib::Propagation::Stop;
             }
 
-            if ctrl && shift && key == gdk::Key::Insert {
+            if ctrl && !shift && matches!(key, gdk::Key::Insert | gdk::Key::KP_Insert) {
                 terminal.copy_clipboard();
                 return glib::Propagation::Stop;
             }
 
-            if shift && key == gdk::Key::Insert {
+            if shift && matches!(key, gdk::Key::Insert | gdk::Key::KP_Insert) {
                 terminal.paste_clipboard();
                 return glib::Propagation::Stop;
             }

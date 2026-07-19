@@ -39,7 +39,11 @@ impl AgentProvider for Provider {
             system,
             workspace,
             command_binary("codex", shell)?,
-            vec!["--cd".into(), workspace.root.absolute.clone().into()],
+            vec![
+                "--no-alt-screen".into(),
+                "--cd".into(),
+                workspace.root.absolute.clone().into(),
+            ],
         ))
     }
 
@@ -55,6 +59,7 @@ impl AgentProvider for Provider {
             workspace,
             command_binary("codex", shell)?,
             vec![
+                "--no-alt-screen".into(),
                 "--cd".into(),
                 workspace.root.absolute.clone().into(),
                 "resume".into(),
