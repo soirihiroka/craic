@@ -1,43 +1,20 @@
 use super::{FileBrowser, tree::BrowserRow};
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{FileWatchCallback, FileWatchRequest};
-use gtk::glib;
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::rc::{Rc, Weak};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
+use craic_ui_core::ui::command_mailbox;
+use std::collections::HashSet;
+use std::rc::Rc;
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const FILE_BROWSER_WATCH_REFRESH_DEBOUNCE: Duration = Duration::from_millis(350);
 const FILE_BROWSER_WATCH_REFRESH_MAX_DELAY: Duration = Duration::from_millis(1200);
-static NEXT_FILE_WATCH_UI_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
-
-type FileWatchPendingSet = Arc<Mutex<HashSet<FileNodePath>>>;
-
-thread_local! {
-    static FILE_WATCH_UI_HANDLERS: RefCell<HashMap<u64, FileWatchUiHandler>> =
-        RefCell::new(HashMap::new());
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileBrowserWatchSignature {
     workspace_id: String,
     directories: Vec<FileNodePath>,
-}
-
-struct FileWatchUiHandler {
-    browser: Weak<FileBrowser>,
-    generation: u64,
-    pending_from_threads: FileWatchPendingSet,
-    event_scheduled: Arc<AtomicBool>,
-    pending_changed_paths: HashSet<FileNodePath>,
-    pending_since: Option<Instant>,
-    last_change_at: Option<Instant>,
-    quiet_source: Option<glib::SourceId>,
-    max_source: Option<glib::SourceId>,
 }
 
 impl FileBrowser {
@@ -61,46 +38,34 @@ impl FileBrowser {
         self.stop_file_watch_scope();
         let generation = self.file_watch_generation.get();
         let file_access = self.file_access.borrow().clone();
-        let handler_id = NEXT_FILE_WATCH_UI_HANDLER_ID.fetch_add(1, Ordering::Relaxed);
-        let pending_from_threads = Arc::new(Mutex::new(HashSet::new()));
-        let event_scheduled = Arc::new(AtomicBool::new(false));
-        let mut subscriptions = Vec::new();
-        FILE_WATCH_UI_HANDLERS.with(|handlers| {
-            handlers.borrow_mut().insert(
-                handler_id,
-                FileWatchUiHandler {
-                    browser: Rc::downgrade(self),
-                    generation,
-                    pending_from_threads: pending_from_threads.clone(),
-                    event_scheduled: event_scheduled.clone(),
-                    pending_changed_paths: HashSet::new(),
-                    pending_since: None,
-                    last_change_at: None,
-                    quiet_source: None,
-                    max_source: None,
-                },
+        let browser = Rc::downgrade(self);
+        let (updates, event_subscription) =
+            command_mailbox::latest(move |(event_generation, changed_paths)| {
+                let Some(browser) = browser.upgrade() else {
+                    return;
+                };
+                browser.refresh_watched_folder_view(event_generation, changed_paths);
+            });
+        let (changes_sender, changes_receiver) = mpsc::channel();
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let debounce_workspace = signature.workspace_id.clone();
+        thread::spawn(move || {
+            debounce_file_watch_events(
+                debounce_workspace,
+                generation,
+                changes_receiver,
+                stop_receiver,
+                updates,
             );
         });
+        let mut subscriptions = Vec::new();
 
         let request = FileWatchRequest {
             paths: signature.directories.clone(),
             recursive: false,
         };
-        let callback_pending = pending_from_threads.clone();
-        let callback_scheduled = event_scheduled.clone();
         let callback: FileWatchCallback = Arc::new(move |changes| {
-            if let Ok(mut pending) = callback_pending.lock() {
-                pending.extend(changes);
-            } else {
-                return;
-            }
-
-            if callback_scheduled
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                gtk::glib::idle_add_once(move || drain_file_watch_ui_events(handler_id));
-            }
+            let _ = changes_sender.send(changes);
         });
         match file_access.watch(request, callback) {
             Ok(subscription) => subscriptions.push(subscription),
@@ -121,21 +86,24 @@ impl FileBrowser {
         );
 
         if subscriptions.is_empty() {
-            remove_file_watch_ui_handler(handler_id);
+            let _ = stop_sender.send(());
             return;
         }
 
         self.file_watch_signature.replace(Some(signature.clone()));
         self.file_watch_subscriptions.replace(subscriptions);
-        self.file_watch_handler_id.set(Some(handler_id));
+        self.file_watch_event_subscription
+            .replace(Some(event_subscription));
+        self.file_watch_debounce_stop.replace(Some(stop_sender));
     }
 
     pub fn stop_file_watch_scope(&self) {
         self.file_watch_generation
             .set(self.file_watch_generation.get().wrapping_add(1).max(1));
-        if let Some(handler_id) = self.file_watch_handler_id.take() {
-            remove_file_watch_ui_handler(handler_id);
+        if let Some(stop_sender) = self.file_watch_debounce_stop.borrow_mut().take() {
+            let _ = stop_sender.send(());
         }
+        self.file_watch_event_subscription.borrow_mut().take();
         self.file_watch_subscriptions.borrow_mut().clear();
         self.file_watch_signature.borrow_mut().take();
     }
@@ -217,142 +185,52 @@ impl FileBrowser {
     }
 }
 
-fn drain_file_watch_ui_events(handler_id: u64) {
-    let mut should_schedule_quiet = false;
-    let mut should_schedule_max = false;
-    FILE_WATCH_UI_HANDLERS.with(|handlers| {
-        let mut handlers = handlers.borrow_mut();
-        let Some(handler) = handlers.get_mut(&handler_id) else {
-            return;
-        };
-        handler.event_scheduled.store(false, Ordering::Release);
-        let Some(browser) = handler.browser.upgrade() else {
-            return;
-        };
-        if browser.file_watch_generation.get() != handler.generation {
-            return;
+fn debounce_file_watch_events(
+    workspace_id: String,
+    generation: u64,
+    changes: mpsc::Receiver<HashSet<FileNodePath>>,
+    stop: mpsc::Receiver<()>,
+    updates: command_mailbox::UiCommandSender<(u64, HashSet<FileNodePath>)>,
+) {
+    log::info!(
+        "file browser debounce worker started workspace={} generation={}",
+        workspace_id,
+        generation
+    );
+    let mut pending = HashSet::new();
+    let mut pending_since = None;
+    let mut last_change_at = None;
+    loop {
+        if stop.try_recv().is_ok() {
+            break;
         }
-
-        let changes = handler
-            .pending_from_threads
-            .lock()
-            .map(|mut pending| std::mem::take(&mut *pending))
-            .unwrap_or_default();
-        if changes.is_empty() {
-            return;
+        match changes.recv_timeout(Duration::from_millis(50)) {
+            Ok(paths) => {
+                let now = Instant::now();
+                pending_since.get_or_insert(now);
+                last_change_at = Some(now);
+                pending.extend(paths);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
 
         let now = Instant::now();
-        if handler.pending_since.is_none() {
-            handler.pending_since = Some(now);
-            should_schedule_max = handler.max_source.is_none();
+        let quiet = last_change_at
+            .is_some_and(|last| now.duration_since(last) >= FILE_BROWSER_WATCH_REFRESH_DEBOUNCE);
+        let max_delay = pending_since
+            .is_some_and(|first| now.duration_since(first) >= FILE_BROWSER_WATCH_REFRESH_MAX_DELAY);
+        if !pending.is_empty() && (quiet || max_delay) {
+            updates.send((generation, std::mem::take(&mut pending)));
+            pending_since = None;
+            last_change_at = None;
         }
-        handler.last_change_at = Some(now);
-        handler.pending_changed_paths.extend(changes);
-
-        if let Some(source_id) = handler.quiet_source.take() {
-            source_id.remove();
-        }
-        should_schedule_quiet = true;
-    });
-
-    if should_schedule_quiet {
-        FILE_WATCH_UI_HANDLERS.with(|handlers| {
-            if let Some(handler) = handlers.borrow_mut().get_mut(&handler_id) {
-                handler.quiet_source = Some(glib::timeout_add_local_once(
-                    FILE_BROWSER_WATCH_REFRESH_DEBOUNCE,
-                    move || flush_file_watch_ui_events(handler_id, false),
-                ));
-            }
-        });
     }
-
-    if should_schedule_max {
-        FILE_WATCH_UI_HANDLERS.with(|handlers| {
-            if let Some(handler) = handlers.borrow_mut().get_mut(&handler_id)
-                && handler.max_source.is_none()
-            {
-                handler.max_source = Some(glib::timeout_add_local_once(
-                    FILE_BROWSER_WATCH_REFRESH_MAX_DELAY,
-                    move || flush_file_watch_ui_events(handler_id, true),
-                ));
-            }
-        });
-    }
-}
-
-fn flush_file_watch_ui_events(handler_id: u64, force: bool) {
-    let mut refresh = None;
-    FILE_WATCH_UI_HANDLERS.with(|handlers| {
-        let mut handlers = handlers.borrow_mut();
-        let Some(handler) = handlers.get_mut(&handler_id) else {
-            return;
-        };
-        let Some(browser) = handler.browser.upgrade() else {
-            handlers.remove(&handler_id);
-            return;
-        };
-        if browser.file_watch_generation.get() != handler.generation {
-            handlers.remove(&handler_id);
-            return;
-        }
-
-        if force {
-            handler.max_source.take();
-        } else {
-            handler.quiet_source.take();
-            let quiet = handler.last_change_at.is_some_and(|last| {
-                Instant::now().duration_since(last) >= FILE_BROWSER_WATCH_REFRESH_DEBOUNCE
-            });
-            if !quiet {
-                handler.quiet_source = Some(glib::timeout_add_local_once(
-                    FILE_BROWSER_WATCH_REFRESH_DEBOUNCE,
-                    move || flush_file_watch_ui_events(handler_id, false),
-                ));
-                return;
-            }
-        }
-
-        if handler.pending_changed_paths.is_empty() {
-            handler.pending_since = None;
-            handler.last_change_at = None;
-            if let Some(source_id) = handler.quiet_source.take() {
-                source_id.remove();
-            }
-            if let Some(source_id) = handler.max_source.take() {
-                source_id.remove();
-            }
-            return;
-        }
-
-        let changed_paths = std::mem::take(&mut handler.pending_changed_paths);
-        handler.pending_since = None;
-        handler.last_change_at = None;
-        if let Some(source_id) = handler.quiet_source.take() {
-            source_id.remove();
-        }
-        if let Some(source_id) = handler.max_source.take() {
-            source_id.remove();
-        }
-        refresh = Some((browser, handler.generation, changed_paths));
-    });
-
-    if let Some((browser, generation, changed_paths)) = refresh {
-        browser.refresh_watched_folder_view(generation, changed_paths);
-    }
-}
-
-fn remove_file_watch_ui_handler(handler_id: u64) {
-    FILE_WATCH_UI_HANDLERS.with(|handlers| {
-        if let Some(mut handler) = handlers.borrow_mut().remove(&handler_id) {
-            if let Some(source_id) = handler.quiet_source.take() {
-                source_id.remove();
-            }
-            if let Some(source_id) = handler.max_source.take() {
-                source_id.remove();
-            }
-        }
-    });
+    log::info!(
+        "file browser debounce worker stopped workspace={} generation={}",
+        workspace_id,
+        generation
+    );
 }
 
 fn open_folder_watch_directories(

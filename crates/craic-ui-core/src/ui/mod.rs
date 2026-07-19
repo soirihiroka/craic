@@ -1,5 +1,6 @@
 pub mod canvas_scroll;
 pub mod canvas_scrollbar;
+pub mod command_mailbox;
 pub mod components;
 pub mod dialogs;
 pub mod file_row;

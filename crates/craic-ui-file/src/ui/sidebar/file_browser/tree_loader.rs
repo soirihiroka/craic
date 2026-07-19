@@ -5,11 +5,11 @@ use super::{
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{DirectoryListing, FileAccess, FileNodeKind};
 use crate::system::path::FileNodeRef;
+use craic_ui_core::ui::command_mailbox;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
 impl FileBrowser {
     pub fn visible_rows(self: &Rc<Self>) -> Vec<BrowserRow> {
@@ -117,7 +117,10 @@ impl FileBrowser {
         let generation = self.tree_directory_load_generation.get();
         let file_access = Arc::clone(file_access);
         let workspace_name = workspace.display_name.clone();
-        let (sender, receiver) = mpsc::channel();
+        let browser = self.clone();
+        let updates = command_mailbox::once(move |result| {
+            browser.finish_directory_load(generation, result);
+        });
         thread::spawn(move || {
             log::debug!(
                 "file browser directory load start workspace={} count={}",
@@ -125,28 +128,7 @@ impl FileBrowser {
                 missing_dirs.len()
             );
             let result = load_directory_rows(file_access, missing_dirs);
-            let _ = sender.send(result);
-        });
-
-        gtk::glib::timeout_add_local(Duration::from_millis(super::SEARCH_POLL_MS), {
-            let browser = self.clone();
-
-            move || match receiver.try_recv() {
-                Ok(result) => {
-                    browser.finish_directory_load(generation, result);
-                    gtk::glib::ControlFlow::Break
-                }
-                Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    browser.finish_directory_load(
-                        generation,
-                        vec![TreeDirectoryLoadResult::batch_error(
-                            "Directory listing did not return a result.".to_string(),
-                        )],
-                    );
-                    gtk::glib::ControlFlow::Break
-                }
-            }
+            updates.send(result);
         });
     }
 
@@ -245,14 +227,6 @@ impl TreeDirectoryLoadResult {
     fn err(path: FileNodePath, message: String) -> Self {
         Self {
             path: Some(path),
-            rows: Err(message.clone()),
-            message,
-        }
-    }
-
-    fn batch_error(message: String) -> Self {
-        Self {
-            path: None,
             rows: Err(message.clone()),
             message,
         }

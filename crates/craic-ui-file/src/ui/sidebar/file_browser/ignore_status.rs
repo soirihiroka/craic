@@ -1,13 +1,13 @@
 use super::{
-    FileBrowser, MAX_TREE_ROWS, SEARCH_POLL_MS, file_name,
+    FileBrowser, MAX_TREE_ROWS, file_name,
     tree::{BrowserRow, RowIgnoreDisplay},
 };
 use crate::gitignore::IgnoreCheck;
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{FileAccess, FileNodeKind};
+use craic_ui_core::ui::command_mailbox;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
 
 const GIT_IGNORE_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -98,42 +98,26 @@ impl FileBrowser {
             .iter()
             .map(|query| query.path.clone())
             .collect::<Vec<_>>();
-        let disconnected_pending_paths = pending_paths.clone();
-        let (sender, receiver) = mpsc::channel();
+        let browser = self.clone();
+        let updates = command_mailbox::once(move |result: GitIgnoreQueryResult| {
+            if result.generation == browser.git_ignore_generation.get()
+                && browser.apply_git_ignore_result(result.paths, result.ignored_paths)
+                && browser.search_query.borrow().is_empty()
+            {
+                browser.rebuild_if_changed();
+            }
+        });
 
         git_handle.check_ignored_paths(
             &queries,
             Box::new(move |ignored_paths| {
-                let _ = sender.send(GitIgnoreQueryResult {
+                updates.send(GitIgnoreQueryResult {
                     generation,
                     paths: pending_paths,
                     ignored_paths,
                 });
             }),
         );
-
-        gtk::glib::timeout_add_local(Duration::from_millis(SEARCH_POLL_MS), {
-            let browser = self.clone();
-
-            move || match receiver.try_recv() {
-                Ok(result) => {
-                    if result.generation == browser.git_ignore_generation.get()
-                        && browser.apply_git_ignore_result(result.paths, result.ignored_paths)
-                        && browser.search_query.borrow().is_empty()
-                    {
-                        browser.rebuild_if_changed();
-                    }
-                    gtk::glib::ControlFlow::Break
-                }
-                Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-                Err(TryRecvError::Disconnected) => {
-                    if generation == browser.git_ignore_generation.get() {
-                        browser.clear_git_ignore_pending(&disconnected_pending_paths);
-                    }
-                    gtk::glib::ControlFlow::Break
-                }
-            }
-        });
     }
 
     fn apply_git_ignore_result(
@@ -183,13 +167,6 @@ impl FileBrowser {
             );
         }
         changed
-    }
-
-    fn clear_git_ignore_pending(&self, paths: &[String]) {
-        let mut cache = self.git_ignore_cache.borrow_mut();
-        for path in paths {
-            cache.pending.remove(path);
-        }
     }
 
     fn refresh_git_ignore_cache(&self) {

@@ -1,15 +1,15 @@
 use super::{
     BrowserTarget, FileBrowser, MAX_SEARCH_FILE_BYTES, MAX_SEARCH_RESULTS, SEARCH_DEBOUNCE_MS,
-    SEARCH_POLL_MS, rows, skipped_names,
+    rows, skipped_names,
     tree::{BrowserRow, TreeRowRole},
 };
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{FileSearchMatch, FileSearchOutput, FileSearchQuery};
 use crate::ui::components::search::SearchOption;
+use craic_ui_core::ui::command_mailbox;
 use gtk::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -194,39 +194,25 @@ impl FileBrowser {
         }
         self.last_search_signature.replace(Some(signature));
 
-        let (sender, receiver) = mpsc::channel();
+        let result_command = command_mailbox::once({
+            let browser = self.clone();
+
+            move |result: SearchResult| {
+                if result.generation == browser.search_generation.get()
+                    && result.options == browser.search_options()
+                {
+                    browser.replace_search_result_rows(result.result);
+                }
+            }
+        });
 
         thread::spawn(move || {
             let result = search_repository_text_with_access(file_access, root, &options);
-            let _ = sender.send(SearchResult {
+            result_command.send(SearchResult {
                 generation,
                 options,
                 result,
             });
-        });
-
-        gtk::glib::timeout_add_local(Duration::from_millis(SEARCH_POLL_MS), {
-            let browser = self.clone();
-
-            move || match receiver.try_recv() {
-                Ok(result) => {
-                    if result.generation == browser.search_generation.get()
-                        && result.options == browser.search_options()
-                    {
-                        browser.replace_search_result_rows(result.result);
-                    }
-                    gtk::glib::ControlFlow::Break
-                }
-                Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-                Err(TryRecvError::Disconnected) => {
-                    if generation == browser.search_generation.get() {
-                        browser.replace_search_result_rows(Err(
-                            "File search did not return a result.".to_string(),
-                        ));
-                    }
-                    gtk::glib::ControlFlow::Break
-                }
-            }
         });
     }
 

@@ -1,8 +1,7 @@
 use adw::prelude::*;
-use craic_ui_core::reconcile::{Element, PartialEqRenderState};
 use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
@@ -75,9 +74,8 @@ pub struct AgentList {
     history_rows: Rc<RefCell<Vec<AgentSessionRow>>>,
     search_query: Rc<RefCell<String>>,
     selected_tags: Rc<RefCell<HashSet<String>>>,
-    row_reconciler: Rc<
-        RefCell<craic_ui_core::reconcile::gtk::ListBoxReconciler<AgentRowKey, AgentRowRenderState>>,
-    >,
+    row_widgets: Rc<RefCell<HashMap<AgentRowKey, gtk::ListBoxRow>>>,
+    row_states: Rc<RefCell<HashMap<AgentRowKey, AgentRowRenderState>>>,
     loaded_limit: Rc<Cell<usize>>,
     has_more: Rc<Cell<bool>>,
     loading: Rc<Cell<bool>>,
@@ -220,9 +218,8 @@ impl AgentList {
             history_rows: Rc::new(RefCell::new(Vec::new())),
             search_query: Rc::new(RefCell::new(String::new())),
             selected_tags: Rc::new(RefCell::new(HashSet::new())),
-            row_reconciler: Rc::new(RefCell::new(
-                craic_ui_core::reconcile::gtk::ListBoxReconciler::new(),
-            )),
+            row_widgets: Rc::new(RefCell::new(HashMap::new())),
+            row_states: Rc::new(RefCell::new(HashMap::new())),
             loaded_limit: Rc::new(Cell::new(HISTORY_PAGE_SIZE)),
             has_more: Rc::new(Cell::new(false)),
             loading: Rc::new(Cell::new(false)),
@@ -269,7 +266,7 @@ impl AgentList {
         self.selected_tags.borrow_mut().clear();
         self.history_rows.borrow_mut().clear();
         self.search_panel.set_tags(Vec::new());
-        self.reconcile_rows();
+        self.apply_rows();
         self.reload_workspace_history();
     }
 
@@ -302,7 +299,7 @@ impl AgentList {
             self.loading.set(false);
             self.history_rows.borrow_mut().clear();
             self.has_more.set(false);
-            self.reconcile_rows();
+            self.apply_rows();
             return;
         };
 
@@ -388,13 +385,13 @@ impl AgentList {
                 }
                 self.has_more.set(has_more);
                 self.history_rows.replace(rows);
-                self.reconcile_rows();
+                self.apply_rows();
             }
             Err(err) => {
                 log::warn!("agent history load failed: {err}");
                 self.has_more.set(false);
                 self.history_rows.replace(Vec::new());
-                self.reconcile_rows();
+                self.apply_rows();
             }
         }
     }
@@ -474,7 +471,7 @@ impl AgentList {
                 last_seen_at_ms,
             },
         );
-        self.reconcile_rows();
+        self.apply_rows();
         self.select_session(session_id);
     }
 
@@ -511,7 +508,7 @@ impl AgentList {
         self.active_sessions
             .borrow_mut()
             .retain(|session| session.session_id != session_id);
-        self.reconcile_rows();
+        self.apply_rows();
         before != self.active_sessions.borrow().len()
     }
 
@@ -533,7 +530,7 @@ impl AgentList {
             changed = true;
         }
         if changed {
-            self.reconcile_rows();
+            self.apply_rows();
         }
     }
 
@@ -560,7 +557,7 @@ impl AgentList {
             }
         }
         if changed {
-            self.reconcile_rows();
+            self.apply_rows();
         }
         changed
     }
@@ -580,7 +577,7 @@ impl AgentList {
             changed = true;
         }
         if changed {
-            self.reconcile_rows();
+            self.apply_rows();
         }
     }
 
@@ -841,7 +838,7 @@ impl AgentList {
         self.search_panel.set_tags(tags);
     }
 
-    fn reconcile_rows(&self) {
+    fn apply_rows(&self) {
         let selected = self.list.selected_row().and_then(|row| row_identity(&row));
         let search_query = self.search_query.borrow().clone();
         let tag_filter_active = !self.selected_tags.borrow().is_empty();
@@ -870,7 +867,7 @@ impl AgentList {
                 .then_with(|| right.session_id.cmp(&left.session_id))
         });
         for session in pinned_active_sessions {
-            elements.push(Element::new(
+            elements.push((
                 AgentRowKey::Active(session.session_id),
                 active_row_render_state(session, history_rows.as_slice()),
             ));
@@ -909,40 +906,71 @@ impl AgentList {
             let group = history_group_label(row.last_seen_at_ms());
             if group != current_group {
                 current_group = group.clone();
-                elements.push(Element::new(
+                elements.push((
                     AgentRowKey::Header(group.clone()),
                     AgentRowRenderState::Header { label: group },
                 ));
             }
             match row {
                 TimelineRow::Active(session) => {
-                    elements.push(Element::new(
+                    elements.push((
                         AgentRowKey::Active(session.session_id),
                         active_row_render_state(session, history_rows.as_slice()),
                     ));
                 }
                 TimelineRow::History(row) => {
-                    elements.push(Element::new(
-                        AgentRowKey::History(row.id),
-                        history_row_render_state(row),
-                    ));
+                    elements.push((AgentRowKey::History(row.id), history_row_render_state(row)));
                 }
             }
         }
 
-        let mount_close_cb = close_cb.clone();
-        let update_close_cb = close_cb.clone();
-        let _ = self.row_reconciler.borrow_mut().reconcile(
-            &self.list,
-            elements,
-            PartialEqRenderState,
-            move |_, _, state| agent_row(state, mount_close_cb.clone()).upcast::<gtk::Widget>(),
-            move |_, widget, _, next| update_agent_row(widget, next, update_close_cb.clone()),
-        );
+        self.apply_row_commands(elements, close_cb);
 
         if let Some(selected) = selected.and_then(|identity| row_for_identity(&self.list, identity))
         {
             self.select_row_without_callback(&selected);
+        }
+    }
+
+    fn apply_row_commands(
+        &self,
+        rows: Vec<(AgentRowKey, AgentRowRenderState)>,
+        close_callback: Rc<dyn Fn(u64)>,
+    ) {
+        let desired = rows.iter().map(|(key, _)| key).collect::<HashSet<_>>();
+        let removed = self
+            .row_widgets
+            .borrow()
+            .keys()
+            .filter(|key| !desired.contains(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in removed {
+            if let Some(row) = self.row_widgets.borrow_mut().remove(&key) {
+                self.list.remove(&row);
+            }
+            self.row_states.borrow_mut().remove(&key);
+        }
+
+        for (index, (key, state)) in rows.into_iter().enumerate() {
+            let existing = { self.row_widgets.borrow().get(&key).cloned() };
+            let row = match existing {
+                Some(row) => {
+                    if self.row_states.borrow().get(&key) != Some(&state) {
+                        update_agent_row(row.upcast_ref(), &state, close_callback.clone());
+                    }
+                    row
+                }
+                None => agent_row(&state, close_callback.clone()),
+            };
+            self.row_states.borrow_mut().insert(key.clone(), state);
+            self.row_widgets.borrow_mut().insert(key, row.clone());
+            if row.index() != index as i32 {
+                if row.parent().is_some() {
+                    self.list.remove(&row);
+                }
+                self.list.insert(&row, index as i32);
+            }
         }
     }
 

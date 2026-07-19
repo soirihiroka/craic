@@ -14,4 +14,4 @@ pub use icon_row::{
     sync_icon_row_text,
 };
 pub use tree_row::{TreeRenderState, TreeRow, sticky_items};
-pub use view::{EditFocusPlacement, TreeRenderer, TreeView};
+pub use view::{EditFocusPlacement, TreeRenderer, TreeUpdateStats, TreeView};

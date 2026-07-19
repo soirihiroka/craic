@@ -1,5 +1,5 @@
-use super::super::preview_reconcile::{
-    RightPreviewReconciler, binary_state, diff_state, should_update_preview, unavailable_state,
+use super::super::preview_state::{
+    RightPreviewTracker, binary_state, diff_state, should_apply_preview, unavailable_state,
 };
 use crate::git::{BytesComparison, ChangedFile, Commit, FileComparison};
 use crate::ui::content::binary_preview::{
@@ -34,7 +34,7 @@ pub struct HistoryRight {
     preview_stack: gtk::Stack,
     file_preview: BinaryPreviewWidgets,
     avatar_source: Rc<RefCell<Option<String>>>,
-    preview_reconciler: RefCell<RightPreviewReconciler>,
+    preview_tracker: RefCell<RightPreviewTracker>,
 }
 
 impl HistoryRight {
@@ -230,7 +230,7 @@ impl HistoryRight {
             preview_stack,
             file_preview,
             avatar_source: Rc::new(RefCell::new(None)),
-            preview_reconciler: RefCell::new(RightPreviewReconciler::new()),
+            preview_tracker: RefCell::new(RightPreviewTracker::new()),
         }
     }
 
@@ -308,8 +308,8 @@ impl HistoryRight {
     }
 
     pub fn show_comparison(&self, file_path: &str, comparison: &FileComparison) {
-        if !should_update_preview(
-            &self.preview_reconciler,
+        if !should_apply_preview(
+            &self.preview_tracker,
             diff_state(file_path, comparison),
             "history",
         ) {
@@ -328,8 +328,8 @@ impl HistoryRight {
     }
 
     pub fn show_binary_comparison(&self, file_path: &str, comparison: &BytesComparison) {
-        if !should_update_preview(
-            &self.preview_reconciler,
+        if !should_apply_preview(
+            &self.preview_tracker,
             binary_state(file_path, comparison),
             "history",
         ) {
@@ -359,8 +359,8 @@ impl HistoryRight {
     }
 
     pub fn show_preview_unavailable(&self, file_path: &str, message: &str) {
-        if !should_update_preview(
-            &self.preview_reconciler,
+        if !should_apply_preview(
+            &self.preview_tracker,
             unavailable_state(file_path, message),
             "history",
         ) {

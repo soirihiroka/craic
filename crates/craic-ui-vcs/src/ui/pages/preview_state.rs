@@ -1,10 +1,17 @@
 use crate::git::{BytesComparison, FileComparison};
 use crate::ui::file_type::PreviewKind;
-use craic_ui_core::reconcile::{Element, PartialEqRenderState, ReconcileStats};
 use std::cell::RefCell;
 
-pub type RightPreviewReconciler =
-    craic_ui_core::reconcile::Reconciler<&'static str, RightPreviewState, ()>;
+#[derive(Default)]
+pub struct RightPreviewTracker {
+    state: Option<RightPreviewState>,
+}
+
+impl RightPreviewTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RightPreviewState {
@@ -52,31 +59,28 @@ pub fn unavailable_state(file_path: &str, message: &str) -> RightPreviewState {
     }
 }
 
-pub fn should_update_preview(
-    reconciler: &RefCell<RightPreviewReconciler>,
+pub fn should_apply_preview(
+    tracker: &RefCell<RightPreviewTracker>,
     state: RightPreviewState,
     log_target: &str,
 ) -> bool {
-    let stats = reconciler.borrow_mut().reconcile(
-        [Element::new("right", state.clone())],
-        PartialEqRenderState,
-        |_, _, _| (),
-        |_, _, _, _| (),
-        |_, _, _, _, _| {},
-        |_| {},
-    );
-    log_preview_stats(log_target, &state, stats);
-    stats.changed()
+    let mut tracker = tracker.borrow_mut();
+    if tracker.state.as_ref() == Some(&state) {
+        return false;
+    }
+    log_preview_state(log_target, &state);
+    tracker.state = Some(state);
+    true
 }
 
-fn log_preview_stats(log_target: &str, state: &RightPreviewState, stats: ReconcileStats) {
+fn log_preview_state(log_target: &str, state: &RightPreviewState) {
     match state {
         RightPreviewState::Home => {
-            log::debug!("{log_target} preview reconcile state=home stats={stats:?}");
+            log::debug!("{log_target} preview apply state=home");
         }
         RightPreviewState::Loading { file_path } => {
             log::debug!(
-                "{log_target} preview reconcile state=loading path={} stats={stats:?}",
+                "{log_target} preview apply state=loading path={}",
                 file_path
             );
         }
@@ -86,7 +90,7 @@ fn log_preview_stats(log_target: &str, state: &RightPreviewState, stats: Reconci
             fingerprint,
         } => {
             log::debug!(
-                "{log_target} preview reconcile state=diff path={} rows={} fingerprint={:016x} stats={stats:?}",
+                "{log_target} preview apply state=diff path={} rows={} fingerprint={:016x}",
                 file_path,
                 row_count,
                 fingerprint
@@ -98,7 +102,7 @@ fn log_preview_stats(log_target: &str, state: &RightPreviewState, stats: Reconci
             fingerprint,
         } => {
             log::debug!(
-                "{log_target} preview reconcile state=binary path={} kind={:?} fingerprint={:016x} stats={stats:?}",
+                "{log_target} preview apply state=binary path={} kind={:?} fingerprint={:016x}",
                 file_path,
                 kind,
                 fingerprint
@@ -106,7 +110,7 @@ fn log_preview_stats(log_target: &str, state: &RightPreviewState, stats: Reconci
         }
         RightPreviewState::Unavailable { file_path, message } => {
             log::debug!(
-                "{log_target} preview reconcile state=unavailable path={} message_bytes={} stats={stats:?}",
+                "{log_target} preview apply state=unavailable path={} message_bytes={}",
                 file_path,
                 message.len()
             );
