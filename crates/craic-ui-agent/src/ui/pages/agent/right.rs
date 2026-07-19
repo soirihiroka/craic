@@ -925,6 +925,23 @@ impl AgentChat {
         );
         let title_locked = Rc::new(Cell::new(!provider::is_default_agent_title(title)));
         let local_history_id = Rc::new(Cell::new(local_history_id));
+        if provider.provider_id() == "codex" {
+            terminal.set_copy_all_text_provider({
+                let local_history_id = local_history_id.clone();
+                move || {
+                    let local_id = local_history_id.get()?;
+                    match agent_history::codex_session_transcript(local_id) {
+                        Ok(transcript) => transcript,
+                        Err(err) => {
+                            log::warn!(
+                                "agent Codex Copy All transcript failed local_id={local_id}: {err}"
+                            );
+                            None
+                        }
+                    }
+                }
+            });
+        }
         connect_title_updates(
             session_id,
             session_uuid,

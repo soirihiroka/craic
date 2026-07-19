@@ -39,6 +39,7 @@ const SCROLL_LINES_PER_WHEEL_STEP: i32 = 3;
 type ExitHandlers = Rc<RefCell<Vec<Box<dyn Fn(ExitStatus)>>>>;
 type TitleHandlers = Rc<RefCell<Vec<Box<dyn Fn(String)>>>>;
 type ActivationHandlers = Rc<RefCell<Vec<Box<dyn Fn(TerminalActivation)>>>>;
+type CopyAllTextProvider = Rc<dyn Fn() -> Option<String>>;
 
 #[derive(Clone, Copy)]
 enum TerminalContextAction {
@@ -112,6 +113,7 @@ struct UiState {
     syncing_scrollbar: bool,
     exited: bool,
     event_subscription: Option<command_mailbox::UiCommandSubscription>,
+    copy_all_text_provider: Option<CopyAllTextProvider>,
 }
 
 struct TerminalEngine {
@@ -261,13 +263,35 @@ impl TerminalEngine {
     fn all_text(&self) -> String {
         let term = self.term.lock();
         let grid = term.grid();
-        term.bounds_to_string(
-            Point::new(Line(-(grid.history_size() as i32)), Column(0)),
-            Point::new(
-                Line(grid.screen_lines().saturating_sub(1) as i32),
-                Column(grid.columns().saturating_sub(1)),
-            ),
-        )
+        let mode = *term.mode();
+        let mut text = term.primary_buffer_to_string();
+        let primary_bytes = text.len();
+        let mut alternate_bytes = 0;
+        if mode.contains(TermMode::ALT_SCREEN) {
+            let alternate = term.bounds_to_string(
+                Point::new(Line(-(grid.display_offset() as i32)), Column(0)),
+                Point::new(
+                    Line(
+                        -(grid.display_offset() as i32)
+                            + grid.screen_lines().saturating_sub(1) as i32,
+                    ),
+                    Column(grid.columns().saturating_sub(1)),
+                ),
+            );
+            alternate_bytes = alternate.len();
+            if !text.is_empty() && !alternate.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&alternate);
+        }
+        log::debug!(
+            "terminal full text extracted alt_screen={} primary_bytes={} alternate_bytes={} total_bytes={}",
+            mode.contains(TermMode::ALT_SCREEN),
+            primary_bytes,
+            alternate_bytes,
+            text.len()
+        );
+        text
     }
 
     fn select_all(&self) {
@@ -424,6 +448,7 @@ impl AlacrittyTerminal {
             syncing_scrollbar: false,
             exited: false,
             event_subscription: None,
+            copy_all_text_provider: None,
         }));
 
         install_gl_lifecycle(&area, &state);
@@ -512,6 +537,10 @@ impl AlacrittyTerminal {
             .activation_handlers
             .borrow_mut()
             .push(Box::new(callback));
+    }
+
+    pub fn set_copy_all_text_provider<F: Fn() -> Option<String> + 'static>(&self, provider: F) {
+        self.state.borrow_mut().copy_all_text_provider = Some(Rc::new(provider));
     }
 
     pub fn title(&self) -> Option<String> {
@@ -641,9 +670,14 @@ impl AlacrittyTerminal {
     }
 
     pub fn all_text(&self) -> Option<String> {
-        let state = self.state.borrow();
-        let engine = state.engine.as_ref()?;
-        Some(engine.all_text())
+        let provider = self.state.borrow().copy_all_text_provider.clone();
+        provider.and_then(|provider| provider()).or_else(|| {
+            self.state
+                .borrow()
+                .engine
+                .as_ref()
+                .map(TerminalEngine::all_text)
+        })
     }
 
     pub fn cursor_row(&self) -> Option<i64> {
@@ -1852,9 +1886,11 @@ fn install_context_menu(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                             }
                         }
                         TerminalContextAction::CopyAll => {
-                            if let Some(text) =
+                            let provider = state.borrow().copy_all_text_provider.clone();
+                            let text = provider.and_then(|provider| provider()).or_else(|| {
                                 state.borrow().engine.as_ref().map(TerminalEngine::all_text)
-                            {
+                            });
+                            if let Some(text) = text {
                                 area.clipboard().set_text(&text);
                             }
                         }

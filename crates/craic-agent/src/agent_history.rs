@@ -3,6 +3,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_ite
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -613,6 +614,90 @@ pub fn map_codex_session(local_id: i64) -> Result<CodexMappingOutcome, String> {
             Err(err)
         }
     }
+}
+
+pub fn codex_session_transcript(local_id: i64) -> Result<Option<String>, String> {
+    let Some(row) = lookup_session(local_id)? else {
+        return Ok(None);
+    };
+    if row.provider_id != "codex" {
+        return Ok(None);
+    }
+    let Some(thread_id) = row
+        .cli_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(state_path) = newest_usable_codex_state_db() else {
+        return Ok(None);
+    };
+    let conn = Connection::open_with_flags(&state_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|err| format!("Failed to open Codex state {}: {err}", state_path.display()))?;
+    conn.pragma_update(None, "busy_timeout", DB_BUSY_TIMEOUT_MS)
+        .map_err(db_error)?;
+    let rollout_path = conn
+        .query_row(
+            "SELECT rollout_path FROM threads WHERE id = ?1",
+            params![thread_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let Some(rollout_path) = rollout_path.filter(|path| !path.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let file = fs::File::open(&rollout_path)
+        .map_err(|err| format!("Failed to open Codex rollout {rollout_path}: {err}"))?;
+    let mut transcript = String::new();
+    let mut message_count = 0;
+    let mut malformed_lines = 0;
+
+    for line in BufReader::new(file).lines() {
+        let line =
+            line.map_err(|err| format!("Failed to read Codex rollout {rollout_path}: {err}"))?;
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            malformed_lines += 1;
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        let Some(payload) = event.get("payload") else {
+            continue;
+        };
+        let role = match payload.get("type").and_then(Value::as_str) {
+            Some("user_message") => "User",
+            Some("agent_message") => "Assistant",
+            _ => continue,
+        };
+        let Some(message) = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        else {
+            continue;
+        };
+        if !transcript.is_empty() {
+            transcript.push_str("\n\n");
+        }
+        transcript.push_str(role);
+        transcript.push_str(":\n");
+        transcript.push_str(message);
+        message_count += 1;
+    }
+
+    log::debug!(
+        "agent Codex transcript extracted local_id={} messages={} bytes={} malformed_lines={}",
+        local_id,
+        message_count,
+        transcript.len(),
+        malformed_lines
+    );
+    Ok((!transcript.is_empty()).then_some(transcript))
 }
 
 fn history_connection() -> Result<Connection, rusqlite::Error> {
