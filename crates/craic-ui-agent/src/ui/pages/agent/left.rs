@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::ui::agent_history::{self, AgentSessionRow, RestoreState, WorkspaceKey, WorkspaceTag};
 use crate::ui::agent_status::{AgentActiveState, AgentInactiveState, AgentSessionState};
@@ -81,7 +81,39 @@ pub struct AgentList {
     loading: Rc<Cell<bool>>,
     history_monitor: Rc<RefCell<Option<gio::FileMonitor>>>,
     debounce_source: Rc<RefCell<Option<glib::SourceId>>>,
+    history_db_signature: Rc<RefCell<HistoryDbSignature>>,
+    history_monitor_stats: Rc<RefCell<HistoryMonitorStats>>,
     active_context_menu: Rc<RefCell<Option<gtk::Popover>>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HistoryDbSignature {
+    database: Option<HistoryDbFileSignature>,
+    wal: Option<HistoryDbFileSignature>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryDbFileSignature {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+struct HistoryMonitorStats {
+    started_at: Instant,
+    raw_events: u64,
+    suppressed_events: u64,
+    reloads: u64,
+}
+
+impl Default for HistoryMonitorStats {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+            raw_events: 0,
+            suppressed_events: 0,
+            reloads: 0,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -145,6 +177,9 @@ enum AgentRowRenderState {
 
 impl AgentList {
     pub fn new() -> Self {
+        if let Err(err) = agent_history::initialize_history_database() {
+            log::warn!("agent history database initialization failed: {err}");
+        }
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
         list.add_css_class("navigation-sidebar");
@@ -225,6 +260,8 @@ impl AgentList {
             loading: Rc::new(Cell::new(false)),
             history_monitor: Rc::new(RefCell::new(None)),
             debounce_source: Rc::new(RefCell::new(None)),
+            history_db_signature: Rc::new(RefCell::new(HistoryDbSignature::default())),
+            history_monitor_stats: Rc::new(RefCell::new(HistoryMonitorStats::default())),
             active_context_menu: Rc::new(RefCell::new(None)),
         };
         agent_list.connect_search();
@@ -283,6 +320,7 @@ impl AgentList {
             return;
         }
 
+        self.acknowledge_history_db_signature();
         self.spawn_history_load(false);
     }
 
@@ -291,6 +329,7 @@ impl AgentList {
             return;
         }
 
+        self.acknowledge_history_db_signature();
         self.spawn_history_load(true);
     }
 
@@ -773,6 +812,21 @@ impl AgentList {
             monitor.cancel();
         }
 
+        {
+            let stats = self.history_monitor_stats.borrow();
+            if stats.raw_events > 0 || stats.reloads > 0 {
+                log::info!(
+                    "agent history monitor stopped lifetime_ms={} raw_events={} suppressed_events={} reloads={}",
+                    stats.started_at.elapsed().as_millis(),
+                    stats.raw_events,
+                    stats.suppressed_events,
+                    stats.reloads
+                );
+            }
+        }
+        self.history_monitor_stats
+            .replace(HistoryMonitorStats::default());
+
         let Some(craic_dir) = crate::config::craic_dir() else {
             log::debug!("agent history monitor skipped because HOME is not set");
             return;
@@ -784,6 +838,8 @@ impl AgentList {
             );
             return;
         }
+        self.history_db_signature
+            .replace(history_db_signature(&craic_dir));
 
         let file = gio::File::for_path(&craic_dir);
         let flags = gio::FileMonitorFlags::WATCH_MOVES | gio::FileMonitorFlags::SEND_MOVED;
@@ -803,6 +859,7 @@ impl AgentList {
 
             move |_, file, other_file, event_type| {
                 if history_monitor_event_should_reload(file, other_file, event_type) {
+                    agent_list.history_monitor_stats.borrow_mut().raw_events += 1;
                     agent_list.queue_history_reload();
                 }
             }
@@ -818,10 +875,52 @@ impl AgentList {
         let agent_list = self.clone();
         let source_id = glib::timeout_add_local(HISTORY_DB_REFRESH_DEBOUNCE, move || {
             agent_list.debounce_source.borrow_mut().take();
-            agent_list.reload_workspace_history();
+            if agent_list.loading.get() {
+                agent_list.queue_history_reload();
+                return glib::ControlFlow::Break;
+            }
+            if agent_list.history_db_changed() {
+                let mut stats = agent_list.history_monitor_stats.borrow_mut();
+                stats.reloads += 1;
+                log::debug!(
+                    "agent history monitor reloading raw_events={} suppressed_events={} reloads={}",
+                    stats.raw_events,
+                    stats.suppressed_events,
+                    stats.reloads
+                );
+                drop(stats);
+                agent_list.reload_workspace_history();
+            } else {
+                let mut stats = agent_list.history_monitor_stats.borrow_mut();
+                stats.suppressed_events += 1;
+                if stats.suppressed_events == 1 {
+                    log::debug!("agent history monitor suppressed sidecar-only database events");
+                }
+            }
             glib::ControlFlow::Break
         });
         self.debounce_source.replace(Some(source_id));
+    }
+
+    fn acknowledge_history_db_signature(&self) {
+        let Some(craic_dir) = crate::config::craic_dir() else {
+            return;
+        };
+        self.history_db_signature
+            .replace(history_db_signature(&craic_dir));
+    }
+
+    fn history_db_changed(&self) -> bool {
+        let Some(craic_dir) = crate::config::craic_dir() else {
+            return false;
+        };
+        let next = history_db_signature(&craic_dir);
+        let mut current = self.history_db_signature.borrow_mut();
+        if *current == next {
+            return false;
+        }
+        *current = next;
+        true
     }
 
     fn apply_tags(&self, tags: Vec<WorkspaceTag>) {
@@ -1906,7 +2005,9 @@ fn history_monitor_event_should_reload(
 ) -> bool {
     if matches!(
         event_type,
-        gio::FileMonitorEvent::PreUnmount | gio::FileMonitorEvent::Unmounted
+        gio::FileMonitorEvent::AttributeChanged
+            | gio::FileMonitorEvent::PreUnmount
+            | gio::FileMonitorEvent::Unmounted
     ) {
         return false;
     }
@@ -1917,13 +2018,28 @@ fn history_monitor_event_should_reload(
         .any(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    matches!(
-                        name,
-                        "sessions.sqlite" | "sessions.sqlite-wal" | "sessions.sqlite-shm"
-                    )
-                })
+                .is_some_and(|name| matches!(name, "sessions.sqlite" | "sessions.sqlite-wal"))
         })
+}
+
+fn history_db_signature(craic_dir: &std::path::Path) -> HistoryDbSignature {
+    let database = history_db_file_signature(&craic_dir.join("sessions.sqlite"), false);
+    let wal = history_db_file_signature(&craic_dir.join("sessions.sqlite-wal"), true);
+    HistoryDbSignature { database, wal }
+}
+
+fn history_db_file_signature(
+    path: &std::path::Path,
+    ignore_empty: bool,
+) -> Option<HistoryDbFileSignature> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if ignore_empty && metadata.len() == 0 {
+        return None;
+    }
+    Some(HistoryDbFileSignature {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 fn adjustment_is_near_bottom(adjustment: &gtk::Adjustment) -> bool {

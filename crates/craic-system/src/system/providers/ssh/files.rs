@@ -841,10 +841,9 @@ impl FileAccess for SshFileAccess {
             )
         };
         log::info!(
-            "ssh file watch registered workspace={} paths={} recursive={} interval_secs={}",
+            "ssh file watch registered workspace={} paths={} interval_secs={}",
             self.workspace.display_name,
             requested.len(),
-            request.recursive,
             SSH_FILE_WATCH_POLL_INTERVAL.as_secs()
         );
         Ok(FileWatchSubscription::spawn_signature_map_loop(

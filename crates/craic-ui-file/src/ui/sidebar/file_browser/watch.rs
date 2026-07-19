@@ -49,7 +49,7 @@ impl FileBrowser {
         let (changes_sender, changes_receiver) = mpsc::channel();
         let (stop_sender, stop_receiver) = mpsc::channel();
         let debounce_workspace = signature.workspace_id.clone();
-        thread::spawn(move || {
+        let debounce_thread = thread::spawn(move || {
             debounce_file_watch_events(
                 debounce_workspace,
                 generation,
@@ -62,7 +62,6 @@ impl FileBrowser {
 
         let request = FileWatchRequest {
             paths: signature.directories.clone(),
-            recursive: false,
         };
         let callback: FileWatchCallback = Arc::new(move |changes| {
             let _ = changes_sender.send(changes);
@@ -87,6 +86,7 @@ impl FileBrowser {
 
         if subscriptions.is_empty() {
             let _ = stop_sender.send(());
+            let _ = debounce_thread.join();
             return;
         }
 
@@ -95,6 +95,8 @@ impl FileBrowser {
         self.file_watch_event_subscription
             .replace(Some(event_subscription));
         self.file_watch_debounce_stop.replace(Some(stop_sender));
+        self.file_watch_debounce_thread
+            .replace(Some(debounce_thread));
     }
 
     pub fn stop_file_watch_scope(&self) {
@@ -102,6 +104,11 @@ impl FileBrowser {
             .set(self.file_watch_generation.get().wrapping_add(1).max(1));
         if let Some(stop_sender) = self.file_watch_debounce_stop.borrow_mut().take() {
             let _ = stop_sender.send(());
+        }
+        if let Some(thread) = self.file_watch_debounce_thread.borrow_mut().take()
+            && thread.join().is_err()
+        {
+            log::warn!("file browser debounce worker join failed");
         }
         self.file_watch_event_subscription.borrow_mut().take();
         self.file_watch_subscriptions.borrow_mut().clear();

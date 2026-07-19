@@ -19,12 +19,13 @@ use crate::ui::content::code_editor;
 use crate::ui::file_type;
 use crate::ui::sidebar::file_browser::{ContainerFileAction, FileBrowser};
 use adw::prelude::*;
+use craic_ui_core::ui::command_mailbox;
 use craic_ui_preview::markdown_preview::MarkdownPreviewDocument;
 use gtk::glib;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 const MAX_EDITOR_FILE_BYTES: u64 = 1024 * 1024;
@@ -77,7 +78,7 @@ struct OpenedFileMonitorTarget {
 struct OpenedFileMonitor {
     target: RefCell<Option<OpenedFileMonitorTarget>>,
     subscription: RefCell<Option<FileWatchSubscription>>,
-    event_source: RefCell<Option<glib::SourceId>>,
+    event_subscription: RefCell<Option<command_mailbox::UiCommandSubscription>>,
     debounce_source: RefCell<Option<glib::SourceId>>,
     generation: Cell<u64>,
     displayed_preview: DisplayedPreviewState,
@@ -105,7 +106,7 @@ impl OpenedFileMonitor {
         Rc::new(Self {
             target: RefCell::new(None),
             subscription: RefCell::new(None),
-            event_source: RefCell::new(None),
+            event_subscription: RefCell::new(None),
             debounce_source: RefCell::new(None),
             generation: Cell::new(0),
             displayed_preview,
@@ -155,15 +156,24 @@ impl OpenedFileMonitor {
 
         let request = FileWatchRequest {
             paths: vec![node_path.clone()],
-            recursive: false,
         };
-        let (sender, receiver) = mpsc::channel();
-        let sender = Arc::new(Mutex::new(sender));
-        let callback: FileWatchCallback = Arc::new(move |changes| {
-            if let Ok(sender) = sender.lock() {
-                let _ = sender.send(changes);
+        let monitor_state = Rc::downgrade(self);
+        let ctx = ctx.clone();
+        let right = Rc::clone(right);
+        let pending_save = pending_save.clone();
+        let watched_path = node_path.clone();
+        let (events, event_subscription) = command_mailbox::latest(move |changes| {
+            let Some(monitor_state) = monitor_state.upgrade() else {
+                return;
+            };
+            if monitor_state.generation.get() != generation {
+                return;
+            }
+            if file_watch_changes_include_path(&changes, &watched_path) {
+                monitor_state.queue_reload(&ctx, &right, &pending_save, generation);
             }
         });
+        let callback: FileWatchCallback = Arc::new(move |changes| events.send(changes));
         let subscription = match files.watch(request, callback) {
             Ok(subscription) => subscription,
             Err(err) => {
@@ -175,32 +185,8 @@ impl OpenedFileMonitor {
                 return;
             }
         };
-
-        let monitor_state = Rc::clone(self);
-        let ctx = ctx.clone();
-        let right = Rc::clone(right);
-        let pending_save = pending_save.clone();
-        let watched_path = node_path.clone();
-        let source_id = glib::timeout_add_local(FILE_EVENT_POLL_INTERVAL, move || {
-            if monitor_state.generation.get() != generation {
-                return glib::ControlFlow::Break;
-            }
-
-            let mut should_reload = false;
-            while let Ok(changes) = receiver.try_recv() {
-                if file_watch_changes_include_path(&changes, &watched_path) {
-                    should_reload = true;
-                }
-            }
-
-            if should_reload {
-                monitor_state.queue_reload(&ctx, &right, &pending_save, generation);
-            }
-
-            glib::ControlFlow::Continue
-        });
         self.subscription.replace(Some(subscription));
-        self.event_source.replace(Some(source_id));
+        self.event_subscription.replace(Some(event_subscription));
     }
 
     fn mark_missing(&self, workspace: &WorkspaceRef, node_path: &FileNodePath) {
@@ -235,9 +221,7 @@ impl OpenedFileMonitor {
         if let Some(source_id) = self.debounce_source.borrow_mut().take() {
             source_id.remove();
         }
-        if let Some(source_id) = self.event_source.borrow_mut().take() {
-            source_id.remove();
-        }
+        self.event_subscription.borrow_mut().take();
         self.subscription.borrow_mut().take();
         self.target.borrow_mut().take();
     }

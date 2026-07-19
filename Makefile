@@ -28,7 +28,7 @@ DOCS_DIR := docs
 DOCS_SOURCE_DIR := $(DOCS_DIR)/source
 DOCS_BUILD_DIR := $(DOCS_DIR)/build
 
-.PHONY: dev run build release check test doc clean install uninstall
+.PHONY: dev run build release check test doc resource-watch clean install uninstall
 
 dev:
 	RUST_LOG=$(RUST_LOG) $(CARGO) run
@@ -49,6 +49,10 @@ test:
 
 doc:
 	$(UV) run --locked --project "$(DOCS_DIR)" sphinx-build -b html -j auto -W --keep-going "$(DOCS_SOURCE_DIR)" "$(DOCS_BUILD_DIR)"
+
+resource-watch:
+	@test -n "$(PID)" || { echo "usage: make resource-watch PID=<craic-pid> [INTERVAL=<seconds>]" >&2; exit 2; }
+	./tools/watch-craic-resources.sh "$(PID)" "$(or $(INTERVAL),5)"
 
 clean:
 	$(CARGO) clean
