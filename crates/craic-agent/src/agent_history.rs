@@ -145,6 +145,10 @@ pub fn default_title_should_persist(title: &str) -> bool {
         )
 }
 
+pub fn initialize_history_database() -> Result<(), String> {
+    history_connection().map(|_| ()).map_err(db_error)
+}
+
 pub fn upsert_session(input: AgentSessionUpsert) -> Result<AgentSessionRow, String> {
     let title = normalize_title(&input.title);
     if !default_title_should_persist(&title) {
@@ -258,7 +262,7 @@ pub fn list_sessions(
     title_query: Option<&str>,
     tag_filters: &[String],
 ) -> Result<Vec<AgentSessionRow>, String> {
-    let conn = history_connection().map_err(db_error)?;
+    let conn = history_read_connection().map_err(db_error)?;
     let normalized_query = title_query
         .map(normalize_title_for_match)
         .filter(|query| !query.is_empty());
@@ -406,7 +410,7 @@ pub fn workspace_tags(workspace_key: &str) -> Result<Vec<String>, String> {
 }
 
 pub fn workspace_tag_counts(workspace_key: &str) -> Result<Vec<WorkspaceTag>, String> {
-    let conn = history_connection().map_err(db_error)?;
+    let conn = history_read_connection().map_err(db_error)?;
     let mut stmt = conn
         .prepare(
             "SELECT MIN(tag.tag), COUNT(*)
@@ -749,6 +753,21 @@ fn history_connection() -> Result<Connection, rusqlite::Error> {
             ON agent_session_tags(normalized_tag, session_id);",
     )?;
     ensure_history_columns(&conn)?;
+    Ok(conn)
+}
+
+fn history_read_connection() -> Result<Connection, rusqlite::Error> {
+    let Some(path) = crate::config::sessions_db_path() else {
+        return Err(rusqlite::Error::InvalidPath(PathBuf::from(
+            "HOME is not set",
+        )));
+    };
+    if !path.is_file() {
+        return history_connection();
+    }
+
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.pragma_update(None, "busy_timeout", DB_BUSY_TIMEOUT_MS)?;
     Ok(conn)
 }
 

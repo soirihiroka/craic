@@ -15,6 +15,29 @@ Useful development commands are exposed by the project Makefile:
 
 Run ``cargo fmt`` before submitting Rust changes.
 
+Resource diagnostics
+--------------------
+
+Watcher lifecycle logs include stable subscription identifiers, active watcher
+counts, watched path counts, callback batches, and teardown summaries. Enable
+the relevant debug logs while reproducing a slowdown:
+
+.. code-block:: console
+
+   $ RUST_LOG=craic_system=debug,craic_ui_agent=debug,craic_ui_file=debug make run
+
+In a second terminal, sample the running process. The output is tab-separated
+and tracks CPU, resident memory, threads, file descriptors, descendant
+processes, and inotify marks over time:
+
+.. code-block:: console
+
+   $ make resource-watch PID=$(pgrep -n -x craic) INTERVAL=5
+
+Repeat the operation under investigation and verify that thread, descriptor,
+inotify, and memory counts return to a stable baseline after subscriptions are
+closed or workspaces are changed.
+
 Documentation
 -------------
 

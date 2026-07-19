@@ -106,6 +106,7 @@ pub struct FileBrowser {
     file_watch_event_subscription:
         RefCell<Option<craic_ui_core::ui::command_mailbox::UiCommandSubscription>>,
     file_watch_debounce_stop: RefCell<Option<std::sync::mpsc::Sender<()>>>,
+    file_watch_debounce_thread: RefCell<Option<std::thread::JoinHandle<()>>>,
     git_ignore_cache: RefCell<GitIgnoreCache>,
     git_ignore_generation: Rc<Cell<u64>>,
     git_ignore_rules_signature: RefCell<Option<Vec<GitIgnoreRuleFileSignature>>>,
@@ -204,6 +205,7 @@ impl FileBrowser {
             file_watch_subscriptions: RefCell::new(Vec::new()),
             file_watch_event_subscription: RefCell::new(None),
             file_watch_debounce_stop: RefCell::new(None),
+            file_watch_debounce_thread: RefCell::new(None),
             git_ignore_cache: RefCell::new(GitIgnoreCache::default()),
             git_ignore_generation: Rc::new(Cell::new(0)),
             git_ignore_rules_signature: RefCell::new(None),

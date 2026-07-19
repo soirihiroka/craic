@@ -5,7 +5,7 @@ mod shell;
 mod terminal_link;
 
 use self::docker::LocalDockerAccess;
-use self::files::LocalFileAccess;
+use self::files::{LocalFileAccess, LocalFileWatchService};
 use self::open::LocalDesktopOpenAccess;
 use self::shell::LocalShellAccess;
 use self::terminal_link::LocalTerminalLinkAccess;
@@ -22,17 +22,19 @@ use crate::system::provider::{
     ProviderWorkspaceEntry, ProviderWorkspaceListRequest, ProviderWorkspaceSource, SystemProvider,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Debug)]
 pub struct LocalProvider {
     system: SystemRef,
+    file_watch_service: Arc<OnceLock<Arc<LocalFileWatchService>>>,
 }
 
 impl LocalProvider {
     pub fn new() -> Self {
         Self {
             system: SystemRef::new(SystemId::new("local"), ProviderKind::Local, None),
+            file_watch_service: Arc::new(OnceLock::new()),
         }
     }
 
@@ -140,6 +142,9 @@ impl SystemProvider for LocalProvider {
         Some(Arc::new(LocalFileAccess::new(
             self.system.clone(),
             workspace.clone(),
+            self.file_watch_service
+                .get_or_init(LocalFileWatchService::new)
+                .clone(),
         )))
     }
 

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc,
 };
 use std::thread;
@@ -213,8 +213,8 @@ pub struct DirectoryListing {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileWatchRequest {
+    /// Files are watched exactly. Directories report changes to their immediate children.
     pub paths: Vec<FileNodePath>,
-    pub recursive: bool,
 }
 
 pub type FileWatchChanges = HashSet<FileNodePath>;
@@ -418,11 +418,29 @@ pub fn file_operation_canceled(cancel_requested: &Option<FileCancellation>) -> b
 }
 
 pub struct FileWatchSubscription {
-    stop_sender: Option<mpsc::Sender<()>>,
-    _thread: Option<thread::JoinHandle<()>>,
+    id: u64,
+    label: String,
+    started_at: Instant,
+    cancel: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
+static NEXT_FILE_WATCH_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_FILE_WATCH_SUBSCRIPTIONS: AtomicUsize = AtomicUsize::new(0);
+
 impl FileWatchSubscription {
+    pub(crate) fn new(label: impl Into<String>, cancel: impl FnOnce() + Send + 'static) -> Self {
+        let id = NEXT_FILE_WATCH_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let label = label.into();
+        let active = ACTIVE_FILE_WATCH_SUBSCRIPTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        log::info!("file watcher subscribed id={id} label={label} active={active}");
+        Self {
+            id,
+            label,
+            started_at: Instant::now(),
+            cancel: Some(Box::new(cancel)),
+        }
+    }
+
     pub fn spawn_signature_map_loop<F>(
         label: impl Into<String>,
         interval: Duration,
@@ -500,37 +518,26 @@ impl FileWatchSubscription {
             log::info!("file watcher stopped label={thread_label}");
         });
 
-        Self {
-            stop_sender: Some(stop_sender),
-            _thread: Some(thread),
-        }
-    }
-
-    pub fn spawn_thread<F>(label: impl Into<String>, run: F) -> Self
-    where
-        F: FnOnce(mpsc::Receiver<()>) + Send + 'static,
-    {
-        let label = label.into();
-        let (stop_sender, stop_receiver) = mpsc::channel();
-        let thread_label = label.clone();
-        let thread = thread::spawn(move || {
-            log::info!("file watcher thread started label={thread_label}");
-            run(stop_receiver);
-            log::info!("file watcher thread stopped label={thread_label}");
-        });
-
-        Self {
-            stop_sender: Some(stop_sender),
-            _thread: Some(thread),
-        }
+        Self::new(label, move || {
+            let _ = stop_sender.send(());
+            drop(thread);
+        })
     }
 }
 
 impl Drop for FileWatchSubscription {
     fn drop(&mut self) {
-        if let Some(stop_sender) = self.stop_sender.take() {
-            let _ = stop_sender.send(());
+        if let Some(cancel) = self.cancel.take() {
+            cancel();
         }
+        let active = ACTIVE_FILE_WATCH_SUBSCRIPTIONS.fetch_sub(1, Ordering::Relaxed) - 1;
+        log::info!(
+            "file watcher unsubscribed id={} label={} lifetime_ms={} active={}",
+            self.id,
+            self.label,
+            self.started_at.elapsed().as_millis(),
+            active
+        );
     }
 }
 
