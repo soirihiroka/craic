@@ -1221,19 +1221,14 @@ fn maybe_start_smart_summary(
         return;
     }
 
-    if let Err(err) = start_smart_summary(
+    if start_smart_summary(
         session,
         workspace_history,
         history_callback,
         SmartSummaryMode::Automatic,
-    ) {
-        log::debug!(
-            "agent smart summary automatic start skipped session_id={} provider={} error={}",
-            session.id,
-            session.provider.provider_id(),
-            err
-        );
-    }
+    )
+    .is_err()
+    {}
 }
 
 fn start_smart_summary(
