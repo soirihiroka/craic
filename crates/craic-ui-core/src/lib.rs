@@ -4,5 +4,4 @@ pub use craic_project::workspace_config;
 pub use craic_system::system;
 pub use craic_vcs::{git, github};
 
-pub mod reconcile;
 pub mod ui;

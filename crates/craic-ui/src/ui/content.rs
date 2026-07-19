@@ -15,7 +15,6 @@ use crate::ui::components::tabbed_picker::{
 use crate::ui::pages::{PageCommand, PageCommandResult};
 use crate::workspace_config::QuickActionConfig;
 use adw::prelude::*;
-use craic_ui_core::reconcile::{Element, PartialEqRenderState};
 use gtk::{gio, pango};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -979,22 +978,6 @@ struct QuickActionButton {
     saved_selected_target_id: Rc<RefCell<Option<String>>>,
     runner: Rc<RefCell<Option<Rc<dyn Fn(RunItem)>>>>,
     state_changed: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
-    target_reconciler: Rc<RefCell<QuickActionTargetReconciler>>,
-}
-
-type QuickActionTargetReconciler =
-    craic_ui_core::reconcile::gtk::ListBoxReconciler<String, QuickActionTargetRenderState>;
-
-#[derive(Clone, PartialEq, Eq)]
-enum QuickActionTargetRenderState {
-    Target {
-        label: String,
-        icon_name: String,
-        selected: bool,
-    },
-    Empty {
-        label: String,
-    },
 }
 
 fn install_quick_action_css() {
@@ -1131,7 +1114,6 @@ impl QuickActionButton {
             saved_selected_target_id: Rc::new(RefCell::new(saved_selected_target_id)),
             runner,
             state_changed,
-            target_reconciler: Rc::new(RefCell::new(QuickActionTargetReconciler::new())),
         });
         quick_action.refresh();
         quick_action.connect_search();
@@ -1184,7 +1166,6 @@ impl QuickActionButton {
             .map(|target| target.id.clone());
         fill_quick_action_targets(
             &self.list,
-            &self.target_reconciler,
             &targets,
             &self.search_entry.text(),
             selected_id.as_deref(),
@@ -1196,8 +1177,6 @@ impl QuickActionButton {
             let list = self.list.clone();
             let targets = self.targets.clone();
             let selected_target = self.selected_target.clone();
-            let target_reconciler = self.target_reconciler.clone();
-
             move |entry| {
                 let selected_id = selected_target
                     .borrow()
@@ -1205,7 +1184,6 @@ impl QuickActionButton {
                     .map(|target| target.id.clone());
                 fill_quick_action_targets(
                     &list,
-                    &target_reconciler,
                     &targets.borrow(),
                     &entry.text(),
                     selected_id.as_deref(),
@@ -1279,7 +1257,6 @@ impl QuickActionButton {
 
             popover.connect_show({
                 let list = self.list.clone();
-                let target_reconciler = self.target_reconciler.clone();
                 let targets = self.targets.clone();
                 let search_entry = self.search_entry.clone();
                 let selected_target = self.selected_target.clone();
@@ -1290,7 +1267,6 @@ impl QuickActionButton {
                         .map(|target| target.id.clone());
                     fill_quick_action_targets(
                         &list,
-                        &target_reconciler,
                         &targets.borrow(),
                         &search_entry.text(),
                         selected_id.as_deref(),
@@ -1439,13 +1415,16 @@ fn save_quick_action_state<C: RepositoryActionContext>(
 
 fn fill_quick_action_targets(
     list: &gtk::ListBox,
-    reconciler: &Rc<RefCell<QuickActionTargetReconciler>>,
     targets: &[RunItem],
     filter: &str,
     selected_id: Option<&str>,
 ) {
     let filter = filter.trim().to_lowercase();
-    let mut elements = Vec::new();
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+
+    let mut added = 0;
 
     for target in targets {
         if !filter.is_empty() && !target.label.to_lowercase().contains(&filter) {
@@ -1453,47 +1432,23 @@ fn fill_quick_action_targets(
         }
 
         let selected = selected_id.map_or(false, |id| id == target.id);
-        elements.push(Element::new(
-            target.id.clone(),
-            QuickActionTargetRenderState::Target {
-                label: target.label.clone(),
-                icon_name: target.icon_name.clone(),
-                selected,
-            },
+        list.append(&quick_action_target_row(
+            &target.id,
+            &target.label,
+            &target.icon_name,
+            selected,
         ));
+        added += 1;
     }
 
-    if elements.is_empty() {
+    if added == 0 {
         let label = if targets.is_empty() {
             "No quick actions found"
         } else {
             "No matching quick actions"
         };
-        elements.push(Element::new(
-            "__empty__".to_string(),
-            QuickActionTargetRenderState::Empty {
-                label: label.to_string(),
-            },
-        ));
+        list.append(&quick_action_empty_row(label));
     }
-
-    reconciler.borrow_mut().reconcile(
-        list,
-        elements,
-        PartialEqRenderState,
-        |_, key, state| match state {
-            QuickActionTargetRenderState::Target {
-                label,
-                icon_name,
-                selected,
-            } => quick_action_target_row(key, label, icon_name.as_str(), *selected)
-                .upcast::<gtk::Widget>(),
-            QuickActionTargetRenderState::Empty { label } => {
-                quick_action_empty_row(label).upcast::<gtk::Widget>()
-            }
-        },
-        |_, widget, _, next| update_quick_action_target_row(widget, next),
-    );
 
     if let Some(selected_id) = selected_id {
         select_quick_action_row(list, selected_id);
@@ -1555,57 +1510,6 @@ fn quick_action_empty_row(label: &str) -> gtk::ListBoxRow {
     row.set_selectable(false);
     row.set_activatable(false);
     row
-}
-
-fn update_quick_action_target_row(widget: &gtk::Widget, state: &QuickActionTargetRenderState) {
-    let Ok(row) = widget.clone().downcast::<gtk::ListBoxRow>() else {
-        return;
-    };
-    match state {
-        QuickActionTargetRenderState::Target {
-            label,
-            icon_name,
-            selected,
-        } => {
-            row.set_selectable(true);
-            row.set_activatable(true);
-            if let Some(content) = row.child().and_downcast::<gtk::Box>() {
-                let mut child = content.first_child();
-                let mut icon_widget = None;
-                let mut label_widget = None;
-                let mut check_widget = None;
-
-                if let Some(w) = child {
-                    icon_widget = w.clone().downcast::<gtk::Image>().ok();
-                    child = w.next_sibling();
-                    if let Some(ref lw) = child {
-                        label_widget = lw.clone().downcast::<gtk::Label>().ok();
-                        child = lw.next_sibling();
-                        if let Some(ref cw) = child {
-                            check_widget = cw.clone().downcast::<gtk::Image>().ok();
-                        }
-                    }
-                }
-
-                if let Some(iw) = icon_widget {
-                    file_type::set_icon_for_name(&iw, icon_name.as_str());
-                }
-                if let Some(lw) = label_widget {
-                    lw.set_label(label);
-                }
-                if let Some(cw) = check_widget {
-                    cw.set_visible(*selected);
-                }
-            }
-        }
-        QuickActionTargetRenderState::Empty { label } => {
-            row.set_selectable(false);
-            row.set_activatable(false);
-            if let Some(label_widget) = row.child().and_downcast::<gtk::Label>() {
-                label_widget.set_label(label);
-            }
-        }
-    }
 }
 
 fn select_quick_action_row(list: &gtk::ListBox, selected_id: &str) {

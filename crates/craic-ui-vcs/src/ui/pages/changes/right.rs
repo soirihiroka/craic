@@ -1,5 +1,5 @@
-use super::super::preview_reconcile::{
-    RightPreviewReconciler, RightPreviewState, binary_state, diff_state, should_update_preview,
+use super::super::preview_state::{
+    RightPreviewState, RightPreviewTracker, binary_state, diff_state, should_apply_preview,
     unavailable_state,
 };
 use crate::git::{BytesComparison, FileComparison, RepositorySnapshot};
@@ -22,7 +22,7 @@ pub struct ChangesRight {
     diff: DiffView,
     file_preview: BinaryPreviewWidgets,
     pub suggestions_actions: SuggestionsActions,
-    preview_reconciler: RefCell<RightPreviewReconciler>,
+    preview_tracker: RefCell<RightPreviewTracker>,
 }
 
 impl ChangesRight {
@@ -81,7 +81,7 @@ impl ChangesRight {
             diff,
             file_preview,
             suggestions_actions: suggestions.actions,
-            preview_reconciler: RefCell::new(RightPreviewReconciler::new()),
+            preview_tracker: RefCell::new(RightPreviewTracker::new()),
         }
     }
 
@@ -115,15 +115,15 @@ impl ChangesRight {
     }
 
     pub fn show_home(&self) {
-        if !should_update_preview(&self.preview_reconciler, RightPreviewState::Home, "changes") {
+        if !should_apply_preview(&self.preview_tracker, RightPreviewState::Home, "changes") {
             return;
         }
         self.root.set_visible_child_name("suggestions");
     }
 
     pub fn show_loading(&self, file_path: &str) {
-        if !should_update_preview(
-            &self.preview_reconciler,
+        if !should_apply_preview(
+            &self.preview_tracker,
             RightPreviewState::Loading {
                 file_path: file_path.to_string(),
             },
@@ -135,8 +135,8 @@ impl ChangesRight {
     }
 
     pub fn show_comparison(&self, file_path: &str, comparison: &FileComparison) {
-        if !should_update_preview(
-            &self.preview_reconciler,
+        if !should_apply_preview(
+            &self.preview_tracker,
             diff_state(file_path, comparison),
             "changes",
         ) {
@@ -155,8 +155,8 @@ impl ChangesRight {
     }
 
     pub fn show_binary_comparison(&self, file_path: &str, comparison: &BytesComparison) {
-        if !should_update_preview(
-            &self.preview_reconciler,
+        if !should_apply_preview(
+            &self.preview_tracker,
             binary_state(file_path, comparison),
             "changes",
         ) {
@@ -178,8 +178,8 @@ impl ChangesRight {
     }
 
     pub fn show_preview_unavailable(&self, file_path: &str, message: &str) {
-        if !should_update_preview(
-            &self.preview_reconciler,
+        if !should_apply_preview(
+            &self.preview_tracker,
             unavailable_state(file_path, message),
             "changes",
         ) {

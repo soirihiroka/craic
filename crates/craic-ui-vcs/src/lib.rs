@@ -30,7 +30,7 @@ pub mod ui {
 
         mod changes;
         mod history;
-        mod preview_reconcile;
+        mod preview_state;
 
         pub use changes::ChangesPage;
         pub use history::HistoryPage;

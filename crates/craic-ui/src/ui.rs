@@ -25,6 +25,7 @@ use crate::system::{SystemProviderRegistry, SystemRef, WorkspacePath, WorkspaceR
 use adw::prelude::*;
 use app_menu::{app_menu, install_actions};
 use branch_actions::connect_branch_actions;
+use craic_ui_core::ui::command_mailbox;
 use dialogs::show_error_dialog;
 use dialogs::show_startup_crash_dialog;
 use git_actions::run_git_action;
@@ -34,13 +35,11 @@ use shell_actions::connect_shell_actions;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const JETBRAINS_MONO_DIR: &str = "JetBrainsMono";
-const GIT_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(75);
-
 struct StartupTimer {
     start: Instant,
     previous: Instant,
@@ -414,76 +413,64 @@ pub fn build_ui(
     }
 }
 
-enum GitWorkerCommand {
+enum WorkspaceModelCommand {
     ProviderSnapshot {
         workspace_key: String,
         git_handle: Arc<crate::git::GitRepoHandle>,
-        respond_to: mpsc::Sender<(String, Result<git::RepositorySnapshot, String>)>,
+        respond_to:
+            command_mailbox::UiCommandSender<(String, Result<git::RepositorySnapshot, String>)>,
     },
     ProviderWorkspaceSnapshot {
         workspace_key: String,
         git_handle: Arc<crate::git::GitRepoHandle>,
-        respond_to: mpsc::Sender<(String, Result<git::WorkspaceSnapshot, String>)>,
+        respond_to:
+            command_mailbox::UiCommandSender<(String, Result<git::WorkspaceSnapshot, String>)>,
     },
 }
 
-fn git_snapshot_worker() -> &'static mpsc::Sender<GitWorkerCommand> {
-    static WORKER: OnceLock<mpsc::Sender<GitWorkerCommand>> = OnceLock::new();
+fn workspace_model_worker() -> &'static mpsc::Sender<WorkspaceModelCommand> {
+    static WORKER: OnceLock<mpsc::Sender<WorkspaceModelCommand>> = OnceLock::new();
     WORKER.get_or_init(|| {
-        let (sender, receiver) = mpsc::channel::<GitWorkerCommand>();
+        let (sender, receiver) = mpsc::channel::<WorkspaceModelCommand>();
         thread::spawn(move || {
-            log::info!("git snapshot worker started");
+            log::info!("workspace model worker started");
 
             for command in receiver {
                 match command {
-                    GitWorkerCommand::ProviderSnapshot {
+                    WorkspaceModelCommand::ProviderSnapshot {
                         workspace_key,
                         git_handle,
                         respond_to,
                     } => {
                         let step_start = Instant::now();
-                        git_handle.snapshot(Box::new(move |result| {
-                            let status = if result.is_ok() { "ok" } else { "error" };
-                            log::info!(
-                                "git snapshot worker finished workspace={} status={} elapsed_ms={}",
-                                workspace_key,
-                                status,
-                                step_start.elapsed().as_millis()
-                            );
-                            if respond_to.send((workspace_key.clone(), result)).is_err() {
-                                log::warn!(
-                                    "git snapshot worker: provider response receiver disconnected for {}",
-                                    workspace_key,
-                                );
-                            }
-                        }));
+                        let result = git_handle.load_repository_snapshot();
+                        log::info!(
+                            "git snapshot worker finished workspace={} status={} elapsed_ms={}",
+                            workspace_key,
+                            if result.is_ok() { "ok" } else { "error" },
+                            step_start.elapsed().as_millis()
+                        );
+                        respond_to.send((workspace_key, result));
                     }
-                    GitWorkerCommand::ProviderWorkspaceSnapshot {
+                    WorkspaceModelCommand::ProviderWorkspaceSnapshot {
                         workspace_key,
                         git_handle,
                         respond_to,
                     } => {
                         let step_start = Instant::now();
-                        git_handle.workspace_snapshot(Box::new(move |result| {
-                            let status = if result.is_ok() { "ok" } else { "error" };
-                            log::info!(
-                                "git workspace snapshot worker finished workspace={} status={} elapsed_ms={}",
-                                workspace_key,
-                                status,
-                                step_start.elapsed().as_millis()
-                            );
-                            if respond_to.send((workspace_key.clone(), result)).is_err() {
-                                log::warn!(
-                                    "git workspace snapshot worker: provider response receiver disconnected for {}",
-                                    workspace_key,
-                                );
-                            }
-                        }));
+                        let result = git_handle.load_workspace_snapshot();
+                        log::info!(
+                            "git workspace snapshot worker finished workspace={} status={} elapsed_ms={}",
+                            workspace_key,
+                            if result.is_ok() { "ok" } else { "error" },
+                            step_start.elapsed().as_millis()
+                        );
+                        respond_to.send((workspace_key, result));
                     }
                 }
             }
 
-            log::warn!("git snapshot worker stopped");
+            log::warn!("workspace model worker stopped");
         });
 
         sender
@@ -498,53 +485,46 @@ pub(crate) fn request_provider_git_snapshot<F>(
     F: FnMut(String, Result<git::RepositorySnapshot, String>) + 'static,
 {
     let mut on_result = on_result;
-    let (sender, receiver) = mpsc::channel();
     let request_start = Instant::now();
+    let response = command_mailbox::once(
+        move |(key, result): (String, Result<git::RepositorySnapshot, String>)| {
+            match &result {
+                Ok(snapshot) => log::info!(
+                    "provider git snapshot received workspace={} elapsed_ms={} branch={} changed_files={} branches={}",
+                    key,
+                    request_start.elapsed().as_millis(),
+                    snapshot.branch,
+                    snapshot.changed_files.len(),
+                    snapshot.branches.len()
+                ),
+                Err(err) => log::warn!(
+                    "provider git snapshot failed workspace={} elapsed_ms={}: {}",
+                    key,
+                    request_start.elapsed().as_millis(),
+                    err
+                ),
+            }
+            on_result(key, result);
+        },
+    );
 
-    if let Err(err) = git_snapshot_worker().send(GitWorkerCommand::ProviderSnapshot {
+    if let Err(err) = workspace_model_worker().send(WorkspaceModelCommand::ProviderSnapshot {
         workspace_key: workspace_key.clone(),
         git_handle,
-        respond_to: sender,
+        respond_to: response,
     }) {
         log::error!("failed to enqueue provider git snapshot request for {workspace_key}: {err}");
-        on_result(
+        let WorkspaceModelCommand::ProviderSnapshot { respond_to, .. } = err.0 else {
+            unreachable!("snapshot send error returned a different command")
+        };
+        respond_to.send((
             workspace_key,
             Err("Git snapshot worker is unavailable.".to_string()),
-        );
+        ));
         return;
     }
 
     log::info!("provider git snapshot queued workspace={workspace_key}");
-
-    gtk::glib::timeout_add_local(GIT_SNAPSHOT_POLL_INTERVAL, move || {
-        match receiver.try_recv() {
-            Ok((key, result)) => {
-                match &result {
-                    Ok(snapshot) => log::info!(
-                        "provider git snapshot received workspace={} elapsed_ms={} branch={} changed_files={} branches={}",
-                        key,
-                        request_start.elapsed().as_millis(),
-                        snapshot.branch,
-                        snapshot.changed_files.len(),
-                        snapshot.branches.len()
-                    ),
-                    Err(err) => log::warn!(
-                        "provider git snapshot failed workspace={} elapsed_ms={}: {}",
-                        key,
-                        request_start.elapsed().as_millis(),
-                        err
-                    ),
-                }
-                on_result(key, result);
-                gtk::glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                log::warn!("provider git snapshot response channel disconnected before completion");
-                gtk::glib::ControlFlow::Break
-            }
-        }
-    });
 }
 
 pub(crate) fn request_provider_workspace_snapshot<F>(
@@ -555,55 +535,48 @@ pub(crate) fn request_provider_workspace_snapshot<F>(
     F: FnMut(String, Result<git::WorkspaceSnapshot, String>) + 'static,
 {
     let mut on_result = on_result;
-    let (sender, receiver) = mpsc::channel();
     let request_start = Instant::now();
+    let response = command_mailbox::once(
+        move |(key, result): (String, Result<git::WorkspaceSnapshot, String>)| {
+            match &result {
+                Ok(snapshot) => log::info!(
+                    "provider workspace snapshot received workspace={} elapsed_ms={} name={}",
+                    key,
+                    request_start.elapsed().as_millis(),
+                    snapshot.name()
+                ),
+                Err(err) => log::warn!(
+                    "provider workspace snapshot failed workspace={} elapsed_ms={}: {}",
+                    key,
+                    request_start.elapsed().as_millis(),
+                    err
+                ),
+            }
+            on_result(key, result);
+        },
+    );
 
-    if let Err(err) = git_snapshot_worker().send(GitWorkerCommand::ProviderWorkspaceSnapshot {
-        workspace_key: workspace_key.clone(),
-        git_handle,
-        respond_to: sender,
-    }) {
+    if let Err(err) =
+        workspace_model_worker().send(WorkspaceModelCommand::ProviderWorkspaceSnapshot {
+            workspace_key: workspace_key.clone(),
+            git_handle,
+            respond_to: response,
+        })
+    {
         log::error!(
             "failed to enqueue provider workspace snapshot request for {workspace_key}: {err}"
         );
-        on_result(
+        let WorkspaceModelCommand::ProviderWorkspaceSnapshot { respond_to, .. } = err.0 else {
+            unreachable!("workspace snapshot send error returned a different command")
+        };
+        respond_to.send((
             workspace_key,
             Err("Git snapshot worker is unavailable.".to_string()),
-        );
+        ));
         return;
     }
 
     log::info!("provider workspace snapshot queued workspace={workspace_key}");
-
-    gtk::glib::timeout_add_local(GIT_SNAPSHOT_POLL_INTERVAL, move || {
-        match receiver.try_recv() {
-            Ok((key, result)) => {
-                match &result {
-                    Ok(snapshot) => log::info!(
-                        "provider workspace snapshot received workspace={} elapsed_ms={} name={}",
-                        key,
-                        request_start.elapsed().as_millis(),
-                        snapshot.name()
-                    ),
-                    Err(err) => log::warn!(
-                        "provider workspace snapshot failed workspace={} elapsed_ms={}: {}",
-                        key,
-                        request_start.elapsed().as_millis(),
-                        err
-                    ),
-                }
-                on_result(key, result);
-                gtk::glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                log::warn!(
-                    "provider workspace snapshot response channel disconnected before completion"
-                );
-                gtk::glib::ControlFlow::Break
-            }
-        }
-    });
 }
 
 fn git_handle_for_active_workspace(state: &Rc<AppState>) -> Option<Arc<crate::git::GitRepoHandle>> {
@@ -982,7 +955,7 @@ struct RepositoryMonitor {
     workspace_key: RefCell<Option<String>>,
     subscription: RefCell<Option<crate::git::ChangeListenerSubscription>>,
     background_pull: RefCell<Option<crate::git::BackgroundPullSubscription>>,
-    event_source: RefCell<Option<gtk::glib::SourceId>>,
+    event_subscription: RefCell<Option<command_mailbox::UiCommandSubscription>>,
 }
 
 impl RepositoryMonitor {
@@ -1001,50 +974,34 @@ impl RepositoryMonitor {
             return;
         };
 
-        let (sender, receiver) = mpsc::channel();
-        let sender = Arc::new(Mutex::new(sender));
-        let listener: crate::git::ChangeListener = Arc::new(move || {
-            if let Ok(sender) = sender.lock() {
-                let _ = sender.send(());
+        let state_weak = Rc::downgrade(state);
+        let source_workspace_key = workspace_key.clone();
+        let (sender, event_subscription) = command_mailbox::latest(move |()| {
+            let Some(state) = state_weak.upgrade() else {
+                return;
+            };
+            if state.workspace_ref.borrow().id.to_string() != source_workspace_key {
+                log::debug!(
+                    "ignored repository event for inactive workspace {}",
+                    source_workspace_key
+                );
+                return;
             }
+            log::debug!(
+                "refreshing repository workspace={} from provider git watcher",
+                source_workspace_key
+            );
+            refresh_from_monitor(&state);
+        });
+        let listener: crate::git::ChangeListener = Arc::new(move || {
+            sender.send(());
         });
         let subscription = git_handle.add_on_change_listener(listener.clone());
         let background_pull = git_handle.schedule_background_pull_loop(Some(listener));
 
-        let state_weak = Rc::downgrade(state);
-        let source_workspace_key = workspace_key.clone();
-        let source_id = gtk::glib::timeout_add_local(GIT_SNAPSHOT_POLL_INTERVAL, move || {
-            let Some(state) = state_weak.upgrade() else {
-                return gtk::glib::ControlFlow::Break;
-            };
-
-            if state.workspace_ref.borrow().id.to_string() != source_workspace_key {
-                log::debug!(
-                    "stopping repository monitor event drain for inactive workspace {}",
-                    source_workspace_key
-                );
-                return gtk::glib::ControlFlow::Break;
-            }
-
-            let mut should_refresh = false;
-            while receiver.try_recv().is_ok() {
-                should_refresh = true;
-            }
-
-            if should_refresh {
-                log::debug!(
-                    "refreshing repository workspace={} from provider git watcher",
-                    source_workspace_key
-                );
-                refresh_from_monitor(&state, true);
-            }
-
-            gtk::glib::ControlFlow::Continue
-        });
-
         self.subscription.replace(Some(subscription));
         self.background_pull.replace(Some(background_pull));
-        self.event_source.replace(Some(source_id));
+        self.event_subscription.replace(Some(event_subscription));
         log::info!(
             "repository monitor subscribed workspace={} key={}",
             workspace.display_name,
@@ -1062,9 +1019,7 @@ impl RepositoryMonitor {
     }
 
     fn stop(&self) {
-        if let Some(source_id) = self.event_source.borrow_mut().take() {
-            source_id.remove();
-        }
+        self.event_subscription.borrow_mut().take();
         self.subscription.borrow_mut().take();
         self.background_pull.borrow_mut().take();
         self.workspace_key.take();
@@ -1300,8 +1255,8 @@ fn refresh_active_repo_metadata(state: &Rc<AppState>, item_id: Option<String>) {
     );
 }
 
-fn refresh_from_monitor(state: &Rc<AppState>, force_update: bool) {
-    refresh_workspace(state, None, false, force_update);
+fn refresh_from_monitor(state: &Rc<AppState>) {
+    refresh_workspace(state, None, false, false);
 }
 
 fn refresh_workspace(

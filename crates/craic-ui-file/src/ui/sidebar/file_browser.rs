@@ -39,7 +39,6 @@ use self::watch::FileBrowserWatchSignature;
 const MAX_TREE_ROWS: usize = 4_000;
 const MAX_SEARCH_RESULTS: usize = 250;
 const MAX_SEARCH_FILE_BYTES: u64 = 1024 * 1024;
-const SEARCH_POLL_MS: u64 = 75;
 const SEARCH_DEBOUNCE_MS: u64 = 250;
 const APP_FILE_TRANSFER_MIME_TYPE: &str = "application/x-craic-file-transfer";
 const FILE_TRANSFER_MIME_TYPES: &[&str] = &[
@@ -104,7 +103,9 @@ pub struct FileBrowser {
     file_watch_generation: Rc<Cell<u64>>,
     file_watch_signature: RefCell<Option<FileBrowserWatchSignature>>,
     file_watch_subscriptions: RefCell<Vec<FileWatchSubscription>>,
-    file_watch_handler_id: Cell<Option<u64>>,
+    file_watch_event_subscription:
+        RefCell<Option<craic_ui_core::ui::command_mailbox::UiCommandSubscription>>,
+    file_watch_debounce_stop: RefCell<Option<std::sync::mpsc::Sender<()>>>,
     git_ignore_cache: RefCell<GitIgnoreCache>,
     git_ignore_generation: Rc<Cell<u64>>,
     git_ignore_rules_signature: RefCell<Option<Vec<GitIgnoreRuleFileSignature>>>,
@@ -201,7 +202,8 @@ impl FileBrowser {
             file_watch_generation: Rc::new(Cell::new(0)),
             file_watch_signature: RefCell::new(None),
             file_watch_subscriptions: RefCell::new(Vec::new()),
-            file_watch_handler_id: Cell::new(None),
+            file_watch_event_subscription: RefCell::new(None),
+            file_watch_debounce_stop: RefCell::new(None),
             git_ignore_cache: RefCell::new(GitIgnoreCache::default()),
             git_ignore_generation: Rc::new(Cell::new(0)),
             git_ignore_rules_signature: RefCell::new(None),

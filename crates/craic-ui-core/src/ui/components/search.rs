@@ -1,4 +1,3 @@
-use crate::reconcile::{Element, PartialEqRenderState};
 use adw::prelude::*;
 use gtk::gdk;
 use std::cell::{Cell, RefCell};
@@ -80,7 +79,6 @@ pub struct SearchPanel {
     tags_fade_left: gtk::Box,
     tags_fade_right: gtk::Box,
     empty_bottom_spacer: gtk::Box,
-    tag_reconciler: Rc<RefCell<crate::reconcile::gtk::BoxReconciler<String, SearchTagRenderState>>>,
     clear_on_close: Rc<Cell<bool>>,
     query_callbacks: Rc<RefCell<Vec<QueryCallback>>>,
     open_callbacks: Rc<RefCell<Vec<UnitCallback>>>,
@@ -213,7 +211,6 @@ impl SearchPanel {
             tags_fade_left,
             tags_fade_right,
             empty_bottom_spacer,
-            tag_reconciler: Rc::new(RefCell::new(crate::reconcile::gtk::BoxReconciler::new())),
             clear_on_close: Rc::new(Cell::new(true)),
             query_callbacks: Rc::new(RefCell::new(Vec::new())),
             open_callbacks: Rc::new(RefCell::new(Vec::new())),
@@ -353,40 +350,15 @@ impl SearchPanel {
     pub fn set_tags(&self, tags: Vec<SearchTag>) {
         let has_tags = !tags.is_empty();
         let last_index = tags.len().saturating_sub(1);
-        let elements = tags
-            .into_iter()
-            .enumerate()
-            .map(|(index, tag)| {
-                Element::new(
-                    tag.id.clone(),
-                    SearchTagRenderState {
-                        tag,
-                        first: index == 0,
-                        last: index == last_index,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let stats = self.tag_reconciler.borrow_mut().reconcile(
-            &self.tags_box,
-            elements,
-            PartialEqRenderState,
-            {
-                let panel = self.clone();
-
-                move |_, _, state| panel.tag_button(state.clone()).upcast::<gtk::Widget>()
-            },
-            move |_, widget, _, next| update_tag_button(widget, next),
-        );
-        if stats.changed() {
-            log::debug!(
-                "search panel tags reconciled inserted={} updated={} moved={} removed={} unchanged={}",
-                stats.inserted,
-                stats.updated,
-                stats.moved,
-                stats.removed,
-                stats.unchanged
-            );
+        while let Some(child) = self.tags_box.first_child() {
+            self.tags_box.remove(&child);
+        }
+        for (index, tag) in tags.into_iter().enumerate() {
+            self.tags_box.append(&self.tag_button(SearchTagRenderState {
+                tag,
+                first: index == 0,
+                last: index == last_index,
+            }));
         }
         if self.search_bar.is_search_mode() {
             self.tags_overlay.set_visible(has_tags);
@@ -646,17 +618,6 @@ fn tag_content(tag: &SearchTag) -> gtk::Box {
         content.append(&count_label);
     }
     content
-}
-
-fn update_tag_button(widget: &gtk::Widget, state: &SearchTagRenderState) {
-    let Ok(button) = widget.clone().downcast::<gtk::ToggleButton>() else {
-        return;
-    };
-    if button.is_active() != state.tag.active {
-        button.set_active(state.tag.active);
-    }
-    button.set_child(Some(&tag_content(&state.tag)));
-    apply_tag_edge_margins(&button, state.first, state.last);
 }
 
 fn apply_tag_edge_margins(button: &gtk::ToggleButton, first: bool, last: bool) {

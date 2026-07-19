@@ -1,11 +1,11 @@
 use super::{
     DisclosureAnimator, ICON_SIZE, TreeRenderState, TreeRow, icon_row_entry, sticky_items,
 };
-use crate::reconcile::{Element, PartialEqRenderState};
 use crate::ui::{canvas_scroll, canvas_scrollbar};
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -17,6 +17,20 @@ type PointerPressFn<K, S> = dyn Fn(&gtk::GestureClick, f64, f64, f64, Option<Tre
 pub struct TreeRenderer<K, S> {
     mount: Rc<MountFn<K, S>>,
     update: Rc<UpdateFn<K, S>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeUpdateStats {
+    pub inserted: usize,
+    pub updated: usize,
+    pub moved: usize,
+    pub removed: usize,
+}
+
+impl TreeUpdateStats {
+    pub fn changed(self) -> bool {
+        self.inserted != 0 || self.updated != 0 || self.moved != 0 || self.removed != 0
+    }
 }
 
 impl<K, S> Clone for TreeRenderer<K, S> {
@@ -113,8 +127,10 @@ pub struct TreeView<K, S> {
     scrollbar: Option<TreeCanvasScrollbar>,
     rows: RefCell<Vec<TreeRow<K, S>>>,
     renderer: RefCell<Option<TreeRenderer<K, S>>>,
-    row_reconciler: RefCell<crate::reconcile::gtk::BoxReconciler<K, TreeRenderState<K, S>>>,
-    sticky_reconciler: RefCell<crate::reconcile::gtk::FixedReconciler<K, TreeRenderState<K, S>>>,
+    row_widgets: RefCell<HashMap<K, gtk::Widget>>,
+    row_states: RefCell<HashMap<K, TreeRenderState<K, S>>>,
+    sticky_widgets: RefCell<HashMap<K, gtk::Widget>>,
+    sticky_states: RefCell<HashMap<K, TreeRenderState<K, S>>>,
     disclosure: DisclosureAnimator<K>,
     sticky_signature: RefCell<Vec<K>>,
 }
@@ -240,8 +256,10 @@ impl TreeViewBuilder {
             scrollbar,
             rows: RefCell::new(Vec::new()),
             renderer: RefCell::new(None),
-            row_reconciler: RefCell::new(crate::reconcile::gtk::BoxReconciler::new()),
-            sticky_reconciler: RefCell::new(crate::reconcile::gtk::FixedReconciler::new()),
+            row_widgets: RefCell::new(HashMap::new()),
+            row_states: RefCell::new(HashMap::new()),
+            sticky_widgets: RefCell::new(HashMap::new()),
+            sticky_states: RefCell::new(HashMap::new()),
             disclosure: DisclosureAnimator::new(),
             sticky_signature: RefCell::new(Vec::new()),
         });
@@ -269,14 +287,14 @@ where
         self: &Rc<Self>,
         rows: Vec<TreeRow<K, S>>,
         renderer: TreeRenderer<K, S>,
-    ) -> crate::reconcile::ReconcileStats {
+    ) -> TreeUpdateStats {
         self.renderer.replace(Some(renderer.clone()));
         let width = self.list.allocated_width().max(1);
-        let elements = rows
+        let states = rows
             .iter()
             .cloned()
             .map(|row| {
-                Element::new(
+                (
                     row.key.clone(),
                     TreeRenderState {
                         row,
@@ -288,28 +306,136 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        let stats = self.row_reconciler.borrow_mut().reconcile(
-            &self.list,
-            elements,
-            PartialEqRenderState,
-            |index, key, state| (renderer.mount)(index, key, state),
-            |index, widget, previous, next| (renderer.update)(index, widget, previous, next),
-        );
+        let stats = self.apply_row_commands(states, &renderer);
         self.rows.replace(rows);
         self.update_sticky_rows();
         self.update_canvas_scrollbar();
         stats
     }
 
+    fn apply_row_commands(
+        &self,
+        states: Vec<(K, TreeRenderState<K, S>)>,
+        renderer: &TreeRenderer<K, S>,
+    ) -> TreeUpdateStats {
+        let desired = states
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<HashSet<_>>();
+        let removed = self
+            .row_widgets
+            .borrow()
+            .keys()
+            .filter(|key| !desired.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut stats = TreeUpdateStats::default();
+        for key in removed {
+            if let Some(widget) = self.row_widgets.borrow_mut().remove(&key) {
+                self.list.remove(&widget);
+                stats.removed += 1;
+            }
+            self.row_states.borrow_mut().remove(&key);
+        }
+
+        let mut previous_widget = None;
+        for (index, (key, state)) in states.into_iter().enumerate() {
+            let existing = { self.row_widgets.borrow().get(&key).cloned() };
+            let widget = match existing {
+                Some(widget) => {
+                    let previous = self.row_states.borrow().get(&key).cloned();
+                    if previous.as_ref() != Some(&state) {
+                        if let Some(previous) = previous.as_ref() {
+                            (renderer.update)(index, &widget, previous, &state);
+                        }
+                        stats.updated += 1;
+                    }
+                    if !widget_follows(&widget, previous_widget.as_ref()) {
+                        self.list
+                            .reorder_child_after(&widget, previous_widget.as_ref());
+                        stats.moved += 1;
+                    }
+                    widget
+                }
+                None => {
+                    let widget = (renderer.mount)(index, &key, &state);
+                    self.list
+                        .insert_child_after(&widget, previous_widget.as_ref());
+                    self.row_widgets
+                        .borrow_mut()
+                        .insert(key.clone(), widget.clone());
+                    stats.inserted += 1;
+                    widget
+                }
+            };
+            self.row_states.borrow_mut().insert(key, state);
+            previous_widget = Some(widget);
+        }
+        stats
+    }
+
+    fn apply_sticky_commands(
+        &self,
+        states: Vec<(K, TreeRenderState<K, S>)>,
+        renderer: &TreeRenderer<K, S>,
+    ) {
+        let desired = states
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<HashSet<_>>();
+        let removed = self
+            .sticky_widgets
+            .borrow()
+            .keys()
+            .filter(|key| !desired.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in removed {
+            if let Some(widget) = self.sticky_widgets.borrow_mut().remove(&key) {
+                self.sticky_layer.remove(&widget);
+            }
+            self.sticky_states.borrow_mut().remove(&key);
+        }
+
+        let mut previous_widget = None;
+        for (index, (key, state)) in states.into_iter().enumerate() {
+            let existing = { self.sticky_widgets.borrow().get(&key).cloned() };
+            let widget = match existing {
+                Some(widget) => {
+                    let previous = self.sticky_states.borrow().get(&key).cloned();
+                    if previous.as_ref() != Some(&state)
+                        && let Some(previous) = previous.as_ref()
+                    {
+                        (renderer.update)(index, &widget, previous, &state);
+                    }
+                    if !widget_follows(&widget, previous_widget.as_ref()) {
+                        widget.insert_after(&self.sticky_layer, previous_widget.as_ref());
+                    }
+                    widget
+                }
+                None => {
+                    let widget = (renderer.mount)(index, &key, &state);
+                    self.sticky_layer.put(&widget, 0.0, state.y);
+                    widget.insert_after(&self.sticky_layer, previous_widget.as_ref());
+                    self.sticky_widgets
+                        .borrow_mut()
+                        .insert(key.clone(), widget.clone());
+                    widget
+                }
+            };
+            self.sticky_layer.move_(&widget, 0.0, state.y);
+            self.sticky_states.borrow_mut().insert(key, state);
+            previous_widget = Some(widget);
+        }
+    }
+
     pub fn clear(&self) {
         self.rows.borrow_mut().clear();
-        self.row_reconciler.borrow_mut().reconcile(
-            &self.list,
-            std::iter::empty::<Element<K, TreeRenderState<K, S>>>(),
-            PartialEqRenderState,
-            |_, _, _| unreachable!("empty reconcile cannot mount tree rows"),
-            |_, _, _, _| {},
-        );
+        while let Some(child) = self.list.first_child() {
+            self.list.remove(&child);
+        }
+        self.row_widgets.borrow_mut().clear();
+        self.row_states.borrow_mut().clear();
         self.clear_sticky_rows();
         self.update_canvas_scrollbar();
     }
@@ -352,12 +478,12 @@ where
             self.sticky_signature.replace(signature);
         }
 
-        let elements = items
+        let states = items
             .into_iter()
             .rev()
             .map(|item| {
                 let key = item.row.key.clone();
-                Element::new(
+                (
                     key,
                     TreeRenderState {
                         bottom: bottom_key.as_ref() == Some(&item.row.key),
@@ -370,14 +496,7 @@ where
             })
             .collect::<Vec<_>>();
 
-        self.sticky_reconciler.borrow_mut().reconcile(
-            &self.sticky_layer,
-            elements,
-            PartialEqRenderState,
-            |state| (0.0, state.y),
-            |index, key, state| (renderer.mount)(index, key, state),
-            |index, widget, previous, next| (renderer.update)(index, widget, previous, next),
-        );
+        self.apply_sticky_commands(states, &renderer);
     }
 
     pub fn sticky_row_at_viewport_y(&self, y: f64) -> Option<TreeRow<K, S>> {
@@ -991,18 +1110,26 @@ where
     }
 
     fn clear_sticky_rows(&self) {
-        self.sticky_reconciler.borrow_mut().reconcile(
-            &self.sticky_layer,
-            std::iter::empty::<Element<K, TreeRenderState<K, S>>>(),
-            PartialEqRenderState,
-            |state| (0.0, state.y),
-            |_, _, _| unreachable!("empty reconcile cannot mount sticky rows"),
-            |_, _, _, _| {},
-        );
+        for widget in self
+            .sticky_widgets
+            .borrow_mut()
+            .drain()
+            .map(|(_, widget)| widget)
+        {
+            self.sticky_layer.remove(&widget);
+        }
+        self.sticky_states.borrow_mut().clear();
         self.sticky_signature.borrow_mut().clear();
         if self.sticky_layer.is_visible() {
             self.sticky_layer.set_visible(false);
         }
+    }
+}
+
+fn widget_follows(widget: &gtk::Widget, previous: Option<&gtk::Widget>) -> bool {
+    match previous {
+        Some(previous) => widget.prev_sibling().as_ref() == Some(previous),
+        None => widget.prev_sibling().is_none(),
     }
 }
 

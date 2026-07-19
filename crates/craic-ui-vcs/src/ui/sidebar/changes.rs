@@ -1,18 +1,15 @@
 use super::super::file_row;
 use crate::git::RepositorySnapshot;
 use adw::prelude::*;
-use craic_ui_core::reconcile::{Element, PartialEqRenderState};
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct ChangedFileRowRenderState {
-    status: String,
+#[derive(Default)]
+pub struct ChangedFileRows {
+    rows: HashMap<String, gtk::ListBoxRow>,
+    statuses: HashMap<String, String>,
 }
-
-pub type ChangedFilesReconciler =
-    craic_ui_core::reconcile::gtk::ListBoxReconciler<String, ChangedFileRowRenderState>;
 
 pub fn file_signature(snapshot: &RepositorySnapshot) -> Vec<(String, String)> {
     snapshot
@@ -22,9 +19,9 @@ pub fn file_signature(snapshot: &RepositorySnapshot) -> Vec<(String, String)> {
         .collect()
 }
 
-pub fn reconcile_changed_files(
+pub fn apply_changed_files(
     list: &gtk::ListBox,
-    reconciler: &mut ChangedFilesReconciler,
+    rendered: &mut ChangedFileRows,
     snapshot: &RepositorySnapshot,
     selected: Option<&str>,
     summary_entry: &gtk::Entry,
@@ -36,83 +33,58 @@ pub fn reconcile_changed_files(
     file_signature: Rc<RefCell<Vec<(String, String)>>>,
     checked_paths: Rc<RefCell<HashSet<String>>>,
 ) {
-    let elements = snapshot
+    let desired_paths = snapshot
         .changed_files
         .iter()
-        .map(|file| {
-            Element::new(
-                file.path.clone(),
-                ChangedFileRowRenderState {
-                    status: file.status.clone(),
-                },
-            )
-        })
+        .map(|file| file.path.as_str())
+        .collect::<HashSet<_>>();
+    let removed = rendered
+        .rows
+        .keys()
+        .filter(|path| !desired_paths.contains(path.as_str()))
+        .cloned()
         .collect::<Vec<_>>();
+    for path in removed {
+        if let Some(row) = rendered.rows.remove(&path) {
+            list.remove(&row);
+        }
+        rendered.statuses.remove(&path);
+    }
 
-    reconciler.reconcile(
-        list,
-        elements,
-        PartialEqRenderState,
-        {
-            let list = list.clone();
-            let summary_entry = summary_entry.clone();
-            let generate_button = generate_button.clone();
-            let commit_button = commit_button.clone();
-            let select_all_check = select_all_check.clone();
-            let select_all_label = select_all_label.clone();
-            let selection_syncing = selection_syncing.clone();
-
-            move |_, path, state| {
-                let row = file_row::changed_file_row(path, &state.status, true);
-                if let Some(check_button) = row_check_button(&row) {
-                    check_button.set_active(checked_paths.borrow().contains(path));
-                    check_button.connect_toggled({
-                        let list = list.clone();
-                        let summary_entry = summary_entry.clone();
-                        let generate_button = generate_button.clone();
-                        let commit_button = commit_button.clone();
-                        let select_all_check = select_all_check.clone();
-                        let select_all_label = select_all_label.clone();
-                        let selection_syncing = selection_syncing.clone();
-                        let file_signature = file_signature.clone();
-                        let checked_paths = checked_paths.clone();
-                        let path = path.clone();
-
-                        move |button| {
-                            if button.is_active() {
-                                checked_paths.borrow_mut().insert(path.clone());
-                            } else {
-                                checked_paths.borrow_mut().remove(&path);
-                            }
-                            update_commit_button_sensitivity_for_paths(
-                                &checked_paths.borrow(),
-                                &summary_entry,
-                                &commit_button,
-                                &file_signature.borrow(),
-                            );
-                            generate_button.set_sensitive(!checked_paths.borrow().is_empty());
-                            update_selection_header(
-                                &list,
-                                &select_all_check,
-                                &select_all_label,
-                                &selection_syncing,
-                            );
-                        }
-                    });
+    for (index, file) in snapshot.changed_files.iter().enumerate() {
+        let existing = rendered.rows.get(&file.path).cloned();
+        let row = match existing {
+            Some(row) => {
+                if rendered.statuses.get(&file.path) != Some(&file.status) {
+                    file_row::update_changed_file_row_status(&row, &file.status);
                 }
-                row.upcast::<gtk::Widget>()
+                row
             }
-        },
-        move |_, widget, previous, next| {
-            if previous.status == next.status {
-                return;
+            None => mount_changed_file_row(
+                list,
+                &file.path,
+                &file.status,
+                summary_entry,
+                generate_button,
+                commit_button,
+                select_all_check,
+                select_all_label,
+                selection_syncing,
+                file_signature.clone(),
+                checked_paths.clone(),
+            ),
+        };
+        rendered
+            .statuses
+            .insert(file.path.clone(), file.status.clone());
+        rendered.rows.insert(file.path.clone(), row.clone());
+        if row.index() != index as i32 {
+            if row.parent().is_some() {
+                list.remove(&row);
             }
-
-            if let Ok(row) = widget.clone().downcast::<gtk::ListBoxRow>() {
-                file_row::update_changed_file_row_status(&row, &next.status);
-            }
-        },
-    );
+            list.insert(&row, index as i32);
+        }
+    }
 
     if let Some(selected) = selected {
         match row_for_path(list, selected) {
@@ -124,16 +96,61 @@ pub fn reconcile_changed_files(
     update_selection_header(list, select_all_check, select_all_label, selection_syncing);
 }
 
-pub fn clear_changed_files(list: &gtk::ListBox, reconciler: &mut ChangedFilesReconciler) {
-    reconciler.reconcile(
-        list,
-        Vec::<Element<String, ChangedFileRowRenderState>>::new(),
-        PartialEqRenderState,
-        |_, path, state| {
-            file_row::changed_file_row(path, &state.status, true).upcast::<gtk::Widget>()
-        },
-        |_, _, _, _| {},
-    );
+#[allow(clippy::too_many_arguments)]
+fn mount_changed_file_row(
+    list: &gtk::ListBox,
+    path: &str,
+    status: &str,
+    summary_entry: &gtk::Entry,
+    generate_button: &gtk::Button,
+    commit_button: &gtk::Button,
+    select_all_check: &gtk::CheckButton,
+    select_all_label: &gtk::Label,
+    selection_syncing: &Rc<Cell<bool>>,
+    file_signature: Rc<RefCell<Vec<(String, String)>>>,
+    checked_paths: Rc<RefCell<HashSet<String>>>,
+) -> gtk::ListBoxRow {
+    let row = file_row::changed_file_row(path, status, true);
+    if let Some(check_button) = row_check_button(&row) {
+        check_button.set_active(checked_paths.borrow().contains(path));
+        let list = list.clone();
+        let summary_entry = summary_entry.clone();
+        let generate_button = generate_button.clone();
+        let commit_button = commit_button.clone();
+        let select_all_check = select_all_check.clone();
+        let select_all_label = select_all_label.clone();
+        let selection_syncing = selection_syncing.clone();
+        let path = path.to_string();
+        check_button.connect_toggled(move |button| {
+            if button.is_active() {
+                checked_paths.borrow_mut().insert(path.clone());
+            } else {
+                checked_paths.borrow_mut().remove(&path);
+            }
+            update_commit_button_sensitivity_for_paths(
+                &checked_paths.borrow(),
+                &summary_entry,
+                &commit_button,
+                &file_signature.borrow(),
+            );
+            generate_button.set_sensitive(!checked_paths.borrow().is_empty());
+            update_selection_header(
+                &list,
+                &select_all_check,
+                &select_all_label,
+                &selection_syncing,
+            );
+        });
+    }
+    row
+}
+
+pub fn clear_changed_files(list: &gtk::ListBox, rendered: &mut ChangedFileRows) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    rendered.rows.clear();
+    rendered.statuses.clear();
 }
 
 pub fn checked_file_paths(list: &gtk::ListBox) -> Vec<String> {

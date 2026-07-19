@@ -613,6 +613,14 @@ where
 }
 
 impl GitRepoHandle {
+    pub fn load_repository_snapshot(&self) -> Result<RepositorySnapshot, String> {
+        self.repository_snapshot_blocking()
+    }
+
+    pub fn load_workspace_snapshot(&self) -> Result<WorkspaceSnapshot, String> {
+        self.workspace_snapshot_blocking()
+    }
+
     pub fn snapshot(&self, callback: OperationCallback<RepositorySnapshot>) {
         let handle = self.clone();
         run_operation("git snapshot", callback, move || {

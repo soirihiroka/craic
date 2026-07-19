@@ -1,9 +1,9 @@
 use super::super::{canvas_scroll, widgets};
 use super::changes::{
-    ChangedFilesReconciler, checked_file_paths, clear_changed_files, default_commit_summary,
-    file_signature, install_empty_list_unselect, install_empty_scroller_unselect,
-    reconcile_changed_files, set_all_file_checks, update_commit_button_sensitivity_for_paths,
-    update_selection_header,
+    ChangedFileRows, apply_changed_files, checked_file_paths, clear_changed_files,
+    default_commit_summary, file_signature, install_empty_list_unselect,
+    install_empty_scroller_unselect, set_all_file_checks,
+    update_commit_button_sensitivity_for_paths, update_selection_header,
 };
 use super::commit_panel::CommitPanel;
 use crate::git::RepositorySnapshot;
@@ -30,7 +30,7 @@ pub struct ChangesPanel {
     latest_snapshot: Rc<RefCell<Option<RepositorySnapshot>>>,
     search_query: Rc<RefCell<String>>,
     checked_paths: Rc<RefCell<HashSet<String>>>,
-    file_reconciler: Rc<RefCell<ChangedFilesReconciler>>,
+    file_rows: Rc<RefCell<ChangedFileRows>>,
 }
 
 impl ChangesPanel {
@@ -155,7 +155,7 @@ impl ChangesPanel {
             latest_snapshot: Rc::new(RefCell::new(None)),
             search_query: Rc::new(RefCell::new(String::new())),
             checked_paths: Rc::new(RefCell::new(HashSet::new())),
-            file_reconciler: Rc::new(RefCell::new(ChangedFilesReconciler::new())),
+            file_rows: Rc::new(RefCell::new(ChangedFileRows::default())),
         };
         panel.search_panel.set_key_capture_widget(&panel.root);
         panel.search_panel.install_shortcuts(&panel.root);
@@ -183,7 +183,7 @@ impl ChangesPanel {
                 .collect::<HashSet<_>>();
             *self.file_signature.borrow_mut() = signature;
             self.latest_snapshot.replace(Some(snapshot.clone()));
-            self.reconcile_checked_paths(snapshot, &previous_paths);
+            self.update_checked_paths(snapshot, &previous_paths);
 
             self.render_snapshot(snapshot, selected.as_deref());
         } else {
@@ -193,8 +193,8 @@ impl ChangesPanel {
     }
 
     fn show_clean_repository(&self, snapshot: &RepositorySnapshot) {
-        let mut reconciler = self.file_reconciler.borrow_mut();
-        clear_changed_files(&self.files_list, &mut reconciler);
+        let mut rows = self.file_rows.borrow_mut();
+        clear_changed_files(&self.files_list, &mut rows);
         self.file_signature.borrow_mut().clear();
         self.latest_snapshot.replace(Some(snapshot.clone()));
         self.search_query.borrow_mut().clear();
@@ -266,8 +266,8 @@ impl ChangesPanel {
 
     pub fn clear(&self) {
         self.root.set_visible_child_name("content");
-        let mut reconciler = self.file_reconciler.borrow_mut();
-        clear_changed_files(&self.files_list, &mut reconciler);
+        let mut rows = self.file_rows.borrow_mut();
+        clear_changed_files(&self.files_list, &mut rows);
         self.file_signature.borrow_mut().clear();
         self.latest_snapshot.borrow_mut().take();
         self.search_query.borrow_mut().clear();
@@ -277,8 +277,8 @@ impl ChangesPanel {
     }
 
     pub fn show_initialize_repository(&self) {
-        let mut reconciler = self.file_reconciler.borrow_mut();
-        clear_changed_files(&self.files_list, &mut reconciler);
+        let mut rows = self.file_rows.borrow_mut();
+        clear_changed_files(&self.files_list, &mut rows);
         self.file_signature.borrow_mut().clear();
         self.latest_snapshot.borrow_mut().take();
         self.search_query.borrow_mut().clear();
@@ -316,10 +316,10 @@ impl ChangesPanel {
 
     fn render_snapshot(&self, snapshot: &RepositorySnapshot, selected: Option<&str>) {
         let filtered = filtered_snapshot(snapshot, &self.search_query.borrow());
-        let mut reconciler = self.file_reconciler.borrow_mut();
-        reconcile_changed_files(
+        let mut rows = self.file_rows.borrow_mut();
+        apply_changed_files(
             &self.files_list,
-            &mut reconciler,
+            &mut rows,
             &filtered,
             selected,
             &self.summary_entry,
@@ -333,7 +333,7 @@ impl ChangesPanel {
         );
     }
 
-    fn reconcile_checked_paths(
+    fn update_checked_paths(
         &self,
         snapshot: &RepositorySnapshot,
         previous_paths: &HashSet<String>,
