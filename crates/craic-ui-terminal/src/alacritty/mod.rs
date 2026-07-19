@@ -11,7 +11,7 @@ use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config as TermConfig, TermMode};
 use alacritty_terminal::tty::{self, Options, Shell};
 use alacritty_terminal::vte::ansi::Processor;
-use craic_ui_core::ui::{canvas_scroll, components::context_menu};
+use craic_ui_core::ui::{canvas_scroll, command_mailbox, components::context_menu};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use renderer::{GlRenderer, TerminalSize};
@@ -36,7 +36,6 @@ const INITIAL_COLUMNS: u32 = 100;
 const INITIAL_ROWS: u32 = 34;
 const SCROLLBACK_LINES: usize = 10_000;
 const SCROLL_LINES_PER_WHEEL_STEP: i32 = 3;
-
 type ExitHandlers = Rc<RefCell<Vec<Box<dyn Fn(ExitStatus)>>>>;
 type TitleHandlers = Rc<RefCell<Vec<Box<dyn Fn(String)>>>>;
 type ActivationHandlers = Rc<RefCell<Vec<Box<dyn Fn(TerminalActivation)>>>>;
@@ -112,6 +111,7 @@ struct UiState {
     scrollbar_adjustment: gtk::Adjustment,
     syncing_scrollbar: bool,
     exited: bool,
+    event_subscription: Option<command_mailbox::UiCommandSubscription>,
 }
 
 struct TerminalEngine {
@@ -127,31 +127,45 @@ pub(super) struct TerminalEventProxy {
     sender: Sender<Event>,
     dirty: Arc<AtomicBool>,
     title: Arc<Mutex<Option<String>>>,
+    ui_wakeup: Arc<Mutex<Option<command_mailbox::UiCommandSender<()>>>>,
+}
+
+impl TerminalEventProxy {
+    fn mark_dirty(&self) {
+        if self.dirty.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Ok(wakeup) = self.ui_wakeup.lock()
+            && let Some(wakeup) = wakeup.as_ref()
+        {
+            wakeup.send(());
+        }
+    }
 }
 
 impl EventListener for TerminalEventProxy {
     fn send_event(&self, event: Event) {
         match &event {
             Event::Wakeup | Event::MouseCursorDirty | Event::CursorBlinkingChange => {
-                self.dirty.store(true, Ordering::Release);
+                self.mark_dirty();
             }
             Event::Title(title) => {
                 if let Ok(mut current) = self.title.lock() {
                     *current = Some(title.clone());
                 }
                 let _ = self.sender.send(event);
-                self.dirty.store(true, Ordering::Release);
+                self.mark_dirty();
             }
             Event::ResetTitle => {
                 if let Ok(mut current) = self.title.lock() {
                     *current = None;
                 }
                 let _ = self.sender.send(event);
-                self.dirty.store(true, Ordering::Release);
+                self.mark_dirty();
             }
             _ => {
                 let _ = self.sender.send(event);
-                self.dirty.store(true, Ordering::Release);
+                self.mark_dirty();
             }
         }
     }
@@ -342,7 +356,7 @@ impl Drop for TerminalEngine {
 impl AlacrittyTerminal {
     pub fn new(font_size: f64) -> Self {
         let area = gtk::GLArea::builder()
-            .auto_render(true)
+            .auto_render(false)
             .focusable(true)
             .hexpand(true)
             .vexpand(true)
@@ -382,10 +396,12 @@ impl AlacrittyTerminal {
 
         let (sender, receiver) = mpsc::channel();
         let title = Arc::new(Mutex::new(None));
+        let ui_wakeup = Arc::new(Mutex::new(None));
         let proxy = TerminalEventProxy {
             sender,
-            dirty: Arc::new(AtomicBool::new(true)),
+            dirty: Arc::new(AtomicBool::new(false)),
             title: title.clone(),
+            ui_wakeup: ui_wakeup.clone(),
         };
         let state = Rc::new(RefCell::new(UiState {
             engine: None,
@@ -407,6 +423,7 @@ impl AlacrittyTerminal {
             scrollbar_adjustment: scrollbar_adjustment.clone(),
             syncing_scrollbar: false,
             exited: false,
+            event_subscription: None,
         }));
 
         install_gl_lifecycle(&area, &state);
@@ -419,18 +436,27 @@ impl AlacrittyTerminal {
         install_context_menu(&area, &state);
         install_file_drop(&area, &state);
 
-        area.add_tick_callback({
-            let state = state.clone();
-            let scrollbar = scrollbar.clone();
-            move |area, _| {
-                drain_events(area, &state);
-                sync_scrollbar(&state, &scrollbar);
-                if state.borrow().proxy.dirty.swap(false, Ordering::AcqRel) {
-                    area.queue_render();
+        let (wakeup, event_subscription) = command_mailbox::latest({
+            let area = area.downgrade();
+            let state = Rc::downgrade(&state);
+            let scrollbar = scrollbar.downgrade();
+            move |()| {
+                let (Some(area), Some(state), Some(scrollbar)) =
+                    (area.upgrade(), state.upgrade(), scrollbar.upgrade())
+                else {
+                    return;
+                };
+                if !state.borrow().proxy.dirty.swap(false, Ordering::AcqRel) {
+                    return;
                 }
-                glib::ControlFlow::Continue
+                drain_events(&area, &state);
+                sync_scrollbar(&state, &scrollbar);
+                area.queue_render();
             }
         });
+        state.borrow_mut().event_subscription = Some(event_subscription);
+        ui_wakeup.lock().unwrap().replace(wakeup);
+        state.borrow().proxy.mark_dirty();
 
         Self { root, area, state }
     }
@@ -460,7 +486,7 @@ impl AlacrittyTerminal {
         }
         state.launch_dir = launch_dir;
         state.engine = Some(engine);
-        state.proxy.dirty.store(true, Ordering::Release);
+        state.proxy.mark_dirty();
         Ok(child_pid)
     }
 
@@ -507,11 +533,7 @@ impl AlacrittyTerminal {
 
     pub fn set_font_size(&self, font_size: f64) {
         self.state.borrow_mut().font_size = font_size;
-        self.state
-            .borrow()
-            .proxy
-            .dirty
-            .store(true, Ordering::Release);
+        self.state.borrow().proxy.mark_dirty();
     }
 
     pub fn has_selection(&self) -> bool {
@@ -557,21 +579,21 @@ impl AlacrittyTerminal {
             return;
         };
         engine.feed(bytes);
-        state.proxy.dirty.store(true, Ordering::Release);
+        state.proxy.mark_dirty();
     }
 
     pub fn search(&self, pattern: Option<&str>, backwards: bool) -> Result<bool, String> {
-        let (term, dirty) = {
+        let (term, proxy) = {
             let state = self.state.borrow();
             let Some(engine) = state.engine.as_ref() else {
                 return Ok(false);
             };
-            (engine.term.clone(), state.proxy.dirty.clone())
+            (engine.term.clone(), state.proxy.clone())
         };
         let mut term = term.lock();
         let Some(pattern) = pattern else {
             term.selection = None;
-            dirty.store(true, Ordering::Release);
+            proxy.mark_dirty();
             return Ok(false);
         };
         let mut regex = RegexSearch::new(pattern).map_err(|err| err.to_string())?;
@@ -614,7 +636,7 @@ impl AlacrittyTerminal {
         let mut selection = Selection::new(SelectionType::Simple, *found.start(), Side::Left);
         selection.update(*found.end(), Side::Right);
         term.selection = Some(selection);
-        dirty.store(true, Ordering::Release);
+        proxy.mark_dirty();
         Ok(true)
     }
 
@@ -667,41 +689,7 @@ impl AlacrittyTerminal {
 fn install_gl_lifecycle(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
     area.connect_realize({
         let state = state.clone();
-        move |area| {
-            area.make_current();
-            if let Some(err) = area.error() {
-                log::error!("alacritty GL context realization failed: {err}");
-                return;
-            }
-            let scale = area.scale_factor() as f32;
-            let width = (area.width().max(1) as f32 * scale) as u32;
-            let height = (area.height().max(1) as f32 * scale) as u32;
-            let font_size = state.borrow().font_size;
-            let uses_es = area.context().is_some_and(|context| context.uses_es());
-            match GlRenderer::new(font_size, scale, width, height, uses_es) {
-                Ok(renderer) => {
-                    let size = renderer.size();
-                    let mut state = state.borrow_mut();
-                    state.renderer_font_size = font_size;
-                    if let Some(engine) = state.engine.as_mut() {
-                        engine.resize(size);
-                    }
-                    state.renderer = Some(renderer);
-                    log::info!(
-                        "alacritty GL terminal realized width={} height={} scale={scale}",
-                        width,
-                        height
-                    );
-                }
-                Err(err) => {
-                    log::error!("alacritty GL renderer initialization failed: {err}");
-                    area.set_error(Some(&glib::Error::new(
-                        gio::IOErrorEnum::Failed,
-                        &format!("Unable to initialize terminal renderer: {err}"),
-                    )));
-                }
-            }
-        }
+        move |area| initialize_gl_renderer(area, &state, "realized")
     });
     area.connect_resize({
         let state = state.clone();
@@ -730,7 +718,8 @@ fn install_gl_lifecycle(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
     area.connect_map({
         let state = state.clone();
         move |area| {
-            state.borrow().proxy.dirty.store(true, Ordering::Release);
+            initialize_gl_renderer(area, &state, "mapped");
+            state.borrow().proxy.mark_dirty();
             area.queue_render();
             log::debug!("alacritty GL terminal mapped; fresh frame requested");
         }
@@ -748,7 +737,6 @@ fn install_gl_lifecycle(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 let height = (area.height().max(1) as f32 * scale) as u32;
                 let font_size = state.font_size;
                 let uses_es = area.context().is_some_and(|context| context.uses_es());
-                state.renderer.take();
                 match GlRenderer::new(font_size, scale, width, height, uses_es) {
                     Ok(renderer) => {
                         let size = renderer.size();
@@ -775,18 +763,82 @@ fn install_gl_lifecycle(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
             let Some(renderer) = state.renderer.as_mut() else {
                 return glib::Propagation::Proceed;
             };
-            renderer.draw(&term.lock(), focused, hovered_link);
+            if let Err(err) = renderer.draw(&term.lock(), focused, hovered_link) {
+                log::error!("alacritty GL rendering stopped: {err}");
+                area.set_error(Some(&glib::Error::new(
+                    gio::IOErrorEnum::Failed,
+                    &format!("Unable to render terminal: {err}"),
+                )));
+            }
             glib::Propagation::Stop
         }
     });
     area.connect_unrealize({
         let state = state.clone();
-        move |area| {
-            area.make_current();
-            state.borrow_mut().renderer.take();
-            log::info!("alacritty GL terminal unrealized; GPU resources released");
-        }
+        move |area| release_gl_renderer(area, &state, "unrealized")
     });
+}
+
+fn initialize_gl_renderer(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>, lifecycle: &str) {
+    if state.borrow().renderer.is_some() {
+        return;
+    }
+    area.make_current();
+    if let Some(err) = area.error() {
+        log::error!("alacritty GL context unavailable lifecycle={lifecycle}: {err}");
+        return;
+    }
+    let scale = area.scale_factor() as f32;
+    let width = (area.width().max(1) as f32 * scale) as u32;
+    let height = (area.height().max(1) as f32 * scale) as u32;
+    let font_size = state.borrow().font_size;
+    let uses_es = area.context().is_some_and(|context| context.uses_es());
+    match GlRenderer::new(font_size, scale, width, height, uses_es) {
+        Ok(renderer) => {
+            let size = renderer.size();
+            let mut state = state.borrow_mut();
+            state.renderer_font_size = font_size;
+            if let Some(engine) = state.engine.as_mut() {
+                engine.resize(size);
+            }
+            state.renderer = Some(renderer);
+            log::info!(
+                "alacritty GL terminal {lifecycle} width={} height={} scale={scale}",
+                width,
+                height
+            );
+        }
+        Err(err) => {
+            log::error!("alacritty GL renderer initialization failed lifecycle={lifecycle}: {err}");
+            area.set_error(Some(&glib::Error::new(
+                gio::IOErrorEnum::Failed,
+                &format!("Unable to initialize terminal renderer: {err}"),
+            )));
+        }
+    }
+}
+
+fn release_gl_renderer(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>, lifecycle: &str) {
+    if state.borrow().renderer.is_none() {
+        return;
+    }
+    area.make_current();
+    let context_is_current = area
+        .context()
+        .is_some_and(|context| gdk::GLContext::current().as_ref() == Some(&context));
+    let renderer = state.borrow_mut().renderer.take().unwrap();
+    if !context_is_current {
+        let error = area
+            .error()
+            .map_or_else(|| "unknown GL context error".into(), |err| err.to_string());
+        std::mem::forget(renderer);
+        log::warn!(
+            "alacritty GL cleanup skipped lifecycle={lifecycle} error={error}; context teardown will release GPU resources"
+        );
+        return;
+    }
+    drop(renderer);
+    log::info!("alacritty GL terminal {lifecycle}; GPU resources released");
 }
 
 fn install_input(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
@@ -1005,7 +1057,7 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
             if let Some(engine) = state.engine.as_ref() {
                 engine.term.lock().selection = Some(Selection::new(kind, point, Side::Left));
             }
-            state.proxy.dirty.store(true, Ordering::Release);
+            state.proxy.mark_dirty();
         }
     });
     click.connect_released({
@@ -1076,7 +1128,7 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                     selection.update(point, Side::Right);
                 }
                 state.hovered_link = None;
-                state.proxy.dirty.store(true, Ordering::Release);
+                state.proxy.mark_dirty();
             }
             area.set_cursor_from_name(Some("text"));
             schedule_selection_autoscroll(
@@ -1157,7 +1209,7 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 let mut state = state.borrow_mut();
                 if state.hovered_link != hovered_link {
                     state.hovered_link = hovered_link;
-                    state.proxy.dirty.store(true, Ordering::Release);
+                    state.proxy.mark_dirty();
                 }
             }
             area.set_cursor_from_name(Some(if hovered_link.is_some() {
@@ -1204,7 +1256,7 @@ fn install_selection(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
         move |_| {
             let mut state = state.borrow_mut();
             if state.hovered_link.take().is_some() {
-                state.proxy.dirty.store(true, Ordering::Release);
+                state.proxy.mark_dirty();
             }
             area.set_cursor_from_name(None);
         }
@@ -1328,7 +1380,7 @@ fn schedule_selection_autoscroll(
         if let Some(selection) = term.selection.as_mut() {
             selection.update(point, Side::Right);
         }
-        state.proxy.dirty.store(true, Ordering::Release);
+        state.proxy.mark_dirty();
         glib::ControlFlow::Continue
     });
 }
@@ -1511,7 +1563,7 @@ fn install_scroll(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 }
                 state.hovered_link = None;
                 area.set_cursor_from_name(Some("text"));
-                state.proxy.dirty.store(true, Ordering::Release);
+                state.proxy.mark_dirty();
             }
             glib::Propagation::Stop
         }
@@ -1569,7 +1621,7 @@ fn install_middle_autoscroll(
                 if let Some(engine) = state.engine.as_ref() {
                     engine.scroll(-lines);
                     state.hovered_link = None;
-                    state.proxy.dirty.store(true, Ordering::Release);
+                    state.proxy.mark_dirty();
                 }
             }
         },
@@ -1623,7 +1675,7 @@ fn install_scrollbar(
             drop(term);
             state.hovered_link = None;
             area.set_cursor_from_name(None);
-            state.proxy.dirty.store(true, Ordering::Release);
+            state.proxy.mark_dirty();
         }
     });
 }
@@ -1706,7 +1758,7 @@ fn set_focused(state: &Rc<RefCell<UiState>>, focused: bool) {
             });
         }
     }
-    state.proxy.dirty.store(true, Ordering::Release);
+    state.proxy.mark_dirty();
     log::debug!("alacritty terminal focus changed focused={focused}");
 }
 
@@ -1810,7 +1862,7 @@ fn install_context_menu(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                             let state = state.borrow();
                             if let Some(engine) = state.engine.as_ref() {
                                 engine.select_all();
-                                state.proxy.dirty.store(true, Ordering::Release);
+                                state.proxy.mark_dirty();
                             }
                         }
                         TerminalContextAction::Paste => paste_clipboard(&area, &state),

@@ -16,6 +16,7 @@ use std::ptr;
 use super::{LinkRange, TerminalEventProxy};
 
 const ATLAS_SIZE: i32 = 1024;
+const MAX_ATLASES: usize = 4;
 const DEFAULT_FOREGROUND: Rgb = Rgb {
     r: 212,
     g: 212,
@@ -291,12 +292,18 @@ struct Atlas {
     row_x: i32,
     row_y: i32,
     row_height: i32,
+    upload_failed: bool,
 }
 
 impl Atlas {
-    fn new() -> Self {
+    fn new() -> Result<Self, String> {
         let mut texture = 0;
         unsafe {
+            for _ in 0..8 {
+                if gl::GetError() == gl::NO_ERROR {
+                    break;
+                }
+            }
             gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
             gl::GenTextures(1, &mut texture);
             gl::BindTexture(gl::TEXTURE_2D, texture);
@@ -337,15 +344,28 @@ impl Atlas {
             );
             gl::BindTexture(gl::TEXTURE_2D, 0);
         }
-        Self {
+        let error = unsafe { gl::GetError() };
+        if texture == 0 || error != gl::NO_ERROR {
+            if texture != 0 {
+                unsafe { gl::DeleteTextures(1, &texture) };
+            }
+            return Err(format!(
+                "glyph atlas allocation failed texture={texture} gl_error=0x{error:04x}"
+            ));
+        }
+        Ok(Self {
             texture,
             row_x: 1,
             row_y: 0,
             row_height: 1,
-        }
+            upload_failed: false,
+        })
     }
 
     fn insert(&mut self, glyph: &RasterizedGlyph) -> Option<Glyph> {
+        if self.upload_failed {
+            return None;
+        }
         if glyph.width <= 0 || glyph.height <= 0 {
             return Some(Glyph {
                 texture: self.texture,
@@ -375,6 +395,11 @@ impl Atlas {
         let x = self.row_x;
         let y = self.row_y;
         unsafe {
+            for _ in 0..8 {
+                if gl::GetError() == gl::NO_ERROR {
+                    break;
+                }
+            }
             gl::BindTexture(gl::TEXTURE_2D, self.texture);
             gl::TexSubImage2D(
                 gl::TEXTURE_2D,
@@ -388,6 +413,15 @@ impl Atlas {
                 glyph.pixels.as_ptr().cast(),
             );
             gl::BindTexture(gl::TEXTURE_2D, 0);
+        }
+        let error = unsafe { gl::GetError() };
+        if error != gl::NO_ERROR {
+            self.upload_failed = true;
+            log::error!(
+                "terminal glyph atlas upload stopped texture={} gl_error=0x{error:04x}",
+                self.texture
+            );
+            return None;
         }
         self.row_x += glyph.width;
         self.row_height = self.row_height.max(glyph.height);
@@ -419,6 +453,7 @@ struct FontCache {
     cell_height: f32,
     glyphs: HashMap<(char, usize), Glyph>,
     atlases: Vec<Atlas>,
+    atlas_allocation_blocked: bool,
 }
 
 impl FontCache {
@@ -451,7 +486,8 @@ impl FontCache {
             cell_width,
             cell_height,
             glyphs: HashMap::new(),
-            atlases: vec![Atlas::new()],
+            atlases: vec![Atlas::new()?],
+            atlas_allocation_blocked: false,
         })
     }
 
@@ -489,21 +525,30 @@ impl FontCache {
             }
         }
         let glyph = glyph.unwrap_or_else(|| {
-            let mut atlas = Atlas::new();
-            let glyph = atlas.insert(&rasterized).unwrap_or(Glyph {
-                texture: atlas.texture,
-                multicolor: false,
-                top: 0,
-                left: 0,
-                width: 0,
-                height: 0,
-                uv_left: 0.0,
-                uv_top: 0.0,
-                uv_width: 0.0,
-                uv_height: 0.0,
-            });
-            self.atlases.push(atlas);
-            glyph
+            if self.atlases.len() < MAX_ATLASES {
+                match Atlas::new() {
+                    Ok(mut atlas) => {
+                        let glyph = atlas
+                            .insert(&rasterized)
+                            .unwrap_or_else(|| empty_glyph(atlas.texture));
+                        self.atlases.push(atlas);
+                        return glyph;
+                    }
+                    Err(err) if !self.atlas_allocation_blocked => {
+                        log::error!("terminal glyph atlas allocation stopped: {err}");
+                        self.atlas_allocation_blocked = true;
+                    }
+                    Err(_) => {}
+                }
+            } else if !self.atlas_allocation_blocked {
+                log::warn!(
+                    "terminal glyph atlas limit reached atlases={} bytes={}",
+                    MAX_ATLASES,
+                    MAX_ATLASES * ATLAS_SIZE as usize * ATLAS_SIZE as usize * 4
+                );
+                self.atlas_allocation_blocked = true;
+            }
+            empty_glyph(self.atlases[0].texture)
         });
         self.glyphs.insert(key, glyph);
         glyph
@@ -563,6 +608,21 @@ impl FontCache {
     }
 }
 
+fn empty_glyph(texture: GLuint) -> Glyph {
+    Glyph {
+        texture,
+        multicolor: false,
+        top: 0,
+        left: 0,
+        width: 0,
+        height: 0,
+        uv_left: 0.0,
+        uv_top: 0.0,
+        uv_width: 0.0,
+        uv_height: 0.0,
+    }
+}
+
 pub struct GlRenderer {
     program: GLuint,
     vao: GLuint,
@@ -596,21 +656,34 @@ impl GlRenderer {
                 VERTEX_SHADER
             },
         )?;
-        let fragment = compile_shader(
+        let fragment = match compile_shader(
             gl::FRAGMENT_SHADER,
             if uses_es {
                 GLES_FRAGMENT_SHADER
             } else {
                 FRAGMENT_SHADER
             },
-        )?;
-        let program = link_program(vertex, fragment, uses_es)?;
+        ) {
+            Ok(fragment) => fragment,
+            Err(err) => {
+                unsafe { gl::DeleteShader(vertex) };
+                return Err(err);
+            }
+        };
+        let program = link_program(vertex, fragment, uses_es);
         unsafe {
             gl::DeleteShader(vertex);
             gl::DeleteShader(fragment);
         }
+        let program = program?;
 
-        let font = FontCache::new(font_size, scale)?;
+        let font = match FontCache::new(font_size, scale) {
+            Ok(font) => font,
+            Err(err) => {
+                unsafe { gl::DeleteProgram(program) };
+                return Err(err);
+            }
+        };
         let (cell_width, cell_height) = font.cell_size();
         let size = TerminalSize {
             width: width.max(cell_width.ceil() as u32),
@@ -622,6 +695,11 @@ impl GlRenderer {
         let mut vao = 0;
         let mut vbo = 0;
         unsafe {
+            for _ in 0..8 {
+                if gl::GetError() == gl::NO_ERROR {
+                    break;
+                }
+            }
             gl::GenVertexArrays(1, &mut vao);
             gl::GenBuffers(1, &mut vbo);
             gl::BindVertexArray(vao);
@@ -662,6 +740,21 @@ impl GlRenderer {
             gl::Uniform1i(gl::GetUniformLocation(program, c"glyphTexture".as_ptr()), 0);
             gl::UseProgram(0);
         }
+        let error = unsafe { gl::GetError() };
+        if vao == 0 || vbo == 0 || error != gl::NO_ERROR {
+            unsafe {
+                if vbo != 0 {
+                    gl::DeleteBuffers(1, &vbo);
+                }
+                if vao != 0 {
+                    gl::DeleteVertexArrays(1, &vao);
+                }
+                gl::DeleteProgram(program);
+            }
+            return Err(format!(
+                "terminal GL object initialization failed vao={vao} vbo={vbo} gl_error=0x{error:04x}"
+            ));
+        }
 
         Ok(Self {
             program,
@@ -697,7 +790,14 @@ impl GlRenderer {
         term: &Term<TerminalEventProxy>,
         focused: bool,
         hovered_link: Option<LinkRange>,
-    ) {
+    ) -> Result<(), String> {
+        unsafe {
+            for _ in 0..8 {
+                if gl::GetError() == gl::NO_ERROR {
+                    break;
+                }
+            }
+        }
         let background = color_for_index(term.colors(), NamedColor::Background as usize);
         unsafe {
             gl::Disable(gl::SCISSOR_TEST);
@@ -775,6 +875,11 @@ impl GlRenderer {
             gl::BindVertexArray(0);
             gl::UseProgram(0);
         }
+        let error = unsafe { gl::GetError() };
+        if error != gl::NO_ERROR {
+            return Err(format!("OpenGL error 0x{error:04x}"));
+        }
+        Ok(())
     }
 
     fn collect_cells(
