@@ -908,7 +908,9 @@ fn install_input(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                 copy_terminal_selection(&area, &state, "terminal-key-controller");
                 return glib::Propagation::Stop;
             }
-            if (ctrl && matches!(key, gdk::Key::v | gdk::Key::V)) || (!ctrl && shift && insert) {
+            if (ctrl && shift && matches!(key, gdk::Key::v | gdk::Key::V))
+                || (!ctrl && shift && insert)
+            {
                 paste_clipboard(&area, &state, "terminal-key-controller");
                 return glib::Propagation::Stop;
             }
