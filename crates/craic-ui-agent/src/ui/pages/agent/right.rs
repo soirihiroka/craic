@@ -2138,7 +2138,7 @@ fn install_terminal_shortcuts(
                 return glib::Propagation::Stop;
             }
 
-            if ctrl && matches!(key, gdk::Key::v | gdk::Key::V) {
+            if ctrl && shift && matches!(key, gdk::Key::v | gdk::Key::V) {
                 terminal.paste_clipboard();
                 return glib::Propagation::Stop;
             }
