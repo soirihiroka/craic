@@ -114,6 +114,7 @@ struct UiState {
     exited: bool,
     event_subscription: Option<command_mailbox::UiCommandSubscription>,
     last_selection_text: Option<String>,
+    consecutive_render_failures: u8,
 }
 
 struct TerminalEngine {
@@ -458,6 +459,7 @@ impl AlacrittyTerminal {
             exited: false,
             event_subscription: None,
             last_selection_text: None,
+            consecutive_render_failures: 0,
         }));
 
         install_gl_lifecycle(&area, &state);
@@ -715,10 +717,6 @@ impl AlacrittyTerminal {
 }
 
 fn install_gl_lifecycle(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
-    area.connect_realize({
-        let state = state.clone();
-        move |area| initialize_gl_renderer(area, &state, "realized")
-    });
     area.connect_resize({
         let state = state.clone();
         move |area, width, height| {
@@ -746,6 +744,7 @@ fn install_gl_lifecycle(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
     area.connect_map({
         let state = state.clone();
         move |area| {
+            state.borrow_mut().consecutive_render_failures = 0;
             initialize_gl_renderer(area, &state, "mapped");
             state.borrow().proxy.mark_dirty();
             area.queue_render();
@@ -755,24 +754,25 @@ fn install_gl_lifecycle(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
     area.connect_render({
         let state = state.clone();
         move |area, _| {
-            let mut state = state.borrow_mut();
+            let mut state_ref = state.borrow_mut();
             let scale = area.scale_factor() as f32;
-            if state.renderer.as_ref().is_some_and(|renderer| {
+            if state_ref.renderer.as_ref().is_some_and(|renderer| {
                 (renderer.scale() - scale).abs() > f32::EPSILON
-                    || (state.renderer_font_size - state.font_size).abs() > f64::EPSILON
+                    || (state_ref.renderer_font_size - state_ref.font_size).abs() > f64::EPSILON
             }) {
                 let width = (area.width().max(1) as f32 * scale) as u32;
                 let height = (area.height().max(1) as f32 * scale) as u32;
-                let font_size = state.font_size;
+                let font_size = state_ref.font_size;
                 let uses_es = area.context().is_some_and(|context| context.uses_es());
+                state_ref.renderer.take();
                 match GlRenderer::new(font_size, scale, width, height, uses_es) {
                     Ok(renderer) => {
                         let size = renderer.size();
-                        state.renderer_font_size = font_size;
-                        if let Some(engine) = state.engine.as_mut() {
+                        state_ref.renderer_font_size = font_size;
+                        if let Some(engine) = state_ref.engine.as_mut() {
                             engine.resize(size);
                         }
-                        state.renderer = Some(renderer);
+                        state_ref.renderer = Some(renderer);
                         log::info!(
                             "alacritty GL renderer rebuilt font_size={font_size} scale={scale}"
                         );
@@ -782,23 +782,62 @@ fn install_gl_lifecycle(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>) {
                     }
                 }
             }
-            let focused = state.focused;
-            let hovered_link = state.hovered_link;
-            let Some(engine) = state.engine.as_ref() else {
+            let focused = state_ref.focused;
+            let hovered_link = state_ref.hovered_link;
+            let Some(engine) = state_ref.engine.as_ref() else {
                 return glib::Propagation::Proceed;
             };
             let term = engine.term.clone();
-            let Some(renderer) = state.renderer.as_mut() else {
+            let Some(renderer) = state_ref.renderer.as_mut() else {
                 return glib::Propagation::Proceed;
             };
-            if let Err(err) = renderer.draw(&term.lock(), focused, hovered_link) {
-                log::error!("alacritty GL rendering stopped: {err}");
+            let result = renderer.draw(&term.lock(), focused, hovered_link);
+            if result.is_ok() {
+                state_ref.consecutive_render_failures = 0;
+                return glib::Propagation::Stop;
+            }
+
+            let err = result.unwrap_err();
+            state_ref.consecutive_render_failures =
+                state_ref.consecutive_render_failures.saturating_add(1);
+            let failures = state_ref.consecutive_render_failures;
+            state_ref.renderer.take();
+            drop(state_ref);
+            if failures == 1 {
+                log::warn!("alacritty GL rendering failed; rebuilding renderer once error={err}");
+                initialize_gl_renderer(area, &state, "render-recovery");
+                if state.borrow().renderer.is_some() {
+                    area.queue_render();
+                }
+            } else {
+                log::error!(
+                    "alacritty GL rendering stopped after recovery failures={failures}: {err}"
+                );
                 area.set_error(Some(&glib::Error::new(
                     gio::IOErrorEnum::Failed,
-                    &format!("Unable to render terminal: {err}"),
+                    &format!("Unable to render terminal after recovery: {err}"),
                 )));
             }
             glib::Propagation::Stop
+        }
+    });
+    area.connect_unmap({
+        let state = state.clone();
+        move |area| {
+            release_gl_renderer(area, &state, "unmapped");
+            // GtkGLArea retains its framebuffer textures and context across unmap. Wait until
+            // stack transitions settle, then unrealize hidden areas to release those resources.
+            let area = area.downgrade();
+            glib::idle_add_local_once(move || {
+                let Some(area) = area.upgrade() else {
+                    return;
+                };
+                if area.is_mapped() || !area.is_realized() {
+                    return;
+                }
+                log::info!("alacritty GL terminal hidden; unrealizing GTK framebuffer and context");
+                area.unrealize();
+            });
         }
     });
     area.connect_unrealize({
@@ -859,7 +898,7 @@ fn release_gl_renderer(area: &gtk::GLArea, state: &Rc<RefCell<UiState>>, lifecyc
         let error = area
             .error()
             .map_or_else(|| "unknown GL context error".into(), |err| err.to_string());
-        std::mem::forget(renderer);
+        renderer.abandon();
         log::warn!(
             "alacritty GL cleanup skipped lifecycle={lifecycle} error={error}; context teardown will release GPU resources"
         );
