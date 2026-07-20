@@ -12,11 +12,15 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_void};
 use std::mem::size_of;
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{LinkRange, TerminalEventProxy};
 
 const ATLAS_SIZE: i32 = 1024;
 const MAX_ATLASES: usize = 4;
+// Allow the visible agent and shell plus both outgoing views during stack transitions.
+const MAX_ACTIVE_RENDERERS: usize = 4;
+static ACTIVE_RENDERERS: AtomicUsize = AtomicUsize::new(0);
 const DEFAULT_FOREGROUND: Rgb = Rgb {
     r: 212,
     g: 212,
@@ -640,6 +644,12 @@ impl GlRenderer {
         height: u32,
         uses_es: bool,
     ) -> Result<Self, String> {
+        let active_renderers = ACTIVE_RENDERERS.load(Ordering::Acquire);
+        if active_renderers >= MAX_ACTIVE_RENDERERS {
+            return Err(format!(
+                "active terminal renderer limit reached ({MAX_ACTIVE_RENDERERS})"
+            ));
+        }
         load_epoxy();
         let gl_version = gl_string(gl::VERSION).unwrap_or_else(|| "unknown".to_string());
         let gl_renderer = gl_string(gl::RENDERER).unwrap_or_else(|| "unknown".to_string());
@@ -756,6 +766,10 @@ impl GlRenderer {
             ));
         }
 
+        let active_renderers = ACTIVE_RENDERERS.fetch_add(1, Ordering::AcqRel) + 1;
+        log::info!(
+            "alacritty GL renderer allocated active={active_renderers} limit={MAX_ACTIVE_RENDERERS}"
+        );
         Ok(Self {
             program,
             vao,
@@ -783,6 +797,14 @@ impl GlRenderer {
 
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    pub fn abandon(self) {
+        let active_renderers = ACTIVE_RENDERERS.fetch_sub(1, Ordering::AcqRel) - 1;
+        log::warn!(
+            "alacritty GL renderer abandoned with unavailable context active={active_renderers} limit={MAX_ACTIVE_RENDERERS}"
+        );
+        std::mem::forget(self);
     }
 
     pub fn draw(
@@ -1087,6 +1109,10 @@ impl Drop for GlRenderer {
             gl::DeleteVertexArrays(1, &self.vao);
             gl::DeleteProgram(self.program);
         }
+        let active_renderers = ACTIVE_RENDERERS.fetch_sub(1, Ordering::AcqRel) - 1;
+        log::info!(
+            "alacritty GL renderer released active={active_renderers} limit={MAX_ACTIVE_RENDERERS}"
+        );
     }
 }
 
