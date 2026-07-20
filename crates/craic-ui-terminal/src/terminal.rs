@@ -1339,9 +1339,8 @@ fn close_session(
 
     clear_terminal_auto_close_timer(&session.auto_close_source);
     session.state.set(TerminalSessionState::Closing);
-    let child_pid = session.child_pid.get();
     session.child_pid.set(None);
-    terminate_child(child_pid);
+    session.terminal.terminate();
     session_stack.remove(&session.root);
     session_rail.remove(&session.row);
 
@@ -1489,13 +1488,4 @@ fn confirm_close_running_task(
             );
         }
     });
-}
-
-fn terminate_child(pid: Option<glib::Pid>) {
-    let Some(pid) = pid else {
-        return;
-    };
-    unsafe {
-        libc::kill(pid.0 as libc::pid_t, libc::SIGHUP);
-    }
 }

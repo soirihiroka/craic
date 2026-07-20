@@ -1625,9 +1625,8 @@ fn close_session(
     };
 
     session.state.set(TerminalSessionState::Closing);
-    let child_pid = session.child_pid.get();
     session.child_pid.set(None);
-    terminate_child(child_pid);
+    session.terminal.terminate();
     if let Some(page_num) = notebook.page_num(&session.root) {
         notebook.remove_page(Some(page_num));
     }
@@ -2942,13 +2941,4 @@ fn command_argv(command: &CommandSpec) -> Result<Vec<String>, String> {
             })
         })
         .collect()
-}
-
-fn terminate_child(pid: Option<glib::Pid>) {
-    let Some(pid) = pid else {
-        return;
-    };
-    unsafe {
-        libc::kill(pid.0 as libc::pid_t, libc::SIGHUP);
-    }
 }
