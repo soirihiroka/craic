@@ -372,10 +372,46 @@ impl TerminalEngine {
         let pgid = unsafe { libc::tcgetpgrp(self.pty_file.as_raw_fd()) };
         (pgid > 0).then_some(pgid)
     }
+
+    fn signal_process_groups(&self, signal: libc::c_int) {
+        let foreground_pgid = self.foreground_process_group();
+        for (role, pgid) in [
+            ("foreground", foreground_pgid),
+            ("session-leader", Some(self.child_pid)),
+        ] {
+            let Some(pgid) = pgid.filter(|pgid| *pgid > 0) else {
+                continue;
+            };
+            if role == "session-leader" && foreground_pgid == Some(pgid) {
+                continue;
+            }
+            let result = unsafe { libc::kill(-pgid, signal) };
+            if result == 0 {
+                log::info!(
+                    "alacritty terminal process group signaled role={role} pgid={pgid} signal={signal} pid={}",
+                    self.child_pid
+                );
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    log::debug!(
+                        "alacritty terminal process group already exited role={role} pgid={pgid} signal={signal} pid={}",
+                        self.child_pid
+                    );
+                } else {
+                    log::warn!(
+                        "alacritty terminal process group signal failed role={role} pgid={pgid} signal={signal} pid={} error={error}",
+                        self.child_pid
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl Drop for TerminalEngine {
     fn drop(&mut self) {
+        self.signal_process_groups(libc::SIGHUP);
         if let Err(err) = self.notifier.0.send(Msg::Shutdown) {
             log::debug!("alacritty terminal PTY shutdown already complete: {err}");
         } else {
@@ -565,6 +601,20 @@ impl AlacrittyTerminal {
             .engine
             .as_ref()
             .and_then(TerminalEngine::foreground_process_group)
+    }
+
+    pub fn terminate(&self) {
+        let engine = self.state.borrow_mut().engine.take();
+        let Some(engine) = engine else {
+            log::debug!("alacritty terminal shutdown skipped; process already detached");
+            return;
+        };
+        log::info!(
+            "alacritty terminal shutdown started pid={} foreground_pgid={:?}",
+            engine.child_pid,
+            engine.foreground_process_group()
+        );
+        drop(engine);
     }
 
     pub fn set_font_size(&self, font_size: f64) {
