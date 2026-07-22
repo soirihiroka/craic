@@ -130,7 +130,18 @@ fn append_ignore_section(
     path: &str,
     kind: IgnoreTargetKind,
 ) -> ContextMenuBuilder {
-    for option in gitignore::options_for_path(path, kind) {
+    let options = gitignore::options_for_path(path, kind);
+    if let Some(option) = options.direct {
+        menu = menu.target_item(&option.label, "ignore-pattern", &option.pattern);
+    }
+    if !options.folders.is_empty() {
+        let mut folders = context_menu::builder("repo_file");
+        for option in options.folders {
+            folders = folders.target_item(&option.label, "ignore-pattern", &option.pattern);
+        }
+        menu = menu.submenu("Ignore Folder (Add to .gitignore)", &folders.build());
+    }
+    if let Some(option) = options.extension {
         menu = menu.target_item(&option.label, "ignore-pattern", &option.pattern);
     }
     menu

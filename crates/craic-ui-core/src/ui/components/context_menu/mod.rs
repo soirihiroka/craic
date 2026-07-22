@@ -132,6 +132,12 @@ impl ContextMenuBuilder {
         self.menu_item(label, action, Some(target), None)
     }
 
+    pub fn submenu(mut self, label: &str, submenu: &impl IsA<gio::MenuModel>) -> Self {
+        self.section.append_submenu(Some(label), submenu);
+        self.section_has_items = true;
+        self
+    }
+
     pub fn separator(mut self) -> Self {
         self.flush_section();
         self

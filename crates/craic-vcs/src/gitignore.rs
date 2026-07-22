@@ -18,53 +18,52 @@ pub struct IgnoreOption {
     pub pattern: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IgnoreOptions {
+    pub direct: Option<IgnoreOption>,
+    pub folders: Vec<IgnoreOption>,
+    pub extension: Option<IgnoreOption>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IgnoreCheck {
     pub path: String,
     pub is_dir: bool,
 }
 
-pub fn options_for_path(path: &str, kind: IgnoreTargetKind) -> Vec<IgnoreOption> {
+pub fn options_for_path(path: &str, kind: IgnoreTargetKind) -> IgnoreOptions {
     let path = normalize_repo_path(path);
-    if path.is_empty() {
-        return Vec::new();
+    if path.is_empty()
+        || kind == IgnoreTargetKind::File
+            && path
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name == ".gitignore")
+    {
+        return IgnoreOptions::default();
     }
 
-    let mut options = Vec::new();
-
-    if kind == IgnoreTargetKind::File {
-        if let Some(pattern) = extension_pattern(&path) {
-            options.push(IgnoreOption {
-                label: format!("Ignore All {pattern} Files"),
-                pattern,
-            });
-        }
-    }
-
-    if let Some(pattern) = parent_folder_pattern(&path) {
-        options.push(IgnoreOption {
-            label: if kind == IgnoreTargetKind::Folder {
-                "Ignore Parent Folder".to_string()
-            } else {
-                "Ignore Folder".to_string()
-            },
-            pattern,
-        });
-    }
-
-    let pattern = match kind {
-        IgnoreTargetKind::File => escape_pattern(&path),
-        IgnoreTargetKind::Folder => escape_pattern(&format!("{path}/")),
-    };
-    options.push(IgnoreOption {
-        label: match kind {
-            IgnoreTargetKind::File => "Ignore File".to_string(),
-            IgnoreTargetKind::Folder => "Ignore Folder".to_string(),
-        },
-        pattern,
+    let direct = (kind == IgnoreTargetKind::File).then(|| IgnoreOption {
+        label: "Ignore File (Add to .gitignore)".to_string(),
+        pattern: escape_pattern(&path),
     });
+    let folder = match kind {
+        IgnoreTargetKind::File => path.rsplit_once('/').map(|(folder, _)| folder),
+        IgnoreTargetKind::Folder => Some(path.as_str()),
+    };
+    let folders = folder
+        .into_iter()
+        .flat_map(folder_options)
+        .collect::<Vec<_>>();
+    let extension = (kind == IgnoreTargetKind::File)
+        .then(|| extension_option(&path))
+        .flatten();
 
-    options
+    IgnoreOptions {
+        direct,
+        folders,
+        extension,
+    }
 }
 
 type AddPatternCallback = Box<dyn Fn(Result<String, String>) + Send + 'static>;
@@ -215,23 +214,41 @@ fn normalize_repo_path(path: &str) -> String {
     path.trim_matches('/').to_string()
 }
 
-fn parent_folder_pattern(path: &str) -> Option<String> {
-    let (folder, _) = path.rsplit_once('/')?;
-    (!folder.is_empty()).then(|| escape_pattern(&format!("{folder}/")))
+fn folder_options(folder: &str) -> Vec<IgnoreOption> {
+    let mut folder = folder;
+    let mut options = Vec::new();
+    while !folder.is_empty() {
+        options.push(IgnoreOption {
+            label: format!("/{folder}"),
+            pattern: format!("{}/", escape_pattern(folder)),
+        });
+        folder = folder.rsplit_once('/').map_or("", |(parent, _)| parent);
+    }
+    options
 }
 
-fn extension_pattern(path: &str) -> Option<String> {
+fn extension_option(path: &str) -> Option<IgnoreOption> {
     let file_name = path.rsplit('/').next().unwrap_or(path);
-    let (_, extension) = file_name.rsplit_once('.')?;
-    (!extension.is_empty()).then(|| format!("*.{extension}"))
+    let index = file_name.rfind('.')?;
+    if index == 0 || index + 1 == file_name.len() {
+        return None;
+    }
+    let extension = &file_name[index..];
+    Some(IgnoreOption {
+        label: format!("Ignore All {extension} Files (Add to .gitignore)"),
+        pattern: format!("*{}", escape_pattern(extension)),
+    })
 }
 
 fn escape_pattern(pattern: &str) -> String {
-    if pattern.starts_with('#') || pattern.starts_with('!') {
-        format!("\\{pattern}")
-    } else {
-        pattern.to_string()
+    let mut escaped = String::with_capacity(pattern.len());
+    for character in pattern.chars() {
+        if matches!(character, '[' | ']' | '!' | '*' | '#' | '?') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
     }
+    escaped
 }
 
 fn contains_pattern(contents: &[u8], pattern: &str) -> bool {

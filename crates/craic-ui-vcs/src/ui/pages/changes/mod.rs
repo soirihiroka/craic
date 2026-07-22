@@ -1443,14 +1443,14 @@ fn show_changed_file_context_menu(
     y: f64,
 ) {
     let local_workspace = ctx.system_ref().provider_kind == ProviderKind::Local;
-    let menu = changed_file_menu(file_path, local_workspace);
+    let menu = changed_file_menu(file_path, ctx.files().is_some());
     let actions = changed_file_action_group(ctx, local_workspace);
     menu.popup(parent, x, y, &actions, active_context_menu);
 }
 
 fn changed_file_menu(
     file_path: &str,
-    include_local_actions: bool,
+    include_ignore_actions: bool,
 ) -> context_menu::ContextMenuBuilder {
     let mut menu = context_menu::builder("changed_file")
         .target_item("Open With Default Program", "open-default", file_path)
@@ -1458,11 +1458,8 @@ fn changed_file_menu(
         .target_item("Show in File Manager", "show-folder", file_path)
         .target_item("Show in File View", "show-file-view", file_path);
 
-    if include_local_actions {
-        menu = menu.separator();
-        for option in gitignore::options_for_path(file_path, IgnoreTargetKind::File) {
-            menu = menu.target_item(&option.label, "ignore-pattern", &option.pattern);
-        }
+    if include_ignore_actions {
+        menu = append_changed_file_ignore_section(menu, file_path);
     }
 
     menu.separator()
@@ -1470,6 +1467,32 @@ fn changed_file_menu(
         .target_item("Copy Relative Path", "copy-relative-path", file_path)
         .separator()
         .target_item("Discard Changes...", "discard", file_path)
+}
+
+fn append_changed_file_ignore_section(
+    mut menu: context_menu::ContextMenuBuilder,
+    file_path: &str,
+) -> context_menu::ContextMenuBuilder {
+    let options = gitignore::options_for_path(file_path, IgnoreTargetKind::File);
+    if options.direct.is_none() && options.folders.is_empty() && options.extension.is_none() {
+        return menu;
+    }
+
+    menu = menu.separator();
+    if let Some(option) = options.direct {
+        menu = menu.target_item(&option.label, "ignore-pattern", &option.pattern);
+    }
+    if !options.folders.is_empty() {
+        let mut folders = context_menu::builder("changed_file");
+        for option in options.folders {
+            folders = folders.target_item(&option.label, "ignore-pattern", &option.pattern);
+        }
+        menu = menu.submenu("Ignore Folder (Add to .gitignore)", &folders.build());
+    }
+    if let Some(option) = options.extension {
+        menu = menu.target_item(&option.label, "ignore-pattern", &option.pattern);
+    }
+    menu
 }
 
 fn changed_file_action_group(ctx: &PageContext, local_workspace: bool) -> gio::SimpleActionGroup {
@@ -1557,10 +1580,11 @@ fn changed_file_action_group(ctx: &PageContext, local_workspace: bool) -> gio::S
         let ctx = ctx.clone();
         move |file_path| copy_to_clipboard(&ctx, file_path)
     });
-    context_menu::add_string_menu_action(&actions, "ignore-pattern", {
+    let ignore_pattern = context_menu::add_string_menu_action(&actions, "ignore-pattern", {
         let ctx = ctx.clone();
         move |pattern| ignore_pattern(&ctx, pattern)
     });
+    ignore_pattern.set_enabled(ctx.files().is_some());
     context_menu::add_string_menu_action(&actions, "discard", {
         let ctx = ctx.clone();
         move |file_path| confirm_discard_changes(&ctx, vec![file_path.to_string()])
