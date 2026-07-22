@@ -15,6 +15,27 @@ Markdown linting, search, and common file operations. Craic can preview
 Markdown, reStructuredText, SVG, PDF, images, audio, video, SQLite databases, Jupyter notebooks,
 fonts, and SafeTensors metadata without leaving the application.
 
+Structured data
+~~~~~~~~~~~~~~~
+
+JSON-family files open in the code editor and provide a :guilabel:`Code` / :guilabel:`View`
+switch in the file header. The structured view displays objects and arrays as a tree: the
+document root starts expanded, while nested containers can be unfolded as needed. Container
+rows show their item count, and scalar rows preserve the distinction between strings, numbers,
+booleans, and ``null``.
+
+The viewer supports:
+
+* JSON files (``.json``).
+* JSON with comments and trailing commas (``.jsonc``).
+* Line-delimited JSON records (``.jsonl`` and ``.ndjson``). Each non-empty line must contain one
+  JSON value.
+
+Selecting :guilabel:`View` parses the editor's current contents, including unsaved changes. If
+the contents are invalid, the viewer reports the format and source location of the error; switch
+back to :guilabel:`Code` to correct it. CSV files use the related :guilabel:`Code` /
+:guilabel:`Table` switch.
+
 Git hosting and changes
 -----------------------
 
