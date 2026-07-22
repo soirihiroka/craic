@@ -117,11 +117,11 @@ pub fn build(_menu: &gio::Menu, snapshot: Option<&RepositorySnapshot>) -> Conten
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
         .build();
+    push_content.append(&push_ahead_box);
+    push_content.append(&push_behind_box);
     push_content.append(&push_icon);
     push_content.append(&push_spinner);
     push_content.append(&push_label);
-    push_content.append(&push_ahead_box);
-    push_content.append(&push_behind_box);
     let push_button = gtk::Button::builder()
         .child(&push_content)
         .tooltip_text("Last fetched: unknown")
@@ -616,7 +616,8 @@ impl ContentPane {
         self.push_label.set_label(label);
         self.push_icon
             .set_icon_name(Some(git_action_icon_name(snapshot)));
-        self.push_icon.set_visible(!action_running);
+        self.push_icon
+            .set_visible(!action_running && snapshot.ahead == 0 && snapshot.behind == 0);
         self.push_spinner.set_visible(action_running);
         self.push_ahead_box
             .set_visible(!action_running && snapshot.ahead > 0);

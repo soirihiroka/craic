@@ -1,9 +1,10 @@
 use adw::prelude::*;
-use gtk::cairo;
 use gtk::gdk::RGBA;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
+
+use super::canvas_painter::CanvasPainter;
 
 pub const WIDTH: f64 = 24.0;
 pub const MIN_THUMB: f64 = 40.0;
@@ -322,7 +323,7 @@ fn handle_rect(width: i32, height: i32, hover_progress: f64) -> Rect {
 }
 
 pub fn draw_track(
-    context: &cairo::Context,
+    context: &impl CanvasPainter,
     width: i32,
     height: i32,
     total_height: f64,
@@ -350,7 +351,7 @@ pub fn draw_track(
     );
 }
 
-pub fn clip_to_track(context: &cairo::Context, width: i32, height: i32, hover_progress: f64) {
+pub fn clip_to_track(context: &impl CanvasPainter, width: i32, height: i32, hover_progress: f64) {
     let handle = handle_rect(width, height, hover_progress);
     rounded_rect(
         context,
@@ -364,7 +365,7 @@ pub fn clip_to_track(context: &cairo::Context, width: i32, height: i32, hover_pr
 }
 
 pub fn draw_marker(
-    context: &cairo::Context,
+    context: &impl CanvasPainter,
     kind: MarkerKind,
     x: f64,
     y: f64,
@@ -395,7 +396,7 @@ pub fn draw_marker(
 }
 
 pub fn draw_thumb(
-    context: &cairo::Context,
+    context: &impl CanvasPainter,
     width: i32,
     height: i32,
     total_height: f64,
@@ -427,7 +428,7 @@ pub fn draw_thumb(
 }
 
 pub fn draw_thumb_fill(
-    context: &cairo::Context,
+    context: &impl CanvasPainter,
     width: i32,
     height: i32,
     total_height: f64,
@@ -459,7 +460,7 @@ pub fn draw_thumb_fill(
 }
 
 pub fn draw_thumb_outline(
-    context: &cairo::Context,
+    context: &impl CanvasPainter,
     width: i32,
     height: i32,
     total_height: f64,
@@ -509,7 +510,7 @@ fn handle_thumb_rect(
 }
 
 pub fn set_hover(
-    area: &gtk::DrawingArea,
+    area: &impl IsA<gtk::Widget>,
     hover_cell: &Rc<Cell<bool>>,
     active_cell: &Rc<Cell<bool>>,
     progress_cell: &Rc<Cell<f64>>,
@@ -524,7 +525,7 @@ pub fn set_hover(
 }
 
 pub fn set_active(
-    area: &gtk::DrawingArea,
+    area: &impl IsA<gtk::Widget>,
     hover_cell: &Rc<Cell<bool>>,
     active_cell: &Rc<Cell<bool>>,
     progress_cell: &Rc<Cell<f64>>,
@@ -539,7 +540,7 @@ pub fn set_active(
 }
 
 fn start_hover_animation(
-    area: &gtk::DrawingArea,
+    area: &impl IsA<gtk::Widget>,
     hover_cell: &Rc<Cell<bool>>,
     active_cell: &Rc<Cell<bool>>,
     progress_cell: &Rc<Cell<f64>>,
@@ -550,7 +551,7 @@ fn start_hover_animation(
     }
     animating_cell.set(true);
 
-    let area = area.clone();
+    let area = area.as_ref().clone();
     let hover_cell = hover_cell.clone();
     let active_cell = active_cell.clone();
     let progress_cell = progress_cell.clone();
@@ -570,7 +571,7 @@ fn start_hover_animation(
             if delta.abs() < 0.02 {
                 progress_cell.set(target);
                 animating_cell.set(false);
-                area.queue_draw();
+                queue_redraw(&area);
                 return gtk::glib::ControlFlow::Break;
             }
 
@@ -580,10 +581,18 @@ fn start_hover_animation(
                 delta.max(-step)
             };
             progress_cell.set((current + clamped_delta).clamp(0.0, 1.0));
-            area.queue_draw();
+            queue_redraw(&area);
             gtk::glib::ControlFlow::Continue
         },
     );
+}
+
+fn queue_redraw(area: &gtk::Widget) {
+    if let Some(area) = area.downcast_ref::<gtk::GLArea>() {
+        area.queue_render();
+    } else {
+        area.queue_draw();
+    }
 }
 
 fn lerp(start: f64, end: f64, amount: f64) -> f64 {
@@ -599,7 +608,7 @@ fn lerp_color(start: (f64, f64, f64), end: (f64, f64, f64), amount: f64) -> (f64
 }
 
 fn fill_rect_rgba(
-    context: &cairo::Context,
+    context: &impl CanvasPainter,
     x: f64,
     y: f64,
     width: f64,
@@ -613,7 +622,7 @@ fn fill_rect_rgba(
 }
 
 fn fill_rounded_rect(
-    context: &cairo::Context,
+    context: &impl CanvasPainter,
     x: f64,
     y: f64,
     width: f64,
@@ -626,7 +635,14 @@ fn fill_rounded_rect(
     let _ = context.fill();
 }
 
-fn rounded_rect(context: &cairo::Context, x: f64, y: f64, width: f64, height: f64, radius: f64) {
+fn rounded_rect(
+    context: &impl CanvasPainter,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    radius: f64,
+) {
     let radius = radius.min(width / 2.0).min(height / 2.0);
     context.new_sub_path();
     context.arc(

@@ -11,30 +11,21 @@ use self::line_numbers::{
     gutter_x, text_bounds, viewport_width_for_state,
 };
 use self::theme::{Color, EditorTheme, editor_theme, lerp_color};
+use super::super::skia_canvas;
 use super::{
     CELL_PADDING, EditorState, FoldControlKey, FoldIconState, FoldRange, LayoutCache,
     MIN_CONTENT_WIDTH, ScrollbarMarkerKind, SearchMatch, VisualLine, canvas,
 };
 use crate::ui::{canvas_scroll, canvas_scrollbar};
 use adw::prelude::*;
-use gtk::cairo;
-use gtk::gdk::prelude::GdkCairoContextExt;
-use gtk::gdk_pixbuf::Pixbuf;
-use std::cell::RefCell;
-use std::io::Cursor;
 use std::rc::Rc;
 use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 
 const FOLD_CONTROL_SIZE: f64 = 14.0;
-const FOLD_ICON: &[u8] = craic_ui_core::ui::PAN_DOWN_SYMBOLIC;
 const FOLD_ICON_COLLAPSED_ANGLE: f64 = -std::f64::consts::FRAC_PI_2;
 const FOLD_ICON_EXPANDED_ANGLE: f64 = 0.0;
 const FOLD_ICON_STATE_LIMIT: usize = 512;
-
-thread_local! {
-    static FOLD_ICON_BASE_PIXBUF: RefCell<Option<Pixbuf>> = RefCell::new(None);
-}
 
 pub type FontMetrics = canvas::FontMetrics;
 
@@ -54,8 +45,8 @@ struct FoldControlHit {
 }
 
 pub fn draw_editor(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     width: i32,
     height: i32,
     state: &Rc<EditorState>,
@@ -304,7 +295,7 @@ pub fn invalidate_highlights(state: &Rc<EditorState>) {
     state.highlights_dirty.set(true);
 }
 
-pub fn refresh_font_metrics(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+pub fn refresh_font_metrics(area: &gtk::GLArea, state: &Rc<EditorState>) {
     let metrics = measure_font_metrics(area, state.font_size.get());
     if (metrics.char_width - state.char_width.get()).abs() > 0.01
         || (metrics.char_spacing - state.char_spacing.get()).abs() > 0.01
@@ -319,7 +310,7 @@ pub fn refresh_font_metrics(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     }
 }
 
-pub fn measure_font_metrics(area: &gtk::DrawingArea, font_size: f64) -> FontMetrics {
+pub fn measure_font_metrics(area: &gtk::GLArea, font_size: f64) -> FontMetrics {
     canvas::measure_font_metrics(area, font_size, super::line_height_for_font_size)
 }
 
@@ -328,7 +319,7 @@ fn font_size_key(font_size: f64) -> i32 {
 }
 
 fn ensure_layout(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     viewport_width: i32,
     viewport_height: f64,
@@ -384,7 +375,7 @@ fn ensure_layout(
     state.scroll_x.set(state.scroll_x.get().clamp(0.0, max_x));
 }
 
-fn ensure_highlights(area: &gtk::DrawingArea, state: &Rc<EditorState>, text: &str) {
+fn ensure_highlights(area: &gtk::GLArea, state: &Rc<EditorState>, text: &str) {
     if !state.highlights_dirty.get() {
         return;
     }
@@ -392,8 +383,8 @@ fn ensure_highlights(area: &gtk::DrawingArea, state: &Rc<EditorState>, text: &st
 }
 
 fn draw_cursor(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     state: &Rc<EditorState>,
     text: &str,
     visual_lines: &[VisualLine],
@@ -410,8 +401,8 @@ fn draw_cursor(
 }
 
 fn draw_preedit(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     state: &Rc<EditorState>,
     text: &str,
     visual_lines: &[VisualLine],
@@ -450,7 +441,7 @@ fn draw_preedit(
 }
 
 fn cursor_visual_rect(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     text: &str,
     visual_lines: &[VisualLine],
@@ -471,10 +462,7 @@ fn cursor_visual_rect(
     ))
 }
 
-pub fn cursor_rect(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-) -> Option<(f64, f64, f64, f64)> {
+pub fn cursor_rect(area: &gtk::GLArea, state: &Rc<EditorState>) -> Option<(f64, f64, f64, f64)> {
     let text = state.text.borrow();
     let viewport_width = viewport_width_for_state(state, area.allocated_width());
     ensure_layout(
@@ -500,7 +488,7 @@ pub fn cursor_rect(
 }
 
 pub fn vertical_cursor_target(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     delta: isize,
 ) -> Option<usize> {
@@ -557,7 +545,7 @@ pub fn vertical_cursor_target(
 }
 
 fn draw_empty_selection_marker(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     state: &Rc<EditorState>,
     line: &VisualLine,
     text_x: f64,
@@ -584,8 +572,8 @@ fn draw_empty_selection_marker(
 }
 
 fn draw_search_matches(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     state: &Rc<EditorState>,
     source: &str,
     line: &VisualLine,
@@ -648,7 +636,7 @@ fn valid_search_match(source: &str, search_match: &SearchMatch) -> bool {
 }
 
 fn build_visual_lines(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     width: i32,
     text: &str,
@@ -725,7 +713,7 @@ fn collapsed_fold_starting_at(folds: &[FoldRange], source_line: usize) -> Option
 }
 
 fn push_wrapped_visual_lines(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     lines: &mut Vec<VisualLine>,
     source_line: usize,
@@ -786,14 +774,14 @@ fn push_wrapped_visual_lines(
     wrap_index + 1
 }
 
-pub fn refresh_size(area: &gtk::DrawingArea, state: &Rc<EditorState>, width: i32, height: i32) {
+pub fn refresh_size(area: &gtk::GLArea, state: &Rc<EditorState>, width: i32, height: i32) {
     let text = state.text.borrow();
     let viewport_width = viewport_width_for_state(state, width);
     let viewport_height = height.max(1) as f64;
     ensure_layout(area, state, viewport_width, viewport_height, &text);
 }
 
-pub fn hit_test(area: &gtk::DrawingArea, state: &Rc<EditorState>, x: f64, y: f64) -> usize {
+pub fn hit_test(area: &gtk::GLArea, state: &Rc<EditorState>, x: f64, y: f64) -> usize {
     let text = state.text.borrow();
     let viewport_width = viewport_width_for_state(state, area.allocated_width());
     ensure_layout(
@@ -824,7 +812,7 @@ pub fn hit_test(area: &gtk::DrawingArea, state: &Rc<EditorState>, x: f64, y: f64
 }
 
 pub fn text_range_at_point(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     x: f64,
     y: f64,
@@ -865,28 +853,28 @@ pub fn text_range_at_point(
     None
 }
 
-pub fn set_scroll_y(area: &gtk::DrawingArea, state: &Rc<EditorState>, value: f64) {
+pub fn set_scroll_y(area: &gtk::GLArea, state: &Rc<EditorState>, value: f64) {
     let viewport_height = area.allocated_height().max(1) as f64;
     let max_scroll = max_scroll_y(state, viewport_height);
     let next = value.clamp(0.0, max_scroll);
     if (next - state.scroll_y.get()).abs() > f64::EPSILON {
         state.scroll_y.set(next);
         super::notify_scroll(state, next);
-        area.queue_draw();
+        area.queue_render();
     }
 }
 
-pub fn set_scroll_x(area: &gtk::DrawingArea, state: &Rc<EditorState>, value: f64) {
+pub fn set_scroll_x(area: &gtk::GLArea, state: &Rc<EditorState>, value: f64) {
     let viewport_width = viewport_width_for_state(state, area.allocated_width()) as f64;
     let max_scroll = (state.content_width.get() - viewport_width).max(0.0);
     let next = value.clamp(0.0, max_scroll);
     if (next - state.scroll_x.get()).abs() > f64::EPSILON {
         state.scroll_x.set(next);
-        area.queue_draw();
+        area.queue_render();
     }
 }
 
-pub fn ensure_offset_visible(area: &gtk::DrawingArea, state: &Rc<EditorState>, offset: usize) {
+pub fn ensure_offset_visible(area: &gtk::GLArea, state: &Rc<EditorState>, offset: usize) {
     let text = state.text.borrow();
     let viewport_width = viewport_width_for_state(state, area.allocated_width());
     ensure_layout(
@@ -954,7 +942,7 @@ fn visual_line_index_for_offset(visual_lines: &[VisualLine], offset: usize) -> u
 }
 
 pub fn scrollbar_thumb(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
 ) -> Option<(f64, f64, f64, f64)> {
     let width = area.allocated_width();
@@ -974,7 +962,7 @@ pub fn max_scroll_y(state: &Rc<EditorState>, viewport_height: f64) -> f64 {
     (state.content_height.get() - viewport_height).max(0.0)
 }
 
-pub fn source_offset_at_scroll_top(area: &gtk::DrawingArea, state: &Rc<EditorState>) -> usize {
+pub fn source_offset_at_scroll_top(area: &gtk::GLArea, state: &Rc<EditorState>) -> usize {
     let text = state.text.borrow();
     let viewport_width = viewport_width_for_state(state, area.allocated_width());
     ensure_layout(
@@ -1014,11 +1002,7 @@ pub fn source_offset_at_scroll_top(area: &gtk::DrawingArea, state: &Rc<EditorSta
     line.start + (source_span as f64 * progress).round() as usize
 }
 
-pub fn set_source_offset_at_scroll_top(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-    offset: usize,
-) {
+pub fn set_source_offset_at_scroll_top(area: &gtk::GLArea, state: &Rc<EditorState>, offset: usize) {
     let text = state.text.borrow();
     let viewport_width = viewport_width_for_state(state, area.allocated_width());
     ensure_layout(
@@ -1059,7 +1043,7 @@ pub fn set_source_offset_at_scroll_top(
 }
 
 pub fn fold_action_at_point(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     x: f64,
     y: f64,
@@ -1068,7 +1052,7 @@ pub fn fold_action_at_point(
 }
 
 pub fn fold_control_at_point(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     x: f64,
     y: f64,
@@ -1077,7 +1061,7 @@ pub fn fold_control_at_point(
 }
 
 fn fold_control_hit_at_point(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     x: f64,
     y: f64,
@@ -1125,8 +1109,8 @@ fn fold_control_hit_at_point(
 }
 
 fn draw_scrollbar(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     width: i32,
     height: i32,
     state: &Rc<EditorState>,
@@ -1169,7 +1153,7 @@ fn draw_scrollbar(
 }
 
 fn draw_scrollbar_markers(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     width: i32,
     height: i32,
     state: &Rc<EditorState>,
@@ -1223,7 +1207,7 @@ fn draw_scrollbar_markers(
 }
 
 fn draw_middle_autoscroll_marker(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     width: i32,
     height: i32,
     state: &Rc<EditorState>,
@@ -1297,9 +1281,9 @@ fn fold_toggle_rect(gutter_x: f64, _gutter: f64, y: f64, line_height: f64) -> (f
 }
 
 fn draw_fold_toggle_icon(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     rect: (f64, f64, f64, f64),
     key: FoldControlKey,
     expanded: bool,
@@ -1309,20 +1293,20 @@ fn draw_fold_toggle_icon(
     let (color, active_amount, pressed) = fold_icon_color(state, key, theme);
     draw_fold_control_background(context, rect, active_amount, pressed, theme);
 
-    let Some(pixbuf) = fold_icon_pixbuf(color) else {
-        return;
-    };
-
     let _ = context.save();
     context.translate(rect.0 + rect.2 / 2.0, rect.1 + rect.3 / 2.0);
     context.rotate(angle);
-    context.set_source_pixbuf(&pixbuf, -rect.2 / 2.0, -rect.3 / 2.0);
-    let _ = context.paint();
+    context.set_source_rgba(color.red, color.green, color.blue, 1.0);
+    context.set_line_width(1.7);
+    context.move_to(-4.0, -2.0);
+    context.line_to(0.0, 2.0);
+    context.line_to(4.0, -2.0);
+    let _ = context.stroke();
     let _ = context.restore();
 }
 
 fn fold_icon_angle(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     key: FoldControlKey,
     expanded: bool,
@@ -1353,7 +1337,7 @@ fn fold_icon_angle(
     target_angle
 }
 
-fn start_fold_icon_animation(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn start_fold_icon_animation(area: &gtk::GLArea, state: &Rc<EditorState>) {
     if state.fold_icon_animating.get() {
         return;
     }
@@ -1376,7 +1360,7 @@ fn start_fold_icon_animation(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
             }
         }
 
-        area.queue_draw();
+        area.queue_render();
         if animating {
             gtk::glib::ControlFlow::Continue
         } else {
@@ -1408,7 +1392,7 @@ fn fold_icon_color(
 }
 
 fn draw_fold_control_background(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     rect: (f64, f64, f64, f64),
     active_amount: f64,
     pressed: bool,
@@ -1429,60 +1413,6 @@ fn draw_fold_control_background(
     );
 }
 
-fn fold_icon_pixbuf(color: Color) -> Option<Pixbuf> {
-    let base = FOLD_ICON_BASE_PIXBUF.with(|slot| {
-        let mut cached = slot.borrow_mut();
-        if cached.is_none() {
-            *cached = Pixbuf::from_read(Cursor::new(FOLD_ICON))
-                .ok()
-                .and_then(|pixbuf| {
-                    pixbuf.scale_simple(
-                        FOLD_CONTROL_SIZE as i32,
-                        FOLD_CONTROL_SIZE as i32,
-                        gtk::gdk_pixbuf::InterpType::Bilinear,
-                    )
-                });
-        }
-        cached.clone()
-    });
-    base.and_then(|pixbuf| recolor_symbolic_pixbuf(pixbuf, color))
-}
-
-fn recolor_symbolic_pixbuf(pixbuf: Pixbuf, color: Color) -> Option<Pixbuf> {
-    let pixbuf = if pixbuf.has_alpha() {
-        pixbuf.copy()?
-    } else {
-        pixbuf.add_alpha(false, 0, 0, 0).ok()?
-    };
-    let width = pixbuf.width().max(0) as usize;
-    let height = pixbuf.height().max(0) as usize;
-    let rowstride = pixbuf.rowstride().max(0) as usize;
-    let channels = pixbuf.n_channels().max(0) as usize;
-    if width == 0 || height == 0 || channels < 4 {
-        return None;
-    }
-
-    let red = (color.red.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let green = (color.green.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let blue = (color.blue.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let pixels = unsafe { pixbuf.pixels() };
-    for y in 0..height {
-        for x in 0..width {
-            let offset = y
-                .saturating_mul(rowstride)
-                .saturating_add(x.saturating_mul(channels));
-            if offset + 3 >= pixels.len() {
-                continue;
-            }
-            pixels[offset] = red;
-            pixels[offset + 1] = green;
-            pixels[offset + 2] = blue;
-        }
-    }
-
-    Some(pixbuf)
-}
-
 fn point_in_rect(x: f64, y: f64, rect: (f64, f64, f64, f64)) -> bool {
     let (rect_x, rect_y, rect_width, rect_height) = rect;
     x >= rect_x && x <= rect_x + rect_width && y >= rect_y && y <= rect_y + rect_height
@@ -1496,7 +1426,7 @@ fn wrap_width(state: &Rc<EditorState>, width: i32, gutter_width: f64) -> f64 {
 }
 
 fn content_width_for(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     width: i32,
     text: &str,
@@ -1546,7 +1476,7 @@ fn char_width(state: &Rc<EditorState>) -> f64 {
     state.char_width.get()
 }
 
-pub fn text_width(area: &gtk::DrawingArea, state: &Rc<EditorState>, text: &str) -> f64 {
+pub fn text_width(area: &gtk::GLArea, state: &Rc<EditorState>, text: &str) -> f64 {
     if text.is_empty() {
         return 0.0;
     }
@@ -1554,7 +1484,7 @@ pub fn text_width(area: &gtk::DrawingArea, state: &Rc<EditorState>, text: &str) 
     canvas::cached_text_width(area, state.font_size.get(), &mut cache, text)
 }
 
-pub fn offset_for_x(area: &gtk::DrawingArea, state: &Rc<EditorState>, text: &str, x: f64) -> usize {
+pub fn offset_for_x(area: &gtk::GLArea, state: &Rc<EditorState>, text: &str, x: f64) -> usize {
     let x = x.max(0.0);
     if text.is_empty() || x <= 0.0 {
         return 0;
@@ -1572,8 +1502,8 @@ pub fn offset_for_x(area: &gtk::DrawingArea, state: &Rc<EditorState>, text: &str
 }
 
 fn draw_plain_text(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     state: &Rc<EditorState>,
     text: &str,
     x: f64,
@@ -1584,34 +1514,19 @@ fn draw_plain_text(
         return;
     }
     let color = color.into();
-    if color.alpha < 1.0 {
-        context.push_group();
-        canvas::draw_plain_text(
-            area,
-            context,
-            state.font_size.get(),
-            text,
-            x,
-            baseline,
-            canvas::TextColor::rgb(color.red, color.green, color.blue),
-        );
-        let _ = context.pop_group_to_source();
-        let _ = context.paint_with_alpha(color.alpha);
-    } else {
-        canvas::draw_plain_text(
-            area,
-            context,
-            state.font_size.get(),
-            text,
-            x,
-            baseline,
-            canvas::TextColor::rgb(color.red, color.green, color.blue),
-        );
-    }
+    canvas::draw_plain_text(
+        area,
+        context,
+        state.font_size.get(),
+        text,
+        x,
+        baseline,
+        canvas::TextColor::rgba(color.red, color.green, color.blue, color.alpha),
+    );
 }
 
 fn fill_rect(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     x: f64,
     y: f64,
     width: f64,
@@ -1625,7 +1540,7 @@ fn fill_rect(
 }
 
 fn fill_rounded_rect_rgba(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     x: f64,
     y: f64,
     width: f64,
@@ -1639,7 +1554,14 @@ fn fill_rounded_rect_rgba(
     let _ = context.fill();
 }
 
-fn rounded_rect(context: &cairo::Context, x: f64, y: f64, width: f64, height: f64, radius: f64) {
+fn rounded_rect(
+    context: &skia_canvas::Context,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    radius: f64,
+) {
     let radius = radius.min(width / 2.0).min(height / 2.0);
     context.new_sub_path();
     context.arc(

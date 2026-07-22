@@ -1,10 +1,10 @@
+use super::super::super::skia_canvas;
 use super::super::{CELL_PADDING, EditorState, FoldControlKey, GutterSide, MIN_CONTENT_WIDTH};
 use super::theme::{Color, EditorTheme};
 use super::{
     char_width, draw_fold_toggle_icon, draw_plain_text, fill_rect, fold_toggle_rect, line_height,
     text_width, viewport_width,
 };
-use gtk::cairo;
 use std::rc::Rc;
 
 #[derive(Clone, Copy)]
@@ -16,9 +16,9 @@ pub struct LineNumberStyle {
 }
 
 pub fn draw_line_number(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     gutter_x: f64,
     gutter: f64,
     number: usize,
@@ -67,7 +67,7 @@ pub fn draw_line_number(
 }
 
 pub fn draw_gutter(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     x: f64,
     width: f64,
     height: f64,
@@ -77,7 +77,7 @@ pub fn draw_gutter(
 }
 
 pub fn draw_deleted_hint(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     gutter_x: f64,
     gutter: f64,
     line_y: f64,
@@ -109,7 +109,7 @@ pub fn text_bounds(side: GutterSide, width: i32, gutter: f64) -> (f64, f64) {
 }
 
 pub fn gutter_width_for_state(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     line_count: usize,
 ) -> f64 {
@@ -117,7 +117,7 @@ pub fn gutter_width_for_state(
 }
 
 fn gutter_width_for_line_count(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     line_count: usize,
 ) -> f64 {

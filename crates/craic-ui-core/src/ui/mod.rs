@@ -1,3 +1,4 @@
+pub mod canvas_painter;
 pub mod canvas_scroll;
 pub mod canvas_scrollbar;
 pub mod command_mailbox;

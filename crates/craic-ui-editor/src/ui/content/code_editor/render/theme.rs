@@ -75,7 +75,7 @@ pub struct EditorTheme {
     pub syntax_error_underline: Color,
 }
 
-pub fn editor_theme(area: &gtk::DrawingArea) -> EditorTheme {
+pub fn editor_theme(area: &gtk::GLArea) -> EditorTheme {
     let style_manager = adw::StyleManager::for_display(&area.display());
     let dark = style_manager.is_dark();
     let background = if dark {
