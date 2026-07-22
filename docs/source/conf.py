@@ -1,5 +1,5 @@
 project = "Craic"
-copyright = "Craic contributors"
+copyright = "2026, Soiri Hiroka"
 
 extensions = []
 source_suffix = {".rst": "restructuredtext"}
