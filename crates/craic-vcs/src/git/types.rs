@@ -103,7 +103,14 @@ pub struct BranchInfo {
     pub is_current: bool,
     pub upstream: Option<String>,
     pub is_default: bool,
-    pub is_recent: bool,
+    pub recent_order: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeResult {
+    Success,
+    AlreadyUpToDate,
+    Conflicts(String),
 }
 
 #[derive(Clone, Debug)]

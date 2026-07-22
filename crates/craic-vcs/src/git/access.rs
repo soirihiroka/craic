@@ -24,6 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GIT_CHANGE_LISTENER_INTERVAL: Duration = Duration::from_secs(2);
 const GIT_BACKGROUND_PULL_INTERVAL: Duration = Duration::from_secs(300);
+const RECENT_BRANCHES_LIMIT: usize = 5;
 const CHECK_IGNORE_SCRIPT: &str = include_str!("scripts/check_ignore.sh");
 const COMMIT_SELECTED_SCRIPT: &str = include_str!("scripts/commit_selected.sh");
 const INITIALIZE_REPOSITORY_SCRIPT: &str = include_str!("scripts/initialize_repository.sh");
@@ -817,6 +818,14 @@ impl GitRepoHandle {
         let branch = branch.to_string();
         run_operation("git create branch", callback, move || {
             handle.create_branch_blocking(&branch)
+        });
+    }
+
+    pub fn merge_branch(&self, branch: &str, callback: OperationCallback<git::MergeResult>) {
+        let handle = self.clone();
+        let branch = branch.to_string();
+        run_operation("git merge branch", callback, move || {
+            handle.merge_branch_blocking(&branch)
         });
     }
 
@@ -1680,6 +1689,53 @@ impl GitRepoHandle {
         self.git(&["checkout".into(), "-b".into(), branch.into()])
     }
 
+    fn merge_branch_blocking(&self, branch: &str) -> Result<git::MergeResult, String> {
+        log::info!(
+            "shell git merge branch start workspace={} branch={}",
+            self.workspace.display_name,
+            branch
+        );
+        self.run_with_hooks("git merge branch", || {
+            let output = self.run_command_output(
+                "git merge branch",
+                "git",
+                &["merge".into(), branch.into()],
+                None,
+                &[0, 1],
+            )?;
+            let stdout = output.stdout_text_trimmed();
+            let stderr = output.stderr_text_trimmed();
+
+            if output.status_code == Some(0) {
+                return if stdout == "Already up to date." {
+                    Ok(git::MergeResult::AlreadyUpToDate)
+                } else {
+                    Ok(git::MergeResult::Success)
+                };
+            }
+
+            if self
+                .git_ok(&[
+                    "rev-parse".into(),
+                    "-q".into(),
+                    "--verify".into(),
+                    "MERGE_HEAD".into(),
+                ])
+                .is_ok()
+            {
+                let message = if stderr.is_empty() { stdout } else { stderr };
+                return Ok(git::MergeResult::Conflicts(message));
+            }
+
+            let message = if stderr.is_empty() { stdout } else { stderr };
+            Err(if message.is_empty() {
+                "Git merge failed.".to_string()
+            } else {
+                message
+            })
+        })
+    }
+
     fn checkout_commit_blocking(&self, hash: &str) -> Result<String, String> {
         log::info!(
             "shell git checkout commit start workspace={} hash={}",
@@ -2114,6 +2170,7 @@ impl GitRepoHandle {
             "--format=%(refname:short)".into(),
             "refs/heads".into(),
         ])?;
+        let recent = self.recent_branch_names();
         Ok(out
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -2122,9 +2179,40 @@ impl GitRepoHandle {
                 is_current: line.trim() == current,
                 upstream: None,
                 is_default: line.trim() == "main",
-                is_recent: line.trim() == current,
+                recent_order: recent.iter().position(|name| name == line.trim()),
             })
             .collect())
+    }
+
+    fn recent_branch_names(&self) -> Vec<String> {
+        let Ok(out) = self.git(&[
+            "log".into(),
+            "-g".into(),
+            "--format=%gs".into(),
+            "HEAD".into(),
+            "-n".into(),
+            "2500".into(),
+            "--".into(),
+        ]) else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::new();
+        let mut recent = Vec::new();
+        for line in out.lines() {
+            let Some((_, branch)) = line
+                .strip_prefix("checkout: moving from ")
+                .and_then(|movement| movement.rsplit_once(" to "))
+            else {
+                continue;
+            };
+            if seen.insert(branch.to_string()) {
+                recent.push(branch.to_string());
+            }
+            if recent.len() >= RECENT_BRANCHES_LIMIT + 1 {
+                break;
+            }
+        }
+        recent
     }
 
     fn ahead_behind(&self) -> (u32, u32, bool) {

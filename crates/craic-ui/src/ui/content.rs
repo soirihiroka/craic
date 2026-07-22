@@ -98,6 +98,9 @@ pub fn build(_menu: &gio::Menu, snapshot: Option<&RepositorySnapshot>) -> Conten
             .map(branch_picker_tabs)
             .unwrap_or_else(empty_branch_tabs),
     );
+    if let Some(snapshot) = snapshot {
+        configure_branch_merge_footer(&branch_picker, &snapshot.branch);
+    }
     let push_icon = gtk::Image::from_icon_name("view-refresh-symbolic");
     let push_spinner = adw::Spinner::builder()
         .width_request(16)
@@ -264,6 +267,7 @@ impl ContentPane {
 
     pub fn update(&self, snapshot: &RepositorySnapshot, action_running: bool) {
         self.branch_picker.set_button_label(&snapshot.branch);
+        configure_branch_merge_footer(&self.branch_picker, &snapshot.branch);
         self.update_branch_picker(snapshot);
         self.configure_git_action(snapshot, action_running);
     }
@@ -271,6 +275,7 @@ impl ContentPane {
     pub fn set_error(&self, message: &str) {
         self.clear_git_action_progress();
         self.branch_picker.set_button_label("Branch");
+        self.branch_picker.set_footer_visible(false);
         self.push_icon.set_icon_name(Some("view-refresh-symbolic"));
         self.push_icon.set_visible(true);
         self.push_spinner.set_visible(false);
@@ -889,12 +894,18 @@ fn branches_tab(snapshot: &RepositorySnapshot) -> TabbedPickerTab {
     for branch in snapshot.branches.iter() {
         if branch.is_default {
             default.push(branch_picker_item(branch));
-        } else if branch.is_recent {
-            recent.push(branch_picker_item(branch));
+        } else if let Some(order) = branch.recent_order {
+            recent.push((order, branch_picker_item(branch)));
         } else if !branch.name.starts_with("github-desktop-") {
             other.push(branch_picker_item(branch));
         }
     }
+    recent.sort_by_key(|(order, _)| *order);
+    let recent = recent
+        .into_iter()
+        .take(5)
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
 
     let mut groups = Vec::new();
     if !default.is_empty() {
@@ -917,6 +928,13 @@ fn branches_tab(snapshot: &RepositorySnapshot) -> TabbedPickerTab {
     } else {
         TabbedPickerStatus::Ready
     })
+}
+
+fn configure_branch_merge_footer(picker: &TabbedPicker, branch: &str) {
+    let escaped = gtk::glib::markup_escape_text(branch);
+    let markup = format!("Choose a branch to merge into <b>{escaped}</b>");
+    let tooltip = format!("Choose a branch to merge into {branch}");
+    picker.set_footer("branch-fork-symbolic", &markup, &tooltip);
 }
 
 fn branch_picker_item(branch: &crate::git::BranchInfo) -> TabbedPickerItem {
