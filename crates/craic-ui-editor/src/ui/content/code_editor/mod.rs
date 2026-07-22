@@ -543,6 +543,9 @@ impl CodeEditor {
             return;
         }
 
+        let scroll_anchor =
+            text_changed.then(|| render::source_offset_at_scroll_top(&self.area, &self.state));
+
         if let Some(language) = language.filter(|_| language_changed) {
             input::dismiss_completion(&self.state);
             self.state.language.replace(language.to_string());
@@ -572,6 +575,9 @@ impl CodeEditor {
         render::invalidate_highlights(&self.state);
         rebuild_auto_folds(&self.area, &self.state);
         self.refresh();
+        if let Some(scroll_anchor) = scroll_anchor {
+            render::set_source_offset_at_scroll_top(&self.area, &self.state, scroll_anchor);
+        }
     }
 }
 
