@@ -2,8 +2,10 @@ use gtk::gio;
 use std::path::{Path, PathBuf};
 
 pub const MIME_FOLDER: &str = "inode/directory";
+pub const MIME_JSON_LINES: &str = "application/x-ndjson";
 pub const MIME_MARKDOWN: &str = "text/markdown";
 pub const MIME_PDF: &str = "application/pdf";
+pub const MIME_RST: &str = "text/x-rst";
 pub const MIME_SQLITE: &str = "application/vnd.sqlite3";
 pub const MIME_SVG: &str = "image/svg+xml";
 pub const MIME_SAFETENSORS: &str = "application/vnd.safetensors";
@@ -14,6 +16,7 @@ pub enum PreviewKind {
     Text,
     Notebook,
     Markdown,
+    Rst,
     Html,
     Svg,
     Safetensors,
@@ -95,6 +98,9 @@ fn preview_kind(file_type: &FileType) -> PreviewKind {
     if file_type.mime == MIME_MARKDOWN {
         return PreviewKind::Markdown;
     }
+    if file_type.mime == MIME_RST {
+        return PreviewKind::Rst;
+    }
     if file_type.mime == "text/html" {
         return PreviewKind::Html;
     }
@@ -166,6 +172,7 @@ fn mime_from_name_extension(file_name: &str, extension: &str) -> &'static str {
 
     match extension {
         "md" | "mdown" | "mdx" | "mkd" | "markdown" => MIME_MARKDOWN,
+        "rest" | "rst" => MIME_RST,
         "db" | "sqlite" | "sqlite3" => MIME_SQLITE,
         "safetensors" => MIME_SAFETENSORS,
         "svg" | "svgz" => MIME_SVG,
@@ -254,6 +261,7 @@ fn mime_from_name_extension(file_name: &str, extension: &str) -> &'static str {
         "jl" => "text/x-julia",
         "js" | "cjs" | "mjs" | "jsx" => "text/javascript",
         "json" | "jsonc" => "application/json",
+        "jsonl" | "ndjson" => MIME_JSON_LINES,
         "ipynb" => "application/x-ipynb+json",
         "kt" | "kts" => "text/x-kotlin",
         "lua" => "text/x-lua",
@@ -290,11 +298,13 @@ fn display_kind_for_mime(mime: &str) -> &'static str {
         MIME_FOLDER => "Folder",
         MIME_MARKDOWN => "Markdown",
         MIME_PDF => "PDF",
+        MIME_RST => "reStructuredText",
         MIME_SQLITE => "SQLite database",
         MIME_SVG => "SVG image",
         MIME_SAFETENSORS => "Safetensors metadata",
         "application/x-ipynb+json" => "Jupyter notebook",
         "application/json" => "JSON",
+        MIME_JSON_LINES => "JSON Lines",
         "application/xml" => "XML",
         "application/x-yaml" => "YAML",
         "text/css" => "CSS",
@@ -333,7 +343,8 @@ fn icon_name_from_name_extension(file_name: &str, extension: &str) -> &'static s
         "changelog" => return "text-x-changelog-symbolic",
         "copying" => return "text-x-copying-symbolic",
         "authors" | "maintainers" => return "text-x-authors-symbolic",
-        "readme" | "readme.md" | "readme.markdown" | "readme.txt" => {
+        "readme" | "readme.md" | "readme.markdown" | "readme.rest" | "readme.rst"
+        | "readme.txt" => {
             return "text-x-readme-symbolic";
         }
         "news" => return "text-x-changelog-symbolic",
@@ -394,12 +405,14 @@ fn icon_name_from_name_extension(file_name: &str, extension: &str) -> &'static s
         "jl" => "devicon-julia-symbolic",
         "js" | "cjs" | "mjs" => "text-x-javascript-symbolic",
         "jsx" => "text-x-jsx-symbolic",
-        "json" | "jsonc" => "text-x-javascript-symbolic",
+        "json" | "jsonc" | "jsonl" | "ndjson" => "text-x-javascript-symbolic",
         "kt" | "kts" => "text-x-script-symbolic",
         "lua" => "devicon-lua-symbolic",
+        "lock" => "padlock2-symbolic",
         "m" | "mm" => "devicon-objectivec-symbolic",
         "make" | "mk" => "text-makefile-symbolic",
         "md" | "markdown" | "mdown" | "mdx" | "mkd" => "text-markdown-symbolic",
+        "rest" | "rst" => "rich-text-symbolic",
         "mat" | "mlx" => "devicon-matlab-symbolic",
         "ml" | "mli" => "devicon-ocaml-symbolic",
         "nim" | "nims" => "devicon-nim-symbolic",

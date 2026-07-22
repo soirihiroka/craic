@@ -18,7 +18,7 @@ Any usage outside of my computer is out of scope and unsupported x3
 - Docker integration.
 - SSH Remote connection.
 - Vibe coding integration with Codex, AGY, OpenCode, and Ollama.
-- Document preview for Markdown, SVG, PDF, images, audio, and video.
+- Document preview for Markdown, reStructuredText, SVG, PDF, images, audio, and video.
 - Syntax highlighting, spellchecking, and Markdown linting.
 - Color-coding for workspaces and hosts.
 

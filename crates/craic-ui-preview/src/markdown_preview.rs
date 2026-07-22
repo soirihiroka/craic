@@ -24,10 +24,44 @@ pub struct MarkdownPreviewDocument {
 
 impl MarkdownPreviewDocument {
     pub fn parse(markdown: &str) -> Self {
-        let html = crate::ui::markdown_preview_web::markdown_document_html(markdown);
+        let fragment = crate::ui::markdown_preview_web::markdown_fragment_html(markdown);
+        let html = crate::ui::markdown_preview_web::html_document(&fragment, markdown.len());
         log::debug!(
             "markdown preview document rendered markdown_bytes={} html_bytes={}",
             markdown.len(),
+            html.len(),
+        );
+        Self { html }
+    }
+
+    pub fn parse_rst(rst: &str) -> Self {
+        let rendered = match std::panic::catch_unwind(|| {
+            let document = rst_parser::parse(rst).map_err(|err| err.to_string())?;
+            let mut fragment = Vec::new();
+            rst_renderer::render_html(&document, &mut fragment, false)
+                .map_err(|err| err.to_string())?;
+            String::from_utf8(fragment).map_err(|err| err.to_string())
+        }) {
+            Ok(Ok(rendered)) => rendered,
+            Ok(Err(err)) => {
+                log::warn!("rst preview render failed: {err}");
+                format!(
+                    "<blockquote class=\"markdown-alert markdown-alert-warning\"><p class=\"markdown-alert-title\">RST preview unavailable</p><p>{}</p></blockquote>",
+                    crate::ui::markdown_preview_web::escape_html(&err),
+                )
+            }
+            Err(_) => {
+                let err = "The RST renderer does not support a construct in this document.";
+                log::warn!("rst preview render failed: {err}");
+                format!(
+                    "<blockquote class=\"markdown-alert markdown-alert-warning\"><p class=\"markdown-alert-title\">RST preview unavailable</p><p>{err}</p></blockquote>"
+                )
+            }
+        };
+        let html = crate::ui::markdown_preview_web::html_document(&rendered, rst.len());
+        log::debug!(
+            "rst preview document rendered rst_bytes={} html_bytes={}",
+            rst.len(),
             html.len(),
         );
         Self { html }

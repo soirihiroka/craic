@@ -16,4 +16,6 @@ log.workspace = true
 poppler.workspace = true
 pulldown-cmark.workspace = true
 regex.workspace = true
+rst_parser.workspace = true
+rst_renderer.workspace = true
 webkit6.workspace = true

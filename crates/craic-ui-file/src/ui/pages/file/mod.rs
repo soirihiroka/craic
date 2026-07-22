@@ -950,14 +950,14 @@ fn refresh_live_file_preview(
     let preview_kind = file_type::preview_kind_for_path(file_path, false);
     let signature = provider::content_signature(text.as_bytes());
     match preview_kind {
-        file_type::PreviewKind::Markdown => {
+        preview_kind @ (file_type::PreviewKind::Markdown | file_type::PreviewKind::Rst) => {
             if text.trim().is_empty() {
                 right
                     .file_view_split
                     .set_end_child(Some(&right.file_markdown_status));
                 set_live_displayed_preview(displayed_preview, node_path, signature);
             } else {
-                refresh_live_markdown_preview(
+                refresh_live_markup_preview(
                     ctx,
                     right,
                     displayed_preview,
@@ -965,9 +965,10 @@ fn refresh_live_file_preview(
                     file_path,
                     text,
                     signature,
+                    preview_kind,
                 );
             }
-            log::debug!("refreshed live markdown preview file_path={file_path}");
+            log::debug!("refreshed live markup preview file_path={file_path}");
         }
         file_type::PreviewKind::Html => {
             let local_path = local_workspace_path(ctx, node_path);
@@ -992,7 +993,7 @@ fn refresh_live_file_preview(
     }
 }
 
-fn refresh_live_markdown_preview(
+fn refresh_live_markup_preview(
     ctx: &PageContext,
     right: Rc<right::RightPane>,
     displayed_preview: &DisplayedPreviewState,
@@ -1000,6 +1001,7 @@ fn refresh_live_markdown_preview(
     file_path: &str,
     text: &str,
     signature: provider::ContentSignature,
+    preview_kind: file_type::PreviewKind,
 ) {
     let local_path = local_workspace_path(ctx, node_path);
     let node_path = node_path.clone();
@@ -1009,7 +1011,11 @@ fn refresh_live_markdown_preview(
     let (sender, receiver) = mpsc::channel();
 
     std::thread::spawn(move || {
-        let document = MarkdownPreviewDocument::parse(&text);
+        let document = match preview_kind {
+            file_type::PreviewKind::Markdown => MarkdownPreviewDocument::parse(&text),
+            file_type::PreviewKind::Rst => MarkdownPreviewDocument::parse_rst(&text),
+            _ => unreachable!("live markup preview only handles Markdown and RST"),
+        };
         let _ = sender.send(document);
     });
 
@@ -1018,7 +1024,7 @@ fn refresh_live_markdown_preview(
             Ok(document) => {
                 if right.file_editor_path.borrow().as_ref() != Some(&node_path) {
                     log::debug!(
-                        "skip stale live markdown preview path changed file_path={file_path}"
+                        "skip stale live markup preview path changed file_path={file_path}"
                     );
                     return gtk::glib::ControlFlow::Break;
                 }
@@ -1027,7 +1033,7 @@ fn refresh_live_markdown_preview(
                     provider::content_signature(right.file_editor.document_text().as_bytes());
                 if current_signature != signature {
                     log::debug!(
-                        "skip stale live markdown preview content changed file_path={file_path}"
+                        "skip stale live markup preview content changed file_path={file_path}"
                     );
                     return gtk::glib::ControlFlow::Break;
                 }
@@ -1046,7 +1052,7 @@ fn refresh_live_markdown_preview(
             }
             Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
             Err(mpsc::TryRecvError::Disconnected) => {
-                log::warn!("live markdown preview parse did not return file_path={file_path}");
+                log::warn!("live markup preview parse did not return file_path={file_path}");
                 gtk::glib::ControlFlow::Break
             }
         }

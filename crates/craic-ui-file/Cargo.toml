@@ -7,12 +7,14 @@ license.workspace = true
 [dependencies]
 adw.workspace = true
 craic-config.workspace = true
+craic-dynamic-data.workspace = true
 craic-language.workspace = true
 craic-project.workspace = true
 craic-system.workspace = true
 craic-vcs.workspace = true
 craic-ui-core.workspace = true
 craic-ui-editor.workspace = true
+craic-ui-object-viewer.workspace = true
 craic-ui-preview.workspace = true
 glycin.workspace = true
 gtk.workspace = true

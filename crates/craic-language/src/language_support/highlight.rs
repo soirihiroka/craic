@@ -10,6 +10,7 @@ use tree_sitter::{
 const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 const MAX_HIGHLIGHT_LINES: usize = 10_000;
 const MAX_QUERY_CACHE_ENTRIES: usize = 16;
+const RST_HIGHLIGHT_QUERY: &str = include_str!("queries/rst.scm");
 const RAINBOW_CSV_STYLES: [Style; 10] = [
     Style {
         foreground: "#e06c75",
@@ -64,6 +65,13 @@ pub struct SyntaxIssue {
 
 thread_local! {
     static QUERY_CACHE: RefCell<HashMap<String, Query>> = RefCell::new(HashMap::new());
+    static INJECTION_QUERY_CACHE: RefCell<HashMap<String, Query>> = RefCell::new(HashMap::new());
+}
+
+struct InjectionRegion {
+    language_name: String,
+    start: usize,
+    end: usize,
 }
 
 pub struct SyntaxHighlighter {
@@ -461,6 +469,9 @@ pub fn language_hint_from_path(path: &str) -> String {
         "dockerfile" => return "bash".to_string(),
         _ if file_name.ends_with(".caddyfile") => return "caddyfile".to_string(),
         _ if file_name.ends_with(".desktop.in") => return "ini".to_string(),
+        _ if file_name.ends_with(".jsonl") || file_name.ends_with(".ndjson") => {
+            return "json".to_string();
+        }
         _ if file_name.ends_with("ignore") => return "ignore".to_string(),
         _ => {}
     }
@@ -528,7 +539,189 @@ fn highlight_ranges_for_tree(
         source,
         &mut ranges,
     );
+    let ranges = normalize_ranges(ranges, source.len());
+    let injected = collect_injected_ranges(language_name, language, tree.root_node(), source, 0);
+    overlay_ranges(ranges, injected, source.len())
+}
+
+fn collect_injected_ranges(
+    language_name: &str,
+    language: Option<&Language>,
+    root: Node<'_>,
+    source: &str,
+    depth: usize,
+) -> Vec<HighlightRange> {
+    const MAX_INJECTION_DEPTH: usize = 3;
+
+    if depth >= MAX_INJECTION_DEPTH {
+        return Vec::new();
+    }
+    let Some(language) = language else {
+        return Vec::new();
+    };
+    let regions = injection_regions(language_name, language, root, source);
+    let mut ranges = Vec::new();
+
+    for region in regions {
+        if region.start >= region.end
+            || region.end > source.len()
+            || !source.is_char_boundary(region.start)
+            || !source.is_char_boundary(region.end)
+        {
+            continue;
+        }
+        let Some(embedded_language) = language_for(&region.language_name) else {
+            continue;
+        };
+        let embedded_source = &source[region.start..region.end];
+        let mut parser = Parser::new();
+        if parser.set_language(&embedded_language).is_err() {
+            continue;
+        }
+        let Some(tree) = parser.parse(embedded_source, None) else {
+            continue;
+        };
+
+        let mut embedded_ranges = Vec::new();
+        collect_highlight_ranges(
+            &region.language_name,
+            Some(&embedded_language),
+            tree.root_node(),
+            embedded_source,
+            &mut embedded_ranges,
+        );
+        let nested_ranges = collect_injected_ranges(
+            &region.language_name,
+            Some(&embedded_language),
+            tree.root_node(),
+            embedded_source,
+            depth + 1,
+        );
+        let embedded_ranges = overlay_ranges(
+            normalize_ranges(embedded_ranges, embedded_source.len()),
+            nested_ranges,
+            embedded_source.len(),
+        );
+        ranges.extend(embedded_ranges.into_iter().map(|range| HighlightRange {
+            start: range.start + region.start,
+            end: range.end + region.start,
+            priority: range.priority.saturating_add(100),
+            ..range
+        }));
+    }
+
     normalize_ranges(ranges, source.len())
+}
+
+fn injection_regions(
+    language_name: &str,
+    language: &Language,
+    root: Node<'_>,
+    source: &str,
+) -> Vec<InjectionRegion> {
+    let Some(query_source) = injection_query_for(language_name) else {
+        return Vec::new();
+    };
+
+    INJECTION_QUERY_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(language_name) {
+            let Ok(query) = Query::new(language, query_source) else {
+                return Vec::new();
+            };
+            trim_query_cache(&mut cache);
+            cache.insert(language_name.to_string(), query);
+        }
+
+        let Some(query) = cache.get(language_name) else {
+            return Vec::new();
+        };
+        let capture_names = query.capture_names();
+        let mut cursor = QueryCursor::new();
+        cursor.set_match_limit(512);
+        let mut matches = cursor.matches(query, root, source.as_bytes());
+        let mut regions = Vec::new();
+
+        while let Some(query_match) = matches.next() {
+            let mut injected_language = query
+                .property_settings(query_match.pattern_index)
+                .iter()
+                .find(|property| property.key.as_ref() == "injection.language")
+                .and_then(|property| property.value.as_deref())
+                .map(str::to_string);
+            let mut content_nodes = Vec::new();
+
+            for capture in query_match.captures {
+                let Some(capture_name) = capture_names.get(capture.index as usize) else {
+                    continue;
+                };
+                match *capture_name {
+                    "injection.language" => {
+                        injected_language = capture
+                            .node
+                            .utf8_text(source.as_bytes())
+                            .ok()
+                            .map(str::trim)
+                            .map(str::to_string);
+                    }
+                    "injection.content" => content_nodes.push(capture.node),
+                    _ => {}
+                }
+            }
+
+            let Some(injected_language) = injected_language else {
+                continue;
+            };
+            for content in content_nodes {
+                regions.push(InjectionRegion {
+                    language_name: normalize_language_name(&injected_language),
+                    start: content.start_byte(),
+                    end: content.end_byte(),
+                });
+            }
+        }
+
+        regions
+    })
+}
+
+fn overlay_ranges(
+    base: Vec<HighlightRange>,
+    overlays: Vec<HighlightRange>,
+    source_len: usize,
+) -> Vec<HighlightRange> {
+    if overlays.is_empty() {
+        return base;
+    }
+
+    let overlays = normalize_ranges(overlays, source_len);
+    let mut combined = Vec::with_capacity(base.len() + overlays.len());
+    for range in base {
+        let mut cursor = range.start;
+        let first_overlay = overlays.partition_point(|overlay| overlay.end <= range.start);
+        for overlay in overlays[first_overlay..]
+            .iter()
+            .take_while(|overlay| overlay.start < range.end)
+        {
+            if cursor < overlay.start {
+                combined.push(HighlightRange {
+                    start: cursor,
+                    end: overlay.start.min(range.end),
+                    ..range.clone()
+                });
+            }
+            cursor = cursor.max(overlay.end.min(range.end));
+        }
+        if cursor < range.end {
+            combined.push(HighlightRange {
+                start: cursor,
+                ..range
+            });
+        }
+    }
+    combined.extend(overlays);
+    combined.sort_by_key(|range| (range.start, range.end));
+    combined
 }
 
 fn collect_highlight_ranges(
@@ -1064,7 +1257,9 @@ fn highlight_query_for(name: &str) -> Option<Cow<'static, str>> {
         }
         "python" | "py" | "pyw" => Some(Cow::Borrowed(tree_sitter_python::HIGHLIGHTS_QUERY)),
         "ruby" | "rb" => Some(Cow::Borrowed(tree_sitter_ruby::HIGHLIGHTS_QUERY)),
+        "rst" | "rest" => Some(Cow::Borrowed(RST_HIGHLIGHT_QUERY)),
         "rust" | "rs" => Some(Cow::Borrowed(tree_sitter_rust::HIGHLIGHTS_QUERY)),
+        "scheme" | "scm" => Some(Cow::Borrowed(tree_sitter_scheme::HIGHLIGHTS_QUERY)),
         "toml" => Some(Cow::Borrowed(tree_sitter_toml_ng::HIGHLIGHTS_QUERY)),
         "typescript" | "ts" => Some(Cow::Owned(
             [
@@ -1082,6 +1277,14 @@ fn highlight_query_for(name: &str) -> Option<Cow<'static, str>> {
             .join("\n"),
         )),
         "yaml" | "yml" => Some(Cow::Borrowed(tree_sitter_yaml::HIGHLIGHTS_QUERY)),
+        _ => None,
+    }
+}
+
+fn injection_query_for(name: &str) -> Option<&'static str> {
+    match normalize_language_name(name).as_str() {
+        "html" | "htm" => Some(tree_sitter_html::INJECTIONS_QUERY),
+        "markdown" | "md" | "mdown" | "mkd" => Some(tree_sitter_md::INJECTION_QUERY_BLOCK),
         _ => None,
     }
 }
@@ -1246,7 +1449,9 @@ fn language_for(name: &str) -> Option<Language> {
         "markdown" | "md" | "mdown" | "mkd" => Some(tree_sitter_md::LANGUAGE.into()),
         "python" | "py" | "pyw" => Some(tree_sitter_python::LANGUAGE.into()),
         "ruby" | "rb" => Some(tree_sitter_ruby::LANGUAGE.into()),
+        "rst" | "rest" => Some(tree_sitter_rst::LANGUAGE.into()),
         "rust" | "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
+        "scheme" | "scm" => Some(tree_sitter_scheme::LANGUAGE.into()),
         "ini" => Some(tree_sitter_ini::LANGUAGE.into()),
         "toml" => Some(tree_sitter_toml_ng::LANGUAGE.into()),
         "typescript" | "ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),

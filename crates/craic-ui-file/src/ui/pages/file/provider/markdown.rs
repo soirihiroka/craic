@@ -12,19 +12,46 @@ struct MarkdownPreviewLoad {
     spellcheck_issues: Vec<crate::spellcheck::SpellcheckIssue>,
 }
 
+#[derive(Clone, Copy)]
+enum MarkupKind {
+    Markdown,
+    Rst,
+}
+
 pub fn show(request: PreviewRequest<'_>) {
-    show_markdown(request, None);
+    show_markup(request, None, MarkupKind::Markdown);
 }
 
 pub fn show_match(request: PreviewMatchRequest<'_>) {
     let selection = Some((request.start, request.end));
-    show_markdown(request.into_preview_request(), selection);
+    show_markup(
+        request.into_preview_request(),
+        selection,
+        MarkupKind::Markdown,
+    );
 }
 
-fn show_markdown(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
+pub fn show_rst(request: PreviewRequest<'_>) {
+    show_markup(request, None, MarkupKind::Rst);
+}
+
+pub fn show_rst_match(request: PreviewMatchRequest<'_>) {
+    let selection = Some((request.start, request.end));
+    show_markup(request.into_preview_request(), selection, MarkupKind::Rst);
+}
+
+fn show_markup(
+    request: PreviewRequest<'_>,
+    selection: Option<(usize, usize)>,
+    markup_kind: MarkupKind,
+) {
+    let display_kind = match markup_kind {
+        MarkupKind::Markdown => "Markdown",
+        MarkupKind::Rst => "reStructuredText",
+    };
     request
         .right
-        .show_editor_loading(request.load_token, request.file_path, "Markdown");
+        .show_editor_loading(request.load_token, request.file_path, display_kind);
 
     let files = request.files.clone();
     let file_path = request.file_path.to_string();
@@ -46,31 +73,44 @@ fn show_markdown(request: PreviewRequest<'_>, selection: Option<(usize, usize)>)
         request.load_token,
         file_path.clone(),
         move || {
-            super::super::repository_text_from_prefetch(prefetched_bytes, &file_path).map(|text| {
-                let allowlist = crate::spellcheck::manifest_allowlist_from_texts(&[(
-                    &file_path,
-                    text.as_str(),
-                )]);
-                let spellcheck_issues = crate::spellcheck::check_document(
-                    &language,
-                    Some(&file_path),
-                    &text,
-                    &allowlist,
-                );
-                let ignored_rules =
-                    crate::workspace_config::markdown_lint_ignored_rules_from_file_access(
-                        files.as_ref(),
+            super::super::repository_text_from_prefetch(prefetched_bytes, &file_path).and_then(
+                |text| {
+                    let allowlist = crate::spellcheck::manifest_allowlist_from_texts(&[(
+                        &file_path,
+                        text.as_str(),
+                    )]);
+                    let spellcheck_issues = crate::spellcheck::check_document(
+                        &language,
+                        Some(&file_path),
+                        &text,
+                        &allowlist,
                     );
-                let markdown_lint_issues =
-                    crate::markdown_lint::check_document(Some(&file_path), &text, &ignored_rules);
-                let document = MarkdownPreviewDocument::parse(&text);
-                MarkdownPreviewLoad {
-                    text,
-                    document,
-                    markdown_lint_issues,
-                    spellcheck_issues,
-                }
-            })
+                    let markdown_lint_issues = match markup_kind {
+                        MarkupKind::Markdown => {
+                            let ignored_rules =
+                            crate::workspace_config::markdown_lint_ignored_rules_from_file_access(
+                                files.as_ref(),
+                            );
+                            crate::markdown_lint::check_document(
+                                Some(&file_path),
+                                &text,
+                                &ignored_rules,
+                            )
+                        }
+                        MarkupKind::Rst => Vec::new(),
+                    };
+                    let document = match markup_kind {
+                        MarkupKind::Markdown => MarkdownPreviewDocument::parse(&text),
+                        MarkupKind::Rst => MarkdownPreviewDocument::parse_rst(&text),
+                    };
+                    Ok(MarkdownPreviewLoad {
+                        text,
+                        document,
+                        markdown_lint_issues,
+                        spellcheck_issues,
+                    })
+                },
+            )
         },
         move |right, result| match result {
             Ok(load) => {
