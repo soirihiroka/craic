@@ -1,3 +1,4 @@
+pub(super) mod csv;
 mod folder;
 mod font;
 pub(super) mod html;
@@ -10,6 +11,7 @@ mod pdf;
 mod safetensors;
 pub mod sqlite;
 pub mod svg;
+pub(super) mod table_view;
 mod text;
 
 use super::{PageContext, right};

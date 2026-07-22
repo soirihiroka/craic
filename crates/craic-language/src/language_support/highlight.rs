@@ -10,6 +10,38 @@ use tree_sitter::{
 const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 const MAX_HIGHLIGHT_LINES: usize = 10_000;
 const MAX_QUERY_CACHE_ENTRIES: usize = 16;
+const RAINBOW_CSV_STYLES: [Style; 10] = [
+    Style {
+        foreground: "#e06c75",
+    },
+    Style {
+        foreground: "#d19a66",
+    },
+    Style {
+        foreground: "#e5c07b",
+    },
+    Style {
+        foreground: "#98c379",
+    },
+    Style {
+        foreground: "#56b6c2",
+    },
+    Style {
+        foreground: "#61afef",
+    },
+    Style {
+        foreground: "#c678dd",
+    },
+    Style {
+        foreground: "#d16d9e",
+    },
+    Style {
+        foreground: "#7ec16e",
+    },
+    Style {
+        foreground: "#6f9fd8",
+    },
+];
 
 #[derive(Clone, Copy)]
 pub struct Style {
@@ -109,6 +141,9 @@ impl SyntaxHighlighter {
     }
 
     pub fn highlight_current(&self) -> Vec<HighlightRange> {
+        if self.language_name == "csv" {
+            return rainbow_csv_ranges(&self.source);
+        }
         let Some(tree) = self.tree.as_ref() else {
             return Vec::new();
         };
@@ -158,6 +193,63 @@ impl SyntaxHighlighter {
         let tree = self.tree.as_ref()?;
         suggest::completions(&self.language_name, tree, &self.source, cursor)
     }
+}
+
+fn rainbow_csv_ranges(source: &str) -> Vec<HighlightRange> {
+    if source.len() > MAX_HIGHLIGHT_BYTES || source.lines().count() > MAX_HIGHLIGHT_LINES {
+        return Vec::new();
+    }
+
+    let bytes = source.as_bytes();
+    let mut ranges = Vec::new();
+    let mut field_start = 0;
+    let mut column = 0;
+    let mut cursor = 0;
+    let mut quoted = false;
+
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'"' if quoted && bytes.get(cursor + 1) == Some(&b'"') => {
+                cursor += 2;
+                continue;
+            }
+            b'"' if quoted => quoted = false,
+            b'"' if cursor == field_start => quoted = true,
+            b',' if !quoted => {
+                push_csv_field(&mut ranges, field_start, cursor, column);
+                field_start = cursor + 1;
+                column += 1;
+            }
+            b'\n' if !quoted => {
+                push_csv_field(&mut ranges, field_start, cursor, column);
+                field_start = cursor + 1;
+                column = 0;
+            }
+            b'\r' if !quoted => {
+                push_csv_field(&mut ranges, field_start, cursor, column);
+                cursor += usize::from(bytes.get(cursor + 1) == Some(&b'\n'));
+                field_start = cursor + 1;
+                column = 0;
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+
+    push_csv_field(&mut ranges, field_start, source.len(), column);
+    ranges
+}
+
+fn push_csv_field(ranges: &mut Vec<HighlightRange>, start: usize, end: usize, column: usize) {
+    if start >= end {
+        return;
+    }
+    ranges.push(HighlightRange {
+        start,
+        end,
+        style: RAINBOW_CSV_STYLES[column % RAINBOW_CSV_STYLES.len()],
+        priority: 50,
+    });
 }
 
 impl Style {

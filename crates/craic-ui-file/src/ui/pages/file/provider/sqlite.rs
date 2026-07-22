@@ -1,8 +1,9 @@
+use super::table_view::{self, TableView, TableViewRow};
 use super::{PreviewMatchRequest, PreviewRequest};
 use crate::system::materialize::MaterializedFile;
 use crate::ui::file_type;
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::glib;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use std::cell::{Cell, RefCell};
@@ -84,10 +85,7 @@ pub struct SqlitePreview {
     table_list: gtk::ListBox,
     table_status_label: gtk::Label,
     rows_status_label: gtk::Label,
-    rows_stack: gtk::Stack,
-    column_view: gtk::ColumnView,
-    row_model: gio::ListStore,
-    rows_message_label: gtk::Label,
+    table_view: TableView,
     previous_button: gtk::Button,
     page_label: gtk::Label,
     next_button: gtk::Button,
@@ -150,12 +148,6 @@ struct SqliteRowsPage {
     rows: Vec<Vec<String>>,
     total_rows: usize,
     page: usize,
-}
-
-#[derive(Clone, Debug)]
-struct SqliteDisplayRow {
-    cells: Vec<String>,
-    is_filter: bool,
 }
 
 impl SqlitePreview {
@@ -225,40 +217,7 @@ impl SqlitePreview {
         toolbar.append(&next_button);
         toolbar.append(&reload_button);
 
-        let row_model = gio::ListStore::new::<glib::BoxedAnyObject>();
-        let selection = gtk::SingleSelection::new(Some(row_model.clone()));
-        selection.set_autoselect(false);
-        selection.set_can_unselect(true);
-        let column_view = gtk::ColumnView::new(Some(selection));
-        column_view.set_hexpand(true);
-        column_view.set_vexpand(true);
-        column_view.set_show_column_separators(true);
-        column_view.set_show_row_separators(true);
-        column_view.set_reorderable(false);
-
-        let rows_scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Automatic)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .hexpand(true)
-            .vexpand(true)
-            .child(&column_view)
-            .build();
-
-        let rows_message_label = muted_label("Select a SQLite database to preview.");
-        rows_message_label.set_margin_top(16);
-        rows_message_label.set_margin_start(10);
-        rows_message_label.set_margin_end(10);
-        let rows_message_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .hexpand(true)
-            .vexpand(true)
-            .build();
-        rows_message_box.append(&rows_message_label);
-
-        let rows_stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
-        rows_stack.add_named(&rows_scroller, Some("rows"));
-        rows_stack.add_named(&rows_message_box, Some("message"));
-        rows_stack.set_visible_child_name("message");
+        let table_view = TableView::new("Select a SQLite database to preview.");
 
         let rows_panel = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -266,7 +225,7 @@ impl SqlitePreview {
             .vexpand(true)
             .build();
         rows_panel.append(&toolbar);
-        rows_panel.append(&rows_stack);
+        rows_panel.append(&table_view.root);
 
         let split = gtk::Paned::new(gtk::Orientation::Horizontal);
         split.set_start_child(Some(&table_panel));
@@ -290,10 +249,7 @@ impl SqlitePreview {
             table_list,
             table_status_label,
             rows_status_label,
-            rows_stack,
-            column_view,
-            row_model,
-            rows_message_label,
+            table_view,
             previous_button,
             page_label,
             next_button,
@@ -630,8 +586,7 @@ impl SqlitePreview {
 
     fn render_rows_page(&self, page: &SqliteRowsPage) {
         self.disconnect_sorter_signals();
-        clear_column_view(&self.column_view);
-        self.row_model.remove_all();
+        self.table_view.reset();
         if page.columns.is_empty() {
             self.rows_status_label
                 .set_text(&format!("{} has no columns", page.table.name));
@@ -650,34 +605,37 @@ impl SqlitePreview {
             view_column.set_id(Some(&column_index.to_string()));
             view_column.set_resizable(true);
             view_column.set_expand(false);
-            view_column.set_fixed_width(initial_column_width(page, column_index));
-            view_column.set_sorter(Some(&sqlite_column_sorter(column_index)));
+            view_column.set_fixed_width(table_view::initial_column_width(
+                &column.name,
+                &page.rows,
+                column_index,
+            ));
+            view_column.set_sorter(Some(&table_view::string_sorter(column_index)));
             if sort
                 .as_ref()
                 .is_some_and(|sort| sort.column_index == column_index)
             {
                 active_sort_column = Some(view_column.clone());
             }
-            self.column_view.append_column(&view_column);
+            self.table_view.column_view().append_column(&view_column);
         }
         if let (Some(sort), Some(column)) = (&sort, active_sort_column) {
-            self.column_view
+            self.table_view
+                .column_view()
                 .sort_by_column(Some(&column), sort.direction.into_sort_type());
         }
         self.connect_sorter_signals();
 
-        self.row_model
-            .append(&glib::BoxedAnyObject::new(SqliteDisplayRow {
-                cells: filters_for_columns(&filters, page.columns.len()),
-                is_filter: true,
-            }));
+        self.table_view.append_row(TableViewRow {
+            cells: filters_for_columns(&filters, page.columns.len()),
+            is_filter: true,
+        });
 
         for row in &page.rows {
-            self.row_model
-                .append(&glib::BoxedAnyObject::new(SqliteDisplayRow {
-                    cells: row.clone(),
-                    is_filter: false,
-                }));
+            self.table_view.append_row(TableViewRow {
+                cells: row.clone(),
+                is_filter: false,
+            });
         }
 
         if page.total_rows == 0 {
@@ -691,15 +649,12 @@ impl SqlitePreview {
                 page.table.name, first_row, last_row, page.total_rows
             ));
         }
-        self.rows_stack.set_visible_child_name("rows");
+        self.table_view.show_rows();
     }
 
     fn show_rows_message(&self, message: &str) {
         self.disconnect_sorter_signals();
-        clear_column_view(&self.column_view);
-        self.row_model.remove_all();
-        self.rows_message_label.set_text(message);
-        self.rows_stack.set_visible_child_name("message");
+        self.table_view.show_message(message);
     }
 
     fn update_controls(&self) {
@@ -721,7 +676,8 @@ impl SqlitePreview {
 
     fn connect_sorter_signals(&self) {
         let Some(sorter) = self
-            .column_view
+            .table_view
+            .column_view()
             .sorter()
             .and_then(|sorter| sorter.downcast::<gtk::ColumnViewSorter>().ok())
         else {
@@ -876,12 +832,12 @@ fn column_factory(
                 item.set_child(None::<&gtk::Widget>);
                 return;
             };
-            let row = row_object.borrow::<SqliteDisplayRow>();
+            let row = row_object.borrow::<TableViewRow>();
             let value = row.cells.get(column_index).cloned().unwrap_or_default();
             let child = if row.is_filter {
                 filter_cell(&preview, column_index, &column, &value)
             } else {
-                value_cell(&value)
+                table_view::value_cell(&value)
             };
             item.set_child(Some(&child));
         }
@@ -931,44 +887,6 @@ fn filter_cell(
     content.upcast()
 }
 
-fn value_cell(value: &str) -> gtk::Widget {
-    let label = gtk::Label::builder()
-        .label(value)
-        .xalign(0.0)
-        .single_line_mode(true)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
-        .selectable(true)
-        .hexpand(true)
-        .margin_top(4)
-        .margin_bottom(4)
-        .margin_start(8)
-        .margin_end(8)
-        .build();
-    label.set_tooltip_text(Some(value));
-    label.upcast()
-}
-
-fn initial_column_width(page: &SqliteRowsPage, column_index: usize) -> i32 {
-    let header_width = page
-        .columns
-        .get(column_index)
-        .map(|column| text_width_hint(&column.name))
-        .unwrap_or(0);
-    let row_width = page
-        .rows
-        .iter()
-        .take(20)
-        .filter_map(|row| row.get(column_index))
-        .map(|value| text_width_hint(value))
-        .max()
-        .unwrap_or(0);
-    (header_width.max(row_width) + 36).clamp(140, 320)
-}
-
-fn text_width_hint(text: &str) -> i32 {
-    text.chars().take(36).count() as i32 * 8
-}
-
 fn filters_for_columns(filters: &[String], column_count: usize) -> Vec<String> {
     (0..column_count)
         .map(|index| filters.get(index).cloned().unwrap_or_default())
@@ -1003,31 +921,6 @@ impl SqliteSortDirection {
             Self::Descending => "descending",
         }
     }
-}
-
-fn sqlite_column_sorter(column_index: usize) -> gtk::CustomSorter {
-    gtk::CustomSorter::new(move |left, right| {
-        let left = display_row_cell(left, column_index);
-        let right = display_row_cell(right, column_index);
-        match left.cmp(&right) {
-            std::cmp::Ordering::Less => gtk::Ordering::Smaller,
-            std::cmp::Ordering::Equal => gtk::Ordering::Equal,
-            std::cmp::Ordering::Greater => gtk::Ordering::Larger,
-        }
-    })
-}
-
-fn display_row_cell(object: &glib::Object, column_index: usize) -> String {
-    object
-        .downcast_ref::<glib::BoxedAnyObject>()
-        .and_then(|object| {
-            object
-                .borrow::<SqliteDisplayRow>()
-                .cells
-                .get(column_index)
-                .cloned()
-        })
-        .unwrap_or_default()
 }
 
 fn metadata_icon(icon_name: &str, tooltip: &str) -> gtk::Image {
@@ -1340,18 +1233,5 @@ fn muted_label(text: &str) -> gtk::Label {
 fn clear_list_box(list: &gtk::ListBox) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
-    }
-}
-
-fn clear_column_view(view: &gtk::ColumnView) {
-    loop {
-        let columns = view.columns();
-        let Some(column) = columns
-            .item(0)
-            .and_then(|item| item.downcast::<gtk::ColumnViewColumn>().ok())
-        else {
-            break;
-        };
-        view.remove_column(&column);
     }
 }
