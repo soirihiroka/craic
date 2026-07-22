@@ -1,6 +1,6 @@
 use crate::system::capabilities::shell::{
-    ShellAccess, ShellCommandOutput, ShellCommandRunRequest, ShellCommandSpec, ShellRunCallback,
-    ShellRunRequest, default_shell,
+    ShellAccess, ShellCommandActivity, ShellCommandOutput, ShellCommandRunRequest,
+    ShellCommandSpec, ShellRunCallback, ShellRunRequest, default_shell,
 };
 use crate::system::path::{WorkspacePath, WorkspaceRef};
 use std::collections::HashMap;
@@ -40,7 +40,9 @@ impl ShellAccess for LocalShellAccess {
             self.workspace.display_name,
             working_dir.display()
         );
-        Ok(ShellCommandSpec::new(shell, working_dir).arg("-i"))
+        Ok(ShellCommandSpec::new(shell, working_dir)
+            .arg("-i")
+            .activity(ShellCommandActivity::LocalInteractiveShell))
     }
 
     fn command(

@@ -100,6 +100,7 @@ fn append_container_section(
     for action in actions {
         let (label, action) = match action {
             ContainerFileAction::BuildImage => ("Build Image", "build-image"),
+            ContainerFileAction::ComposeLogs => ("Compose Logs", "compose-logs"),
             ContainerFileAction::ComposeUp => ("Compose Up", "compose-up"),
             ContainerFileAction::ComposePull => ("Compose Pull", "compose-pull"),
             ContainerFileAction::ComposeRestart => ("Compose Restart", "compose-restart"),

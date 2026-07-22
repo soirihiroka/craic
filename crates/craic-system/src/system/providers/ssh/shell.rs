@@ -1,6 +1,7 @@
 use super::{SshCommandRunner, shell_quote};
 use crate::system::capabilities::shell::{
-    ShellAccess, ShellCommandRunRequest, ShellCommandSpec, ShellRunCallback, ShellRunRequest,
+    ShellAccess, ShellCommandActivity, ShellCommandRunRequest, ShellCommandSpec, ShellRunCallback,
+    ShellRunRequest,
 };
 use crate::system::path::{WorkspacePath, WorkspaceRef};
 use std::collections::HashMap;
@@ -8,6 +9,31 @@ use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
+
+const REMOTE_SHELL_ACTIVITY_NOTIFICATION: &str = "craic-terminal-activity";
+const REMOTE_SHELL_ACTIVITY_MONITOR: &str = r#"
+root_pid=$1
+shell_name=$2
+monitor_pid=$$
+last_state=
+
+sleep 0.1
+while kill -0 "$root_pid" 2>/dev/null; do
+    root_name="$(ps -o comm= -p "$root_pid" 2>/dev/null | awk '{$1=$1; print}')"
+    child_pid="$(ps -o pid= --ppid "$root_pid" 2>/dev/null | awk -v monitor="$monitor_pid" '$1 != monitor { print $1; exit }')"
+    if [ -n "$root_name" ] && { [ "$root_name" != "$shell_name" ] || [ -n "$child_pid" ]; }; then
+        state=active
+    else
+        state=idle
+    fi
+
+    if [ "$state" != "$last_state" ]; then
+        printf '\033]0;craic-terminal-activity:%s\007' "$state" > /dev/tty
+        last_state=$state
+    fi
+    sleep 0.5
+done
+"#;
 
 #[derive(Clone, Debug)]
 pub struct SshShellAccess {
@@ -33,13 +59,16 @@ impl ShellAccess for SshShellAccess {
     ) -> Result<ShellCommandSpec, String> {
         let working_dir = working_dir.unwrap_or(&self.workspace.root);
         let remote = format!(
-            "cd {} && exec \"${{SHELL:-/bin/sh}}\" -i",
-            shell_quote(&working_dir.absolute)
+            "cd {} && {{ craic_shell=\"${{SHELL:-/bin/sh}}\"; sh -c {} {} \"$$\" \"${{craic_shell##*/}}\" </dev/null >/dev/null 2>&1 & exec \"$craic_shell\" -i; }}",
+            shell_quote(&working_dir.absolute),
+            shell_quote(REMOTE_SHELL_ACTIVITY_MONITOR),
+            shell_quote(REMOTE_SHELL_ACTIVITY_NOTIFICATION),
         );
         Ok(ShellCommandSpec::new("ssh", self.workspace.root.clone())
             .arg(self.host.clone())
             .arg("-t")
-            .arg(remote))
+            .arg(remote)
+            .activity(ShellCommandActivity::ReportedInteractiveShell))
     }
 
     fn command(

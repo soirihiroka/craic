@@ -3,6 +3,7 @@ use crate::system::path::WorkspacePath;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComposeFileAction {
+    Logs,
     Up,
     Restart,
     Down,

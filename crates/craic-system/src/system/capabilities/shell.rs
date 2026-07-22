@@ -8,6 +8,15 @@ pub struct ShellCommandSpec {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub working_dir: WorkspacePath,
+    pub activity: ShellCommandActivity,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShellCommandActivity {
+    #[default]
+    Command,
+    LocalInteractiveShell,
+    ReportedInteractiveShell,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,11 +125,17 @@ impl ShellCommandSpec {
             program: program.into(),
             args: Vec::new(),
             working_dir: working_dir.into(),
+            activity: ShellCommandActivity::Command,
         }
     }
 
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
         self.args.push(arg.into());
+        self
+    }
+
+    pub fn activity(mut self, activity: ShellCommandActivity) -> Self {
+        self.activity = activity;
         self
     }
 }

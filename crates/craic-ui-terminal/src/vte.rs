@@ -16,6 +16,7 @@ const DEFAULT_COLUMNS: i64 = 100;
 const DEFAULT_ROWS: i64 = 34;
 const SCROLLBACK_LINES: i64 = 10_000;
 const VTE_VERSION: &str = "8400";
+const REPORTED_ACTIVITY_TITLE_PREFIX: &str = "craic-terminal-activity:";
 const TERMINAL_URL_MATCH_PATTERN: &str = r#"https?://[^\s<>\"'`]+"#;
 const TERMINAL_PATH_MATCH_PATTERN: &str = r#"(?x)
     (?:
@@ -39,6 +40,7 @@ pub struct VteTerminal {
     spawning: Rc<Cell<bool>>,
     terminated: Rc<Cell<bool>>,
     launch_dir: Rc<RefCell<String>>,
+    visible_title: Rc<RefCell<Option<String>>>,
     activation_handlers: ActivationHandlers,
 }
 
@@ -137,6 +139,22 @@ impl VteTerminal {
                 terminal.copy_primary();
             }
         });
+        let visible_title = Rc::new(RefCell::new(None));
+        terminal.connect_notify_local(Some("window-title"), {
+            let visible_title = visible_title.clone();
+
+            move |terminal, _| {
+                let title = terminal
+                    .property::<Option<glib::GString>>("window-title")
+                    .map(|title| title.to_string());
+                if !title
+                    .as_deref()
+                    .is_some_and(|title| title.starts_with(REPORTED_ACTIVITY_TITLE_PREFIX))
+                {
+                    visible_title.replace(title);
+                }
+            }
+        });
 
         let this = Self {
             root,
@@ -146,6 +164,7 @@ impl VteTerminal {
             spawning: Rc::new(Cell::new(false)),
             terminated: Rc::new(Cell::new(false)),
             launch_dir: Rc::new(RefCell::new(String::new())),
+            visible_title,
             activation_handlers: Rc::new(RefCell::new(Vec::new())),
         };
         this.install_matches();
@@ -240,12 +259,28 @@ impl VteTerminal {
     pub fn connect_title_changed<F: Fn(String) + 'static>(&self, callback: F) {
         self.terminal
             .connect_notify_local(Some("window-title"), move |terminal, _| {
-                callback(
-                    terminal
-                        .property::<Option<glib::GString>>("window-title")
-                        .map(|title| title.to_string())
-                        .unwrap_or_default(),
-                );
+                let title = terminal
+                    .property::<Option<glib::GString>>("window-title")
+                    .map(|title| title.to_string())
+                    .unwrap_or_default();
+                if !title.starts_with(REPORTED_ACTIVITY_TITLE_PREFIX) {
+                    callback(title);
+                }
+            });
+    }
+
+    pub fn connect_reported_activity_changed<F: Fn(bool) + 'static>(&self, callback: F) {
+        self.terminal
+            .connect_notify_local(Some("window-title"), move |terminal, _| {
+                let title = terminal
+                    .property::<Option<glib::GString>>("window-title")
+                    .map(|title| title.to_string())
+                    .unwrap_or_default();
+                match title.strip_prefix(REPORTED_ACTIVITY_TITLE_PREFIX) {
+                    Some("active") => callback(true),
+                    Some("idle") => callback(false),
+                    _ => {}
+                }
             });
     }
 
@@ -256,9 +291,7 @@ impl VteTerminal {
     }
 
     pub fn title(&self) -> Option<String> {
-        self.terminal
-            .property::<Option<glib::GString>>("window-title")
-            .map(|title| title.to_string())
+        self.visible_title.borrow().clone()
     }
 
     pub fn foreground_process_group(&self) -> Option<libc::pid_t> {

@@ -1308,6 +1308,15 @@ fn run_container_file_action(ctx: &PageContext, file_path: &str, action: Contain
                 return;
             }
         },
+        ContainerFileAction::ComposeLogs => {
+            match docker.compose_file_command(&workspace_path, ComposeFileAction::Logs) {
+                Ok(command) => (command, "Compose Logs", "Started Compose logs in terminal."),
+                Err(err) => {
+                    ctx.show_error("Container Action Failed", &err);
+                    return;
+                }
+            }
+        }
         ContainerFileAction::ComposeUp => {
             match docker.compose_file_command(&workspace_path, ComposeFileAction::Up) {
                 Ok(command) => (command, "Compose Up", "Started Compose Up in terminal."),
