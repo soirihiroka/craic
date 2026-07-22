@@ -1,3 +1,4 @@
+use super::skia_canvas;
 use super::{
     canvas_overshoot,
     code_editor::{
@@ -7,7 +8,7 @@ use super::{
             selection_for_drag, selection_for_mode, word_bounds_at as text_word_bounds_at,
         },
     },
-    diff_layout,
+    diff_layout, skia_gl_area,
 };
 use crate::config;
 use crate::git::{DiffKind, FileDiffRow};
@@ -15,7 +16,6 @@ use crate::language_support::{HighlightRange, SyntaxHighlighter, language_hint_f
 use crate::ui::components::context_menu;
 use crate::ui::{canvas_scroll, canvas_scrollbar};
 use adw::prelude::*;
-use gtk::cairo;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -37,7 +37,7 @@ const DRAG_AUTOSCROLL_OUTSIDE_EXTRA_LINES_PER_FRAME: f64 = 2.0;
 #[derive(Clone)]
 pub struct DiffCanvas {
     pub root: gtk::Overlay,
-    area: gtk::DrawingArea,
+    area: gtk::GLArea,
     spinner: adw::Spinner,
     state: Rc<DiffCanvasState>,
 }
@@ -172,11 +172,7 @@ impl Color {
 
 impl DiffCanvas {
     pub fn new() -> Self {
-        let area = gtk::DrawingArea::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .focusable(true)
-            .build();
+        let area = skia_gl_area::new_area();
         area.set_size_request(MIN_CONTENT_WIDTH, 160);
         let spinner = adw::Spinner::builder()
             .halign(gtk::Align::Center)
@@ -218,7 +214,7 @@ impl DiffCanvas {
             search: RefCell::new(DiffSearchState::default()),
         });
 
-        area.set_draw_func({
+        skia_gl_area::install(&area, {
             let state = state.clone();
             move |area, context, width, height| draw(area, context, width, height, &state)
         });
@@ -273,7 +269,7 @@ impl DiffCanvas {
         rebuild_search_matches(&self.area, &self.state);
         request_layout(&self.area, &self.state, &self.spinner);
         clamp_scroll(&self.area, &self.state);
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     pub fn set_syntax_for_file(
@@ -304,7 +300,7 @@ impl DiffCanvas {
         self.state.layout_pending_signature.borrow_mut().take();
         self.state.content_height.set(1.0);
         self.spinner.set_visible(false);
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     pub fn scroll_y(&self) -> f64 {
@@ -341,7 +337,7 @@ impl DiffCanvas {
         } else {
             select_active_search_match(&self.area, &self.state);
         }
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     pub fn search_next(&self) {
@@ -354,7 +350,7 @@ impl DiffCanvas {
             search.active = Some(search.active.map(|active| (active + 1) % len).unwrap_or(0));
         }
         select_active_search_match(&self.area, &self.state);
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     pub fn search_previous(&self) {
@@ -372,7 +368,7 @@ impl DiffCanvas {
             );
         }
         select_active_search_match(&self.area, &self.state);
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     pub fn search_status(&self) -> String {
@@ -449,8 +445,8 @@ impl DiffSyntaxSignature {
 }
 
 fn draw(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     width: i32,
     height: i32,
     state: &Rc<DiffCanvasState>,
@@ -526,11 +522,7 @@ fn draw(
     draw_middle_autoscroll_marker(context, width, height, state, theme);
 }
 
-fn request_layout(
-    area: &gtk::DrawingArea,
-    state: &Rc<DiffCanvasState>,
-    spinner: &adw::Spinner,
-) -> bool {
+fn request_layout(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, spinner: &adw::Spinner) -> bool {
     let Some(request) = layout_request_for_area(area, state) else {
         state.layout_cache.borrow_mut().take();
         state.layout_pending_signature.borrow_mut().take();
@@ -591,7 +583,7 @@ fn request_layout(
                 if state.search.borrow().active.is_some() {
                     select_active_search_match(&area, &state);
                 }
-                area.queue_draw();
+                area.queue_render();
                 gtk::glib::ControlFlow::Break
             }
             Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
@@ -610,7 +602,7 @@ fn request_layout(
 }
 
 fn layout_request_for_area(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<DiffCanvasState>,
 ) -> Option<diff_layout::Request> {
     let rows = state.rows.borrow();
@@ -647,8 +639,8 @@ fn layout_request_for_area(
 }
 
 fn draw_row(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     state: &Rc<DiffCanvasState>,
     row_index: usize,
     row: &FileDiffRow,
@@ -748,8 +740,8 @@ fn draw_row(
 }
 
 fn draw_side(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     state: &Rc<DiffCanvasState>,
     row_index: usize,
     number: Option<usize>,
@@ -873,8 +865,8 @@ fn draw_side(
 }
 
 fn draw_syntax_line(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     state: &Rc<DiffCanvasState>,
     syntax: &DiffSyntaxSide,
     line: &WrappedLine,
@@ -971,8 +963,8 @@ fn selection_range_for_wrapped_line(
 }
 
 fn draw_search_matches(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     state: &Rc<DiffCanvasState>,
     side: DiffCanvasSide,
     row_index: usize,
@@ -1022,7 +1014,7 @@ fn draw_search_matches(
 }
 
 fn draw_side_background(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     x: f64,
     y: f64,
     width: f64,
@@ -1040,8 +1032,8 @@ fn draw_side_background(
 }
 
 fn draw_scrollbar(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     width: i32,
     height: i32,
     state: &Rc<DiffCanvasState>,
@@ -1076,7 +1068,7 @@ fn draw_scrollbar(
 }
 
 fn draw_scrollbar_markers(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     width: i32,
     height: i32,
     total_height: f64,
@@ -1113,7 +1105,7 @@ fn draw_scrollbar_markers(
 }
 
 fn draw_middle_autoscroll_marker(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     width: i32,
     height: i32,
     state: &Rc<DiffCanvasState>,
@@ -1143,7 +1135,7 @@ fn draw_middle_autoscroll_marker(
     );
 }
 
-fn install_scroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+fn install_scroll(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) {
     let scroll = gtk::EventControllerScroll::new(
         gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
     );
@@ -1201,7 +1193,7 @@ fn install_scroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
     area.add_controller(scroll);
 }
 
-fn install_diff_middle_autoscroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+fn install_diff_middle_autoscroll(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) {
     canvas_scroll::install_middle_autoscroll(
         area,
         &state.middle_autoscroll,
@@ -1265,12 +1257,12 @@ fn install_diff_middle_autoscroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvas
         },
         {
             let area = area.clone();
-            move || area.queue_draw()
+            move || area.queue_render()
         },
     );
 }
 
-fn clear_diff_autoscroll_hover(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+fn clear_diff_autoscroll_hover(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) {
     state.scrollbar_drag.set(None);
     state.selection_drag.set(None);
     canvas_scrollbar::set_hover(
@@ -1291,16 +1283,16 @@ fn clear_diff_autoscroll_hover(area: &gtk::DrawingArea, state: &Rc<DiffCanvasSta
     );
 }
 
-fn stop_diff_middle_autoscroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+fn stop_diff_middle_autoscroll(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) {
     if !state.middle_autoscroll.stop() {
         return;
     }
     area.set_cursor_from_name(None);
     clear_diff_autoscroll_hover(area, state);
-    area.queue_draw();
+    area.queue_render();
 }
 
-fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner: &adw::Spinner) {
+fn install_clicks(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, spinner: &adw::Spinner) {
     let click_selection_mode = Rc::new(Cell::new(SelectionMode::Character));
     let drag_autoscroll_id = Rc::new(Cell::new(0_u64));
     let drag_autoscroll_pointer = Rc::new(Cell::new(None::<(f64, f64)>));
@@ -1359,7 +1351,7 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
             } else {
                 state.selection.borrow_mut().take();
                 state.selection_drag.set(None);
-                area.queue_draw();
+                area.queue_render();
             }
         }
     });
@@ -1542,7 +1534,7 @@ fn install_clicks(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, spinner:
     area.add_controller(secondary_click);
 }
 
-fn install_motion(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+fn install_motion(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) {
     let motion = gtk::EventControllerMotion::new();
     motion.connect_motion({
         let area = area.clone();
@@ -1585,11 +1577,7 @@ fn install_motion(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
     area.add_controller(motion);
 }
 
-fn install_key_shortcuts(
-    area: &gtk::DrawingArea,
-    state: &Rc<DiffCanvasState>,
-    spinner: &adw::Spinner,
-) {
+fn install_key_shortcuts(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, spinner: &adw::Spinner) {
     let keys = gtk::EventControllerKey::new();
     keys.connect_key_pressed({
         let area = area.clone();
@@ -1632,14 +1620,14 @@ fn install_key_shortcuts(
             state.layout_pending_signature.borrow_mut().take();
             request_layout(&area, &state, &spinner);
             clamp_scroll(&area, &state);
-            area.queue_draw();
+            area.queue_render();
             gtk::glib::Propagation::Stop
         }
     });
     area.add_controller(keys);
 }
 
-fn set_scroll_y(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, scroll_y: f64) {
+fn set_scroll_y(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, scroll_y: f64) {
     let max_scroll = state
         .layout_cache
         .borrow()
@@ -1652,11 +1640,11 @@ fn set_scroll_y(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, scroll_y: 
         return;
     }
     state.scroll_y.set(next_scroll_y);
-    area.queue_draw();
+    area.queue_render();
 }
 
 fn apply_click_selection(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<DiffCanvasState>,
     point: DiffSelectionPoint,
     mode: SelectionMode,
@@ -1670,11 +1658,11 @@ fn apply_click_selection(
         |point| line_bounds_at_point(state, point),
     );
     state.selection.replace(Some(selection));
-    area.queue_draw();
+    area.queue_render();
 }
 
 fn selection_drag_for_point(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<DiffCanvasState>,
     point: DiffSelectionPoint,
     mode: SelectionMode,
@@ -1686,12 +1674,12 @@ fn selection_drag_for_point(
         |point| line_bounds_at_point(state, point),
     );
     state.selection.replace(Some(selection));
-    area.queue_draw();
+    area.queue_render();
     drag
 }
 
 fn apply_drag_selection(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<DiffCanvasState>,
     drag: DragSelection<DiffSelectionPoint>,
     focus: DiffSelectionPoint,
@@ -1703,11 +1691,11 @@ fn apply_drag_selection(
         |focus| line_bounds_at_point(state, focus),
     );
     state.selection.replace(Some(selection));
-    area.queue_draw();
+    area.queue_render();
 }
 
 fn scroll_for_diff_drag_selection(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<DiffCanvasState>,
     pointer_y: f64,
 ) -> bool {
@@ -1747,7 +1735,7 @@ fn drag_autoscroll_lines_per_frame(ratio: f64) -> f64 {
 }
 
 fn schedule_diff_drag_autoscroll(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<DiffCanvasState>,
     drag_autoscroll_id: &Rc<Cell<u64>>,
     drag_autoscroll_pointer: &Rc<Cell<Option<(f64, f64)>>>,
@@ -1807,7 +1795,7 @@ fn stop_diff_drag_autoscroll(
     drag_autoscroll_pointer.set(None);
 }
 
-fn show_context_menu(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, x: f64, y: f64) {
+fn show_context_menu(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, x: f64, y: f64) {
     let side = if x
         < (canvas_scrollbar::content_width(area.allocated_width())
             .max(MIN_CONTENT_WIDTH.min(area.allocated_width().max(1))) as f64
@@ -1849,7 +1837,7 @@ fn show_context_menu(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, x: f6
     );
 }
 
-fn copy_selection(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+fn copy_selection(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) {
     let Some(text) = selected_text(state) else {
         return;
     };
@@ -1902,7 +1890,7 @@ fn selected_text(state: &Rc<DiffCanvasState>) -> Option<String> {
     Some(output)
 }
 
-fn select_all_side(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, side: DiffCanvasSide) {
+fn select_all_side(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, side: DiffCanvasSide) {
     state.active_side.set(side);
     let rows = state.rows.borrow();
     let start = rows
@@ -1927,7 +1915,7 @@ fn select_all_side(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, side: D
         state
             .selection
             .replace(Some(DiffSelection { anchor, focus }));
-        area.queue_draw();
+        area.queue_render();
     }
 }
 
@@ -1938,7 +1926,7 @@ fn text_for_side(row: &FileDiffRow, side: DiffCanvasSide) -> Option<&str> {
     }
 }
 
-fn rebuild_search_matches(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+fn rebuild_search_matches(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) {
     let query = state.search.borrow().query.clone();
     let matches = diff_search_matches(&state.rows.borrow(), &query);
     {
@@ -2005,7 +1993,7 @@ fn push_text_search_matches(
     }
 }
 
-fn select_active_search_match(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+fn select_active_search_match(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) {
     let search_match = {
         let search = state.search.borrow();
         search
@@ -2013,7 +2001,7 @@ fn select_active_search_match(area: &gtk::DrawingArea, state: &Rc<DiffCanvasStat
             .and_then(|active| search.matches.get(active).copied())
     };
     let Some(search_match) = search_match else {
-        area.queue_draw();
+        area.queue_render();
         return;
     };
 
@@ -2034,7 +2022,7 @@ fn select_active_search_match(area: &gtk::DrawingArea, state: &Rc<DiffCanvasStat
 }
 
 fn ensure_search_match_visible(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<DiffCanvasState>,
     search_match: DiffSearchMatch,
 ) {
@@ -2108,7 +2096,7 @@ fn line_bounds_at_point(
     ))
 }
 
-fn clamp_scroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
+fn clamp_scroll(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) {
     let Some(content_height) = state
         .layout_cache
         .borrow()
@@ -2123,7 +2111,7 @@ fn clamp_scroll(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) {
         .set(state.scroll_y.get().clamp(0.0, max_scroll));
 }
 
-fn fold_index_at(_area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, y: f64) -> Option<usize> {
+fn fold_index_at(_area: &gtk::GLArea, state: &Rc<DiffCanvasState>, y: f64) -> Option<usize> {
     let document_y = y + state.scroll_y.get();
     let cache = state.layout_cache.borrow();
     let row_index = cache
@@ -2135,7 +2123,7 @@ fn fold_index_at(_area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, y: f64) 
 }
 
 fn selection_point_at(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<DiffCanvasState>,
     x: f64,
     y: f64,
@@ -2152,7 +2140,7 @@ fn selection_point_at(
 }
 
 fn selection_point_at_side(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<DiffCanvasState>,
     x: f64,
     y: f64,
@@ -2203,16 +2191,12 @@ fn selection_point_at_side(
     })
 }
 
-fn cached_text_width_for_state(
-    area: &gtk::DrawingArea,
-    state: &Rc<DiffCanvasState>,
-    text: &str,
-) -> f64 {
+fn cached_text_width_for_state(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, text: &str) -> f64 {
     let mut cache = state.text_width_cache.borrow_mut();
     canvas::cached_text_width(area, state.font_size.get(), &mut cache, text)
 }
 
-fn byte_for_x(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, text: &str, x: f64) -> usize {
+fn byte_for_x(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, text: &str, x: f64) -> usize {
     if x <= 0.0 || text.is_empty() {
         return 0;
     }
@@ -2228,12 +2212,19 @@ fn byte_for_x(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>, text: &str, 
     text.len()
 }
 
-fn gutter_width(area: &gtk::DrawingArea, state: &Rc<DiffCanvasState>) -> f64 {
+fn gutter_width(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) -> f64 {
     let max_number = state.max_line_number.get().max(1).to_string();
     cached_text_width_for_state(area, state, &max_number) + PREFIX_WIDTH + CELL_PADDING * 2.0
 }
 
-fn fill_rect(context: &cairo::Context, x: f64, y: f64, width: f64, height: f64, color: Color) {
+fn fill_rect(
+    context: &skia_canvas::Context,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    color: Color,
+) {
     context.set_source_rgba(color.red, color.green, color.blue, color.alpha);
     context.rectangle(x, y, width, height);
     let _ = context.fill();
@@ -2281,7 +2272,7 @@ fn font_size_delta_for_key(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType
     None
 }
 
-fn theme_for(area: &gtk::DrawingArea) -> DiffCanvasTheme {
+fn theme_for(area: &gtk::GLArea) -> DiffCanvasTheme {
     let dark = adw::StyleManager::for_display(&area.display()).is_dark();
     if dark {
         DiffCanvasTheme {

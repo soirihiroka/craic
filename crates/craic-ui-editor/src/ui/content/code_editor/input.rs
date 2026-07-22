@@ -29,7 +29,7 @@ const DRAG_AUTOSCROLL_AGGRESSIVE_EXTRA_LINES_PER_FRAME: f64 = 2.0;
 const DRAG_AUTOSCROLL_OUTSIDE_EXTRA_LINES_PER_FRAME: f64 = 2.0;
 const INDENT_TEXT: &str = "    ";
 
-pub fn install_interactions(area: &gtk::DrawingArea, root: &gtk::Box, state: &Rc<EditorState>) {
+pub fn install_interactions(area: &gtk::GLArea, root: &gtk::Box, state: &Rc<EditorState>) {
     let scroll_drag = Rc::new(Cell::new(None::<canvas_scrollbar::Drag>));
     let selection_drag = Rc::new(Cell::new(None::<DragSelection<usize>>));
     let selected_text_drag = Rc::new(Cell::new(None::<SelectedTextDrag>));
@@ -643,7 +643,7 @@ pub fn install_interactions(area: &gtk::DrawingArea, root: &gtk::Box, state: &Rc
     area.add_controller(keys);
 }
 
-fn install_editor_middle_autoscroll(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn install_editor_middle_autoscroll(area: &gtk::GLArea, state: &Rc<EditorState>) {
     canvas_scroll::install_middle_autoscroll(
         area,
         &state.middle_autoscroll,
@@ -705,12 +705,12 @@ fn install_editor_middle_autoscroll(area: &gtk::DrawingArea, state: &Rc<EditorSt
         },
         {
             let area = area.clone();
-            move || area.queue_draw()
+            move || area.queue_render()
         },
     );
 }
 
-fn clear_editor_autoscroll_hover(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn clear_editor_autoscroll_hover(area: &gtk::GLArea, state: &Rc<EditorState>) {
     canvas_scrollbar::set_hover(
         area,
         &state.scrollbar_hover,
@@ -723,11 +723,7 @@ fn clear_editor_autoscroll_hover(area: &gtk::DrawingArea, state: &Rc<EditorState
     set_fold_pressed(area, state, None);
 }
 
-fn install_im_context(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-    keys: &gtk::EventControllerKey,
-) {
+fn install_im_context(area: &gtk::GLArea, state: &Rc<EditorState>, keys: &gtk::EventControllerKey) {
     let im_context = gtk::IMMulticontext::new();
     im_context.set_client_widget(Some(area));
     im_context.set_use_preedit(true);
@@ -749,7 +745,7 @@ fn install_im_context(
         move |context| {
             let (preedit, _, _) = context.preedit_string();
             state.preedit.replace(preedit.to_string());
-            area.queue_draw();
+            area.queue_render();
         }
     });
     im_context.connect_preedit_end({
@@ -757,7 +753,7 @@ fn install_im_context(
         let state = state.clone();
         move |_| {
             state.preedit.borrow_mut().clear();
-            area.queue_draw();
+            area.queue_render();
         }
     });
     area.connect_has_focus_notify({
@@ -770,7 +766,7 @@ fn install_im_context(
             } else {
                 im_context.focus_out();
                 state.preedit.borrow_mut().clear();
-                area.queue_draw();
+                area.queue_render();
             }
         }
     });
@@ -784,7 +780,7 @@ fn install_im_context(
 }
 
 fn update_im_cursor_location(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     im_context: &gtk::IMMulticontext,
 ) {
@@ -799,12 +795,7 @@ fn update_im_cursor_location(
     ));
 }
 
-fn set_drag_selection(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-    anchor: usize,
-    focus: usize,
-) {
+fn set_drag_selection(area: &gtk::GLArea, state: &Rc<EditorState>, anchor: usize, focus: usize) {
     state.selection.replace(Some(Selection {
         anchor,
         focus,
@@ -817,7 +808,7 @@ fn set_drag_selection(
 }
 
 fn set_initial_drag_selection(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     offset: usize,
     selection: AnchoredSelection<usize>,
@@ -834,7 +825,7 @@ fn set_initial_drag_selection(
 }
 
 fn apply_drag_selection(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     drag: DragSelection<usize>,
     focus: usize,
@@ -868,11 +859,7 @@ fn apply_drag_selection(
     reset_cursor_blink(area, state);
 }
 
-fn scroll_for_drag_selection(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-    pointer_y: f64,
-) -> bool {
+fn scroll_for_drag_selection(area: &gtk::GLArea, state: &Rc<EditorState>, pointer_y: f64) -> bool {
     let viewport_height = area.allocated_height().max(1) as f64;
     let line_height = render::line_height(state);
     let zone = line_height * DRAG_AUTOSCROLL_ZONE_LINES;
@@ -908,7 +895,7 @@ fn drag_autoscroll_lines_per_frame(ratio: f64) -> f64 {
 }
 
 fn schedule_drag_autoscroll(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     drag_autoscroll_id: &Rc<Cell<u64>>,
     drag_autoscroll_pointer: &Rc<Cell<Option<(f64, f64)>>>,
@@ -970,7 +957,7 @@ fn schedule_drag_autoscroll(
 }
 
 fn begin_selected_text_drag(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     selection_drag: &Rc<Cell<Option<DragSelection<usize>>>>,
     selected_text_drag: &Rc<Cell<Option<SelectedTextDrag>>>,
@@ -992,7 +979,7 @@ fn begin_selected_text_drag(
 }
 
 fn update_selected_text_drag_drop(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     selected_text_drag: &Rc<Cell<Option<SelectedTextDrag>>>,
     x: f64,
@@ -1010,7 +997,7 @@ fn update_selected_text_drag_drop(
     reset_cursor_blink(area, state);
 }
 
-fn move_selected_text(area: &gtk::DrawingArea, state: &Rc<EditorState>, drag: SelectedTextDrag) {
+fn move_selected_text(area: &gtk::GLArea, state: &Rc<EditorState>, drag: SelectedTextDrag) {
     if !can_drag_move_selected_text(state) {
         restore_selected_text_drag_origin(area, state, drag);
         return;
@@ -1065,7 +1052,7 @@ fn move_selected_text(area: &gtk::DrawingArea, state: &Rc<EditorState>, drag: Se
 }
 
 fn restore_selected_text_drag_origin(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     drag: SelectedTextDrag,
 ) {
@@ -1078,7 +1065,7 @@ fn restore_selected_text_drag_origin(
 }
 
 fn selected_text_drag_bounds_at(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     x: f64,
     y: f64,
@@ -1112,7 +1099,7 @@ fn line_drag_bounds(state: &Rc<EditorState>, offset: usize) -> Option<(usize, us
     Some(logical_line_bounds_at(&text, offset))
 }
 
-fn install_cursor_blink(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn install_cursor_blink(area: &gtk::GLArea, state: &Rc<EditorState>) {
     let area = area.downgrade();
     let state = state.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(530), move || {
@@ -1121,7 +1108,7 @@ fn install_cursor_blink(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
         };
         if area.has_focus() && state.editable.get() {
             state.cursor_visible.set(!state.cursor_visible.get());
-            area.queue_draw();
+            area.queue_render();
         } else if !state.cursor_visible.get() {
             state.cursor_visible.set(true);
         }
@@ -1129,9 +1116,9 @@ fn install_cursor_blink(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     });
 }
 
-fn reset_cursor_blink(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn reset_cursor_blink(area: &gtk::GLArea, state: &Rc<EditorState>) {
     state.cursor_visible.set(true);
-    area.queue_draw();
+    area.queue_render();
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1144,7 +1131,7 @@ struct SelectedTextDrag {
     before_selection: Option<Selection>,
 }
 
-fn update_pointer_cursor(area: &gtk::DrawingArea, state: &Rc<EditorState>, x: f64, y: f64) {
+fn update_pointer_cursor(area: &gtk::GLArea, state: &Rc<EditorState>, x: f64, y: f64) {
     if state.middle_autoscroll.is_active() {
         return;
     }
@@ -1177,33 +1164,25 @@ fn update_pointer_cursor(area: &gtk::DrawingArea, state: &Rc<EditorState>, x: f6
     });
 }
 
-fn set_fold_hover(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-    hovered: Option<FoldControlKey>,
-) {
+fn set_fold_hover(area: &gtk::GLArea, state: &Rc<EditorState>, hovered: Option<FoldControlKey>) {
     if state.fold_hovered.get() == hovered {
         return;
     }
     state.fold_hovered.set(hovered);
     start_fold_hover_animation(area, state);
-    area.queue_draw();
+    area.queue_render();
 }
 
-fn set_fold_pressed(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-    pressed: Option<FoldControlKey>,
-) {
+fn set_fold_pressed(area: &gtk::GLArea, state: &Rc<EditorState>, pressed: Option<FoldControlKey>) {
     if state.fold_pressed.get() == pressed {
         return;
     }
     state.fold_pressed.set(pressed);
     start_fold_hover_animation(area, state);
-    area.queue_draw();
+    area.queue_render();
 }
 
-fn start_fold_hover_animation(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn start_fold_hover_animation(area: &gtk::GLArea, state: &Rc<EditorState>) {
     if state.fold_hover_animating.get() {
         return;
     }
@@ -1223,12 +1202,12 @@ fn start_fold_hover_animation(area: &gtk::DrawingArea, state: &Rc<EditorState>) 
         if delta.abs() < 0.02 {
             state.fold_hover_progress.set(target);
             state.fold_hover_animating.set(false);
-            area.queue_draw();
+            area.queue_render();
             return gtk::glib::ControlFlow::Break;
         }
 
         state.fold_hover_progress.set(current + delta * 0.32);
-        area.queue_draw();
+        area.queue_render();
         gtk::glib::ControlFlow::Continue
     });
 }
@@ -1283,7 +1262,7 @@ impl Default for ClickPressState {
 }
 
 fn handle_key(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     key: gdk::Key,
     modifiers: gdk::ModifierType,
@@ -1511,7 +1490,7 @@ fn handle_key(
     gtk::glib::Propagation::Proceed
 }
 
-fn clear_transient_selection(area: &gtk::DrawingArea, state: &Rc<EditorState>) -> bool {
+fn clear_transient_selection(area: &gtk::GLArea, state: &Rc<EditorState>) -> bool {
     let cleared_selection = state.selection.borrow_mut().take().is_some();
     let cleared_preedit = {
         let mut preedit = state.preedit.borrow_mut();
@@ -1537,7 +1516,7 @@ fn is_tab_key(key: gdk::Key) -> bool {
     matches!(key, gdk::Key::Tab | gdk::Key::ISO_Left_Tab)
 }
 
-fn edit_tab(area: &gtk::DrawingArea, state: &Rc<EditorState>, outdent: bool) {
+fn edit_tab(area: &gtk::GLArea, state: &Rc<EditorState>, outdent: bool) {
     if outdent {
         edit_line_indentation(area, state, false);
     } else if selection_bounds(state).is_some() {
@@ -1547,7 +1526,7 @@ fn edit_tab(area: &gtk::DrawingArea, state: &Rc<EditorState>, outdent: bool) {
     }
 }
 
-fn position_context_click(area: &gtk::DrawingArea, state: &Rc<EditorState>, x: f64, y: f64) {
+fn position_context_click(area: &gtk::GLArea, state: &Rc<EditorState>, x: f64, y: f64) {
     if render::fold_action_at_point(area, state, x, y).is_some() {
         return;
     }
@@ -1559,7 +1538,7 @@ fn position_context_click(area: &gtk::DrawingArea, state: &Rc<EditorState>, x: f
     }
 }
 
-fn show_context_menu(area: &gtk::DrawingArea, state: &Rc<EditorState>, x: f64, y: f64) {
+fn show_context_menu(area: &gtk::GLArea, state: &Rc<EditorState>, x: f64, y: f64) {
     let offset = render::hit_test(area, state, x, y);
     context_menu::popup_action_menu(area, x, y, editor_context_menu_sections(state, offset), {
         let area = area.clone();
@@ -1573,7 +1552,7 @@ fn show_context_menu(area: &gtk::DrawingArea, state: &Rc<EditorState>, x: f64, y
 }
 
 pub fn apply_completion_result(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     completions: Option<CompletionSet>,
 ) {
@@ -1603,7 +1582,7 @@ pub fn dismiss_completion(state: &Rc<EditorState>) {
 }
 
 fn handle_completion_key(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     key: gdk::Key,
     command: bool,
@@ -1657,7 +1636,7 @@ fn completion_is_open(state: &Rc<EditorState>) -> bool {
     !completion.items.is_empty() && completion.replacement_range.is_some()
 }
 
-fn request_or_dismiss_completion(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn request_or_dismiss_completion(area: &gtk::GLArea, state: &Rc<EditorState>) {
     if !state.editable.get()
         || state.selection.borrow().is_some()
         || !matches!(state.language.borrow().as_str(), "rust" | "rs")
@@ -1698,7 +1677,7 @@ fn clear_completion(state: &Rc<EditorState>, invalidate_request: bool) {
     }
 }
 
-fn show_completion_popover(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn show_completion_popover(area: &gtk::GLArea, state: &Rc<EditorState>) {
     let ui = ensure_completion_ui(area, state);
     refill_completion_rows(&ui, state);
     select_completion_row(&ui, state.completion.borrow().selected);
@@ -1707,7 +1686,7 @@ fn show_completion_popover(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     area.grab_focus();
 }
 
-fn ensure_completion_ui(area: &gtk::DrawingArea, state: &Rc<EditorState>) -> CompletionUi {
+fn ensure_completion_ui(area: &gtk::GLArea, state: &Rc<EditorState>) -> CompletionUi {
     if let Some(ui) = state.completion_ui.borrow().as_ref().cloned() {
         return ui;
     }
@@ -1768,7 +1747,7 @@ fn completion_row(label: &str) -> gtk::ListBoxRow {
     let label = gtk::Label::builder()
         .label(label)
         .xalign(0.0)
-        .ellipsize(pango::EllipsizeMode::End)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
     label.add_css_class("code-editor-completion-label");
 
@@ -1785,7 +1764,7 @@ fn completion_row(label: &str) -> gtk::ListBoxRow {
         .build()
 }
 
-fn position_completion_popover(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn position_completion_popover(area: &gtk::GLArea, state: &Rc<EditorState>) {
     let Some(ui) = state.completion_ui.borrow().as_ref().cloned() else {
         return;
     };
@@ -1807,7 +1786,7 @@ fn select_completion_row(ui: &CompletionUi, selected: usize) {
     }
 }
 
-fn accept_completion(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn accept_completion(area: &gtk::GLArea, state: &Rc<EditorState>) {
     let Some((item, start, end)) = ({
         let completion = state.completion.borrow();
         completion.replacement_range.and_then(|(start, end)| {
@@ -1994,7 +1973,7 @@ fn action_enabled(state: &Rc<EditorState>, action: TextContextAction) -> bool {
     }
 }
 
-fn run_action(area: &gtk::DrawingArea, state: &Rc<EditorState>, action: TextContextAction) {
+fn run_action(area: &gtk::GLArea, state: &Rc<EditorState>, action: TextContextAction) {
     match action {
         TextContextAction::ApplyMarkdownFix { edits } => {
             apply_markdown_fix(area, state, &edits);
@@ -2030,30 +2009,26 @@ fn run_action(area: &gtk::DrawingArea, state: &Rc<EditorState>, action: TextCont
                 visual_focus: state.text.borrow().len(),
             }));
             state.cursor.set(state.text.borrow().len());
-            area.queue_draw();
+            area.queue_render();
         }
         TextContextAction::ToggleWrap => {
             state.wrap.set(!state.wrap.get());
             render::invalidate_layout(state);
             render::refresh_size(area, state, area.allocated_width(), area.allocated_height());
-            area.queue_draw();
+            area.queue_render();
         }
         TextContextAction::ToggleReadOnly => {
             state.editable.set(!state.editable.get());
             area.set_focusable(true);
             area.set_cursor_from_name(None);
             state.cursor_visible.set(true);
-            area.queue_draw();
+            area.queue_render();
         }
         TextContextAction::FoldSelection => fold_selection(area, state),
     }
 }
 
-fn apply_markdown_fix(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-    edits: &[MarkdownLintEdit],
-) {
+fn apply_markdown_fix(area: &gtk::GLArea, state: &Rc<EditorState>, edits: &[MarkdownLintEdit]) {
     if edits.is_empty() {
         return;
     }
@@ -2109,7 +2084,7 @@ fn copy_selection(state: &Rc<EditorState>) {
     display.clipboard().set_text(&text[start..end]);
 }
 
-fn paste_from_clipboard(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn paste_from_clipboard(area: &gtk::GLArea, state: &Rc<EditorState>) {
     if !state.editable.get() {
         return;
     }
@@ -2129,7 +2104,7 @@ fn paste_from_clipboard(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     });
 }
 
-fn insert_text(area: &gtk::DrawingArea, state: &Rc<EditorState>, inserted: &str) {
+fn insert_text(area: &gtk::GLArea, state: &Rc<EditorState>, inserted: &str) {
     let text = state.text.borrow();
     let (start, end) = selection_bounds(state).unwrap_or_else(|| {
         let cursor = state.cursor.get().min(text.len());
@@ -2148,7 +2123,7 @@ fn matching_auto_pair(ch: char) -> Option<char> {
     }
 }
 
-fn insert_auto_pair(area: &gtk::DrawingArea, state: &Rc<EditorState>, open: char, close: char) {
+fn insert_auto_pair(area: &gtk::GLArea, state: &Rc<EditorState>, open: char, close: char) {
     let text = state.text.borrow();
     let (start, end) = selection_bounds(state).unwrap_or_else(|| {
         let cursor = state.cursor.get().min(text.len());
@@ -2182,7 +2157,7 @@ fn insert_auto_pair(area: &gtk::DrawingArea, state: &Rc<EditorState>, open: char
     );
 }
 
-fn insert_newline(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn insert_newline(area: &gtk::GLArea, state: &Rc<EditorState>) {
     let text = state.text.borrow();
     let (start, end) = selection_bounds(state).unwrap_or_else(|| {
         let cursor = state.cursor.get().min(text.len());
@@ -2215,7 +2190,7 @@ struct LinePrefixEdit {
     inserted: usize,
 }
 
-fn edit_line_indentation(area: &gtk::DrawingArea, state: &Rc<EditorState>, indent: bool) {
+fn edit_line_indentation(area: &gtk::GLArea, state: &Rc<EditorState>, indent: bool) {
     let text = state.text.borrow();
     let (range_start, range_end, replacement, edits) = line_indentation_edit(&text, state, indent);
     let before_cursor = state.cursor.get().min(text.len());
@@ -2306,7 +2281,7 @@ fn line_indentation_edit(
     (range_start, range_end, replacement, edits)
 }
 
-fn toggle_line_comment(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn toggle_line_comment(area: &gtk::GLArea, state: &Rc<EditorState>) {
     if !state.editable.get() {
         return;
     }
@@ -2558,7 +2533,7 @@ fn leading_whitespace(line: &str) -> &str {
     &line[..end]
 }
 
-fn edit_backspace(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn edit_backspace(area: &gtk::GLArea, state: &Rc<EditorState>) {
     if delete_selection(area, state) {
         return;
     }
@@ -2573,7 +2548,7 @@ fn edit_backspace(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     commit_edit(area, state, start, cursor, "", start, None, true);
 }
 
-fn edit_delete(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn edit_delete(area: &gtk::GLArea, state: &Rc<EditorState>) {
     if delete_selection(area, state) {
         return;
     }
@@ -2587,7 +2562,7 @@ fn edit_delete(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     commit_edit(area, state, cursor, end, "", cursor, None, true);
 }
 
-fn edit_delete_leading_whitespace(area: &gtk::DrawingArea, state: &Rc<EditorState>) -> bool {
+fn edit_delete_leading_whitespace(area: &gtk::GLArea, state: &Rc<EditorState>) -> bool {
     if selection_bounds(state).is_some() {
         return false;
     }
@@ -2614,7 +2589,7 @@ enum DeleteDirection {
 }
 
 fn edit_delete_word(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     direction: DeleteDirection,
     extend_selection: bool,
@@ -2645,7 +2620,7 @@ fn edit_delete_word(
     commit_edit(area, state, start, end, "", start, None, true);
 }
 
-fn delete_word_range(area: &gtk::DrawingArea, state: &Rc<EditorState>, direction: DeleteDirection) {
+fn delete_word_range(area: &gtk::GLArea, state: &Rc<EditorState>, direction: DeleteDirection) {
     let text = state.text.borrow();
     let len = text.len();
     let selection = *state.selection.borrow();
@@ -2670,7 +2645,7 @@ fn delete_word_range(area: &gtk::DrawingArea, state: &Rc<EditorState>, direction
     commit_edit(area, state, start, end, "", start, None, true);
 }
 
-fn delete_selection(area: &gtk::DrawingArea, state: &Rc<EditorState>) -> bool {
+fn delete_selection(area: &gtk::GLArea, state: &Rc<EditorState>) -> bool {
     let Some((start, end)) = selection_bounds(state) else {
         return false;
     };
@@ -2679,7 +2654,7 @@ fn delete_selection(area: &gtk::DrawingArea, state: &Rc<EditorState>) -> bool {
 }
 
 fn move_cursor_to(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     offset: usize,
     extend_selection: bool,
@@ -2708,7 +2683,7 @@ fn move_cursor_to(
 }
 
 fn move_cursor_vertical(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     delta: isize,
     extend_selection: bool,
@@ -2757,7 +2732,7 @@ fn cursor_right_target(state: &Rc<EditorState>, by_word: bool, extend_selection:
     }
 }
 
-fn scroll_page(area: &gtk::DrawingArea, state: &Rc<EditorState>, direction: isize) {
+fn scroll_page(area: &gtk::GLArea, state: &Rc<EditorState>, direction: isize) {
     let line_height = render::line_height(state);
     let distance = (area.allocated_height() as f64 - line_height).max(line_height);
     render::set_scroll_y(
@@ -2767,7 +2742,7 @@ fn scroll_page(area: &gtk::DrawingArea, state: &Rc<EditorState>, direction: isiz
     );
 }
 
-fn page_line_delta(area: &gtk::DrawingArea, state: &Rc<EditorState>, direction: isize) -> isize {
+fn page_line_delta(area: &gtk::GLArea, state: &Rc<EditorState>, direction: isize) -> isize {
     let line_height = render::line_height(state);
     let lines = ((area.allocated_height() as f64 - line_height).max(line_height) / line_height)
         .floor()
@@ -2776,7 +2751,7 @@ fn page_line_delta(area: &gtk::DrawingArea, state: &Rc<EditorState>, direction: 
 }
 
 fn select_at_mode(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     offset: usize,
     mode: SelectionMode,
@@ -2973,7 +2948,7 @@ fn logical_line_bounds_at(text: &str, offset: usize) -> (usize, usize) {
 }
 
 fn commit_edit(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     start: usize,
     old_end: usize,
@@ -3038,7 +3013,7 @@ fn commit_edit(
     reset_cursor_blink(area, state);
 }
 
-fn undo(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn undo(area: &gtk::GLArea, state: &Rc<EditorState>) {
     if !state.editable.get() {
         return;
     }
@@ -3049,7 +3024,7 @@ fn undo(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     push_history_snapshot(&mut state.redo_stack.borrow_mut(), snapshot);
 }
 
-fn redo(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn redo(area: &gtk::GLArea, state: &Rc<EditorState>) {
     if !state.editable.get() {
         return;
     }
@@ -3074,7 +3049,7 @@ enum HistoryDirection {
 }
 
 fn restore_snapshot(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     snapshot: &HistorySnapshot,
     direction: HistoryDirection,
@@ -3116,7 +3091,7 @@ fn text_affects_folds(text: &str) -> bool {
         .any(|byte| matches!(byte, b'\n' | b'{' | b'}' | b'[' | b']' | b'(' | b')' | b':'))
 }
 
-fn fold_selection(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn fold_selection(area: &gtk::GLArea, state: &Rc<EditorState>) {
     let Some((start, end)) = selection_bounds(state) else {
         return;
     };
@@ -3137,10 +3112,10 @@ fn fold_selection(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     }
     state.selection.borrow_mut().take();
     render::refresh_size(area, state, area.allocated_width(), area.allocated_height());
-    area.queue_draw();
+    area.queue_render();
 }
 
-fn toggle_fold_at(area: &gtk::DrawingArea, state: &Rc<EditorState>, x: f64, y: f64) -> bool {
+fn toggle_fold_at(area: &gtk::GLArea, state: &Rc<EditorState>, x: f64, y: f64) -> bool {
     let Some(action) = render::fold_action_at_point(area, state, x, y) else {
         return false;
     };
@@ -3170,7 +3145,7 @@ fn toggle_fold_at(area: &gtk::DrawingArea, state: &Rc<EditorState>, x: f64, y: f
             }
             super::mark_fold_state_changed(state);
             render::refresh_size(area, state, area.allocated_width(), area.allocated_height());
-            area.queue_draw();
+            area.queue_render();
         }
     }
     true

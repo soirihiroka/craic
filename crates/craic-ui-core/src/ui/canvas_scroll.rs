@@ -4,6 +4,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
+use super::canvas_painter::CanvasPainter;
+
 const MIDDLE_AUTOSCROLL_FRAME_MS: u64 = 16;
 const MIDDLE_AUTOSCROLL_DEAD_ZONE: f64 = 12.0;
 const MIDDLE_AUTOSCROLL_RAMP_DISTANCE: f64 = 150.0;
@@ -822,7 +824,7 @@ fn translate_surface_coordinates(
 }
 
 pub fn draw_middle_autoscroll_marker(
-    context: &gtk::cairo::Context,
+    context: &impl CanvasPainter,
     width: i32,
     height: i32,
     state: Option<MiddleAutoscrollState>,
@@ -866,11 +868,11 @@ pub fn draw_middle_autoscroll_marker(
     let _ = context.restore();
 }
 
-fn set_source(context: &gtk::cairo::Context, color: MarkerColor) {
+fn set_source(context: &impl CanvasPainter, color: MarkerColor) {
     context.set_source_rgba(color.red, color.green, color.blue, color.alpha);
 }
 
-fn draw_vertical_marker_arrows(context: &gtk::cairo::Context, x: f64, y: f64) {
+fn draw_vertical_marker_arrows(context: &impl CanvasPainter, x: f64, y: f64) {
     context.move_to(x, y - 11.0);
     context.line_to(x - 4.5, y - 5.0);
     context.line_to(x + 4.5, y - 5.0);
@@ -884,7 +886,7 @@ fn draw_vertical_marker_arrows(context: &gtk::cairo::Context, x: f64, y: f64) {
     let _ = context.fill();
 }
 
-fn draw_horizontal_marker_arrows(context: &gtk::cairo::Context, x: f64, y: f64) {
+fn draw_horizontal_marker_arrows(context: &impl CanvasPainter, x: f64, y: f64) {
     context.move_to(x - 11.0, y);
     context.line_to(x - 5.0, y - 4.5);
     context.line_to(x - 5.0, y + 4.5);

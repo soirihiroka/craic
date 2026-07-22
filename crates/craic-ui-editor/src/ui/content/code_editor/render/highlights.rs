@@ -1,15 +1,15 @@
+use super::super::super::skia_canvas;
 use super::theme::{Color, EditorTheme};
 use super::{draw_plain_text, text_width};
 use crate::language_support::{HighlightRange, SyntaxIssue};
 use crate::markdown_lint::MarkdownLintIssue;
 use crate::spellcheck::SpellcheckIssue;
 use crate::ui::content::code_editor::EditorState;
-use gtk::cairo;
 use std::rc::Rc;
 
 pub fn draw_highlighted_slice(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     state: &Rc<EditorState>,
     source: &str,
     highlights: &[HighlightRange],
@@ -77,8 +77,8 @@ fn valid_highlight_range(source: &str, range: &HighlightRange) -> bool {
 }
 
 pub fn draw_syntax_issues(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     state: &Rc<EditorState>,
     source: &str,
     issues: &[SyntaxIssue],
@@ -125,8 +125,8 @@ fn valid_syntax_issue(source: &str, issue: &SyntaxIssue) -> bool {
 }
 
 pub fn draw_spellcheck_issues(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     state: &Rc<EditorState>,
     source: &str,
     issues: &[SpellcheckIssue],
@@ -166,8 +166,8 @@ pub fn draw_spellcheck_issues(
 }
 
 pub fn draw_markdown_lint_issues(
-    area: &gtk::DrawingArea,
-    context: &cairo::Context,
+    area: &gtk::GLArea,
+    context: &skia_canvas::Context,
     state: &Rc<EditorState>,
     source: &str,
     issues: &[MarkdownLintIssue],
@@ -206,7 +206,7 @@ pub fn draw_markdown_lint_issues(
     }
 }
 
-fn draw_wavy_underline(context: &cairo::Context, x: f64, y: f64, width: f64, color: Color) {
+fn draw_wavy_underline(context: &skia_canvas::Context, x: f64, y: f64, width: f64, color: Color) {
     if width <= 1.0 {
         return;
     }

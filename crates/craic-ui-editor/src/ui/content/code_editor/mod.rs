@@ -4,7 +4,7 @@ mod render;
 pub mod selection;
 mod text_buffer;
 
-use super::canvas_overshoot;
+use super::{canvas_overshoot, skia_gl_area};
 use crate::config;
 use crate::git::{DiffKind, FileComparison};
 use crate::language_support::{
@@ -38,7 +38,7 @@ const MAX_HISTORY_SNAPSHOTS: usize = 200;
 #[derive(Clone)]
 pub struct CodeEditor {
     pub root: gtk::Box,
-    area: gtk::DrawingArea,
+    area: gtk::GLArea,
     search_panel: SearchPanel,
     state: Rc<EditorState>,
 }
@@ -251,16 +251,11 @@ impl CodeEditor {
         let line_count = text.lines().count().max(1);
         let font_size = config::DEFAULT_EDITOR_FONT_SIZE;
         let line_height = line_height_for_font_size(font_size);
-        let area = gtk::DrawingArea::builder()
-            .content_width(MIN_CONTENT_WIDTH)
-            .content_height(line_height as i32)
-            .focusable(true)
-            .hexpand(true)
-            .vexpand(true)
-            .build();
+        let area = skia_gl_area::new_area();
+        area.set_size_request(MIN_CONTENT_WIDTH, line_height as i32);
         let font_metrics = render::measure_font_metrics(&area, font_size);
         let line_height = font_metrics.line_height;
-        area.set_content_height(line_height as i32);
+        area.set_size_request(MIN_CONTENT_WIDTH, line_height as i32);
         let (syntax_sender, syntax_receiver) = mpsc::channel();
         let (syntax_result_sender, syntax_result_receiver) = mpsc::channel();
         thread::spawn(move || run_syntax_worker(syntax_receiver, syntax_result_sender));
@@ -328,7 +323,7 @@ impl CodeEditor {
         install_syntax_result_receiver(&area, &state, syntax_result_receiver);
         reset_syntax_worker(&state);
 
-        area.set_draw_func({
+        skia_gl_area::install(&area, {
             let state = state.clone();
             move |area, context, width, height| {
                 if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
@@ -340,7 +335,14 @@ impl CodeEditor {
         });
         area.connect_resize({
             let state = state.clone();
-            move |area, width, height| render::refresh_size(area, &state, width, height)
+            move |area, _, _| {
+                render::refresh_size(
+                    area,
+                    &state,
+                    area.allocated_width(),
+                    area.allocated_height(),
+                )
+            }
         });
 
         let root = gtk::Box::builder()
@@ -410,7 +412,7 @@ impl CodeEditor {
         self.state.cursor_visible.set(true);
         self.area.grab_focus();
         render::ensure_offset_visible(&self.area, &self.state, start);
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     pub fn select_line_column(&self, line: usize, column: usize) {
@@ -422,22 +424,22 @@ impl CodeEditor {
 
     pub fn set_file_diff(&self, comparison: Option<&FileComparison>) {
         apply_file_diff_marks(&self.state, comparison);
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     pub fn clear_file_diff(&self) {
         reset_git_state(&self.state);
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     pub fn set_spellcheck_issues(&self, issues: Vec<SpellcheckIssue>) {
         self.state.spellcheck_issues.replace(issues);
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     pub fn set_markdown_lint_issues(&self, issues: Vec<MarkdownLintIssue>) {
         self.state.markdown_lint_issues.replace(issues);
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     pub fn set_language(&self, language: &str) {
@@ -451,7 +453,7 @@ impl CodeEditor {
         render::invalidate_layout(&self.state);
         render::invalidate_highlights(&self.state);
         rebuild_auto_folds(&self.area, &self.state);
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     pub fn set_font_size(&self, font_size: f64) {
@@ -472,7 +474,7 @@ impl CodeEditor {
             self.state.syntax_error.get(),
             editable && self.state.syntax_error.get()
         );
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     pub fn set_read_only(&self, read_only: bool) {
@@ -524,7 +526,7 @@ impl CodeEditor {
             self.area.allocated_width(),
             self.area.allocated_height(),
         );
-        self.area.queue_draw();
+        self.area.queue_render();
     }
 
     fn set_document_with_language(&self, language: Option<&str>, text: &str, force_reset: bool) {
@@ -564,7 +566,7 @@ impl CodeEditor {
     }
 }
 
-fn build_search_panel(area: &gtk::DrawingArea, state: &Rc<EditorState>) -> SearchPanel {
+fn build_search_panel(area: &gtk::GLArea, state: &Rc<EditorState>) -> SearchPanel {
     let search_panel = SearchPanel::new("Search");
     search_panel.set_key_capture_widget(area);
     search_panel.set_clear_on_close(false);
@@ -620,11 +622,7 @@ fn build_search_panel(area: &gtk::DrawingArea, state: &Rc<EditorState>) -> Searc
     search_panel
 }
 
-fn handle_search_opened(
-    area: &gtk::DrawingArea,
-    search_panel: &SearchPanel,
-    state: &Rc<EditorState>,
-) {
+fn handle_search_opened(area: &gtk::GLArea, search_panel: &SearchPanel, state: &Rc<EditorState>) {
     if let Some((start, end)) = selection_bounds(state).filter(|(start, end)| start < end) {
         let selected = state.text.borrow()[start..end].to_string();
         search_panel.set_query(&selected, true);
@@ -638,7 +636,7 @@ fn handle_search_opened(
     );
 }
 
-fn update_search_query(area: &gtk::DrawingArea, state: &Rc<EditorState>, query: &str) {
+fn update_search_query(area: &gtk::GLArea, state: &Rc<EditorState>, query: &str) {
     {
         let mut search = state.search.borrow_mut();
         if search.query == query {
@@ -650,7 +648,7 @@ fn update_search_query(area: &gtk::DrawingArea, state: &Rc<EditorState>, query: 
     log::debug!("code_editor search query updated len={}", query.len());
 }
 
-fn rebuild_search_matches(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn rebuild_search_matches(area: &gtk::GLArea, state: &Rc<EditorState>) {
     let text = state.text.borrow();
     let query = state.search.borrow().query.clone();
     let matches = search_matches(&text, &query);
@@ -675,7 +673,7 @@ fn rebuild_search_matches(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     if active.is_some() {
         select_search_match(area, state);
     } else {
-        area.queue_draw();
+        area.queue_render();
     }
 }
 
@@ -715,7 +713,7 @@ fn next_search_cursor(text: &str, start: usize, end: usize) -> usize {
     }
 }
 
-fn search_next(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn search_next(area: &gtk::GLArea, state: &Rc<EditorState>) {
     let len = state.search.borrow().matches.len();
     if len == 0 {
         return;
@@ -731,7 +729,7 @@ fn search_next(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     );
 }
 
-fn search_previous(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn search_previous(area: &gtk::GLArea, state: &Rc<EditorState>) {
     let len = state.search.borrow().matches.len();
     if len == 0 {
         return;
@@ -752,14 +750,14 @@ fn search_previous(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     );
 }
 
-fn select_search_match(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn select_search_match(area: &gtk::GLArea, state: &Rc<EditorState>) {
     let search = state.search.borrow();
     let Some(search_match) = search
         .active
         .and_then(|active| search.matches.get(active).copied())
     else {
         drop(search);
-        area.queue_draw();
+        area.queue_render();
         return;
     };
     drop(search);
@@ -773,7 +771,7 @@ fn select_search_match(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     state.cursor.set(search_match.end);
     state.cursor_visible.set(true);
     render::ensure_offset_visible(area, state, search_match.start);
-    area.queue_draw();
+    area.queue_render();
 }
 
 fn update_search_status(search_panel: &SearchPanel, state: &Rc<EditorState>) {
@@ -793,7 +791,7 @@ fn line_height_for_font_size(font_size: f64) -> f64 {
     (font_size + 9.0).ceil()
 }
 
-fn install_font_size_shortcuts(area: &gtk::DrawingArea, root: &gtk::Box, state: &Rc<EditorState>) {
+fn install_font_size_shortcuts(area: &gtk::GLArea, root: &gtk::Box, state: &Rc<EditorState>) {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     keys.connect_key_pressed({
@@ -816,7 +814,7 @@ fn install_font_size_shortcuts(area: &gtk::DrawingArea, root: &gtk::Box, state: 
 }
 
 fn set_font_size_for_state(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     root: &gtk::Box,
     state: &Rc<EditorState>,
     font_size: f64,
@@ -833,10 +831,10 @@ fn set_font_size_for_state(
         .clear_for_font_size(font_size.round() as i32);
     render::refresh_font_metrics(area, state);
     let line_height = state.line_height.get();
-    area.set_content_height(line_height as i32);
+    area.set_height_request(line_height as i32);
     root.set_size_request(MIN_CONTENT_WIDTH, (line_height * 4.0) as i32);
     render::invalidate_layout(state);
-    area.queue_draw();
+    area.queue_render();
     font_size
 }
 
@@ -1249,7 +1247,7 @@ fn apply_syntax_command(
 }
 
 fn install_syntax_result_receiver(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &Rc<EditorState>,
     receiver: Receiver<SyntaxWorkerResult>,
 ) {
@@ -1280,11 +1278,7 @@ fn install_syntax_result_receiver(
     });
 }
 
-fn apply_syntax_result(
-    area: &gtk::DrawingArea,
-    state: &Rc<EditorState>,
-    result: SyntaxWorkerResult,
-) {
+fn apply_syntax_result(area: &gtk::GLArea, state: &Rc<EditorState>, result: SyntaxWorkerResult) {
     let (generation, highlights, folds, syntax_error, syntax_issues) = match result {
         SyntaxWorkerResult::Analysis {
             generation,
@@ -1350,7 +1344,7 @@ fn apply_syntax_result(
         }
     }
 
-    area.queue_draw();
+    area.queue_render();
 }
 
 fn send_syntax_command(state: &Rc<EditorState>, command: SyntaxWorkerCommand) {
@@ -1429,7 +1423,7 @@ fn next_syntax_generation(state: &Rc<EditorState>) -> u64 {
     generation
 }
 
-fn schedule_highlights(_area: &gtk::DrawingArea, state: &Rc<EditorState>, _text: &str) {
+fn schedule_highlights(_area: &gtk::GLArea, state: &Rc<EditorState>, _text: &str) {
     let generation = state.syntax_generation.get();
     if state.highlight_request_generation.get() == generation {
         return;
@@ -1437,7 +1431,7 @@ fn schedule_highlights(_area: &gtk::DrawingArea, state: &Rc<EditorState>, _text:
     state.highlight_request_generation.set(generation);
 }
 
-fn rebuild_auto_folds(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
+fn rebuild_auto_folds(area: &gtk::GLArea, state: &Rc<EditorState>) {
     let removed_auto_folds = if !state.auto_folding_enabled.get() {
         clear_automatic_folds(state, "auto folding unavailable")
     } else {
@@ -1446,7 +1440,7 @@ fn rebuild_auto_folds(area: &gtk::DrawingArea, state: &Rc<EditorState>) {
     if !state.auto_folding_enabled.get() {
         if removed_auto_folds {
             render::refresh_size(area, state, area.allocated_width(), area.allocated_height());
-            area.queue_draw();
+            area.queue_render();
         }
         reset_syntax_worker(state);
         return;

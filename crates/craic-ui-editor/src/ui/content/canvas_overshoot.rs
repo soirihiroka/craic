@@ -1,5 +1,9 @@
-use gtk::cairo::{self, RadialGradient};
+use super::skia_canvas;
 use gtk::prelude::*;
+use skia_safe::{
+    Color4f, Paint, TileMode,
+    gradient::{Colors, Gradient, Interpolation, shaders},
+};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -37,7 +41,7 @@ impl EdgeGlow {
         }
     }
 
-    pub fn pull(&self, area: &gtk::DrawingArea, edge: Edge, overflow: f64) {
+    pub fn pull(&self, area: &gtk::GLArea, edge: Edge, overflow: f64) {
         if overflow <= f64::EPSILON {
             return;
         }
@@ -46,7 +50,7 @@ impl EdgeGlow {
         let impulse = (overflow * 0.72).clamp(2.0, 42.0);
         let cell = self.cell(edge);
         cell.set((cell.get() + impulse).min(MAX_OVERSHOOT_DISTANCE));
-        area.queue_draw();
+        area.queue_render();
         self.start_decay(area);
     }
 
@@ -68,7 +72,7 @@ impl EdgeGlow {
         }
     }
 
-    fn start_decay(&self, area: &gtk::DrawingArea) {
+    fn start_decay(&self, area: &gtk::GLArea) {
         if self.animating.get() {
             return;
         }
@@ -82,7 +86,7 @@ impl EdgeGlow {
                 | decay_cell(&state.left)
                 | decay_cell(&state.right);
 
-            area.queue_draw();
+            area.queue_render();
             if active {
                 gtk::glib::ControlFlow::Continue
             } else {
@@ -94,7 +98,7 @@ impl EdgeGlow {
 }
 
 pub fn pull_for_delta(
-    area: &gtk::DrawingArea,
+    area: &gtk::GLArea,
     state: &EdgeGlow,
     current: f64,
     max: f64,
@@ -129,7 +133,7 @@ pub fn pull_for_delta(
     );
 }
 
-pub fn draw(context: &cairo::Context, width: i32, height: i32, state: &EdgeGlow) {
+pub fn draw(context: &skia_canvas::Context, width: i32, height: i32, state: &EdgeGlow) {
     if width <= 0 || height <= 0 {
         return;
     }
@@ -142,7 +146,13 @@ pub fn draw(context: &cairo::Context, width: i32, height: i32, state: &EdgeGlow)
     draw_horizontal_edge(context, width, height, state.right.get(), false);
 }
 
-fn draw_vertical_edge(context: &cairo::Context, width: f64, height: f64, distance: f64, top: bool) {
+fn draw_vertical_edge(
+    context: &skia_canvas::Context,
+    width: f64,
+    height: f64,
+    distance: f64,
+    top: bool,
+) {
     let distance = distance.clamp(0.0, MAX_OVERSHOOT_DISTANCE).min(height);
     if distance <= 0.5 {
         return;
@@ -186,7 +196,7 @@ fn draw_vertical_edge(context: &cairo::Context, width: f64, height: f64, distanc
 }
 
 fn draw_horizontal_edge(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     width: f64,
     height: f64,
     distance: f64,
@@ -235,7 +245,7 @@ fn draw_horizontal_edge(
 }
 
 fn fill_edge_gradient(
-    context: &cairo::Context,
+    context: &skia_canvas::Context,
     rect: (f64, f64, f64, f64),
     center: (f64, f64),
     radius: (f64, f64),
@@ -254,19 +264,31 @@ fn fill_edge_gradient(
     context.translate(center_x, center_y);
     context.scale(radius_x, radius_y);
 
-    let gradient = RadialGradient::new(0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
-    add_edge_stops(&gradient, alpha);
-    let _ = context.set_source(&gradient);
-    let _ = context.paint();
+    let colors = [
+        glow_color(alpha),
+        glow_color(alpha * 0.72),
+        glow_color(alpha * 0.28),
+        glow_color(alpha * 0.08),
+        glow_color(0.0),
+    ];
+    let positions = [0.0, 0.20, 0.48, 0.72, 1.0];
+    let colors = Colors::new(&colors, Some(&positions), TileMode::Clamp, None);
+    let gradient = Gradient::new(colors, Interpolation::default());
+    if let Some(shader) = shaders::radial_gradient(((0.0, 0.0), 1.0), &gradient, None) {
+        let mut paint = Paint::default();
+        paint.set_anti_alias(true).set_shader(shader);
+        context.canvas().draw_paint(&paint);
+    }
     let _ = context.restore();
 }
 
-fn add_edge_stops(gradient: &RadialGradient, alpha: f64) {
-    gradient.add_color_stop_rgba(0.0, GLOW_COLOR.0, GLOW_COLOR.1, GLOW_COLOR.2, alpha);
-    gradient.add_color_stop_rgba(0.20, GLOW_COLOR.0, GLOW_COLOR.1, GLOW_COLOR.2, alpha * 0.72);
-    gradient.add_color_stop_rgba(0.48, GLOW_COLOR.0, GLOW_COLOR.1, GLOW_COLOR.2, alpha * 0.28);
-    gradient.add_color_stop_rgba(0.72, GLOW_COLOR.0, GLOW_COLOR.1, GLOW_COLOR.2, alpha * 0.08);
-    gradient.add_color_stop_rgba(1.0, GLOW_COLOR.0, GLOW_COLOR.1, GLOW_COLOR.2, 0.0);
+fn glow_color(alpha: f64) -> Color4f {
+    Color4f::new(
+        GLOW_COLOR.0 as f32,
+        GLOW_COLOR.1 as f32,
+        GLOW_COLOR.2 as f32,
+        alpha as f32,
+    )
 }
 
 fn decay_cell(cell: &Cell<f64>) -> bool {
