@@ -1255,6 +1255,7 @@ fn highlight_query_for(name: &str) -> Option<Cow<'static, str>> {
         "markdown" | "md" | "mdown" | "mkd" => {
             Some(Cow::Borrowed(tree_sitter_md::HIGHLIGHT_QUERY_BLOCK))
         }
+        "markdown_inline" => Some(Cow::Borrowed(tree_sitter_md::HIGHLIGHT_QUERY_INLINE)),
         "python" | "py" | "pyw" => Some(Cow::Borrowed(tree_sitter_python::HIGHLIGHTS_QUERY)),
         "ruby" | "rb" => Some(Cow::Borrowed(tree_sitter_ruby::HIGHLIGHTS_QUERY)),
         "rst" | "rest" => Some(Cow::Borrowed(RST_HIGHLIGHT_QUERY)),
@@ -1285,6 +1286,7 @@ fn injection_query_for(name: &str) -> Option<&'static str> {
     match normalize_language_name(name).as_str() {
         "html" | "htm" => Some(tree_sitter_html::INJECTIONS_QUERY),
         "markdown" | "md" | "mdown" | "mkd" => Some(tree_sitter_md::INJECTION_QUERY_BLOCK),
+        "markdown_inline" => Some(tree_sitter_md::INJECTION_QUERY_INLINE),
         _ => None,
     }
 }
@@ -1388,6 +1390,13 @@ fn style_for_capture(name: &str) -> Option<(Style, u8)> {
             },
             65,
         )
+    } else if name == "punctuation.special" {
+        (
+            Style {
+                foreground: "#d19a66",
+            },
+            55,
+        )
     } else if name.starts_with("operator") || name.starts_with("punctuation") || name == "delimiter"
     {
         (
@@ -1447,6 +1456,7 @@ fn language_for(name: &str) -> Option<Language> {
         "cuda" | "cu" | "cuh" => Some(tree_sitter_cuda::LANGUAGE.into()),
         "kotlin" | "kt" | "kts" | "ktm" => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         "markdown" | "md" | "mdown" | "mkd" => Some(tree_sitter_md::LANGUAGE.into()),
+        "markdown_inline" => Some(tree_sitter_md::INLINE_LANGUAGE.into()),
         "python" | "py" | "pyw" => Some(tree_sitter_python::LANGUAGE.into()),
         "ruby" | "rb" => Some(tree_sitter_ruby::LANGUAGE.into()),
         "rst" | "rest" => Some(tree_sitter_rst::LANGUAGE.into()),
