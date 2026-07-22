@@ -308,7 +308,14 @@ impl DiffCanvas {
     }
 
     pub fn set_scroll_y(&self, scroll_y: f64) {
-        set_scroll_y(&self.area, &self.state, scroll_y);
+        if self.state.layout_cache.borrow().is_some() {
+            set_scroll_y(&self.area, &self.state, scroll_y);
+        } else {
+            // A replacement diff is laid out off-thread. Keep the requested
+            // position until that layout arrives, then clamp it to its bounds.
+            self.state.scroll_y.set(scroll_y.max(0.0));
+            self.area.queue_render();
+        }
     }
 
     pub fn set_fold_callback<F>(&self, callback: F)
