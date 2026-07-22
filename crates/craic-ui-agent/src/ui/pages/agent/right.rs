@@ -25,8 +25,8 @@ use crate::ui::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsageTr
 use crate::ui::components::search::{SearchOption, SearchPanel};
 use crate::ui::pages::PageCommand;
 use crate::ui::{AGENT_SESSION_NOTIFICATION_DETAILED_ACTION, agent_session_notification_id};
-use craic_ui_terminal::alacritty::{AlacrittyTerminal, SpawnSpec, terminal_environment};
 use craic_ui_terminal::ui::components::terminal as terminal_component;
+use craic_ui_terminal::vte::{SpawnSpec, VteTerminal, terminal_environment};
 
 #[cfg(test)]
 use super::provider::agy::terminal_text_active_state as agy_terminal_text_active_state;
@@ -54,7 +54,7 @@ struct AgentSession {
     session_uuid: String,
     provider: &'static dyn AgentProvider,
     root: gtk::Overlay,
-    terminal: AlacrittyTerminal,
+    terminal: VteTerminal,
     child_pid: Rc<Cell<Option<glib::Pid>>>,
     state: Rc<Cell<TerminalSessionState>>,
     active_state: Rc<Cell<AgentActiveState>>,
@@ -1345,7 +1345,7 @@ fn start_smart_summary(
     Ok(())
 }
 
-fn terminal_full_text(terminal: &AlacrittyTerminal) -> Option<String> {
+fn terminal_full_text(terminal: &VteTerminal) -> Option<String> {
     let text = terminal
         .all_text()?
         .trim_start_matches(|ch| matches!(ch, '\n' | '\r'))
@@ -1818,7 +1818,7 @@ fn connect_terminal_search_option(
 fn active_terminal(
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
     notebook: &gtk::Notebook,
-) -> Option<AlacrittyTerminal> {
+) -> Option<VteTerminal> {
     notebook
         .current_page()
         .and_then(|page_num| notebook.nth_page(Some(page_num)))
@@ -1827,7 +1827,7 @@ fn active_terminal(
 }
 
 fn apply_terminal_search(
-    terminal: &AlacrittyTerminal,
+    terminal: &VteTerminal,
     search_panel: &SearchPanel,
     options: &TerminalSearchOptions,
     search_move: TerminalSearchMove,
@@ -2077,18 +2077,18 @@ fn configured_terminal(
     font_size: f64,
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
     search_panel: &SearchPanel,
-) -> AlacrittyTerminal {
-    let terminal = AlacrittyTerminal::new(font_size);
+) -> VteTerminal {
+    let terminal = VteTerminal::new(font_size);
     install_terminal_shortcuts(&terminal, sessions, search_panel);
     terminal
 }
 
-fn set_terminal_font(terminal: &AlacrittyTerminal, font_size: f64) {
+fn set_terminal_font(terminal: &VteTerminal, font_size: f64) {
     terminal.set_font_size(font_size);
 }
 
 fn install_terminal_shortcuts(
-    terminal: &AlacrittyTerminal,
+    terminal: &VteTerminal,
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
     search_panel: &SearchPanel,
 ) {
@@ -2165,11 +2165,11 @@ fn install_terminal_shortcuts(
             glib::Propagation::Proceed
         }
     });
-    terminal.area().add_controller(keys);
+    terminal.terminal().add_controller(keys);
 }
 
 fn set_terminal_font_for_sessions(
-    terminal: &AlacrittyTerminal,
+    terminal: &VteTerminal,
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
     font_size: f64,
 ) {
@@ -2196,7 +2196,7 @@ fn font_size_delta_for_key(key: gdk::Key, modifiers: gdk::ModifierType) -> Optio
     None
 }
 
-fn install_focus_tracking(terminal: &AlacrittyTerminal, focus_handlers: &FocusHandlers) {
+fn install_focus_tracking(terminal: &VteTerminal, focus_handlers: &FocusHandlers) {
     let focus = gtk::EventControllerFocus::new();
     focus.connect_enter({
         let focus_handlers = focus_handlers.clone();
@@ -2208,7 +2208,7 @@ fn install_focus_tracking(terminal: &AlacrittyTerminal, focus_handlers: &FocusHa
 
         move |_| notify_focus_handlers(&focus_handlers, false)
     });
-    terminal.area().add_controller(focus);
+    terminal.terminal().add_controller(focus);
 }
 
 fn notify_focus_handlers(focus_handlers: &FocusHandlers, focused: bool) {
@@ -2229,7 +2229,7 @@ fn set_terminal_conflicting_accels_enabled(app: &gtk::Application, enabled: bool
 
 fn install_exit_key_handler(
     session_id: u64,
-    terminal: &AlacrittyTerminal,
+    terminal: &VteTerminal,
     state: &Rc<Cell<TerminalSessionState>>,
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
     notebook: &gtk::Notebook,
@@ -2262,13 +2262,13 @@ fn install_exit_key_handler(
             glib::Propagation::Proceed
         }
     });
-    terminal.area().add_controller(keys);
+    terminal.terminal().add_controller(keys);
 }
 
 fn connect_child_exit(
     session_id: u64,
     provider: &'static dyn AgentProvider,
-    terminal: &AlacrittyTerminal,
+    terminal: &VteTerminal,
     label: &gtk::Label,
     fallback_title: &str,
     child_pid: &Rc<Cell<Option<glib::Pid>>>,
@@ -2318,7 +2318,7 @@ fn connect_title_updates(
     session_id: u64,
     session_uuid: &str,
     provider: &'static dyn AgentProvider,
-    terminal: &AlacrittyTerminal,
+    terminal: &VteTerminal,
     label: &gtk::Label,
     state: &Rc<Cell<TerminalSessionState>>,
     title_locked: &Rc<Cell<bool>>,
@@ -2877,7 +2877,7 @@ fn child_exit_summary(status: ExitStatus) -> ChildExitSummary {
 }
 
 fn spawn_command(
-    terminal: &AlacrittyTerminal,
+    terminal: &VteTerminal,
     command: &CommandSpec,
     child_pid: &Rc<Cell<Option<glib::Pid>>>,
     state: &Rc<Cell<TerminalSessionState>>,
@@ -2898,7 +2898,7 @@ fn spawn_command(
         .next()
         .ok_or_else(|| "Cannot start an empty agent command.".to_string())?;
     let display = command.display();
-    let pid = match terminal.spawn(
+    terminal.spawn(
         SpawnSpec {
             program,
             args: argv.collect(),
@@ -2906,24 +2906,47 @@ fn spawn_command(
             env,
         },
         command.target_working_dir().to_string(),
-    ) {
-        Ok(pid) => glib::Pid(pid),
-        Err(err) => {
-            child_pid.set(None);
-            state.set(TerminalSessionState::Exited);
-            notify_session_state_changed(
-                state_callback,
-                session_id,
-                provider,
-                AgentSessionState::Inactive(AgentInactiveState::Dead),
-            );
-            shell_integration.log_spawn_failed(&display, &err);
-            return Err(format!("Failed to start {display}: {err}"));
-        }
-    };
-    child_pid.set(Some(pid));
-    state.set(TerminalSessionState::Running);
-    shell_integration.log_spawned(pid, &display);
+        {
+            let terminal = terminal.clone();
+            let child_pid = child_pid.clone();
+            let state = state.clone();
+            let state_callback = state_callback.clone();
+
+            move |result| match result {
+                Ok(pid) => {
+                    let pid = glib::Pid(pid);
+                    if state.get() == TerminalSessionState::Closing {
+                        shell_integration.log_spawn_completed_after_close(pid, &display);
+                        return;
+                    }
+                    child_pid.set(Some(pid));
+                    state.set(TerminalSessionState::Running);
+                    shell_integration.log_spawned(pid, &display);
+                }
+                Err(err) => {
+                    if state.get() == TerminalSessionState::Closing {
+                        shell_integration.log_spawn_failed_after_close(&display, &err);
+                        return;
+                    }
+                    child_pid.set(None);
+                    state.set(TerminalSessionState::Exited);
+                    notify_session_state_changed(
+                        &state_callback,
+                        session_id,
+                        provider,
+                        AgentSessionState::Inactive(AgentInactiveState::Dead),
+                    );
+                    shell_integration.log_spawn_failed(&display, &err);
+                    terminal.feed(
+                        format!(
+                            "Failed to start {display}: {err}\r\n\r\nPress Enter to close the terminal.\r\n"
+                        )
+                        .as_bytes(),
+                    );
+                }
+            }
+        },
+    )?;
     Ok(())
 }
 
