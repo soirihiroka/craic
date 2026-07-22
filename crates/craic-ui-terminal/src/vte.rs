@@ -1,4 +1,5 @@
 use crate::ui::components::terminal::{TerminalActivation, TerminalFileActivation};
+use crate::process::signal_terminal_process_groups;
 use craic_ui_core::ui::{canvas_scroll, components::context_menu};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib, pango};
@@ -213,7 +214,11 @@ impl VteTerminal {
                             this.child_pid.set(Some(pid.0));
                             log::info!("VTE terminal PTY started pid={}", pid.0);
                             if this.terminated.get() {
-                                this.signal_process_groups(pid.0, libc::SIGHUP);
+                                signal_terminal_process_groups(
+                                    pid.0,
+                                    this.foreground_process_group(),
+                                    libc::SIGHUP,
+                                );
                                 this.child_pid.set(None);
                             }
                             callback(Ok(pid.0));
@@ -272,7 +277,7 @@ impl VteTerminal {
             "VTE terminal shutdown started pid={pid} foreground_pgid={:?}",
             self.foreground_process_group()
         );
-        self.signal_process_groups(pid, libc::SIGHUP);
+        signal_terminal_process_groups(pid, self.foreground_process_group(), libc::SIGHUP);
     }
 
     pub fn set_font_size(&self, font_size: f64) {
@@ -361,38 +366,6 @@ impl VteTerminal {
         let start_row = (adjustment.value() / char_height).floor().max(0.0) as i64;
         let visible_rows = (adjustment.page_size() / char_height).ceil().max(1.0) as i64;
         self.text_range_between(start_row, start_row + visible_rows)
-    }
-
-    fn signal_process_groups(&self, pid: i32, signal: libc::c_int) {
-        let foreground_pgid = self.foreground_process_group();
-        for (role, pgid) in [
-            ("foreground", foreground_pgid),
-            ("session-leader", Some(pid)),
-        ] {
-            let Some(pgid) = pgid.filter(|pgid| *pgid > 0) else {
-                continue;
-            };
-            if role == "session-leader" && foreground_pgid == Some(pgid) {
-                continue;
-            }
-            let result = unsafe { libc::kill(-pgid, signal) };
-            if result == 0 {
-                log::info!(
-                    "VTE terminal process group signaled role={role} pgid={pgid} signal={signal} pid={pid}"
-                );
-            } else {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    log::debug!(
-                        "VTE terminal process group already exited role={role} pgid={pgid} signal={signal} pid={pid}"
-                    );
-                } else {
-                    log::warn!(
-                        "VTE terminal process group signal failed role={role} pgid={pgid} signal={signal} pid={pid} error={error}"
-                    );
-                }
-            }
-        }
     }
 
     fn install_matches(&self) {
