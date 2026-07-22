@@ -12,11 +12,13 @@ license = "GPL-3.0-or-later"
 adw = { package = "libadwaita", version = "0.9", features = ["v1_9"] }
 base64 = "0.22.1"
 cairo = { package = "cairo-rs", version = "0.22", features = ["freetype"] }
+criterion = "0.7"
 craic-agent = { path = "crates/craic-agent" }
 craic-config = { path = "crates/craic-config" }
 craic-language = { path = "crates/craic-language" }
 craic-project = { path = "crates/craic-project" }
 craic-system = { path = "crates/craic-system" }
+craic-text-layout = { path = "crates/craic-text-layout" }
 craic-vcs = { path = "crates/craic-vcs" }
 craic-ui-core = { path = "crates/craic-ui-core" }
 craic-ui-agent = { path = "crates/craic-ui-agent" }
@@ -45,6 +47,7 @@ poppler = { package = "poppler-rs", version = "0.26", features = ["v26_1"] }
 pulldown-cmark = "0.13"
 regex = "1"
 reqwest = { version = "0.13.4", features = ["blocking"] }
+rayon = "1.11"
 rumdl = { version = "0.2.27", default-features = false }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 safetensors = "0.8.0"

@@ -2989,6 +2989,9 @@ fn commit_edit(
             .text
             .borrow_mut()
             .replace_range(start, old_end, replacement);
+        state
+            .document_revision
+            .set(state.document_revision.get().wrapping_add(1).max(1));
         super::send_syntax_edit(
             state,
             start,

@@ -344,7 +344,6 @@ fn ensure_layout(
                     || cache.font_size != font_size
                     || cache.text_len != text.len()
                     || cache.fold_generation != fold_generation
-                    || cache.gutter_width != gutter_width_for_state(area, state, line_count(text))
                     || cache.wrap != wrap
             }
             None => true,
@@ -354,6 +353,7 @@ fn ensure_layout(
         let line_count = line_count(text);
         let gutter_width = gutter_width_for_state(area, state, line_count);
         let visual_lines = build_visual_lines(area, state, viewport_width, text, gutter_width);
+        let visual_spans = craic_text_layout::visual_spans(&visual_lines, line_count);
         let line_height = line_height(state);
         let content_height = visual_lines.len().max(1) as f64 * line_height;
         let content_width =
@@ -368,6 +368,7 @@ fn ensure_layout(
             content_width: content_width.max(viewport_width as f64),
             content_height: content_height.max(line_height),
             visual_lines,
+            visual_spans,
         }));
         state.layout_dirty.set(false);
     }
@@ -652,135 +653,22 @@ fn build_visual_lines(
     gutter_width: f64,
 ) -> Vec<VisualLine> {
     let wrap_width = wrap_width(state, width, gutter_width);
-    let mut lines = Vec::new();
-    let mut source_line = 0;
     let folds = state.folds.borrow();
-    let line_ranges = logical_line_ranges(text);
-
-    while source_line < line_ranges.len() {
-        let (line_start, line_end) = line_ranges[source_line];
-        if let Some(fold_index) = collapsed_fold_starting_at(&folds, source_line) {
-            lines.push(VisualLine {
-                source_line,
-                start: line_start,
-                end: line_end,
-                wrap_index: 0,
-                folded: Some(fold_index),
-            });
-            source_line = folds[fold_index]
-                .end_line
-                .saturating_add(1)
-                .min(line_ranges.len());
-            continue;
-        }
-        push_wrapped_visual_lines(
-            area,
-            state,
-            &mut lines,
-            source_line,
-            line_start,
-            line_end,
-            text,
-            wrap_width,
-        );
-        source_line += 1;
-    }
-    if lines.is_empty() {
-        lines.push(VisualLine {
-            source_line: 0,
-            start: 0,
-            end: 0,
-            wrap_index: 0,
-            folded: None,
-        });
-    }
-    lines
-}
-
-fn logical_line_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut line_start = 0;
-
-    for (byte, ch) in text.char_indices() {
-        if ch == '\n' {
-            ranges.push((line_start, byte));
-            line_start = byte.saturating_add(ch.len_utf8()).min(text.len());
-        }
-    }
-
-    ranges.push((line_start, text.len()));
-    ranges
-}
-
-fn collapsed_fold_starting_at(folds: &[FoldRange], source_line: usize) -> Option<usize> {
-    folds
+    let folds = folds
         .iter()
-        .enumerate()
-        .filter(|(_, fold)| fold.start_line == source_line && !fold.expanded)
-        .max_by_key(|(_, fold)| fold.end_line)
-        .map(|(index, _)| index)
-}
-
-fn push_wrapped_visual_lines(
-    area: &gtk::GLArea,
-    state: &Rc<EditorState>,
-    lines: &mut Vec<VisualLine>,
-    source_line: usize,
-    start: usize,
-    end: usize,
-    text: &str,
-    wrap_width: f64,
-) -> usize {
-    if start == end {
-        lines.push(VisualLine {
-            source_line,
-            start,
-            end,
-            wrap_index: 0,
-            folded: None,
-        });
-        return 1;
-    }
-    if !state.wrap.get() {
-        lines.push(VisualLine {
-            source_line,
-            start,
-            end,
-            wrap_index: 0,
-            folded: None,
-        });
-        return 1;
-    }
-
-    let wrap_width = wrap_width.max(char_width(state));
-    let mut segment_start = start;
-    let mut line_width = 0.0;
-    let mut wrap_index = 0;
-    for (byte, grapheme) in text[start..end].grapheme_indices(true) {
-        let grapheme_start = start + byte;
-        let grapheme_width = text_width(area, state, grapheme);
-        if segment_start < grapheme_start && line_width + grapheme_width > wrap_width {
-            lines.push(VisualLine {
-                source_line,
-                start: segment_start,
-                end: grapheme_start,
-                wrap_index,
-                folded: None,
-            });
-            segment_start = grapheme_start;
-            line_width = 0.0;
-            wrap_index += 1;
-        }
-        line_width += grapheme_width;
-    }
-    lines.push(VisualLine {
-        source_line,
-        start: segment_start,
-        end,
-        wrap_index,
-        folded: None,
-    });
-    wrap_index + 1
+        .map(|fold| craic_text_layout::FoldRange {
+            start_line: fold.start_line,
+            end_line: fold.end_line,
+            expanded: fold.expanded,
+        })
+        .collect::<Vec<_>>();
+    let _ = area;
+    craic_text_layout::build_visual_lines_monospace(
+        text,
+        &folds,
+        state.wrap.get(),
+        wrap_width / char_width(state).max(1.0),
+    )
 }
 
 pub fn refresh_size(area: &gtk::GLArea, state: &Rc<EditorState>, width: i32, height: i32) {
@@ -929,25 +817,7 @@ pub fn ensure_offset_visible(area: &gtk::GLArea, state: &Rc<EditorState>, offset
 }
 
 fn visual_line_index_for_offset(visual_lines: &[VisualLine], offset: usize) -> usize {
-    for (index, line) in visual_lines.iter().enumerate() {
-        if offset >= line.start && offset <= line.end {
-            return index;
-        }
-
-        if line.folded.is_some() && offset > line.end {
-            let next_start = visual_lines
-                .get(index + 1)
-                .map(|next| next.start)
-                .unwrap_or(usize::MAX);
-            if offset < next_start {
-                return index;
-            }
-        }
-    }
-
-    visual_lines
-        .partition_point(|line| line.end < offset)
-        .min(visual_lines.len().saturating_sub(1))
+    craic_text_layout::visual_line_index_for_offset(visual_lines, offset)
 }
 
 pub fn scrollbar_thumb(
@@ -1187,7 +1057,7 @@ fn draw_scrollbar_markers(
     for marker in markers.iter() {
         let line_height = line_height(state);
         let Some((first_visual_line, visual_line_count)) =
-            scrollbar_marker_visual_span(&layout.visual_lines, marker.row)
+            layout.visual_spans.get(marker.row).copied().flatten()
         else {
             continue;
         };
@@ -1252,21 +1122,6 @@ fn draw_middle_autoscroll_marker(
             ),
         },
     );
-}
-
-fn scrollbar_marker_visual_span(
-    visual_lines: &[VisualLine],
-    source_line: usize,
-) -> Option<(usize, usize)> {
-    let first = visual_lines
-        .iter()
-        .position(|line| line.source_line == source_line)?;
-    let count = visual_lines[first..]
-        .iter()
-        .take_while(|line| line.source_line == source_line)
-        .count()
-        .max(1);
-    Some((first, count))
 }
 
 fn fold_index_starting_at(state: &Rc<EditorState>, source_line: usize) -> Option<usize> {
@@ -1472,10 +1327,8 @@ fn content_width_for(
     if state.wrap.get() {
         return width.max(MIN_CONTENT_WIDTH);
     }
-    let longest = text
-        .lines()
-        .map(|line| text_width(area, state, line))
-        .fold(0.0, f64::max);
+    let _ = area;
+    let longest = craic_text_layout::max_line_columns(text) * char_width(state);
     (longest + gutter_width + CELL_PADDING * 2.0)
         .ceil()
         .max(MIN_CONTENT_WIDTH as f64) as i32
