@@ -103,6 +103,9 @@ impl TabbedPickerTab {
 pub struct TabbedPicker {
     pub button: gtk::MenuButton,
     pub action_button: gtk::Button,
+    footer_button: gtk::Button,
+    footer_icon: gtk::Image,
+    footer_label: gtk::Label,
     popover: gtk::Popover,
     stack: gtk::Stack,
     search_entry: gtk::SearchEntry,
@@ -144,6 +147,30 @@ impl TabbedPicker {
         let stack = gtk::Stack::builder().vhomogeneous(false).build();
         let switcher = gtk::StackSwitcher::new();
         switcher.set_stack(Some(&stack));
+        switcher.set_margin_top(6);
+        switcher.set_margin_start(6);
+        switcher.set_margin_end(6);
+
+        let footer_icon = gtk::Image::builder().pixel_size(16).build();
+        let footer_label = gtk::Label::builder()
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .hexpand(true)
+            .build();
+        let footer_content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .halign(gtk::Align::Center)
+            .build();
+        footer_content.append(&footer_icon);
+        footer_content.append(&footer_label);
+        let footer_button = gtk::Button::builder()
+            .child(&footer_content)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .visible(false)
+            .build();
 
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -152,6 +179,7 @@ impl TabbedPicker {
         content.append(&switcher);
         content.append(&search_row);
         content.append(&stack);
+        content.append(&footer_button);
 
         let popover = gtk::Popover::builder()
             .width_request(365)
@@ -198,6 +226,9 @@ impl TabbedPicker {
         let picker = Self {
             button,
             action_button,
+            footer_button,
+            footer_icon,
+            footer_label,
             popover,
             stack,
             search_entry,
@@ -212,6 +243,17 @@ impl TabbedPicker {
 
     pub fn set_button_label(&self, label: &str) {
         self.button_label.set_label(label);
+    }
+
+    pub fn set_footer(&self, icon_name: &str, markup: &str, tooltip: &str) {
+        self.footer_icon.set_icon_name(Some(icon_name));
+        self.footer_label.set_markup(markup);
+        self.footer_button.set_tooltip_text(Some(tooltip));
+        self.footer_button.set_visible(true);
+    }
+
+    pub fn set_footer_visible(&self, visible: bool) {
+        self.footer_button.set_visible(visible);
     }
 
     pub fn set_tab(&self, tab: TabbedPickerTab) {
@@ -234,6 +276,20 @@ impl TabbedPicker {
 
     pub fn connect_action_clicked<F: Fn() + 'static>(&self, callback: F) {
         self.action_button.connect_clicked({
+            let popover = self.button.popover();
+
+            move |_| {
+                if let Some(popover) = popover.as_ref() {
+                    popover.popdown();
+                }
+
+                callback();
+            }
+        });
+    }
+
+    pub fn connect_footer_clicked<F: Fn() + 'static>(&self, callback: F) {
+        self.footer_button.connect_clicked({
             let popover = self.button.popover();
 
             move |_| {
@@ -394,9 +450,9 @@ fn header_row(title: &str) -> gtk::ListBoxRow {
         .halign(gtk::Align::Start)
         .xalign(0.0)
         .margin_top(8)
-        .margin_bottom(4)
-        .margin_start(10)
-        .margin_end(10)
+        .margin_bottom(3)
+        .margin_start(6)
+        .margin_end(6)
         .build();
     label.add_css_class("heading");
     let row = gtk::ListBoxRow::builder()
@@ -449,10 +505,10 @@ fn item_row(item: &TabbedPickerItem) -> gtk::ListBoxRow {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
-        .margin_top(4)
-        .margin_bottom(4)
-        .margin_start(10)
-        .margin_end(10)
+        .margin_top(3)
+        .margin_bottom(3)
+        .margin_start(6)
+        .margin_end(6)
         .build();
     content.append(&icon);
     content.append(&labels);
@@ -481,8 +537,8 @@ fn message_row(icon_name: &str, message: &str) -> gtk::ListBoxRow {
         .spacing(8)
         .margin_top(10)
         .margin_bottom(10)
-        .margin_start(10)
-        .margin_end(10)
+        .margin_start(6)
+        .margin_end(6)
         .build();
     content.append(&icon);
     content.append(&label);
