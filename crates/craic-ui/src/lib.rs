@@ -9,4 +9,4 @@ mod crash_log;
 mod ui;
 
 pub use crash_log::install as install_crash_log;
-pub use ui::build_ui;
+pub use ui::{StartupOpenLocation, build_ui};

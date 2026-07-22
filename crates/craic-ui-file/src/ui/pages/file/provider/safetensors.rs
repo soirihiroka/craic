@@ -16,9 +16,11 @@ pub fn show_match(request: PreviewMatchRequest<'_>) {
 }
 
 fn show_safetensors(request: PreviewRequest<'_>) {
-    request
-        .right
-        .show_provider_loading(request.file_path, "Safetensors metadata");
+    request.right.show_provider_loading(
+        request.load_token,
+        request.file_path,
+        "Safetensors metadata",
+    );
     let file_path = request.file_path.to_string();
     let apply_file_path = file_path.clone();
     let local_path = request.local_path.map(PathBuf::from);

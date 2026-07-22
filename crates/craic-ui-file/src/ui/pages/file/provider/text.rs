@@ -19,7 +19,9 @@ pub fn show_match(request: PreviewMatchRequest<'_>) {
 }
 
 fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
-    request.right.show_editor_loading(request.file_path, "code");
+    request
+        .right
+        .show_editor_loading(request.load_token, request.file_path, "code");
 
     let files = request.files.clone();
     let file_path = request.file_path.to_string();

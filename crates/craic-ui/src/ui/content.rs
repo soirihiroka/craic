@@ -71,6 +71,12 @@ pub trait RepositoryActionContext: Clone {
     fn workspace_root(&self) -> WorkspacePath;
     fn url_opener(&self) -> Option<Arc<dyn UrlOpenAccess>>;
     fn terminal_links(&self) -> Option<Arc<dyn TerminalLinkAccess>>;
+    fn open_external_terminal_path(
+        &self,
+        path: &WorkspacePath,
+        line: Option<usize>,
+        column: Option<usize>,
+    );
     fn shell(&self) -> Option<Arc<dyn ShellAccess>>;
     fn window(&self) -> adw::ApplicationWindow;
     fn refresh(&self, message: Option<String>);
@@ -758,7 +764,14 @@ fn open_terminal_file_location<C: RepositoryActionContext>(
     let path = match target {
         TerminalLinkTarget::Workspace(path) => path,
         TerminalLinkTarget::External(path) => {
-            open_external_terminal_file(context, file, &path);
+            log::info!(
+                "terminal external file activation requesting new window target={} path={} line={:?} column={:?}",
+                file.target,
+                path.absolute,
+                location.line,
+                location.column
+            );
+            context.open_external_terminal_path(&path, location.line, location.column);
             return;
         }
     };
@@ -787,20 +800,6 @@ fn open_terminal_file_location<C: RepositoryActionContext>(
             );
         }
     }
-}
-
-fn open_external_terminal_file<C: RepositoryActionContext>(
-    context: &C,
-    file: &terminal::TerminalFileActivation,
-    path: &WorkspacePath,
-) {
-    let message = "Opening files outside the workspace is unavailable.".to_string();
-    log::warn!(
-        "terminal external file activation failed target={} path={} reason=no-node-path",
-        file.target,
-        path.absolute
-    );
-    context.show_toast(&message);
 }
 
 fn parse_terminal_file_location(target: &str) -> TerminalFileLocation {

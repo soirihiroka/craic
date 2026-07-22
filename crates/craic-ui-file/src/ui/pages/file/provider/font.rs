@@ -7,7 +7,7 @@ const MAX_FONT_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 pub fn show(request: PreviewRequest<'_>) {
     request
         .right
-        .show_provider_loading(request.file_path, "font");
+        .show_provider_loading(request.load_token, request.file_path, "font");
 
     let file_path = request.file_path.to_string();
     let node_path = request.node_path.clone();

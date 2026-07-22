@@ -29,9 +29,11 @@ pub fn show(request: PreviewRequest<'_>) {
         return;
     }
 
-    request
-        .right
-        .show_provider_loading_message(request.file_path, "Materializing SQLite database...");
+    request.right.show_provider_loading_message(
+        request.load_token,
+        request.file_path,
+        "Materializing SQLite database...",
+    );
     let files = request.files.clone();
     let source = request.info.clone();
     let file_path = request.file_path.to_string();

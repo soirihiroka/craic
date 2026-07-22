@@ -53,7 +53,9 @@ pub fn show_match(request: PreviewMatchRequest<'_>) {
 }
 
 fn show_html(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
-    request.right.show_editor_loading(request.file_path, "HTML");
+    request
+        .right
+        .show_editor_loading(request.load_token, request.file_path, "HTML");
 
     let file_path = request.file_path.to_string();
     let apply_node_path = request.node_path.clone();

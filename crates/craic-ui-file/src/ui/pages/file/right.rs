@@ -10,9 +10,27 @@ use craic_ui_preview::markdown_preview::MarkdownPreview as AdwMarkdownPreview;
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
+
+const PREVIEW_LOADING_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreviewLoadToken(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewLoadingKind {
+    Provider,
+    Editor,
+}
+
+#[derive(Clone, Debug)]
+struct PendingPreviewLoading {
+    token: PreviewLoadToken,
+    file_path: String,
+    message: String,
+    kind: PreviewLoadingKind,
+    shown: bool,
+}
 
 pub struct RightPane {
     pub root: gtk::Box,
@@ -20,6 +38,7 @@ pub struct RightPane {
     subtitle_label: gtk::Label,
     stack: gtk::Stack,
     preview_generation: Cell<u64>,
+    pending_preview_loading: RefCell<Option<PendingPreviewLoading>>,
     provider_loading_label: gtk::Label,
     editor_loading: gtk::Box,
     pub folder_view: folder_view::FolderView,
@@ -190,6 +209,7 @@ impl RightPane {
             subtitle_label,
             stack,
             preview_generation: Cell::new(0),
+            pending_preview_loading: RefCell::new(None),
             provider_loading_label,
             editor_loading,
             folder_view,
@@ -212,58 +232,78 @@ impl RightPane {
         }
     }
 
-    pub fn begin_preview_load(&self, file_path: &str) -> PreviewLoadToken {
+    pub fn begin_preview_load(self: &Rc<Self>, file_path: &str) -> PreviewLoadToken {
         let generation = self.preview_generation.get().wrapping_add(1).max(1);
         self.preview_generation.set(generation);
-        log::debug!("begin preview load file_path={file_path}");
-        self.set_title(file_path, file_path);
-        self.clear_file_state();
-        self.file_view_split
-            .set_start_child(Some(&self.file_editor.root));
-        self.file_view_split.set_end_child(None::<&gtk::Widget>);
-        self.clear_auxiliary_previews();
-        self.status_label.set_text("");
-        PreviewLoadToken(generation)
+        let token = PreviewLoadToken(generation);
+        self.pending_preview_loading
+            .replace(Some(PendingPreviewLoading {
+                token,
+                file_path: file_path.to_string(),
+                message: "Loading file preview...".to_string(),
+                kind: PreviewLoadingKind::Provider,
+                shown: false,
+            }));
+        log::debug!(
+            "preview load queued file_path={file_path} generation={generation} loading_delay_ms={}",
+            PREVIEW_LOADING_DELAY.as_millis()
+        );
+
+        let right = Rc::clone(self);
+        gtk::glib::timeout_add_local_once(PREVIEW_LOADING_DELAY, move || {
+            let loading = {
+                let mut pending = right.pending_preview_loading.borrow_mut();
+                let Some(loading) = pending.as_mut() else {
+                    return;
+                };
+                if loading.token != token || !right.is_current_load(token) {
+                    return;
+                }
+                loading.shown = true;
+                loading.clone()
+            };
+            log::debug!(
+                "preview loading shown file_path={} generation={} delay_ms={}",
+                loading.file_path,
+                token.0,
+                PREVIEW_LOADING_DELAY.as_millis()
+            );
+            right.show_loading_now(&loading);
+        });
+        token
     }
 
     pub fn is_current_load(&self, token: PreviewLoadToken) -> bool {
         self.preview_generation.get() == token.0
     }
 
-    pub fn show_provider_loading(&self, file_path: &str, preview_kind: &str) {
+    pub fn show_provider_loading(
+        &self,
+        token: PreviewLoadToken,
+        file_path: &str,
+        preview_kind: &str,
+    ) {
         let message = format!("Loading {preview_kind} preview...");
-        self.show_provider_loading_message(file_path, &message);
+        self.show_provider_loading_message(token, file_path, &message);
     }
 
-    pub fn show_provider_loading_message(&self, file_path: &str, message: &str) {
-        log::debug!("show preview loading file_path={file_path} message={message}");
-        self.set_title(file_path, file_path);
-        self.provider_loading_label.set_text(message);
-        self.stack.set_visible_child_name("provider-loading");
-        self.clear_file_state();
-        self.file_view_split
-            .set_start_child(Some(&self.file_editor.root));
-        self.file_view_split.set_end_child(None::<&gtk::Widget>);
-        self.clear_auxiliary_previews();
+    pub fn show_provider_loading_message(
+        &self,
+        token: PreviewLoadToken,
+        file_path: &str,
+        message: &str,
+    ) {
+        self.configure_loading(token, file_path, message, PreviewLoadingKind::Provider);
     }
 
-    pub fn show_editor_loading(&self, file_path: &str, preview_kind: &str) {
+    pub fn show_editor_loading(
+        &self,
+        token: PreviewLoadToken,
+        file_path: &str,
+        preview_kind: &str,
+    ) {
         let message = format!("Loading {preview_kind} preview...");
-        log::debug!("show editor preview loading file_path={file_path} message={message}");
-        self.set_title(file_path, file_path);
-        if let Some(label) = self
-            .editor_loading
-            .last_child()
-            .and_then(|child| child.downcast::<gtk::Label>().ok())
-        {
-            label.set_text(&message);
-        }
-        self.stack.set_visible_child_name("editor");
-        self.clear_file_state();
-        self.file_view_split
-            .set_start_child(Some(&self.editor_loading));
-        self.file_view_split.set_end_child(None::<&gtk::Widget>);
-        self.clear_auxiliary_previews();
+        self.configure_loading(token, file_path, &message, PreviewLoadingKind::Editor);
     }
 
     pub fn show_unavailable(&self, file_path: &str, message: &str) {
@@ -327,6 +367,7 @@ impl RightPane {
         markdown_lint_issues: Vec<MarkdownLintIssue>,
         spellcheck_issues: Vec<SpellcheckIssue>,
     ) {
+        self.pending_preview_loading.borrow_mut().take();
         self.set_title(file_path, file_path);
         self.stack.set_visible_child_name("editor");
         self.file_view_split
@@ -347,6 +388,7 @@ impl RightPane {
     }
 
     pub fn show_media_preview(&self, file_path: &str, _subtitle: &str) {
+        self.pending_preview_loading.borrow_mut().take();
         self.set_title(file_path, file_path);
         self.stack.set_visible_child_name("media");
         self.clear_file_state();
@@ -357,6 +399,7 @@ impl RightPane {
     }
 
     pub fn show_font_preview(&self, file_path: &str) {
+        self.pending_preview_loading.borrow_mut().take();
         self.set_title(file_path, file_path);
         self.stack.set_visible_child_name("font");
         self.clear_file_state();
@@ -367,6 +410,7 @@ impl RightPane {
     }
 
     pub fn show_sqlite_preview(&self, file_path: &str) {
+        self.pending_preview_loading.borrow_mut().take();
         self.set_title(file_path, file_path);
         self.stack.set_visible_child_name("sqlite");
         self.clear_file_state();
@@ -377,6 +421,7 @@ impl RightPane {
     }
 
     pub fn show_notebook_preview(&self, file_path: &str) {
+        self.pending_preview_loading.borrow_mut().take();
         self.set_title(file_path, file_path);
         self.stack.set_visible_child_name("notebook");
         self.clear_file_state();
@@ -387,6 +432,7 @@ impl RightPane {
     }
 
     pub fn show_pdf_preview(&self, file_path: &str) {
+        self.pending_preview_loading.borrow_mut().take();
         self.set_title(file_path, file_path);
         self.stack.set_visible_child_name("pdf");
         self.clear_file_state();
@@ -397,6 +443,7 @@ impl RightPane {
     }
 
     pub fn show_safetensors_metadata(&self, file_path: &str, metadata_text: &str) {
+        self.pending_preview_loading.borrow_mut().take();
         self.set_title(file_path, file_path);
         self.stack.set_visible_child_name("safetensors");
         self.clear_file_state();
@@ -408,6 +455,61 @@ impl RightPane {
     fn cancel_preview_load(&self) {
         let generation = self.preview_generation.get().wrapping_add(1).max(1);
         self.preview_generation.set(generation);
+        self.pending_preview_loading.borrow_mut().take();
+    }
+
+    fn configure_loading(
+        &self,
+        token: PreviewLoadToken,
+        file_path: &str,
+        message: &str,
+        kind: PreviewLoadingKind,
+    ) {
+        let loading = {
+            let mut pending = self.pending_preview_loading.borrow_mut();
+            let Some(loading) = pending.as_mut() else {
+                return;
+            };
+            if loading.token != token || !self.is_current_load(token) {
+                return;
+            }
+            loading.file_path = file_path.to_string();
+            loading.message = message.to_string();
+            loading.kind = kind;
+            loading.shown.then(|| loading.clone())
+        };
+        if let Some(loading) = loading {
+            self.show_loading_now(&loading);
+        }
+    }
+
+    fn show_loading_now(&self, loading: &PendingPreviewLoading) {
+        self.set_title(&loading.file_path, &loading.file_path);
+        self.clear_file_state();
+        self.file_view_split
+            .set_start_child(Some(&self.file_editor.root));
+        self.file_view_split.set_end_child(None::<&gtk::Widget>);
+        self.clear_auxiliary_previews();
+        self.status_label.set_text("");
+
+        match loading.kind {
+            PreviewLoadingKind::Provider => {
+                self.provider_loading_label.set_text(&loading.message);
+                self.stack.set_visible_child_name("provider-loading");
+            }
+            PreviewLoadingKind::Editor => {
+                if let Some(label) = self
+                    .editor_loading
+                    .last_child()
+                    .and_then(|child| child.downcast::<gtk::Label>().ok())
+                {
+                    label.set_text(&loading.message);
+                }
+                self.file_view_split
+                    .set_start_child(Some(&self.editor_loading));
+                self.stack.set_visible_child_name("editor");
+            }
+        }
     }
 
     fn clear_file_state(&self) {
