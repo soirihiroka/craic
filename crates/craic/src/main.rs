@@ -1,5 +1,6 @@
 use adw::prelude::*;
 use gtk::{gio, glib};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -45,6 +46,7 @@ fn main() -> glib::ExitCode {
             app,
             launch_start,
             startup_workspace.workspace.clone(),
+            startup_workspace.open_location.clone(),
             startup_workspace.error.clone(),
         )
     });
@@ -60,6 +62,7 @@ fn main() -> glib::ExitCode {
 #[derive(Clone, Default)]
 struct StartupWorkspaceArg {
     workspace: Option<config::ConfiguredWorkspace>,
+    open_location: Option<craic_ui::StartupOpenLocation>,
     error: Option<String>,
 }
 
@@ -69,8 +72,19 @@ fn startup_workspace_arg() -> StartupWorkspaceArg {
         return StartupWorkspaceArg::default();
     }
     if args.len() > 1 {
+        if args
+            .first()
+            .is_some_and(|arg| arg == "--workspace-provider")
+        {
+            return startup_navigation_args(&args).unwrap_or_else(|error| StartupWorkspaceArg {
+                workspace: None,
+                open_location: None,
+                error: Some(error),
+            });
+        }
         return StartupWorkspaceArg {
             workspace: None,
+            open_location: None,
             error: Some("Expected at most one workspace path.".to_string()),
         };
     }
@@ -85,14 +99,103 @@ fn startup_workspace_arg() -> StartupWorkspaceArg {
                 workspace: Some(config::ConfiguredWorkspace::local(
                     path.to_string_lossy().to_string(),
                 )),
+                open_location: None,
                 error: None,
             }
         }
         Err(error) => StartupWorkspaceArg {
             workspace: None,
+            open_location: None,
             error: Some(error),
         },
     }
+}
+
+fn startup_navigation_args(args: &[OsString]) -> Result<StartupWorkspaceArg, String> {
+    let mut provider = None;
+    let mut workspace_path = None;
+    let mut open_path = None;
+    let mut line = None;
+    let mut column = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let flag = args[index]
+            .to_str()
+            .ok_or_else(|| "Startup option names must be valid UTF-8.".to_string())?;
+        index += 1;
+        let value = args
+            .get(index)
+            .ok_or_else(|| format!("Missing value for {flag}."))?;
+        index += 1;
+
+        match flag {
+            "--workspace-provider" => provider = Some(os_string_value(value, flag)?),
+            "--workspace-path" => workspace_path = Some(os_string_value(value, flag)?),
+            "--open-path" => open_path = Some(os_string_value(value, flag)?),
+            "--line" => line = Some(positive_usize(value, flag)?),
+            "--column" => column = Some(positive_usize(value, flag)?),
+            _ => return Err(format!("Unknown startup option: {flag}.")),
+        }
+    }
+
+    let provider = provider.ok_or_else(|| "Missing --workspace-provider.".to_string())?;
+    let workspace_path = workspace_path.ok_or_else(|| "Missing --workspace-path.".to_string())?;
+    let open_path = open_path.ok_or_else(|| "Missing --open-path.".to_string())?;
+    if column.is_some() && line.is_none() {
+        return Err("--column requires --line.".to_string());
+    }
+
+    let provider = match provider.as_str() {
+        "local" => config::WorkspaceProvider::Local,
+        value => {
+            let host = value
+                .strip_prefix("ssh:")
+                .filter(|host| !host.is_empty())
+                .ok_or_else(|| format!("Unsupported workspace provider: {value}."))?;
+            config::WorkspaceProvider::Ssh {
+                host: host.to_string(),
+            }
+        }
+    };
+    let workspace_path = if provider == config::WorkspaceProvider::Local {
+        resolve_workspace_arg(Path::new(&workspace_path))?
+            .to_string_lossy()
+            .to_string()
+    } else {
+        workspace_path
+    };
+
+    Ok(StartupWorkspaceArg {
+        workspace: Some(config::ConfiguredWorkspace {
+            path: workspace_path,
+            provider,
+            display_name: None,
+            color: None,
+        }),
+        open_location: Some(craic_ui::StartupOpenLocation {
+            path: open_path,
+            line,
+            column,
+        }),
+        error: None,
+    })
+}
+
+fn os_string_value(value: &OsString, flag: &str) -> Result<String, String> {
+    value
+        .to_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| format!("{flag} must be valid UTF-8."))
+}
+
+fn positive_usize(value: &OsString, flag: &str) -> Result<usize, String> {
+    let value = os_string_value(value, flag)?;
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{flag} must be a positive integer."))
 }
 
 fn resolve_workspace_arg(path: &Path) -> Result<PathBuf, String> {

@@ -106,6 +106,7 @@ pub struct PageContext {
     show_toast: Rc<dyn Fn(&str)>,
     run_git_action: Rc<dyn Fn()>,
     open_terminal: Rc<dyn Fn(&WorkspacePath) -> Result<(), String>>,
+    open_external_terminal_path: Rc<dyn Fn(&WorkspacePath, Option<usize>, Option<usize>)>,
     run_shell_command: Rc<dyn Fn(&ShellCommandSpec, &str) -> Result<(), String>>,
     request_git_snapshot: Rc<dyn Fn(String, Arc<crate::git::GitRepoHandle>, GitSnapshotComplete)>,
     notify_badge_changed: Rc<dyn Fn()>,
@@ -125,6 +126,7 @@ impl PageContext {
         run_git_action: Rc<dyn Fn()>,
         show_toast: Rc<dyn Fn(&str)>,
         open_terminal: Rc<dyn Fn(&WorkspacePath) -> Result<(), String>>,
+        open_external_terminal_path: Rc<dyn Fn(&WorkspacePath, Option<usize>, Option<usize>)>,
         run_shell_command: Rc<dyn Fn(&ShellCommandSpec, &str) -> Result<(), String>>,
         request_git_snapshot: Rc<
             dyn Fn(String, Arc<crate::git::GitRepoHandle>, GitSnapshotComplete),
@@ -143,6 +145,7 @@ impl PageContext {
             show_toast,
             run_git_action,
             open_terminal,
+            open_external_terminal_path,
             run_shell_command,
             request_git_snapshot,
             notify_badge_changed,
@@ -283,6 +286,15 @@ impl PageContext {
 
     pub fn open_terminal(&self, working_dir: &WorkspacePath) -> Result<(), String> {
         (self.open_terminal)(working_dir)
+    }
+
+    pub fn open_external_terminal_path(
+        &self,
+        path: &WorkspacePath,
+        line: Option<usize>,
+        column: Option<usize>,
+    ) {
+        (self.open_external_terminal_path)(path, line, column);
     }
 
     pub fn run_shell_command(&self, command: &ShellCommandSpec, title: &str) -> Result<(), String> {

@@ -734,7 +734,15 @@ fn show_repository_file_location(
     let file_monitor = Rc::clone(file_monitor);
     let displayed_preview = displayed_preview.clone();
     let file_path = file_path.to_string();
+    file_monitor.stop();
+    let load_token = right.begin_preview_load(&file_path);
     load_repository_item(&load_ctx, node_path.clone(), move |result| {
+        if !right.is_current_load(load_token) {
+            log::debug!(
+                "repository item load result ignored because token is stale file_path={file_path}"
+            );
+            return;
+        }
         let item = match result {
             Ok(item) => item,
             Err(err) => {
@@ -757,6 +765,7 @@ fn show_repository_file_location(
             &displayed_preview,
             item,
             selection,
+            load_token,
         );
     });
 }
@@ -866,7 +875,15 @@ fn show_repository_node_path(
     let pending_save = pending_save.clone();
     let file_monitor = Rc::clone(file_monitor);
     let displayed_preview = displayed_preview.clone();
+    file_monitor.stop();
+    let load_token = right.begin_preview_load(&file_path);
     load_repository_item(&load_ctx, node_path.clone(), move |result| {
+        if !right.is_current_load(load_token) {
+            log::debug!(
+                "repository item load result ignored because token is stale file_path={file_path}"
+            );
+            return;
+        }
         let item = match result {
             Ok(item) => item,
             Err(err) => {
@@ -886,6 +903,7 @@ fn show_repository_node_path(
             &displayed_preview,
             item,
             selection,
+            load_token,
         );
     });
 }
@@ -1131,16 +1149,13 @@ fn show_repository_item(
     displayed_preview: &DisplayedPreviewState,
     item: RepositoryItem,
     selection: Option<(usize, usize)>,
+    load_token: right::PreviewLoadToken,
 ) {
     let file_path = item.node_path.display();
     let displayed = DisplayedPreview {
         node_path: item.node_path.clone(),
         signature: PreviewSignature::Disk(provider::disk_signature(&item.info)),
     };
-    if displayed_preview.borrow().as_ref() == Some(&displayed) {
-        log::debug!("skip unchanged file preview file_path={file_path}");
-        return;
-    }
 
     if item.info.kind.is_file() && item.info.capabilities.watchable {
         file_monitor.watch_file(
@@ -1158,7 +1173,6 @@ fn show_repository_item(
     }
 
     displayed_preview.replace(Some(displayed));
-    let load_token = right.begin_preview_load(&file_path);
     let selected_provider =
         provider::for_file(&file_path, &item.info, item.prefetched_bytes.as_deref());
     match selection {

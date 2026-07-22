@@ -40,7 +40,11 @@ pub fn show(
     local_path: Option<PathBuf>,
     prefetched_bytes: Option<Vec<u8>>,
 ) {
-    right.show_provider_loading_message(&file_path, "Rendering read-only notebook preview...");
+    right.show_provider_loading_message(
+        load_token,
+        &file_path,
+        "Rendering read-only notebook preview...",
+    );
 
     let apply_file_path = file_path.clone();
     super::spawn_preview_load(

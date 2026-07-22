@@ -1,5 +1,6 @@
 use super::dialogs::show_error_dialog;
 use super::shortcuts::show_shortcuts_window;
+use crate::config::ConfiguredWorkspace;
 use adw::prelude::*;
 use gtk::gio;
 use std::path::{Path, PathBuf};
@@ -77,6 +78,38 @@ pub(in crate::ui) fn launch_workspace_in_new_instance(workspace_path: &Path) -> 
     launch_new_instance_with_workspace(Some(workspace_path))
 }
 
+pub(in crate::ui) fn launch_workspace_location_in_new_instance(
+    workspace: &ConfiguredWorkspace,
+    path: &str,
+    line: Option<usize>,
+    column: Option<usize>,
+) -> Result<(), String> {
+    let executable = resolve_new_instance_executable()?;
+    log::info!(
+        "launching new Craic window executable={} provider={} workspace={} selected_path={} line={line:?} column={column:?}",
+        executable.display(),
+        workspace.provider_id(),
+        workspace.path,
+        path
+    );
+
+    let mut command = Command::new(&executable);
+    command
+        .arg("--workspace-provider")
+        .arg(workspace.provider_id())
+        .arg("--workspace-path")
+        .arg(&workspace.path)
+        .arg("--open-path")
+        .arg(path);
+    if let Some(line) = line {
+        command.arg("--line").arg(line.to_string());
+    }
+    if let Some(column) = column {
+        command.arg("--column").arg(column.to_string());
+    }
+    spawn_new_instance(command, &executable)
+}
+
 fn launch_new_instance_with_workspace(workspace_path: Option<&Path>) -> Result<(), String> {
     let executable = resolve_new_instance_executable()?;
     if let Some(workspace_path) = workspace_path {
@@ -96,6 +129,10 @@ fn launch_new_instance_with_workspace(workspace_path: Option<&Path>) -> Result<(
     if let Some(workspace_path) = workspace_path {
         command.arg(workspace_path);
     }
+    spawn_new_instance(command, &executable)
+}
+
+fn spawn_new_instance(mut command: Command, executable: &Path) -> Result<(), String> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())

@@ -23,7 +23,7 @@ use crate::system::providers::local::LocalProvider;
 use crate::system::providers::ssh::{SshProvider, SshProviderConfig};
 use crate::system::{SystemProviderRegistry, SystemRef, WorkspacePath, WorkspaceRef};
 use adw::prelude::*;
-use app_menu::{app_menu, install_actions};
+use app_menu::{app_menu, install_actions, launch_workspace_location_in_new_instance};
 use branch_actions::connect_branch_actions;
 use craic_ui_core::ui::command_mailbox;
 use dialogs::show_error_dialog;
@@ -40,6 +40,14 @@ use std::thread;
 use std::time::Instant;
 
 const JETBRAINS_MONO_DIR: &str = "JetBrainsMono";
+
+#[derive(Clone, Debug)]
+pub struct StartupOpenLocation {
+    pub path: String,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+}
+
 struct StartupTimer {
     start: Instant,
     previous: Instant,
@@ -68,6 +76,7 @@ pub fn build_ui(
     app: &adw::Application,
     launch_start: Instant,
     startup_workspace: Option<crate::config::ConfiguredWorkspace>,
+    startup_open_location: Option<StartupOpenLocation>,
     startup_error: Option<String>,
 ) {
     let mut startup = StartupTimer::new(launch_start);
@@ -259,6 +268,14 @@ pub fn build_ui(
         }),
         Rc::new({
             let state_slot = state_slot.clone();
+            move |path, line, column| {
+                if let Some(state) = state_slot.borrow().upgrade() {
+                    prompt_open_external_terminal_path(&state, path, line, column);
+                }
+            }
+        }),
+        Rc::new({
+            let state_slot = state_slot.clone();
             move |command, title| {
                 if let Some(state) = state_slot.borrow().upgrade() {
                     state.content.run_shell_command(command, title)
@@ -367,7 +384,22 @@ pub fn build_ui(
     apply_workspace_color(&state);
     startup.mark("apply-workspace-color");
 
-    activate_page(&state, 0);
+    if let Some(location) = startup_open_location {
+        let result = dispatch_page_command(
+            &state,
+            PageCommand::OpenFileLocation {
+                path: location.path,
+                line: location.line,
+                column: location.column,
+            },
+        );
+        if result == PageCommandResult::Ignored {
+            log::warn!("startup file location was not handled");
+            activate_page(&state, 0);
+        }
+    } else {
+        activate_page(&state, 0);
+    }
     startup.mark("activate-initial-page");
 
     connect_git_actions(&state);
@@ -1048,6 +1080,15 @@ impl content::RepositoryActionContext for Rc<AppState> {
         self.providers.terminal_links(&system.id, &workspace)
     }
 
+    fn open_external_terminal_path(
+        &self,
+        path: &WorkspacePath,
+        line: Option<usize>,
+        column: Option<usize>,
+    ) {
+        prompt_open_external_terminal_path(self, path, line, column);
+    }
+
     fn shell(&self) -> Option<Arc<dyn ShellAccess>> {
         let system = self.system_ref.borrow().clone();
         let workspace = self.workspace_ref.borrow().clone();
@@ -1073,6 +1114,102 @@ impl content::RepositoryActionContext for Rc<AppState> {
     fn dispatch_command(&self, command: PageCommand) -> PageCommandResult {
         dispatch_page_command(self, command)
     }
+}
+
+fn prompt_open_external_terminal_path(
+    state: &Rc<AppState>,
+    path: &WorkspacePath,
+    line: Option<usize>,
+    column: Option<usize>,
+) {
+    let system = state.system_ref.borrow().clone();
+    let (workspace_path, selected_path) = external_workspace_location(&path.absolute);
+    let workspace = match system.provider_kind {
+        crate::system::ProviderKind::Local => {
+            crate::config::ConfiguredWorkspace::local(workspace_path)
+        }
+        crate::system::ProviderKind::Ssh => {
+            let Some(host) = system.host.as_ref().map(|host| host.label().to_string()) else {
+                let message = "The SSH host for this terminal link is unavailable.";
+                log::warn!(
+                    "external terminal path launch failed path={} reason=missing-ssh-host",
+                    path.absolute
+                );
+                state.show_toast(message);
+                return;
+            };
+            crate::config::ConfiguredWorkspace {
+                path: workspace_path,
+                provider: crate::config::WorkspaceProvider::Ssh { host },
+                display_name: None,
+                color: None,
+            }
+        }
+        crate::system::ProviderKind::Container => {
+            let message = "Opening external terminal paths is unavailable for this provider.";
+            log::warn!(
+                "external terminal path launch failed path={} provider={} reason=unsupported-provider",
+                path.absolute,
+                system.provider_kind
+            );
+            state.show_toast(message);
+            return;
+        }
+    };
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Open in New Craic Window?")
+        .body(format!(
+            "The terminal path is outside the current workspace:\n\n{}",
+            path.absolute
+        ))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("open", "Open");
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("open", adw::ResponseAppearance::Suggested);
+
+    let window = state.window.clone();
+    let callback_window = window.clone();
+    let target = path.absolute.clone();
+    dialog.choose(
+        Some(&window),
+        None::<&gtk::gio::Cancellable>,
+        move |response| {
+            if response.as_str() != "open" {
+                log::debug!("external terminal path launch cancelled path={target}");
+                return;
+            }
+
+            match launch_workspace_location_in_new_instance(
+                &workspace,
+                &selected_path,
+                line,
+                column,
+            ) {
+                Ok(()) => log::info!(
+                    "external terminal path launch accepted path={target} workspace={} selected_path={selected_path}",
+                    workspace.path
+                ),
+                Err(err) => {
+                    log::warn!("external terminal path launch failed path={target}: {err}");
+                    show_error_dialog(&callback_window, "Open Terminal Path Failed", &err);
+                }
+            }
+        },
+    );
+}
+
+fn external_workspace_location(absolute: &str) -> (String, String) {
+    let absolute = absolute.trim_end_matches('/');
+    if absolute.is_empty() {
+        return ("/".to_string(), String::new());
+    }
+
+    let (parent, name) = absolute.rsplit_once('/').unwrap_or(("", absolute));
+    let parent = if parent.is_empty() { "/" } else { parent };
+    (parent.to_string(), name.to_string())
 }
 
 fn connect_git_actions(state: &Rc<AppState>) {

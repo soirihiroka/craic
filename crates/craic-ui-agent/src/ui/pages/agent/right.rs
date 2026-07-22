@@ -17,7 +17,6 @@ use super::{
     provider::{self, AgentProvider, CommandSpec},
 };
 use crate::config;
-use crate::system::WorkspacePath;
 use crate::system::capabilities::terminal_link::TerminalLinkTarget;
 use crate::ui::agent_history::{self, AgentSessionRow, RestoreState};
 use crate::ui::agent_status::{AgentActiveState, AgentInactiveState, AgentSessionState};
@@ -1978,7 +1977,14 @@ fn open_agent_terminal_file_location(
     let path = match target {
         TerminalLinkTarget::Workspace(path) => path,
         TerminalLinkTarget::External(path) => {
-            open_external_agent_terminal_file(ctx, file, &path);
+            log::info!(
+                "agent terminal external file activation requesting new window target={} path={} line={:?} column={:?}",
+                file.target,
+                path.absolute,
+                location.line,
+                location.column
+            );
+            ctx.open_external_terminal_path(&path, location.line, location.column);
             return;
         }
     };
@@ -1995,20 +2001,6 @@ fn open_agent_terminal_file_location(
         line: location.line,
         column: location.column,
     });
-}
-
-fn open_external_agent_terminal_file(
-    ctx: &PageContext,
-    file: &terminal_component::TerminalFileActivation,
-    path: &WorkspacePath,
-) {
-    let message = "Opening files outside the workspace is unavailable.".to_string();
-    log::warn!(
-        "agent terminal external file activation failed target={} path={} reason=no-node-path",
-        file.target,
-        path.absolute
-    );
-    ctx.show_toast(&message);
 }
 
 fn parse_terminal_file_location(target: &str) -> TerminalFileLocation {

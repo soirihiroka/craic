@@ -7,9 +7,11 @@ struct FolderPreviewLoad {
 }
 
 pub fn show(request: PreviewRequest<'_>) {
-    request
-        .right
-        .show_provider_loading_message(request.file_path, "Loading folder contents...");
+    request.right.show_provider_loading_message(
+        request.load_token,
+        request.file_path,
+        "Loading folder contents...",
+    );
 
     let files = request.files.clone();
     let workspace_root = request.ctx.workspace_ref().root.absolute.clone();

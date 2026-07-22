@@ -40,7 +40,6 @@ pub struct MediaPreview {
     image_viewer: Rc<image_viewer::ImageViewer>,
     video: gtk::Video,
     audio_controls: gtk::MediaControls,
-    loading_label: gtk::Label,
     message: gtk::Label,
     audio_stream: RefCell<Option<gtk::MediaFile>>,
     video_stream: RefCell<Option<gtk::MediaFile>>,
@@ -115,18 +114,10 @@ impl MediaPreview {
             .build();
 
         let stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
-        let loading_label = gtk::Label::builder()
-            .halign(gtk::Align::Center)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .css_classes(["dim-label"])
-            .build();
-        let loading = super::super::right::loading_screen_with_label(&loading_label);
-        stack.add_named(&loading, Some("loading"));
         stack.add_named(&image_viewer.root, Some("image"));
         stack.add_named(&video, Some("video"));
         stack.add_named(&audio_clamp, Some("audio"));
-        stack.set_visible_child_name("loading");
+        stack.set_visible_child_name("image");
 
         let message = widgets::muted("");
         message.set_halign(gtk::Align::Center);
@@ -150,7 +141,6 @@ impl MediaPreview {
             image_viewer,
             video,
             audio_controls,
-            loading_label,
             message,
             audio_stream: RefCell::new(None),
             video_stream: RefCell::new(None),
@@ -177,13 +167,6 @@ impl MediaPreview {
         self.audio_stream.borrow_mut().take();
         self.video_stream.borrow_mut().take();
         self.materialized.borrow_mut().take();
-    }
-
-    fn show_loading(&self, kind: MediaKind) {
-        self.clear();
-        self.loading_label
-            .set_text(&format!("Loading {} preview...", kind.label()));
-        self.stack.set_visible_child_name("loading");
     }
 
     fn set_media(&self, load: MediaPreviewLoad) {
@@ -270,8 +253,9 @@ pub fn show_video_match(request: PreviewMatchRequest<'_>) {
 }
 
 fn show_media(request: PreviewRequest<'_>, kind: MediaKind) {
-    request.right.show_media_preview(request.file_path, "");
-    request.right.file_media_preview.show_loading(kind);
+    request
+        .right
+        .show_provider_loading(request.load_token, request.file_path, kind.label());
 
     let file_path = request.file_path.to_string();
     let local_path = request.local_path.map(|path| path.to_path_buf());

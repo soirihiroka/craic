@@ -861,9 +861,11 @@ impl ReadonlyNotebookSource {
 }
 
 fn show_notebook(request: PreviewRequest<'_>) {
-    request
-        .right
-        .show_provider_loading_message(request.file_path, "Checking notebook environment...");
+    request.right.show_provider_loading_message(
+        request.load_token,
+        request.file_path,
+        "Checking notebook environment...",
+    );
 
     let readonly_source = ReadonlyNotebookSource {
         local_path: request.local_path.map(Path::to_path_buf),
@@ -999,6 +1001,7 @@ fn ask_open_notebook_mode(
     };
 
     right.show_provider_loading_message(
+        load_token,
         &file_path,
         "Choose how to open this notebook: live Jupyter Notebook or read-only preview.",
     );
@@ -1032,7 +1035,11 @@ fn ask_open_notebook_mode(
             right.show_notebook_preview(&file_path);
             right.file_notebook_preview.load_reused_notebook(&url);
         } else {
-            right.show_provider_loading_message(&file_path, "Starting Jupyter Notebook server...");
+            right.show_provider_loading_message(
+                load_token,
+                &file_path,
+                "Starting Jupyter Notebook server...",
+            );
             launch_server_for_preview(
                 ctx.clone(),
                 Rc::clone(&right),
@@ -1064,6 +1071,7 @@ fn ask_initialize_notebook(
     };
 
     right.show_provider_loading_message(
+        load_token,
         &file_path,
         &format!("{reason}\n\nInitialize notebook support to open this file."),
     );
@@ -1090,7 +1098,11 @@ fn ask_initialize_notebook(
         }
 
         log::info!("jupyter notebook initialization accepted file_path={file_path}");
-        right.show_provider_loading_message(&file_path, "Initializing notebook support...");
+        right.show_provider_loading_message(
+            load_token,
+            &file_path,
+            "Initializing notebook support...",
+        );
         initialize_then_launch(
             ctx.clone(),
             Rc::clone(&right),
@@ -1156,6 +1168,7 @@ fn receive_launch_result(
                 if right.is_current_load(load_token) {
                     log::info!("jupyter notebook preview ready file_path={file_path}");
                     right.show_provider_loading_message(
+                        load_token,
                         &file_path,
                         "Loading notebook in embedded browser...",
                     );
