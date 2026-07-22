@@ -14,16 +14,24 @@ Any usage outside of my computer is out of scope and unsupported x3
 
 ## Features
 
-- Git integration with auto generated commit messages.
-- Docker integration.
-- SSH Remote connection.
-- Vibe coding integration with Codex, AGY, OpenCode, and Ollama.
-- Document preview for Markdown, reStructuredText, SVG, PDF, images, audio, and video.
-- Syntax highlighting, spellchecking, and Markdown linting.
-- Color-coding for workspaces and hosts.
+- Vibe coding sessions with Codex, AGY, and OpenCode, plus Ollama-backed smart
+  features.
+- Git and GitHub workflows, generated commit messages, and Docker integration.
+- Local and SSH workspaces with color-coded projects and hosts.
+- Editing with syntax highlighting, search, spellchecking, and Markdown
+  linting.
+- Rich document, media, notebook, database, and structured-data previews.
 
 ---
 
 ## Documentation
 
-See the [Craic documentation](https://soirihiroka.github.io/craic) for installation, usage, and configuration details.
+See the [Craic documentation](https://soirihiroka.github.io/craic/) for
+installation, usage, and configuration details.
+
+## License
+
+Copyright © 2026 Soiri Hiroka.
+
+Craic is free software released under the
+[GNU General Public License version 3 or later](LICENSE).

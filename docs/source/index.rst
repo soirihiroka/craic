@@ -1,9 +1,9 @@
 Craic Documentation
 ===================
 
-Craic is a GNOME development environment for working with local and remote
-projects. It brings editing, Git workflows, terminals, containers, previews,
-and coding agents into one Libadwaita application.
+Craic is a vibe IDE and agentic development environment. It brings coding
+agents, editing, Git workflows, terminals, containers, and previews into one
+Libadwaita application.
 
 Start here
 ----------
