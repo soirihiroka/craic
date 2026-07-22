@@ -193,6 +193,7 @@ impl SystemProvider for LocalProvider {
         Some(Arc::new(GioUrlOpenAccess::new(
             self.label(),
             workspace.clone(),
+            None,
         )))
     }
 

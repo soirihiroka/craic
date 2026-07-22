@@ -108,6 +108,7 @@ pub struct TabbedPicker {
     footer_label: gtk::Label,
     popover: gtk::Popover,
     stack: gtk::Stack,
+    switcher: gtk::StackSwitcher,
     search_entry: gtk::SearchEntry,
     button_label: gtk::Label,
     tabs: Rc<RefCell<Vec<TabbedPickerTab>>>,
@@ -182,7 +183,7 @@ impl TabbedPicker {
         content.append(&footer_button);
 
         let popover = gtk::Popover::builder()
-            .width_request(365)
+            .width_request(360)
             .child(&content)
             .build();
         popover.add_css_class("menu");
@@ -231,6 +232,7 @@ impl TabbedPicker {
             footer_label,
             popover,
             stack,
+            switcher,
             search_entry,
             button_label,
             tabs: Rc::new(RefCell::new(tabs)),
@@ -315,6 +317,7 @@ impl TabbedPicker {
     }
 
     fn refresh(&self) {
+        self.switcher.set_visible(self.tabs.borrow().len() > 1);
         let active = self
             .stack
             .visible_child_name()
@@ -339,7 +342,7 @@ impl TabbedPicker {
                 .hscrollbar_policy(gtk::PolicyType::Never)
                 .vscrollbar_policy(gtk::PolicyType::Automatic)
                 .min_content_height(120)
-                .max_content_height(300)
+                .max_content_height(260)
                 .propagate_natural_height(true)
                 .child(&list)
                 .build();
@@ -410,13 +413,15 @@ fn fill_tab(list: &gtk::ListBox, tab: &TabbedPickerTab, filter: &str) {
             continue;
         }
 
-        if let Some(title) = group.title.as_ref() {
-            list.append(&header_row(title));
-        }
-
-        for item in items {
+        for (index, item) in items.into_iter().enumerate() {
             visible += 1;
-            list.append(&item_row(item));
+            let row = item_row(item);
+            if index == 0
+                && let Some(title) = group.title.as_ref()
+            {
+                row.set_header(Some(&header_label(title)));
+            }
+            list.append(&row);
         }
     }
 
@@ -444,23 +449,18 @@ fn tab_label(tab: &TabbedPickerTab) -> String {
     }
 }
 
-fn header_row(title: &str) -> gtk::ListBoxRow {
+fn header_label(title: &str) -> gtk::Label {
     let label = gtk::Label::builder()
         .label(title)
         .halign(gtk::Align::Start)
         .xalign(0.0)
-        .margin_top(8)
-        .margin_bottom(3)
+        .margin_top(4)
+        .margin_bottom(0)
         .margin_start(6)
         .margin_end(6)
         .build();
     label.add_css_class("heading");
-    let row = gtk::ListBoxRow::builder()
-        .child(&label)
-        .selectable(false)
-        .build();
-    row.set_activatable(false);
-    row
+    label
 }
 
 fn item_row(item: &TabbedPickerItem) -> gtk::ListBoxRow {
@@ -504,11 +504,11 @@ fn item_row(item: &TabbedPickerItem) -> gtk::ListBoxRow {
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .margin_top(3)
-        .margin_bottom(3)
-        .margin_start(6)
-        .margin_end(6)
+        .spacing(6)
+        .margin_top(0)
+        .margin_bottom(0)
+        .margin_start(0)
+        .margin_end(0)
         .build();
     content.append(&icon);
     content.append(&labels);

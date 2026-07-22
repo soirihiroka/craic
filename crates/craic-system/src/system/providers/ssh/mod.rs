@@ -244,6 +244,7 @@ impl SystemProvider for SshProvider {
         Some(Arc::new(GioUrlOpenAccess::new(
             self.label(),
             workspace.clone(),
+            Some(self.config.host.clone()),
         )))
     }
 
