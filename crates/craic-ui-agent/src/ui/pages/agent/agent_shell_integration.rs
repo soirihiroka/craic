@@ -1,4 +1,4 @@
-use craic_ui_terminal::alacritty::AlacrittyTerminal;
+use craic_ui_terminal::vte::VteTerminal;
 use gtk::glib;
 use std::cell::RefCell;
 use std::process::ExitStatus;
@@ -100,8 +100,19 @@ pub trait AgentShellIntegration: Sync {
         log::info!("agent command spawned pid={} command={}", pid.0, command);
     }
 
+    fn log_spawn_completed_after_close(&self, pid: glib::Pid, command: &str) {
+        log::debug!(
+            "agent command spawn completed after close pid={} command={command}",
+            pid.0
+        );
+    }
+
     fn log_spawn_failed(&self, command: &str, err: &str) {
         log::warn!("agent command spawn failed command={command}: {err}");
+    }
+
+    fn log_spawn_failed_after_close(&self, command: &str, err: &str) {
+        log::debug!("agent command spawn failed after close command={command}: {err}");
     }
 
     fn log_child_exited(&self, status: ExitStatus, message: &str) {
@@ -120,7 +131,7 @@ fn notification_title(title: &str) -> Option<String> {
 
 pub fn session_title(
     provider: &'static dyn AgentProvider,
-    terminal: &AlacrittyTerminal,
+    terminal: &VteTerminal,
     _log_scan: bool,
 ) -> Option<String> {
     let scan = recent_terminal_text(terminal)?;
@@ -131,7 +142,7 @@ pub fn session_title(
 pub fn active_state(
     _session_id: u64,
     provider: &'static dyn AgentProvider,
-    terminal: &AlacrittyTerminal,
+    terminal: &VteTerminal,
     _log_scan: bool,
 ) -> AgentActiveState {
     let window_title = terminal_window_title(terminal);
@@ -154,11 +165,11 @@ pub fn active_state(
     active_state
 }
 
-fn terminal_window_title(terminal: &AlacrittyTerminal) -> Option<String> {
+fn terminal_window_title(terminal: &VteTerminal) -> Option<String> {
     terminal.title()
 }
 
-fn recent_terminal_text(terminal: &AlacrittyTerminal) -> Option<TerminalTextScan> {
+fn recent_terminal_text(terminal: &VteTerminal) -> Option<TerminalTextScan> {
     let text = terminal
         .text_before_cursor(TITLE_SCAN_ROWS as usize)?
         .trim_start_matches(|ch| matches!(ch, '\n' | '\r'))
@@ -170,7 +181,7 @@ fn recent_terminal_text(terminal: &AlacrittyTerminal) -> Option<TerminalTextScan
     })
 }
 
-fn recent_terminal_active_state_text(terminal: &AlacrittyTerminal) -> Option<ActiveStateTextScan> {
+fn recent_terminal_active_state_text(terminal: &VteTerminal) -> Option<ActiveStateTextScan> {
     let text = terminal
         .recent_text(TITLE_SCAN_ROWS as usize)?
         .trim_start_matches(|ch| matches!(ch, '\n' | '\r'))

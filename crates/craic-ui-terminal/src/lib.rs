@@ -4,6 +4,6 @@ pub use craic_system::system;
 pub mod terminal;
 pub mod ui;
 
-pub mod alacritty;
+pub mod vte;
 
 pub use terminal::*;
