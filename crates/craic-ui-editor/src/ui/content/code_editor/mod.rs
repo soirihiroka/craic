@@ -12,7 +12,7 @@ use crate::config;
 use crate::git::{DiffKind, FileComparison};
 use crate::language_support::{
     CompletionItem, CompletionSet, HighlightRange, SyntaxHighlighter, SyntaxIssue,
-    apply_edit_to_ranges,
+    apply_edit_to_ranges, language_support,
 };
 use crate::markdown_lint::MarkdownLintIssue;
 use crate::spellcheck::SpellcheckIssue;
@@ -20,6 +20,7 @@ use crate::ui::components::search::SearchPanel;
 use crate::ui::{canvas_scroll, canvas_scrollbar};
 use adw::prelude::*;
 use canvas::TextWidthCache;
+use craic_file_support::LanguageId;
 use gtk::gdk;
 use selection::{Selection, SelectionMode};
 use std::any::Any;
@@ -31,7 +32,6 @@ use std::thread;
 use std::time::Duration;
 use text_buffer::{TextBuffer, clamp_to_char_boundary, next_char_boundary};
 
-pub use crate::language_support::language_hint_from_path;
 pub use text_buffer::byte_offset_for_line_column;
 
 const CELL_PADDING: f64 = 8.0;
@@ -56,7 +56,7 @@ type ScrollCallback = Rc<dyn Fn(f64)>;
 struct EditorState {
     text: RefCell<TextBuffer>,
     document_revision: Cell<u64>,
-    language: RefCell<String>,
+    language: Cell<LanguageId>,
     font_size: Cell<f64>,
     char_width: Cell<f64>,
     char_spacing: Cell<f64>,
@@ -144,7 +144,7 @@ struct SearchMatch {
 enum SyntaxWorkerCommand {
     Reset {
         generation: u64,
-        language: String,
+        language: LanguageId,
         source: String,
         auto_folds: bool,
     },
@@ -249,6 +249,7 @@ struct LayoutCache {
 
 impl CodeEditor {
     pub fn new(language: &str, text: &str) -> Self {
+        let language = language_support(language).id;
         let line_count = text.lines().count().max(1);
         let font_size = config::DEFAULT_EDITOR_FONT_SIZE;
         let line_height = line_height_for_font_size(font_size);
@@ -264,7 +265,7 @@ impl CodeEditor {
         let state = Rc::new(EditorState {
             text: RefCell::new(TextBuffer::new(text)),
             document_revision: Cell::new(1),
-            language: RefCell::new(language.to_string()),
+            language: Cell::new(language),
             font_size: Cell::new(font_size),
             char_width: Cell::new(font_metrics.char_width),
             char_spacing: Cell::new(font_metrics.char_spacing),
@@ -379,6 +380,10 @@ impl CodeEditor {
     }
 
     pub fn set_document(&self, language: &str, text: &str) {
+        self.set_document_id(language_support(language).id, text);
+    }
+
+    pub fn set_document_id(&self, language: LanguageId, text: &str) {
         self.set_document_with_language(Some(language), text, false);
     }
 
@@ -445,12 +450,16 @@ impl CodeEditor {
     }
 
     pub fn set_language(&self, language: &str) {
-        if self.state.language.borrow().as_str() == language {
+        self.set_language_id(language_support(language).id);
+    }
+
+    pub fn set_language_id(&self, language: LanguageId) {
+        if self.state.language.get() == language {
             return;
         }
 
         input::dismiss_completion(&self.state);
-        self.state.language.replace(language.to_string());
+        self.state.language.set(language);
         clear_automatic_folds(&self.state, "language changed");
         render::invalidate_layout(&self.state);
         render::invalidate_highlights(&self.state);
@@ -535,9 +544,14 @@ impl CodeEditor {
         self.area.queue_render();
     }
 
-    fn set_document_with_language(&self, language: Option<&str>, text: &str, force_reset: bool) {
+    fn set_document_with_language(
+        &self,
+        language: Option<LanguageId>,
+        text: &str,
+        force_reset: bool,
+    ) {
         let language_changed =
-            language.is_some_and(|language| self.state.language.borrow().as_str() != language);
+            language.is_some_and(|language| self.state.language.get() != language);
         let text_changed = force_reset || self.state.text.borrow().as_str() != text;
         if !language_changed && !text_changed {
             return;
@@ -548,7 +562,7 @@ impl CodeEditor {
 
         if let Some(language) = language.filter(|_| language_changed) {
             input::dismiss_completion(&self.state);
-            self.state.language.replace(language.to_string());
+            self.state.language.set(language);
         }
         if text_changed {
             input::dismiss_completion(&self.state);
@@ -1233,7 +1247,7 @@ fn apply_syntax_command(
             source,
             auto_folds,
         } => {
-            highlighter.set_language(&language);
+            highlighter.set_language_id(language);
             highlighter.set_source(&source);
             *latest_generation = generation;
             *latest_auto_folds = auto_folds;
@@ -1383,7 +1397,7 @@ fn reset_syntax_worker(state: &Rc<EditorState>) {
         state,
         SyntaxWorkerCommand::Reset {
             generation,
-            language: state.language.borrow().clone(),
+            language: state.language.get(),
             source,
             auto_folds,
         },

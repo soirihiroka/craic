@@ -1,3 +1,4 @@
+use crate::language_support::{LanguageSupport, LintKind};
 use rumdl_lib::config::{Config, MarkdownFlavor};
 use rumdl_lib::rules::{all_rules, filter_rules};
 use std::path::PathBuf;
@@ -22,6 +23,18 @@ pub struct MarkdownLintEdit {
     pub start: usize,
     pub end: usize,
     pub replacement: String,
+}
+
+pub fn check_language_document(
+    language: &'static LanguageSupport,
+    path: Option<&str>,
+    text: &str,
+    ignored_rules: &[String],
+) -> Vec<MarkdownLintIssue> {
+    match language.lint {
+        LintKind::None => Vec::new(),
+        LintKind::Markdown => check_document(path, text, ignored_rules),
+    }
 }
 
 pub fn check_document(

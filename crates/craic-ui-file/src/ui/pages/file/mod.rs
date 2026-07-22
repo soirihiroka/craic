@@ -1524,8 +1524,10 @@ fn spellcheck_editor_document(
         return;
     };
     let allowlist = crate::spellcheck::SpellcheckAllowlist::default();
-    let language = code_editor::language_hint_from_path(file_path);
-    let issues = crate::spellcheck::check_document(&language, Some(file_path), text, &allowlist);
+    let language = craic_language::language_support_for_id(
+        crate::ui::file_type::detect(file_path, false).language,
+    );
+    let issues = crate::spellcheck::check_document(language, Some(file_path), text, &allowlist);
     file_editor.set_spellcheck_issues(issues);
     let ignored_rules =
         crate::workspace_config::markdown_lint_ignored_rules_from_file_access(files.as_ref());
@@ -1537,12 +1539,10 @@ pub fn markdown_lint_issues(
     text: &str,
     ignored_rules: &[String],
 ) -> Vec<crate::markdown_lint::MarkdownLintIssue> {
-    let language = code_editor::language_hint_from_path(file_path);
-    if matches!(language.as_str(), "md" | "markdown" | "mdown" | "mkd") {
-        crate::markdown_lint::check_document(Some(file_path), text, ignored_rules)
-    } else {
-        Vec::new()
-    }
+    let language = craic_language::language_support_for_id(
+        crate::ui::file_type::detect(file_path, false).language,
+    );
+    crate::markdown_lint::check_language_document(language, Some(file_path), text, ignored_rules)
 }
 
 fn text_from_repository_bytes(bytes: Vec<u8>) -> Result<String, String> {

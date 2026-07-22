@@ -478,15 +478,15 @@ impl RightPane {
             .replace(Some(disk_signature));
         self.file_editor_writable.set(writable);
 
-        let language = code_editor::language_hint_from_path(file_path);
-        self.file_editor.set_document(&language, text);
+        let language = crate::ui::file_type::detect(file_path, false).language;
+        self.file_editor.set_document_id(language, text);
         self.file_editor.set_editable(writable);
         self.file_editor.set_file_diff(comparison);
         self.file_editor
             .set_markdown_lint_issues(markdown_lint_issues);
         self.file_editor.set_spellcheck_issues(spellcheck_issues);
         self.clear_auxiliary_previews();
-        let view_kind = if language == "csv" {
+        let view_kind = if language == crate::ui::file_type::LanguageId::Csv {
             Some(FileViewKind::Csv)
         } else {
             TextFormat::for_path(file_path).map(FileViewKind::DynamicData)

@@ -1,3 +1,4 @@
+use crate::language_support::{LanguageSupport, SpellcheckMode};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use typos::tokens::{Identifier, Tokenizer, Word};
@@ -20,7 +21,7 @@ pub struct SpellcheckAllowlist {
 }
 
 pub fn check_document(
-    language: &str,
+    language: &'static LanguageSupport,
     path: Option<&str>,
     text: &str,
     allowlist: &SpellcheckAllowlist,
@@ -36,13 +37,13 @@ pub fn check_document(
 
     let checker = Spellchecker::new(allowlist);
     let mut issues = Vec::new();
-    for (start, end) in spellcheck_spans(language, path, text) {
+    for (start, end) in spellcheck_spans(language.spellcheck, text) {
         checker.check_slice(text, start, end, &mut issues);
     }
     log::debug!(
-        "spellcheck document complete path={} language={} issues={}",
+        "spellcheck document complete path={} language={:?} issues={}",
         path.unwrap_or_default(),
-        language,
+        language.id,
         issues.len()
     );
     issues
@@ -183,25 +184,13 @@ fn status_for_token<'s>(token: &str, allowlist: &'s SpellcheckAllowlist) -> Opti
     })
 }
 
-fn spellcheck_spans(language: &str, path: Option<&str>, text: &str) -> Vec<(usize, usize)> {
-    let language = language.to_ascii_lowercase();
-    if language == "csv" {
-        return Vec::new();
+fn spellcheck_spans(mode: SpellcheckMode, text: &str) -> Vec<(usize, usize)> {
+    match mode {
+        SpellcheckMode::Disabled => Vec::new(),
+        SpellcheckMode::Markup => markdown_spans(text),
+        SpellcheckMode::QuotedValues => quoted_value_spans(text),
+        SpellcheckMode::FullDocument => full_document_spans(text),
     }
-    if matches!(
-        language.as_str(),
-        "md" | "markdown" | "txt" | "text" | "rst" | "adoc"
-    ) {
-        return markdown_spans(text);
-    }
-    if matches!(language.as_str(), "toml" | "json" | "yaml" | "yml") {
-        return quoted_value_spans(text);
-    }
-    if path.is_some_and(|path| path.ends_with(".md") || path.ends_with(".txt")) {
-        return markdown_spans(text);
-    }
-    log::debug!("spellcheck using full document spans for code language={language}");
-    full_document_spans(text)
 }
 
 fn full_document_spans(text: &str) -> Vec<(usize, usize)> {

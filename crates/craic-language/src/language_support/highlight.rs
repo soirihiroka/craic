@@ -3,6 +3,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use super::suggest;
+use super::{LanguageSupport, language_support, language_support_for_id};
+use craic_file_support::LanguageId;
 use tree_sitter::{
     InputEdit, Language, Node, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
 };
@@ -10,7 +12,6 @@ use tree_sitter::{
 const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 const MAX_HIGHLIGHT_LINES: usize = 10_000;
 const MAX_QUERY_CACHE_ENTRIES: usize = 16;
-const RST_HIGHLIGHT_QUERY: &str = include_str!("queries/rst.scm");
 const RAINBOW_CSV_STYLES: [Style; 10] = [
     Style {
         foreground: "#e06c75",
@@ -63,9 +64,108 @@ pub struct SyntaxIssue {
     pub end: usize,
 }
 
+pub trait SyntaxSupport: Sync {
+    fn parser_language(&self) -> Option<Language>;
+    fn highlight_query(&self) -> Option<Cow<'static, str>>;
+    fn injection_query(&self) -> Option<&'static str>;
+    fn is_foldable(&self, node_kind: &str) -> bool;
+    fn custom_highlights(&self, source: &str) -> Option<Vec<HighlightRange>>;
+}
+
+pub struct TreeSitterSyntax {
+    pub language: fn() -> Language,
+    pub highlight_query_parts: &'static [&'static str],
+    pub injection_query: Option<&'static str>,
+    pub fold_nodes: &'static [&'static str],
+}
+
+impl SyntaxSupport for TreeSitterSyntax {
+    fn parser_language(&self) -> Option<Language> {
+        Some((self.language)())
+    }
+    fn highlight_query(&self) -> Option<Cow<'static, str>> {
+        match self.highlight_query_parts {
+            [] => None,
+            [query] => Some(Cow::Borrowed(query)),
+            parts => Some(Cow::Owned(parts.join("\n"))),
+        }
+    }
+    fn injection_query(&self) -> Option<&'static str> {
+        self.injection_query
+    }
+    fn is_foldable(&self, node_kind: &str) -> bool {
+        COMMON_FOLD_NODES.contains(&node_kind) || self.fold_nodes.contains(&node_kind)
+    }
+    fn custom_highlights(&self, _source: &str) -> Option<Vec<HighlightRange>> {
+        None
+    }
+}
+
+pub struct CsvSyntax;
+impl SyntaxSupport for CsvSyntax {
+    fn parser_language(&self) -> Option<Language> {
+        None
+    }
+    fn highlight_query(&self) -> Option<Cow<'static, str>> {
+        None
+    }
+    fn injection_query(&self) -> Option<&'static str> {
+        None
+    }
+    fn is_foldable(&self, _node_kind: &str) -> bool {
+        false
+    }
+    fn custom_highlights(&self, source: &str) -> Option<Vec<HighlightRange>> {
+        Some(rainbow_csv_ranges(source))
+    }
+}
+
+pub struct PlainSyntax;
+impl SyntaxSupport for PlainSyntax {
+    fn parser_language(&self) -> Option<Language> {
+        None
+    }
+    fn highlight_query(&self) -> Option<Cow<'static, str>> {
+        None
+    }
+    fn injection_query(&self) -> Option<&'static str> {
+        None
+    }
+    fn is_foldable(&self, _node_kind: &str) -> bool {
+        false
+    }
+    fn custom_highlights(&self, _source: &str) -> Option<Vec<HighlightRange>> {
+        None
+    }
+}
+
+const COMMON_FOLD_NODES: &[&str] = &[
+    "block",
+    "statement_block",
+    "compound_statement",
+    "declaration_list",
+    "initializer_list",
+    "argument_list",
+    "parameters",
+    "formal_parameters",
+    "parenthesized_expression",
+    "array",
+    "object",
+    "pair",
+    "element",
+    "stylesheet",
+    "rule_set",
+    "block_mapping",
+    "block_sequence",
+    "table",
+    "array_table",
+    "table_array_element",
+    "inline_table",
+];
+
 thread_local! {
-    static QUERY_CACHE: RefCell<HashMap<String, Query>> = RefCell::new(HashMap::new());
-    static INJECTION_QUERY_CACHE: RefCell<HashMap<String, Query>> = RefCell::new(HashMap::new());
+    static QUERY_CACHE: RefCell<HashMap<LanguageId, Query>> = RefCell::new(HashMap::new());
+    static INJECTION_QUERY_CACHE: RefCell<HashMap<LanguageId, Query>> = RefCell::new(HashMap::new());
 }
 
 struct InjectionRegion {
@@ -75,7 +175,7 @@ struct InjectionRegion {
 }
 
 pub struct SyntaxHighlighter {
-    language_name: String,
+    support: &'static LanguageSupport,
     language: Option<Language>,
     parser: Parser,
     tree: Option<Tree>,
@@ -85,7 +185,7 @@ pub struct SyntaxHighlighter {
 impl SyntaxHighlighter {
     pub fn new(language_name: &str) -> Self {
         let mut highlighter = Self {
-            language_name: String::new(),
+            support: language_support(""),
             language: None,
             parser: Parser::new(),
             tree: None,
@@ -95,13 +195,26 @@ impl SyntaxHighlighter {
         highlighter
     }
 
+    pub fn new_id(language: LanguageId) -> Self {
+        let mut highlighter = Self::new("");
+        highlighter.set_language_id(language);
+        highlighter
+    }
+
     pub fn set_language(&mut self, language_name: &str) {
-        let normalized = normalize_language_name(language_name);
-        if self.language_name == normalized {
+        self.set_support(language_support(language_name));
+    }
+
+    pub fn set_language_id(&mut self, language: LanguageId) {
+        self.set_support(language_support_for_id(language));
+    }
+
+    pub fn set_support(&mut self, support: &'static LanguageSupport) {
+        if self.support.id == support.id {
             return;
         }
-        self.language_name = normalized.clone();
-        self.language = language_for(&normalized);
+        self.support = support;
+        self.language = support.syntax.parser_language();
         self.tree = None;
         if let Some(language) = self.language.as_ref() {
             let _ = self.parser.set_language(language);
@@ -149,18 +262,13 @@ impl SyntaxHighlighter {
     }
 
     pub fn highlight_current(&self) -> Vec<HighlightRange> {
-        if self.language_name == "csv" {
-            return rainbow_csv_ranges(&self.source);
+        if let Some(ranges) = self.support.syntax.custom_highlights(&self.source) {
+            return ranges;
         }
         let Some(tree) = self.tree.as_ref() else {
             return Vec::new();
         };
-        highlight_ranges_for_tree(
-            &self.language_name,
-            self.language.as_ref(),
-            tree,
-            &self.source,
-        )
+        highlight_ranges_for_tree(self.support, self.language.as_ref(), tree, &self.source)
     }
 
     pub fn fold_ranges_current(&self) -> Vec<(usize, usize)> {
@@ -169,7 +277,7 @@ impl SyntaxHighlighter {
         };
 
         let mut ranges = Vec::new();
-        collect_fold_ranges(&self.language_name, tree.root_node(), &mut ranges);
+        collect_fold_ranges(self.support.syntax, tree.root_node(), &mut ranges);
         ranges.sort_unstable();
         ranges.dedup();
         ranges
@@ -199,7 +307,7 @@ impl SyntaxHighlighter {
 
     pub fn completions_current(&self, cursor: usize) -> Option<suggest::CompletionSet> {
         let tree = self.tree.as_ref()?;
-        suggest::completions(&self.language_name, tree, &self.source, cursor)
+        suggest::completions(self.support.completion?, tree, &self.source, cursor)
     }
 }
 
@@ -266,8 +374,12 @@ impl Style {
     }
 }
 
-fn collect_fold_ranges(language_name: &str, node: Node<'_>, ranges: &mut Vec<(usize, usize)>) {
-    if node.is_named() && is_foldable_node(language_name, node.kind()) {
+fn collect_fold_ranges(
+    syntax: &dyn SyntaxSupport,
+    node: Node<'_>,
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    if node.is_named() && syntax.is_foldable(node.kind()) {
         let start_line = node.start_position().row;
         let end_line = node.end_position().row;
         if end_line > start_line {
@@ -277,7 +389,7 @@ fn collect_fold_ranges(language_name: &str, node: Node<'_>, ranges: &mut Vec<(us
 
     for index in 0..node.child_count() {
         if let Some(child) = node.child(index as u32) {
-            collect_fold_ranges(language_name, child, ranges);
+            collect_fold_ranges(syntax, child, ranges);
         }
     }
 }
@@ -320,172 +432,16 @@ fn syntax_issue_range(start: usize, end: usize, source: &str) -> Option<SyntaxIs
     })
 }
 
-fn is_foldable_node(language_name: &str, kind: &str) -> bool {
-    if matches!(
-        kind,
-        "block"
-            | "statement_block"
-            | "compound_statement"
-            | "declaration_list"
-            | "initializer_list"
-            | "argument_list"
-            | "parameters"
-            | "formal_parameters"
-            | "parenthesized_expression"
-            | "array"
-            | "object"
-            | "pair"
-            | "element"
-            | "stylesheet"
-            | "rule_set"
-            | "block_mapping"
-            | "block_sequence"
-            | "table"
-            | "array_table"
-            | "table_array_element"
-            | "inline_table"
-    ) {
-        return true;
-    }
-
-    match normalize_language_name(language_name).as_str() {
-        "rust" | "rs" => matches!(
-            kind,
-            "function_item"
-                | "impl_item"
-                | "trait_item"
-                | "struct_item"
-                | "enum_item"
-                | "mod_item"
-                | "macro_definition"
-                | "match_block"
-        ),
-        "python" | "py" | "pyw" => matches!(
-            kind,
-            "function_definition"
-                | "class_definition"
-                | "decorated_definition"
-                | "for_statement"
-                | "while_statement"
-                | "if_statement"
-                | "with_statement"
-                | "try_statement"
-                | "match_statement"
-        ),
-        "javascript" | "js" | "mjs" | "cjs" | "jsx" | "typescript" | "ts" | "tsx" => matches!(
-            kind,
-            "function_declaration"
-                | "function"
-                | "arrow_function"
-                | "method_definition"
-                | "class_declaration"
-                | "class"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "type_alias_declaration"
-        ),
-        "go" | "golang" => matches!(
-            kind,
-            "function_declaration"
-                | "method_declaration"
-                | "type_declaration"
-                | "struct_type"
-                | "interface_type"
-                | "literal_value"
-        ),
-        "java" => matches!(
-            kind,
-            "class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-                | "method_declaration"
-                | "constructor_declaration"
-        ),
-        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => matches!(
-            kind,
-            "function_definition"
-                | "struct_specifier"
-                | "union_specifier"
-                | "enum_specifier"
-                | "namespace_definition"
-                | "class_specifier"
-                | "template_declaration"
-        ),
-        "ruby" | "rb" => matches!(
-            kind,
-            "method"
-                | "singleton_method"
-                | "class"
-                | "module"
-                | "do_block"
-                | "begin"
-                | "if"
-                | "case"
-        ),
-        "bash" | "sh" | "shell" | "zsh" => matches!(
-            kind,
-            "function_definition"
-                | "if_statement"
-                | "for_statement"
-                | "while_statement"
-                | "case_statement"
-                | "subshell"
-                | "compound_statement"
-        ),
-        "html" | "htm" | "xml" | "xhtml" => {
-            matches!(kind, "element" | "script_element" | "style_element")
-        }
-        "css" | "scss" => matches!(kind, "rule_set" | "media_statement" | "supports_statement"),
-        "toml" => matches!(
-            kind,
-            "table" | "array_table" | "table_array_element" | "inline_table" | "array"
-        ),
-        "yaml" | "yml" => matches!(kind, "block_mapping" | "block_sequence"),
-        "json" | "jsonc" | "json5" => matches!(kind, "object" | "array"),
-        "markdown" | "md" | "mdown" | "mkd" => matches!(
-            kind,
-            "section" | "fenced_code_block" | "list" | "block_quote"
-        ),
-        _ => false,
-    }
+pub fn language_id_from_path(path: &str) -> LanguageId {
+    craic_file_support::resolve(craic_file_support::FileProbe {
+        path,
+        is_dir: false,
+        leading_bytes: None,
+    })
+    .language
 }
 
-pub fn language_hint_from_path(path: &str) -> String {
-    let path = path.to_ascii_lowercase();
-    let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
-    match file_name {
-        name if name == ".env" || name.starts_with(".env.") => {
-            return "bash".to_string();
-        }
-        ".bash_profile" | ".bashrc" | ".profile" | ".zprofile" | ".zshrc" => {
-            return "bash".to_string();
-        }
-        "cargo.lock" | "uv.lock" => return "toml".to_string(),
-        "gemfile" | "rakefile" => return "ruby".to_string(),
-        "gnumakefile" | "makefile" => return "make".to_string(),
-        "caddyfile" => return "caddyfile".to_string(),
-        "package.json" | "package-lock.json" | "tsconfig.json" => return "json".to_string(),
-        "dockerfile" => return "bash".to_string(),
-        _ if file_name.ends_with(".caddyfile") => return "caddyfile".to_string(),
-        _ if file_name.ends_with(".desktop.in") => return "ini".to_string(),
-        _ if file_name.ends_with(".jsonl") || file_name.ends_with(".ndjson") => {
-            return "json".to_string();
-        }
-        _ if file_name.ends_with("ignore") => return "ignore".to_string(),
-        _ => {}
-    }
-    if file_name.ends_with(".svg") || file_name.ends_with(".svgz") {
-        return "xml".to_string();
-    }
-    path.rsplit('.')
-        .next()
-        .filter(|extension| *extension != path)
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn trim_query_cache(cache: &mut HashMap<String, Query>) {
+fn trim_query_cache(cache: &mut HashMap<LanguageId, Query>) {
     if cache.len() < MAX_QUERY_CACHE_ENTRIES {
         return;
     }
@@ -526,26 +482,20 @@ fn next_char_boundary(source: &str, mut offset: usize) -> usize {
 }
 
 fn highlight_ranges_for_tree(
-    language_name: &str,
+    support: &'static LanguageSupport,
     language: Option<&Language>,
     tree: &Tree,
     source: &str,
 ) -> Vec<HighlightRange> {
     let mut ranges = Vec::new();
-    collect_highlight_ranges(
-        language_name,
-        language,
-        tree.root_node(),
-        source,
-        &mut ranges,
-    );
+    collect_highlight_ranges(support, language, tree.root_node(), source, &mut ranges);
     let ranges = normalize_ranges(ranges, source.len());
-    let injected = collect_injected_ranges(language_name, language, tree.root_node(), source, 0);
+    let injected = collect_injected_ranges(support, language, tree.root_node(), source, 0);
     overlay_ranges(ranges, injected, source.len())
 }
 
 fn collect_injected_ranges(
-    language_name: &str,
+    support: &'static LanguageSupport,
     language: Option<&Language>,
     root: Node<'_>,
     source: &str,
@@ -559,7 +509,7 @@ fn collect_injected_ranges(
     let Some(language) = language else {
         return Vec::new();
     };
-    let regions = injection_regions(language_name, language, root, source);
+    let regions = injection_regions(support, language, root, source);
     let mut ranges = Vec::new();
 
     for region in regions {
@@ -570,7 +520,8 @@ fn collect_injected_ranges(
         {
             continue;
         }
-        let Some(embedded_language) = language_for(&region.language_name) else {
+        let embedded_support = language_support(&region.language_name);
+        let Some(embedded_language) = embedded_support.syntax.parser_language() else {
             continue;
         };
         let embedded_source = &source[region.start..region.end];
@@ -584,14 +535,14 @@ fn collect_injected_ranges(
 
         let mut embedded_ranges = Vec::new();
         collect_highlight_ranges(
-            &region.language_name,
+            embedded_support,
             Some(&embedded_language),
             tree.root_node(),
             embedded_source,
             &mut embedded_ranges,
         );
         let nested_ranges = collect_injected_ranges(
-            &region.language_name,
+            embedded_support,
             Some(&embedded_language),
             tree.root_node(),
             embedded_source,
@@ -614,26 +565,26 @@ fn collect_injected_ranges(
 }
 
 fn injection_regions(
-    language_name: &str,
+    support: &'static LanguageSupport,
     language: &Language,
     root: Node<'_>,
     source: &str,
 ) -> Vec<InjectionRegion> {
-    let Some(query_source) = injection_query_for(language_name) else {
+    let Some(query_source) = support.syntax.injection_query() else {
         return Vec::new();
     };
 
     INJECTION_QUERY_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if !cache.contains_key(language_name) {
+        if !cache.contains_key(&support.id) {
             let Ok(query) = Query::new(language, query_source) else {
                 return Vec::new();
             };
             trim_query_cache(&mut cache);
-            cache.insert(language_name.to_string(), query);
+            cache.insert(support.id, query);
         }
 
-        let Some(query) = cache.get(language_name) else {
+        let Some(query) = cache.get(&support.id) else {
             return Vec::new();
         };
         let capture_names = query.capture_names();
@@ -674,7 +625,7 @@ fn injection_regions(
             };
             for content in content_nodes {
                 regions.push(InjectionRegion {
-                    language_name: normalize_language_name(&injected_language),
+                    language_name: injected_language.clone(),
                     start: content.start_byte(),
                     end: content.end_byte(),
                 });
@@ -725,14 +676,14 @@ fn overlay_ranges(
 }
 
 fn collect_highlight_ranges(
-    language_name: &str,
+    support: &'static LanguageSupport,
     language: Option<&Language>,
     root: Node<'_>,
     source: &str,
     ranges: &mut Vec<HighlightRange>,
 ) {
     if let Some(language) = language {
-        if collect_query_ranges(language_name, language, root, source, ranges) {
+        if collect_query_ranges(support, language, root, source, ranges) {
             return;
         }
     }
@@ -740,27 +691,27 @@ fn collect_highlight_ranges(
 }
 
 fn collect_query_ranges(
-    language_name: &str,
+    support: &'static LanguageSupport,
     language: &Language,
     root: Node<'_>,
     source: &str,
     ranges: &mut Vec<HighlightRange>,
 ) -> bool {
-    let Some(query_source) = highlight_query_for(language_name) else {
+    let Some(query_source) = support.syntax.highlight_query() else {
         return false;
     };
 
     QUERY_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if !cache.contains_key(language_name) {
+        if !cache.contains_key(&support.id) {
             let Ok(query) = Query::new(language, query_source.as_ref()) else {
                 return false;
             };
             trim_query_cache(&mut cache);
-            cache.insert(language_name.to_string(), query);
+            cache.insert(support.id, query);
         }
 
-        let Some(query) = cache.get(language_name) else {
+        let Some(query) = cache.get(&support.id) else {
             return false;
         };
         let capture_names = query.capture_names();
@@ -1211,86 +1162,6 @@ fn rgb(hex: &str) -> (f64, f64, f64) {
     )
 }
 
-fn highlight_query_for(name: &str) -> Option<Cow<'static, str>> {
-    match normalize_language_name(name).as_str() {
-        "bash" | "sh" | "shell" | "zsh" | "ignore" => {
-            Some(Cow::Borrowed(tree_sitter_bash::HIGHLIGHT_QUERY))
-        }
-        "c" | "h" => Some(Cow::Borrowed(tree_sitter_c::HIGHLIGHT_QUERY)),
-        "cpp" | "c++" | "cc" | "cxx" | "hh" | "hpp" | "hxx" => Some(Cow::Owned(
-            [
-                tree_sitter_c::HIGHLIGHT_QUERY,
-                tree_sitter_cpp::HIGHLIGHT_QUERY,
-            ]
-            .join("\n"),
-        )),
-        "caddy" | "caddyfile" => None,
-        "css" | "scss" => Some(Cow::Borrowed(tree_sitter_css::HIGHLIGHTS_QUERY)),
-        "go" | "golang" => Some(Cow::Borrowed(tree_sitter_go::HIGHLIGHTS_QUERY)),
-        "html" | "htm" => Some(Cow::Borrowed(tree_sitter_html::HIGHLIGHTS_QUERY)),
-        "xml" | "xhtml" => Some(Cow::Borrowed(tree_sitter_xml::XML_HIGHLIGHT_QUERY)),
-        "java" => Some(Cow::Borrowed(tree_sitter_java::HIGHLIGHTS_QUERY)),
-        "javascript" | "js" | "mjs" | "cjs" => Some(Cow::Owned(
-            [
-                tree_sitter_javascript::HIGHLIGHT_QUERY,
-                tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
-            ]
-            .join("\n"),
-        )),
-        "jsx" => Some(Cow::Owned(
-            [
-                tree_sitter_javascript::HIGHLIGHT_QUERY,
-                tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
-            ]
-            .join("\n"),
-        )),
-        "json" | "jsonc" | "json5" => Some(Cow::Borrowed(tree_sitter_json::HIGHLIGHTS_QUERY)),
-        "hlsl" => None,
-        "slang" => None,
-        "cuda" | "cu" | "cuh" => Some(Cow::Borrowed(tree_sitter_cuda::HIGHLIGHTS_QUERY)),
-        "kotlin" | "kt" | "kts" | "ktm" => None,
-        "ini" => Some(Cow::Borrowed(tree_sitter_ini::HIGHLIGHTS_QUERY)),
-        "powershell" | "ps1" | "psm1" | "psd1" => None,
-        "make" | "mk" | "makefile" => Some(Cow::Borrowed(tree_sitter_make::HIGHLIGHTS_QUERY)),
-        "markdown" | "md" | "mdown" | "mkd" => {
-            Some(Cow::Borrowed(tree_sitter_md::HIGHLIGHT_QUERY_BLOCK))
-        }
-        "markdown_inline" => Some(Cow::Borrowed(tree_sitter_md::HIGHLIGHT_QUERY_INLINE)),
-        "python" | "py" | "pyw" => Some(Cow::Borrowed(tree_sitter_python::HIGHLIGHTS_QUERY)),
-        "ruby" | "rb" => Some(Cow::Borrowed(tree_sitter_ruby::HIGHLIGHTS_QUERY)),
-        "rst" | "rest" => Some(Cow::Borrowed(RST_HIGHLIGHT_QUERY)),
-        "rust" | "rs" => Some(Cow::Borrowed(tree_sitter_rust::HIGHLIGHTS_QUERY)),
-        "scheme" | "scm" => Some(Cow::Borrowed(tree_sitter_scheme::HIGHLIGHTS_QUERY)),
-        "toml" => Some(Cow::Borrowed(tree_sitter_toml_ng::HIGHLIGHTS_QUERY)),
-        "typescript" | "ts" => Some(Cow::Owned(
-            [
-                tree_sitter_javascript::HIGHLIGHT_QUERY,
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
-            ]
-            .join("\n"),
-        )),
-        "tsx" => Some(Cow::Owned(
-            [
-                tree_sitter_javascript::HIGHLIGHT_QUERY,
-                tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
-            ]
-            .join("\n"),
-        )),
-        "yaml" | "yml" => Some(Cow::Borrowed(tree_sitter_yaml::HIGHLIGHTS_QUERY)),
-        _ => None,
-    }
-}
-
-fn injection_query_for(name: &str) -> Option<&'static str> {
-    match normalize_language_name(name).as_str() {
-        "html" | "htm" => Some(tree_sitter_html::INJECTIONS_QUERY),
-        "markdown" | "md" | "mdown" | "mkd" => Some(tree_sitter_md::INJECTION_QUERY_BLOCK),
-        "markdown_inline" => Some(tree_sitter_md::INJECTION_QUERY_INLINE),
-        _ => None,
-    }
-}
-
 fn style_for_capture(name: &str) -> Option<(Style, u8)> {
     if name.starts_with('_') || name.starts_with("injection.") || name.starts_with("local.") {
         return None;
@@ -1431,51 +1302,4 @@ fn style_for_capture(name: &str) -> Option<(Style, u8)> {
     };
 
     Some(style)
-}
-
-fn language_for(name: &str) -> Option<Language> {
-    match normalize_language_name(name).as_str() {
-        "bash" | "sh" | "shell" | "zsh" | "ignore" => Some(tree_sitter_bash::LANGUAGE.into()),
-        "c" | "h" => Some(tree_sitter_c::LANGUAGE.into()),
-        "caddy" | "caddyfile" => Some(tree_sitter_caddy::LANGUAGE.into()),
-        "cpp" | "c++" | "cc" | "cxx" | "hh" | "hpp" | "hxx" => {
-            Some(tree_sitter_cpp::LANGUAGE.into())
-        }
-        "css" | "scss" => Some(tree_sitter_css::LANGUAGE.into()),
-        "go" | "golang" => Some(tree_sitter_go::LANGUAGE.into()),
-        "html" | "htm" => Some(tree_sitter_html::LANGUAGE.into()),
-        "xml" | "xhtml" => Some(tree_sitter_xml::LANGUAGE_XML.into()),
-        "java" => Some(tree_sitter_java::LANGUAGE.into()),
-        "javascript" | "js" | "mjs" | "cjs" => Some(tree_sitter_javascript::LANGUAGE.into()),
-        "jsx" => Some(tree_sitter_javascript::LANGUAGE.into()),
-        "json" | "jsonc" | "json5" => Some(tree_sitter_json::LANGUAGE.into()),
-        "make" | "mk" | "makefile" => Some(tree_sitter_make::LANGUAGE.into()),
-        "powershell" | "ps1" | "psm1" | "psd1" => Some(tree_sitter_powershell::LANGUAGE.into()),
-        "hlsl" => Some(tree_sitter_hlsl::LANGUAGE_HLSL.into()),
-        "slang" => Some(tree_sitter_slang::LANGUAGE_SLANG.into()),
-        "cuda" | "cu" | "cuh" => Some(tree_sitter_cuda::LANGUAGE.into()),
-        "kotlin" | "kt" | "kts" | "ktm" => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
-        "markdown" | "md" | "mdown" | "mkd" => Some(tree_sitter_md::LANGUAGE.into()),
-        "markdown_inline" => Some(tree_sitter_md::INLINE_LANGUAGE.into()),
-        "python" | "py" | "pyw" => Some(tree_sitter_python::LANGUAGE.into()),
-        "ruby" | "rb" => Some(tree_sitter_ruby::LANGUAGE.into()),
-        "rst" | "rest" => Some(tree_sitter_rst::LANGUAGE.into()),
-        "rust" | "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
-        "scheme" | "scm" => Some(tree_sitter_scheme::LANGUAGE.into()),
-        "ini" => Some(tree_sitter_ini::LANGUAGE.into()),
-        "toml" => Some(tree_sitter_toml_ng::LANGUAGE.into()),
-        "typescript" | "ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
-        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
-        "yaml" | "yml" => Some(tree_sitter_yaml::LANGUAGE.into()),
-        _ => None,
-    }
-}
-
-fn normalize_language_name(name: &str) -> String {
-    name.trim()
-        .trim_start_matches('.')
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase()
 }

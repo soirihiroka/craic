@@ -33,6 +33,7 @@ const PREVIEW_POLL_MS: u64 = 30;
 pub type PreviewFn = for<'a> fn(PreviewRequest<'a>);
 pub type MatchPreviewFn = for<'a> fn(PreviewMatchRequest<'a>);
 
+#[derive(Clone, Copy)]
 pub struct Provider {
     pub show: PreviewFn,
     pub show_match: MatchPreviewFn,
@@ -83,79 +84,122 @@ impl<'a> PreviewMatchRequest<'a> {
 pub fn for_file(file_path: &str, info: &FileNodeInfo, prefetched_bytes: Option<&[u8]>) -> Provider {
     let is_file = info.kind.is_file();
     let is_dir = info.kind == FileKind::Directory;
-    let path_preview_kind = file_type::preview_kind_for_path(file_path, is_dir);
-    let preview_kind = if is_file
-        && path_preview_kind != file_type::PreviewKind::Sqlite
-        && prefetched_bytes.is_some_and(sqlite::has_sqlite_magic_bytes)
-    {
-        log::debug!("sqlite preview selected by magic file_path={file_path}");
-        file_type::PreviewKind::Sqlite
-    } else {
-        path_preview_kind
-    };
+    let preview_kind = file_type::detect_with_bytes(
+        file_path,
+        is_dir,
+        is_file.then_some(prefetched_bytes).flatten(),
+    )
+    .preview_kind;
 
     if preview_kind == file_type::PreviewKind::Sqlite {
         log::debug!("sqlite preview selected file_path={file_path}");
     }
 
-    match preview_kind {
-        file_type::PreviewKind::Folder => Provider {
-            show: folder::show,
-            show_match: folder::show_match,
-        },
-        file_type::PreviewKind::Notebook => Provider {
-            show: notebook::show,
-            show_match: notebook::show_match,
-        },
-        file_type::PreviewKind::Svg => Provider {
-            show: svg::show,
-            show_match: svg::show_match,
-        },
-        file_type::PreviewKind::Safetensors => Provider {
-            show: safetensors::show,
-            show_match: safetensors::show_match,
-        },
-        file_type::PreviewKind::Markdown => Provider {
-            show: markdown::show,
-            show_match: markdown::show_match,
-        },
-        file_type::PreviewKind::Rst => Provider {
-            show: markdown::show_rst,
-            show_match: markdown::show_rst_match,
-        },
-        file_type::PreviewKind::Html => Provider {
-            show: html::show,
-            show_match: html::show_match,
-        },
-        file_type::PreviewKind::Image => Provider {
-            show: media::show_image,
-            show_match: media::show_image_match,
-        },
-        file_type::PreviewKind::Audio => Provider {
-            show: media::show_audio,
-            show_match: media::show_audio_match,
-        },
-        file_type::PreviewKind::Video => Provider {
-            show: media::show_video,
-            show_match: media::show_video_match,
-        },
-        file_type::PreviewKind::Font => Provider {
-            show: font::show,
-            show_match: font::show_match,
-        },
-        file_type::PreviewKind::Pdf => Provider {
-            show: pdf::show,
-            show_match: pdf::show_match,
-        },
-        file_type::PreviewKind::Sqlite => Provider {
-            show: sqlite::show,
-            show_match: sqlite::show_match,
-        },
-        file_type::PreviewKind::Text => Provider {
-            show: text::show,
-            show_match: text::show_match,
-        },
-    }
+    const PROVIDERS: &[(file_type::PreviewKind, Provider)] = &[
+        (
+            file_type::PreviewKind::Folder,
+            Provider {
+                show: folder::show,
+                show_match: folder::show_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Notebook,
+            Provider {
+                show: notebook::show,
+                show_match: notebook::show_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Svg,
+            Provider {
+                show: svg::show,
+                show_match: svg::show_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Safetensors,
+            Provider {
+                show: safetensors::show,
+                show_match: safetensors::show_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Markdown,
+            Provider {
+                show: markdown::show,
+                show_match: markdown::show_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Rst,
+            Provider {
+                show: markdown::show_rst,
+                show_match: markdown::show_rst_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Html,
+            Provider {
+                show: html::show,
+                show_match: html::show_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Image,
+            Provider {
+                show: media::show_image,
+                show_match: media::show_image_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Audio,
+            Provider {
+                show: media::show_audio,
+                show_match: media::show_audio_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Video,
+            Provider {
+                show: media::show_video,
+                show_match: media::show_video_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Font,
+            Provider {
+                show: font::show,
+                show_match: font::show_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Pdf,
+            Provider {
+                show: pdf::show,
+                show_match: pdf::show_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Sqlite,
+            Provider {
+                show: sqlite::show,
+                show_match: sqlite::show_match,
+            },
+        ),
+        (
+            file_type::PreviewKind::Text,
+            Provider {
+                show: text::show,
+                show_match: text::show_match,
+            },
+        ),
+    ];
+
+    PROVIDERS
+        .iter()
+        .find_map(|(kind, provider)| (*kind == preview_kind).then_some(*provider))
+        .expect("every preview kind has a provider")
 }
 
 pub fn spawn_preview_load<T, Work, Apply>(

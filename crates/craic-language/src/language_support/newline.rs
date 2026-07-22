@@ -1,12 +1,12 @@
 const INDENT_UNIT: &str = "    ";
 
-static PLAIN_TEXT_NEWLINE: PlainTextNewline = PlainTextNewline;
-static RUST_NEWLINE: RustNewline = RustNewline;
+pub(super) static PLAIN_TEXT_NEWLINE: PlainTextNewline = PlainTextNewline;
+pub(super) static RUST_NEWLINE: RustNewline = RustNewline;
 
 pub struct NewlineContext<'a> {
     pub text: &'a str,
     pub cursor: usize,
-    pub language: &'a str,
+    pub language: &'static super::LanguageSupport,
 }
 
 pub struct EnterNewline {
@@ -14,7 +14,7 @@ pub struct EnterNewline {
     pub cursor: usize,
 }
 
-trait NewlineService {
+pub trait NewlineService: Sync {
     fn indent_for_newline(&self, text: &str, cursor: usize) -> String {
         current_line_indent(text, cursor).to_string()
     }
@@ -22,25 +22,21 @@ trait NewlineService {
 
 pub fn enter_newline(context: NewlineContext<'_>) -> EnterNewline {
     let cursor = previous_char_boundary(context.text, context.cursor);
-    let indent = service_for_language(context.language).indent_for_newline(context.text, cursor);
+    let indent = context
+        .language
+        .newline
+        .indent_for_newline(context.text, cursor);
     let inserted = format!("\n{indent}");
     let cursor = cursor + inserted.len();
 
     EnterNewline { inserted, cursor }
 }
 
-fn service_for_language(language: &str) -> &'static dyn NewlineService {
-    match normalize_language_name(language).as_str() {
-        "rust" | "rs" => &RUST_NEWLINE,
-        _ => &PLAIN_TEXT_NEWLINE,
-    }
-}
-
-struct PlainTextNewline;
+pub(super) struct PlainTextNewline;
 
 impl NewlineService for PlainTextNewline {}
 
-struct RustNewline;
+pub(super) struct RustNewline;
 
 impl NewlineService for RustNewline {
     fn indent_for_newline(&self, text: &str, cursor: usize) -> String {
@@ -235,10 +231,6 @@ fn previous_char_boundary(text: &str, mut offset: usize) -> usize {
         offset -= 1;
     }
     offset
-}
-
-fn normalize_language_name(language: &str) -> String {
-    language.trim().to_ascii_lowercase()
 }
 
 fn is_identifier_start(ch: char) -> bool {

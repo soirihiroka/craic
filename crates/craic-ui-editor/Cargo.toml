@@ -11,6 +11,7 @@ editor-bench = []
 adw.workspace = true
 craic-config.workspace = true
 craic-language.workspace = true
+craic-file-support.workspace = true
 craic-text-layout.workspace = true
 craic-ui-core.workspace = true
 craic-vcs.workspace = true
