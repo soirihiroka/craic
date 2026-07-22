@@ -141,9 +141,11 @@ fn startup_navigation_args(args: &[OsString]) -> Result<StartupWorkspaceArg, Str
 
     let provider = provider.ok_or_else(|| "Missing --workspace-provider.".to_string())?;
     let workspace_path = workspace_path.ok_or_else(|| "Missing --workspace-path.".to_string())?;
-    let open_path = open_path.ok_or_else(|| "Missing --open-path.".to_string())?;
     if column.is_some() && line.is_none() {
         return Err("--column requires --line.".to_string());
+    }
+    if line.is_some() && open_path.is_none() {
+        return Err("--line requires --open-path.".to_string());
     }
 
     let provider = match provider.as_str() {
@@ -173,11 +175,7 @@ fn startup_navigation_args(args: &[OsString]) -> Result<StartupWorkspaceArg, Str
             display_name: None,
             color: None,
         }),
-        open_location: Some(craic_ui::StartupOpenLocation {
-            path: open_path,
-            line,
-            column,
-        }),
+        open_location: open_path.map(|path| craic_ui::StartupOpenLocation { path, line, column }),
         error: None,
     })
 }

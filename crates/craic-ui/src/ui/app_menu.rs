@@ -1,6 +1,6 @@
 use super::dialogs::show_error_dialog;
 use super::shortcuts::show_shortcuts_window;
-use crate::config::ConfiguredWorkspace;
+use crate::config::{ConfiguredWorkspace, WorkspaceProvider};
 use adw::prelude::*;
 use gtk::gio;
 use std::path::{Path, PathBuf};
@@ -74,8 +74,38 @@ fn launch_new_instance() -> Result<(), String> {
     launch_new_instance_with_workspace(None)
 }
 
-pub(in crate::ui) fn launch_workspace_in_new_instance(workspace_path: &Path) -> Result<(), String> {
-    launch_new_instance_with_workspace(Some(workspace_path))
+pub(in crate::ui) fn launch_workspace_in_new_instance(
+    workspace: &ConfiguredWorkspace,
+) -> Result<(), String> {
+    let executable = resolve_new_instance_executable()?;
+    let workspace_path = match &workspace.provider {
+        WorkspaceProvider::Local => {
+            let path = crate::config::expand_config_path_for_ui(&workspace.path)
+                .unwrap_or_else(|| PathBuf::from(&workspace.path));
+            if !path.exists() {
+                return Err(format!("Workspace path does not exist: {}", path.display()));
+            }
+            path.canonicalize()
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string()
+        }
+        WorkspaceProvider::Ssh { .. } => workspace.path.clone(),
+    };
+    log::info!(
+        "launching new Craic window executable={} provider={} workspace={}",
+        executable.display(),
+        workspace.provider_id(),
+        workspace_path
+    );
+
+    let mut command = Command::new(&executable);
+    command
+        .arg("--workspace-provider")
+        .arg(workspace.provider_id())
+        .arg("--workspace-path")
+        .arg(workspace_path);
+    spawn_new_instance(command, &executable)
 }
 
 pub(in crate::ui) fn launch_workspace_location_in_new_instance(
