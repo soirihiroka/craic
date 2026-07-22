@@ -6,7 +6,7 @@ use super::{
 };
 use crate::git::WorkspaceSnapshot;
 use crate::system::WorkspacePath;
-use crate::system::capabilities::shell::ShellCommandSpec;
+use crate::system::capabilities::shell::{ShellCommandActivity, ShellCommandSpec};
 use crate::ui::components::context_menu::{self, ActionMenuItem, ActionMenuSection};
 use crate::ui::components::search::SearchPanel;
 use crate::ui::components::tree_view::{self, IconRow, TreeRenderState, TreeRenderer, TreeRow};
@@ -1968,13 +1968,15 @@ fn docker_logs_command(ctx: &PageContext, container_id: &str) -> Result<ShellCom
     let Some(docker) = ctx.docker() else {
         return Err("Docker is unavailable for this workspace.".to_string());
     };
-    docker.docker_command(
-        &["logs", "--tail", "1000", "-f", container_id]
-            .into_iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        None,
-    )
+    docker
+        .docker_command(
+            &["logs", "--tail", "1000", "-f", container_id]
+                .into_iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            None,
+        )
+        .map(|command| command.activity(ShellCommandActivity::LogStream))
 }
 
 fn docker_shell_command(ctx: &PageContext, container_id: &str) -> Result<ShellCommandSpec, String> {
@@ -2003,7 +2005,9 @@ fn compose_terminal_command(
         .as_ref()
         .map(|path| WorkspacePath::from_absolute(path.clone()))
         .unwrap_or_else(|| ctx.workspace_ref().root);
-    docker_access.docker_command(&docker::compose_args(compose, args), Some(&working_dir))
+    docker_access
+        .docker_command(&docker::compose_args(compose, args), Some(&working_dir))
+        .map(|command| command.activity(ShellCommandActivity::LogStream))
 }
 
 fn validate_selection(

@@ -1,5 +1,5 @@
 use crate::system::capabilities::docker::{ComposeFileAction, DockerAccess};
-use crate::system::capabilities::shell::ShellCommandSpec;
+use crate::system::capabilities::shell::{ShellCommandActivity, ShellCommandSpec};
 use crate::system::path::{WorkspacePath, WorkspaceRef};
 use crate::system::providers::ssh::shell_quote;
 use std::path::Path;
@@ -111,7 +111,8 @@ impl DockerAccess for LocalDockerAccess {
                 .arg("logs")
                 .arg("--tail")
                 .arg("1000")
-                .arg("-f"),
+                .arg("-f")
+                .activity(ShellCommandActivity::LogStream),
             ComposeFileAction::Up => ShellCommandSpec::new("docker", self.workspace.root.clone())
                 .arg("compose")
                 .arg("-f")
