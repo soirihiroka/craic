@@ -15,6 +15,7 @@ cairo = { package = "cairo-rs", version = "0.22", features = ["freetype"] }
 criterion = "0.7"
 craic-agent = { path = "crates/craic-agent" }
 craic-config = { path = "crates/craic-config" }
+craic-dynamic-data = { path = "crates/craic-dynamic-data" }
 craic-language = { path = "crates/craic-language" }
 craic-project = { path = "crates/craic-project" }
 craic-system = { path = "crates/craic-system" }
@@ -25,6 +26,7 @@ craic-ui-agent = { path = "crates/craic-ui-agent" }
 craic-ui-containers = { path = "crates/craic-ui-containers" }
 craic-ui-editor = { path = "crates/craic-ui-editor" }
 craic-ui-file = { path = "crates/craic-ui-file" }
+craic-ui-object-viewer = { path = "crates/craic-ui-object-viewer" }
 craic-ui-preview = { path = "crates/craic-ui-preview" }
 craic-ui-terminal = { path = "crates/craic-ui-terminal" }
 craic-ui-vcs = { path = "crates/craic-ui-vcs" }
@@ -39,6 +41,7 @@ gtk4 = { version = "0.11", features = ["v4_10"] }
 libc = "0.2"
 libpanel = "0.7"
 log = "0.4"
+jsonc-parser = { version = "0.33.0", features = ["error_unicode_width", "serde"] }
 moka = { version = "0.12", default-features = false, features = ["sync"] }
 nbformat = "3.0.0"
 pango = { version = "0.22", features = ["v1_56"] }
@@ -48,11 +51,13 @@ pulldown-cmark = "0.13"
 regex = "1"
 reqwest = { version = "0.13.4", features = ["blocking"] }
 rayon = "1.11"
+rst_parser = "0.4"
+rst_renderer = "0.4"
 rumdl = { version = "0.2.27", default-features = false }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 safetensors = "0.8.0"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 skia-safe = { version = "0.99", default-features = false, features = ["binary-cache", "embed-icudtl", "gl", "egl", "wayland", "svg", "textlayout"] }
 sourceview5 = "0.11.0"
 syntect = "5"
@@ -77,7 +82,9 @@ tree-sitter-md = "0.5"
 tree-sitter-powershell = "0.26"
 tree-sitter-python = "0.25"
 tree-sitter-ruby = "0.23"
+tree-sitter-rst = "0.2"
 tree-sitter-rust = "0.24"
+tree-sitter-scheme = "0.24"
 tree-sitter-slang = "0.3"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-typescript = "0.23"

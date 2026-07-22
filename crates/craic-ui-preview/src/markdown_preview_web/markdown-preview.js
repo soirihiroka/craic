@@ -24,6 +24,11 @@
     return Math.min(max, Math.max(min, value));
   }
 
+  function sourceLength() {
+    const length = Number.parseInt(document.body?.dataset.sourceLength ?? "", 10);
+    return Number.isFinite(length) && length > 0 ? length : null;
+  }
+
   const maxOvershootDistance = 100;
   const overshootDecay = 0.80;
   const overshootEdges = ["top", "bottom", "left", "right"];
@@ -187,7 +192,12 @@
 
   function yForSourceOffset(offset) {
     const anchors = sourceAnchors();
-    if (anchors.length === 0) return null;
+    if (anchors.length === 0) {
+      const length = sourceLength();
+      const target = Number(offset);
+      if (length === null || !Number.isFinite(target)) return null;
+      return clamp(target / length, 0, 1) * scrollMetrics().maxY;
+    }
 
     const target = Number(offset);
     if (!Number.isFinite(target) || target <= anchors[0].offset) return anchors[0].y;
@@ -207,7 +217,14 @@
 
   function sourceOffsetForY(y) {
     const anchors = sourceAnchors();
-    if (anchors.length === 0) return null;
+    if (anchors.length === 0) {
+      const length = sourceLength();
+      const target = Number(y);
+      const maxY = scrollMetrics().maxY;
+      if (length === null || !Number.isFinite(target)) return null;
+      if (maxY <= Number.EPSILON) return 0;
+      return Math.round(clamp(target / maxY, 0, 1) * length);
+    }
 
     const target = Number(y);
     if (!Number.isFinite(target) || target <= anchors[0].y) return anchors[0].offset;

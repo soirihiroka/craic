@@ -633,6 +633,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "craic-dynamic-data"
+version = "0.1.0"
+dependencies = [
+ "jsonc-parser",
+ "serde_json",
+]
+
+[[package]]
 name = "craic-language"
 version = "0.1.0"
 dependencies = [
@@ -659,8 +667,10 @@ dependencies = [
  "tree-sitter-md",
  "tree-sitter-powershell",
  "tree-sitter-python",
+ "tree-sitter-rst",
  "tree-sitter-ruby",
  "tree-sitter-rust",
+ "tree-sitter-scheme",
  "tree-sitter-slang",
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
@@ -809,11 +819,13 @@ name = "craic-ui-file"
 version = "0.1.0"
 dependencies = [
  "craic-config",
+ "craic-dynamic-data",
  "craic-language",
  "craic-project",
  "craic-system",
  "craic-ui-core",
  "craic-ui-editor",
+ "craic-ui-object-viewer",
  "craic-ui-preview",
  "craic-vcs",
  "glycin",
@@ -826,6 +838,15 @@ dependencies = [
  "serde_json",
  "uuid",
  "webkit6",
+]
+
+[[package]]
+name = "craic-ui-object-viewer"
+version = "0.1.0"
+dependencies = [
+ "craic-dynamic-data",
+ "gtk4",
+ "serde_json",
 ]
 
 [[package]]
@@ -843,6 +864,8 @@ dependencies = [
  "poppler-rs",
  "pulldown-cmark",
  "regex",
+ "rst_parser",
+ "rst_renderer",
  "webkit6",
 ]
 
@@ -1038,6 +1061,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
  "libloading",
+]
+
+[[package]]
+name = "document_tree"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6742722dd3e6cd908bc522283cb5502e25f696d1c9904fb251ec266b6b3f9cce"
+dependencies = [
+ "anyhow",
+ "regex",
+ "serde",
+ "serde_derive",
+ "url",
 ]
 
 [[package]]
@@ -2332,6 +2368,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonc-parser"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "362fdb0bfedf94ebd31e4e82ff38ba705b6b82417b3b25f0c4bbb024dd11f552"
+dependencies = [
+ "serde",
+ "unicode-width",
+]
+
+[[package]]
 name = "jupyter-protocol"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2799,6 +2845,48 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "pest"
+version = "2.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47627dd7305c6a2d6c8c6bcd24c5a4c17dbbf425f4f9c5313e724b38fc9782e9"
+dependencies = [
+ "memchr",
+ "ucd-trie",
+]
+
+[[package]]
+name = "pest_derive"
+version = "2.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b4254325ecad416ab689e27ba51da03ba01a9632bc6e108f5fe7c3c4ad29d58"
+dependencies = [
+ "pest",
+ "pest_generator",
+]
+
+[[package]]
+name = "pest_generator"
+version = "2.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c4c0e91ead7a8f7acecbca6f003fc2e8282b1dbe2dd9c9d2f16aba42995e0a7"
+dependencies = [
+ "pest",
+ "pest_meta",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "pest_meta"
+version = "2.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9744bc48116fee06334924bb5f2bad41eed5e89bd26e29b0b799f9a3f82c210"
+dependencies = [
+ "pest",
+]
 
 [[package]]
 name = "phf"
@@ -3307,6 +3395,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "rst_parser"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f3029872a42c0be67d86e3e88bf8c1e73d1da3d714da00b9c29f60a4605bfb1"
+dependencies = [
+ "anyhow",
+ "document_tree",
+ "pest",
+ "pest_derive",
+]
+
+[[package]]
+name = "rst_renderer"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf982408766e5055367c60382b78dcee50c83b2b731e036a8b510e0aedf1efa1"
+dependencies = [
+ "anyhow",
+ "document_tree",
+ "serde-xml-rs",
+ "serde_json",
+]
+
+[[package]]
 name = "rumdl"
 version = "0.2.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3555,6 +3667,18 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-xml-rs"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65162e9059be2f6a3421ebbb4fef3e74b7d9e7c60c50a0e292c6239f19f1edfa"
+dependencies = [
+ "log",
+ "serde",
+ "thiserror 1.0.69",
+ "xml-rs",
 ]
 
 [[package]]
@@ -4384,6 +4508,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-rst"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5dfcdcad099da73915f36bf5fa5be7e81d1e7ffaa38913d7189697cc6ea177d7"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-ruby"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4398,6 +4532,16 @@ name = "tree-sitter-rust"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-scheme"
+version = "0.24.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7e7f156bdf38145f26705d1733185698845307d3e9d9c071ecce4375575131"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -4482,6 +4626,12 @@ dependencies = [
  "dictgen",
  "phf",
 ]
+
+[[package]]
+name = "ucd-trie"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
 
 [[package]]
 name = "uds_windows"

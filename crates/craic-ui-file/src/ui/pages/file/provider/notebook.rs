@@ -712,7 +712,8 @@ fn readonly_markdown_cell(source: &str, base_uri: Option<&str>) -> gtk::Widget {
         source.len(),
         visible_markdown_line_count(source)
     );
-    let html = markdown_preview_web::markdown_document_html(source);
+    let fragment = markdown_preview_web::markdown_fragment_html(source);
+    let html = markdown_preview_web::html_document(&fragment, source.len());
     let web_view = webkit6::WebView::new();
     web_view.set_hexpand(true);
     web_view.set_vexpand(false);

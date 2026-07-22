@@ -1,0 +1,9 @@
+[package]
+name = "craic-dynamic-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jsonc-parser.workspace = true
+serde_json.workspace = true

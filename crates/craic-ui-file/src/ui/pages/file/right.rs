@@ -6,6 +6,8 @@ use crate::spellcheck::SpellcheckIssue;
 use crate::system::FileNodePath;
 use crate::ui::content::{binary_preview, code_editor, folder_view};
 use adw::prelude::*;
+use craic_dynamic_data::{TextFormat, parse_text};
+use craic_ui_object_viewer::ObjectViewer;
 use craic_ui_preview::markdown_preview::MarkdownPreview as AdwMarkdownPreview;
 use std::cell::{Cell, RefCell};
 use std::path::Path;
@@ -23,6 +25,12 @@ enum PreviewLoadingKind {
     Editor,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileViewKind {
+    Csv,
+    DynamicData(TextFormat),
+}
+
 #[derive(Clone, Debug)]
 struct PendingPreviewLoading {
     token: PreviewLoadToken,
@@ -38,6 +46,8 @@ pub struct RightPane {
     subtitle_label: gtk::Label,
     file_view_mode_switcher: gtk::Box,
     file_code_button: gtk::ToggleButton,
+    file_view_button: gtk::ToggleButton,
+    file_view_kind: Rc<Cell<Option<FileViewKind>>>,
     stack: gtk::Stack,
     preview_generation: Cell<u64>,
     pending_preview_loading: RefCell<Option<PendingPreviewLoading>>,
@@ -59,6 +69,7 @@ pub struct RightPane {
     pub file_pdf_preview: binary_preview::BinaryPreviewWidgets,
     pub file_sqlite_preview: Rc<super::provider::sqlite::SqlitePreview>,
     file_csv_preview: Rc<super::provider::csv::CsvPreview>,
+    file_object_preview: Rc<ObjectViewer>,
     pub file_safetensors_metadata_preview: gtk::TextView,
     status_label: gtk::Label,
 }
@@ -87,10 +98,11 @@ impl RightPane {
             .label("Code")
             .active(true)
             .build();
-        let file_table_button = gtk::ToggleButton::builder()
+        let file_view_button = gtk::ToggleButton::builder()
             .label("Table")
             .group(&file_code_button)
             .build();
+        let file_view_kind = Rc::new(Cell::new(None));
         let file_view_mode_switcher = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .valign(gtk::Align::Center)
@@ -98,7 +110,7 @@ impl RightPane {
             .build();
         file_view_mode_switcher.add_css_class("linked");
         file_view_mode_switcher.append(&file_code_button);
-        file_view_mode_switcher.append(&file_table_button);
+        file_view_mode_switcher.append(&file_view_button);
 
         let header = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -121,7 +133,7 @@ impl RightPane {
         let file_html_preview = super::provider::html::HtmlPreview::new();
         let file_markdown_preview = AdwMarkdownPreview::new();
         let markdown_status_label = gtk::Label::builder()
-            .label("No markdown preview.")
+            .label("No rendered preview.")
             .halign(gtk::Align::Center)
             .valign(gtk::Align::Center)
             .wrap(true)
@@ -144,6 +156,7 @@ impl RightPane {
         let file_pdf_preview = binary_preview::BinaryPreviewWidgets::new("PDF");
         let file_sqlite_preview = super::provider::sqlite::SqlitePreview::new();
         let file_csv_preview = super::provider::csv::CsvPreview::new();
+        let file_object_preview = ObjectViewer::new();
         install_markdown_scroll_sync(&file_editor, &file_markdown_preview);
         let file_safetensors_metadata_preview = gtk::TextView::builder()
             .editable(false)
@@ -221,6 +234,7 @@ impl RightPane {
         stack.add_named(&file_pdf_preview.root, Some("pdf"));
         stack.add_named(&file_sqlite_preview.root, Some("sqlite"));
         stack.add_named(&file_csv_preview.root, Some("csv-table"));
+        stack.add_named(&file_object_preview.root, Some("object-view"));
         stack.add_named(&status_box, Some("status"));
         stack.add_named(&provider_loading, Some("provider-loading"));
         stack.set_visible_child_name("folder");
@@ -228,25 +242,50 @@ impl RightPane {
         file_code_button.connect_toggled({
             let stack = stack.clone();
             let switcher = file_view_mode_switcher.clone();
+            let view_kind = Rc::clone(&file_view_kind);
 
             move |button| {
                 if button.is_active() && switcher.is_visible() {
-                    log::debug!("csv preview display mode changed mode=code");
+                    log::debug!(
+                        "file preview display mode changed kind={:?} mode=code",
+                        view_kind.get()
+                    );
                     stack.set_visible_child_name("editor");
                 }
             }
         });
-        file_table_button.connect_toggled({
+        file_view_button.connect_toggled({
             let editor = file_editor.clone();
-            let preview = Rc::clone(&file_csv_preview);
+            let csv_preview = Rc::clone(&file_csv_preview);
+            let object_preview = Rc::clone(&file_object_preview);
             let stack = stack.clone();
             let switcher = file_view_mode_switcher.clone();
+            let view_kind = Rc::clone(&file_view_kind);
 
             move |button| {
-                if button.is_active() && switcher.is_visible() {
-                    log::debug!("csv preview display mode changed mode=table");
-                    preview.set_source(&editor.document_text());
-                    stack.set_visible_child_name("csv-table");
+                if !button.is_active() || !switcher.is_visible() {
+                    return;
+                }
+                let Some(kind) = view_kind.get() else {
+                    return;
+                };
+                let source = editor.document_text();
+                log::debug!("file preview display mode changed kind={kind:?} mode=view");
+                match kind {
+                    FileViewKind::Csv => {
+                        csv_preview.set_source(&source);
+                        stack.set_visible_child_name("csv-table");
+                    }
+                    FileViewKind::DynamicData(format) => {
+                        match parse_text(format, &source) {
+                            Ok(document) => object_preview.set_document(document),
+                            Err(error) => {
+                                log::warn!("structured data preview parse failed: {error}");
+                                object_preview.show_error(&error);
+                            }
+                        }
+                        stack.set_visible_child_name("object-view");
+                    }
                 }
             }
         });
@@ -265,6 +304,8 @@ impl RightPane {
             subtitle_label,
             file_view_mode_switcher,
             file_code_button,
+            file_view_button,
+            file_view_kind,
             stack,
             preview_generation: Cell::new(0),
             pending_preview_loading: RefCell::new(None),
@@ -286,6 +327,7 @@ impl RightPane {
             file_pdf_preview,
             file_sqlite_preview,
             file_csv_preview,
+            file_object_preview,
             file_safetensors_metadata_preview,
             status_label,
         }
@@ -444,7 +486,19 @@ impl RightPane {
             .set_markdown_lint_issues(markdown_lint_issues);
         self.file_editor.set_spellcheck_issues(spellcheck_issues);
         self.clear_auxiliary_previews();
-        self.file_view_mode_switcher.set_visible(language == "csv");
+        let view_kind = if language == "csv" {
+            Some(FileViewKind::Csv)
+        } else {
+            TextFormat::for_path(file_path).map(FileViewKind::DynamicData)
+        };
+        if let Some(view_kind) = view_kind {
+            self.file_view_button.set_label(match view_kind {
+                FileViewKind::Csv => "Table",
+                FileViewKind::DynamicData(_) => "View",
+            });
+            self.file_view_kind.set(Some(view_kind));
+            self.file_view_mode_switcher.set_visible(true);
+        }
     }
 
     pub fn show_media_preview(&self, file_path: &str, _subtitle: &str) {
@@ -582,21 +636,23 @@ impl RightPane {
         self.file_editor.clear_file_diff();
         self.file_editor.set_markdown_lint_issues(Vec::new());
         self.file_editor.set_spellcheck_issues(Vec::new());
-        self.clear_csv_preview();
+        self.clear_file_view_previews();
     }
 
     fn clear_auxiliary_previews(&self) {
         self.file_media_preview.clear();
         self.file_sqlite_preview.clear();
-        self.clear_csv_preview();
+        self.clear_file_view_previews();
         self.file_notebook_preview.clear();
         self.file_safetensors_metadata_preview.buffer().set_text("");
     }
 
-    fn clear_csv_preview(&self) {
+    fn clear_file_view_previews(&self) {
         self.file_view_mode_switcher.set_visible(false);
         self.file_code_button.set_active(true);
+        self.file_view_kind.set(None);
         self.file_csv_preview.clear();
+        self.file_object_preview.clear();
     }
 
     fn set_title(&self, file_path: &str, subtitle: &str) {

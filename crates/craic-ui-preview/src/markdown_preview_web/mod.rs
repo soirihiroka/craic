@@ -11,7 +11,7 @@ const GITHUB_MARKDOWN_CSS: &str = include_str!("github-markdown.css");
 const APP_INTEGRATION_CSS: &str = include_str!("app-integration.css");
 pub const SOURCE_MAP_SCRIPT: &str = include_str!("markdown-preview.js");
 
-pub fn markdown_document_html(markdown: &str) -> String {
+pub fn html_document(fragment: &str, source_len: usize) -> String {
     let mut document = String::new();
     document.push_str("<!doctype html>\n<html><head><meta charset=\"utf-8\">");
     document.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
@@ -19,8 +19,10 @@ pub fn markdown_document_html(markdown: &str) -> String {
     document.push_str(GITHUB_MARKDOWN_CSS);
     document.push_str("</style><style>");
     document.push_str(APP_INTEGRATION_CSS);
-    document.push_str("</style></head><body class=\"markdown-body\">");
-    document.push_str(&markdown_fragment_html(markdown));
+    document.push_str(&format!(
+        "</style></head><body class=\"markdown-body\" data-source-length=\"{source_len}\">"
+    ));
+    document.push_str(fragment);
     document.push_str("</body></html>");
     document
 }
@@ -436,7 +438,7 @@ fn sanitize_class(language: &str) -> String {
     class
 }
 
-fn escape_html(input: &str) -> String {
+pub(crate) fn escape_html(input: &str) -> String {
     input
         .replace('&', "&amp;")
         .replace('<', "&lt;")

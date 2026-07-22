@@ -12,7 +12,7 @@ Editing and files
 
 The file browser and editor provide syntax highlighting, spellchecking,
 Markdown linting, search, and common file operations. Craic can preview
-Markdown, SVG, PDF, images, audio, video, SQLite databases, Jupyter notebooks,
+Markdown, reStructuredText, SVG, PDF, images, audio, video, SQLite databases, Jupyter notebooks,
 fonts, and SafeTensors metadata without leaving the application.
 
 Git hosting and changes

@@ -119,6 +119,10 @@ pub fn for_file(file_path: &str, info: &FileNodeInfo, prefetched_bytes: Option<&
             show: markdown::show,
             show_match: markdown::show_match,
         },
+        file_type::PreviewKind::Rst => Provider {
+            show: markdown::show_rst,
+            show_match: markdown::show_rst_match,
+        },
         file_type::PreviewKind::Html => Provider {
             show: html::show,
             show_match: html::show_match,
