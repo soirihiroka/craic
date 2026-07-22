@@ -72,7 +72,9 @@ mod tests {
             });
         }
 
-        let mut child = command.spawn().expect("isolated terminal process should start");
+        let mut child = command
+            .spawn()
+            .expect("isolated terminal process should start");
         let session_leader = child.id() as libc::pid_t;
         let stdout = child.stdout.take().expect("terminal process stdout");
         let program_pid = BufReader::new(stdout)
@@ -97,6 +99,44 @@ mod tests {
             wait_for_process_exit(program_pid, Duration::from_secs(2)),
             "program in the terminal process group remained alive after close"
         );
+    }
+
+    #[test]
+    fn terminal_close_terminates_distinct_foreground_and_session_leader_groups() {
+        let mut session_leader = isolated_sleep_process();
+        let mut foreground = isolated_sleep_process();
+        let session_leader_pid = session_leader.pgid;
+        let foreground_pid = foreground.pgid;
+
+        signal_terminal_process_groups(session_leader_pid, Some(foreground_pid), libc::SIGHUP);
+
+        assert!(
+            wait_for_child_exit(&mut foreground.child, Duration::from_secs(2)),
+            "foreground terminal process group remained alive after close"
+        );
+        assert!(
+            wait_for_child_exit(&mut session_leader.child, Duration::from_secs(2)),
+            "terminal session leader process group remained alive after close"
+        );
+    }
+
+    fn isolated_sleep_process() -> ProcessGroupGuard {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command
+            .spawn()
+            .expect("isolated terminal process should start");
+        let pgid = child.id() as libc::pid_t;
+        ProcessGroupGuard { child, pgid }
     }
 
     fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {

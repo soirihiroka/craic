@@ -1,5 +1,5 @@
-use crate::ui::components::terminal::{TerminalActivation, TerminalFileActivation};
 use crate::process::signal_terminal_process_groups;
+use crate::ui::components::terminal::{TerminalActivation, TerminalFileActivation};
 use craic_ui_core::ui::{canvas_scroll, components::context_menu};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib, pango};
