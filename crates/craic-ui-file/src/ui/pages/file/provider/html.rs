@@ -67,7 +67,9 @@ fn show_html(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
     let local_path = request.local_path.map(Path::to_path_buf);
     let disk_signature = super::disk_signature(request.info);
     let writable = request.info.capabilities.writable;
-    let language = crate::ui::content::code_editor::language_hint_from_path(&file_path);
+    let language = craic_language::language_support_for_id(
+        crate::ui::file_type::detect(&file_path, false).language,
+    );
     let comparison_right = Rc::clone(&request.right);
     let comparison_token = request.load_token;
 
@@ -82,7 +84,7 @@ fn show_html(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
                     text.as_str(),
                 )]);
                 let spellcheck_issues = crate::spellcheck::check_document(
-                    &language,
+                    language,
                     Some(&file_path),
                     &text,
                     &allowlist,

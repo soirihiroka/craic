@@ -917,36 +917,19 @@ impl BrowserTarget {
             return Vec::new();
         }
 
-        if is_dockerfile_path(&self.path) {
-            return vec![ContainerFileAction::BuildImage];
-        }
-
-        if is_compose_file_path(&self.path) {
-            return vec![
+        match crate::ui::file_type::detect(&self.path, false).role {
+            Some(crate::ui::file_type::FileRole::Dockerfile) => {
+                vec![ContainerFileAction::BuildImage]
+            }
+            Some(crate::ui::file_type::FileRole::Compose) => vec![
                 ContainerFileAction::ComposeUp,
                 ContainerFileAction::ComposePull,
                 ContainerFileAction::ComposeRestart,
                 ContainerFileAction::ComposeDown,
-            ];
+            ],
+            None => Vec::new(),
         }
-
-        Vec::new()
     }
-}
-
-fn is_dockerfile_path(path: &str) -> bool {
-    let name = file_name(path);
-    name == "Dockerfile" || name.starts_with("Dockerfile.") || name == "Containerfile"
-}
-
-fn is_compose_file_path(path: &str) -> bool {
-    let name = file_name(path).to_ascii_lowercase();
-    is_compose_file_name(&name)
-}
-
-fn is_compose_file_name(name: &str) -> bool {
-    matches!(name, "compose.yml" | "compose.yaml")
-        || (name.contains("docker-compose") && (name.ends_with(".yml") || name.ends_with(".yaml")))
 }
 
 enum TreeScrollTarget {

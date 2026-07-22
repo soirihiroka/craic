@@ -22,6 +22,7 @@ pub struct ChangesPanel {
     summary_entry: gtk::Entry,
     generate_button: gtk::Button,
     commit_button: gtk::Button,
+    files_stack: gtk::Stack,
     search_panel: SearchPanel,
     select_all_check: gtk::CheckButton,
     select_all_label: gtk::Label,
@@ -123,9 +124,14 @@ impl ChangesPanel {
         files_box.append(&search_panel.widget());
         files_box.append(&files_content);
 
+        let files_stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
+        files_stack.add_named(&files_box, Some("files"));
+        files_stack.add_named(&clean_status_page, Some("clean"));
+        files_stack.set_visible_child_name("files");
+
         let content = gtk::Paned::new(gtk::Orientation::Vertical);
         content.set_vexpand(true);
-        content.set_start_child(Some(&files_box));
+        content.set_start_child(Some(&files_stack));
         content.set_end_child(Some(&commit_panel.root));
         content.set_resize_start_child(true);
         content.set_shrink_start_child(false);
@@ -136,7 +142,6 @@ impl ChangesPanel {
         let root = gtk::Stack::builder().hexpand(true).vexpand(true).build();
         root.add_named(&content, Some("content"));
         root.add_named(&status_page, Some("status"));
-        root.add_named(&clean_status_page, Some("clean"));
         root.set_visible_child_name("content");
 
         let panel = Self {
@@ -147,6 +152,7 @@ impl ChangesPanel {
             summary_entry: commit_panel.summary_entry.clone(),
             generate_button: commit_panel.generate_button.clone(),
             commit_button: commit_panel.commit_button.clone(),
+            files_stack,
             search_panel,
             select_all_check,
             select_all_label,
@@ -172,6 +178,7 @@ impl ChangesPanel {
         }
 
         self.root.set_visible_child_name("content");
+        self.files_stack.set_visible_child_name("files");
         let signature = file_signature(snapshot);
         if *self.file_signature.borrow() != signature {
             let selected = self.selected_file_path();
@@ -200,7 +207,8 @@ impl ChangesPanel {
         self.search_query.borrow_mut().clear();
         self.checked_paths.borrow_mut().clear();
         self.search_panel.set_query("", false);
-        self.root.set_visible_child_name("clean");
+        self.root.set_visible_child_name("content");
+        self.files_stack.set_visible_child_name("clean");
         log::debug!(
             "changes panel showing clean status workspace={} branch={}",
             snapshot.name,
@@ -266,6 +274,7 @@ impl ChangesPanel {
 
     pub fn clear(&self) {
         self.root.set_visible_child_name("content");
+        self.files_stack.set_visible_child_name("files");
         let mut rows = self.file_rows.borrow_mut();
         clear_changed_files(&self.files_list, &mut rows);
         self.file_signature.borrow_mut().clear();

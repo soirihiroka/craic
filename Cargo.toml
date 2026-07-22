@@ -16,6 +16,7 @@ criterion = "0.7"
 craic-agent = { path = "crates/craic-agent" }
 craic-config = { path = "crates/craic-config" }
 craic-dynamic-data = { path = "crates/craic-dynamic-data" }
+craic-file-support = { path = "crates/craic-file-support" }
 craic-language = { path = "crates/craic-language" }
 craic-project = { path = "crates/craic-project" }
 craic-system = { path = "crates/craic-system" }

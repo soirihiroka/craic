@@ -641,9 +641,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "craic-file-support"
+version = "0.1.0"
+
+[[package]]
 name = "craic-language"
 version = "0.1.0"
 dependencies = [
+ "craic-file-support",
  "log",
  "rumdl",
  "serde_json",
@@ -783,6 +788,7 @@ name = "craic-ui-core"
 version = "0.1.0"
 dependencies = [
  "cairo-rs",
+ "craic-file-support",
  "craic-language",
  "craic-project",
  "craic-system",
@@ -800,6 +806,7 @@ name = "craic-ui-editor"
 version = "0.1.0"
 dependencies = [
  "craic-config",
+ "craic-file-support",
  "craic-language",
  "craic-text-layout",
  "craic-ui-core",

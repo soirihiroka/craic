@@ -1,21 +1,17 @@
 use super::table_view::{self, TableView, TableViewRow};
 use super::{PreviewMatchRequest, PreviewRequest};
 use crate::system::materialize::MaterializedFile;
-use crate::ui::file_type;
 use adw::prelude::*;
 use gtk::glib;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use std::cell::{Cell, RefCell};
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
-const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const SQLITE_PAGE_SIZE: usize = 100;
 const SQLITE_FILTER_DEBOUNCE_MS: u64 = 180;
 const SQLITE_POLL_MS: u64 = 30;
@@ -65,17 +61,6 @@ pub fn show(request: PreviewRequest<'_>) {
 
 pub fn show_match(request: PreviewMatchRequest<'_>) {
     show(request.into_preview_request());
-}
-
-pub fn has_sqlite_magic_bytes(bytes: &[u8]) -> bool {
-    bytes.starts_with(SQLITE_MAGIC)
-}
-
-fn local_has_sqlite_magic(path: &Path) -> bool {
-    let mut header = [0_u8; 16];
-    File::open(path)
-        .and_then(|mut file| file.read_exact(&mut header))
-        .is_ok_and(|_| &header == SQLITE_MAGIC)
 }
 
 #[derive(Clone)]
@@ -297,14 +282,7 @@ impl SqlitePreview {
         db_path: &Path,
         materialized: Option<MaterializedFile>,
     ) {
-        let detected_by = if local_has_sqlite_magic(db_path) {
-            "magic"
-        } else if file_type::is_sqlite_database_name(file_path) {
-            "extension"
-        } else {
-            "provider"
-        };
-        log::info!("sqlite preview load file_path={file_path} detected_by={detected_by}");
+        log::info!("sqlite preview load file_path={file_path}");
 
         self.cancel_filter_debounce();
         self.disconnect_sorter_signals();

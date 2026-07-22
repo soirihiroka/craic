@@ -64,7 +64,9 @@ fn show_markup(
     let local_path = request.local_path.map(Path::to_path_buf);
     let disk_signature = super::disk_signature(request.info);
     let writable = request.info.capabilities.writable;
-    let language = crate::ui::content::code_editor::language_hint_from_path(&file_path);
+    let language = craic_language::language_support_for_id(
+        crate::ui::file_type::detect(&file_path, false).language,
+    );
     let comparison_right = Rc::clone(&request.right);
     let comparison_token = request.load_token;
 
@@ -80,25 +82,21 @@ fn show_markup(
                         text.as_str(),
                     )]);
                     let spellcheck_issues = crate::spellcheck::check_document(
-                        &language,
+                        language,
                         Some(&file_path),
                         &text,
                         &allowlist,
                     );
-                    let markdown_lint_issues = match markup_kind {
-                        MarkupKind::Markdown => {
-                            let ignored_rules =
-                            crate::workspace_config::markdown_lint_ignored_rules_from_file_access(
-                                files.as_ref(),
-                            );
-                            crate::markdown_lint::check_document(
-                                Some(&file_path),
-                                &text,
-                                &ignored_rules,
-                            )
-                        }
-                        MarkupKind::Rst => Vec::new(),
-                    };
+                    let ignored_rules =
+                        crate::workspace_config::markdown_lint_ignored_rules_from_file_access(
+                            files.as_ref(),
+                        );
+                    let markdown_lint_issues = crate::markdown_lint::check_language_document(
+                        language,
+                        Some(&file_path),
+                        &text,
+                        &ignored_rules,
+                    );
                     let document = match markup_kind {
                         MarkupKind::Markdown => MarkdownPreviewDocument::parse(&text),
                         MarkupKind::Rst => MarkdownPreviewDocument::parse_rst(&text),

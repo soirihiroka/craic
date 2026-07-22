@@ -12,7 +12,7 @@ use super::{
 };
 use crate::config;
 use crate::git::{DiffKind, FileDiffRow};
-use crate::language_support::{HighlightRange, SyntaxHighlighter, language_hint_from_path};
+use crate::language_support::{HighlightRange, SyntaxHighlighter, language_id_from_path};
 use crate::ui::components::context_menu;
 use crate::ui::{canvas_scroll, canvas_scrollbar};
 use adw::prelude::*;
@@ -401,14 +401,18 @@ fn update_syntax_state(
         return;
     }
 
-    let language = language_hint_from_path(file_path);
-    let left = build_syntax_side(&language, rows, DiffCanvasSide::Left);
-    let right = build_syntax_side(&language, rows, DiffCanvasSide::Right);
+    let language = language_id_from_path(file_path);
+    let left = build_syntax_side(language, rows, DiffCanvasSide::Left);
+    let right = build_syntax_side(language, rows, DiffCanvasSide::Right);
     state.syntax.replace(Some(DiffSyntaxState { left, right }));
     state.syntax_signature.replace(Some(signature));
 }
 
-fn build_syntax_side(language: &str, rows: &[FileDiffRow], side: DiffCanvasSide) -> DiffSyntaxSide {
+fn build_syntax_side(
+    language: craic_file_support::LanguageId,
+    rows: &[FileDiffRow],
+    side: DiffCanvasSide,
+) -> DiffSyntaxSide {
     let mut source = String::new();
     let mut ranges_by_line = HashMap::new();
     for row in rows {
@@ -429,7 +433,7 @@ fn build_syntax_side(language: &str, rows: &[FileDiffRow], side: DiffCanvasSide)
         source.push('\n');
     }
 
-    let mut highlighter = SyntaxHighlighter::new(language);
+    let mut highlighter = SyntaxHighlighter::new_id(language);
     highlighter.set_source(&source);
     let mut highlights = highlighter.highlight_current();
     highlights.sort_by_key(|range| (range.start, range.end));

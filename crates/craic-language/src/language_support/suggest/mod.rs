@@ -15,14 +15,24 @@ pub struct CompletionSet {
     pub replacement_end: usize,
 }
 
+pub trait CompletionService: Sync {
+    fn completions(&self, tree: &Tree, source: &str, cursor: usize) -> Option<CompletionSet>;
+}
+
+pub(super) struct RustCompletion;
+pub(super) static RUST_COMPLETION: RustCompletion = RustCompletion;
+
+impl CompletionService for RustCompletion {
+    fn completions(&self, tree: &Tree, source: &str, cursor: usize) -> Option<CompletionSet> {
+        rust::completions(tree, source, cursor)
+    }
+}
+
 pub fn completions(
-    language_name: &str,
+    service: &dyn CompletionService,
     tree: &Tree,
     source: &str,
     cursor: usize,
 ) -> Option<CompletionSet> {
-    match language_name {
-        "rust" | "rs" => rust::completions(tree, source, cursor),
-        _ => None,
-    }
+    service.completions(tree, source, cursor)
 }

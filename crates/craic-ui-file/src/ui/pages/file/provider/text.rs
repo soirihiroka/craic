@@ -36,7 +36,9 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
     let apply_file_path = file_path.clone();
     let disk_signature = super::disk_signature(request.info);
     let writable = request.info.capabilities.writable;
-    let language = crate::ui::content::code_editor::language_hint_from_path(&file_path);
+    let language = craic_language::language_support_for_id(
+        crate::ui::file_type::detect(&file_path, false).language,
+    );
     let deferred_right = Rc::clone(&request.right);
     let load_token = request.load_token;
 
@@ -73,7 +75,7 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
 
                 let diagnostics_source = load.text;
                 let diagnostics_path = apply_file_path.clone();
-                let diagnostics_language = language.clone();
+                let diagnostics_language = language;
                 let diagnostics_files = files.clone();
                 super::spawn_preview_load(
                     Rc::clone(&deferred_right),
@@ -85,7 +87,7 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
                             diagnostics_source.as_str(),
                         )]);
                         let spellcheck_issues = crate::spellcheck::check_document(
-                            &diagnostics_language,
+                            diagnostics_language,
                             Some(&diagnostics_path),
                             &diagnostics_source,
                             &allowlist,

@@ -8,6 +8,7 @@ license.workspace = true
 adw.workspace = true
 cairo.workspace = true
 craic-language.workspace = true
+craic-file-support.workspace = true
 craic-project.workspace = true
 craic-system.workspace = true
 craic-vcs.workspace = true

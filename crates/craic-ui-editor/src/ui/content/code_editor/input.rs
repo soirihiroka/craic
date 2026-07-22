@@ -1639,7 +1639,9 @@ fn completion_is_open(state: &Rc<EditorState>) -> bool {
 fn request_or_dismiss_completion(area: &gtk::GLArea, state: &Rc<EditorState>) {
     if !state.editable.get()
         || state.selection.borrow().is_some()
-        || !matches!(state.language.borrow().as_str(), "rust" | "rs")
+        || crate::language_support::language_support_for_id(state.language.get())
+            .completion
+            .is_none()
         || !text_has_completion_trigger(&state.text.borrow(), state.cursor.get())
     {
         dismiss_completion(state);
@@ -2163,9 +2165,9 @@ fn insert_newline(area: &gtk::GLArea, state: &Rc<EditorState>) {
         let cursor = state.cursor.get().min(text.len());
         (cursor, cursor)
     });
-    let language = state.language.borrow();
+    let language = crate::language_support::language_support_for_id(state.language.get());
     let newline = enter_newline(NewlineContext {
-        language: &language,
+        language,
         text: &text,
         cursor: start,
     });
@@ -2286,15 +2288,14 @@ fn toggle_line_comment(area: &gtk::GLArea, state: &Rc<EditorState>) {
         return;
     }
 
-    let language = state.language.borrow();
-    let Some(prefix) = line_comment_prefix(&language) else {
+    let language = crate::language_support::language_support_for_id(state.language.get());
+    let Some(prefix) = language.line_comment else {
         log::debug!(
-            "code_editor line_comment skipped unsupported language={}",
-            language.as_str()
+            "code_editor line_comment skipped unsupported language={:?}",
+            language.id
         );
         return;
     };
-    drop(language);
 
     let text = state.text.borrow();
     let (first_line_start, last_line_start) = indentation_line_range(&text, state);
@@ -2346,30 +2347,6 @@ fn toggle_line_comment(area: &gtk::GLArea, state: &Rc<EditorState>) {
         restored_selection,
         true,
     );
-}
-
-fn line_comment_prefix(language: &str) -> Option<&'static str> {
-    match language
-        .trim()
-        .trim_start_matches('.')
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "bash" | "sh" | "shell" | "zsh" | "ignore" | "dockerfile" | "caddy" | "caddyfile"
-        | "cmake" | "ini" | "make" | "mk" | "makefile" | "nim" | "nims" | "perl" | "pl" | "pm"
-        | "powershell" | "ps1" | "psm1" | "psd1" | "python" | "py" | "pyw" | "r" | "rmd"
-        | "ruby" | "rb" | "terraform" | "tf" | "tfvars" | "toml" | "yaml" | "yml" => Some("#"),
-        "c" | "h" | "cpp" | "c++" | "cc" | "cxx" | "hh" | "hpp" | "hxx" | "cs" | "csx" | "cuda"
-        | "cu" | "cuh" | "dart" | "go" | "golang" | "hlsl" | "java" | "javascript" | "js"
-        | "mjs" | "cjs" | "jsx" | "jsonc" | "json5" | "kotlin" | "kt" | "kts" | "ktm" | "php"
-        | "phtml" | "rust" | "rs" | "scala" | "sc" | "slang" | "sol" | "swift" | "typescript"
-        | "ts" | "tsx" | "vala" | "vapi" => Some("//"),
-        "elm" | "haskell" | "hs" | "lua" | "sql" => Some("--"),
-        _ => None,
-    }
 }
 
 fn should_uncomment_line_comment(text: &str, line_starts: &[usize], prefix: &str) -> bool {

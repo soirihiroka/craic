@@ -353,7 +353,9 @@ fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
     let apply_file_path = file_path.clone();
     let disk_signature = super::disk_signature(request.info);
     let writable = request.info.capabilities.writable;
-    let language = crate::ui::content::code_editor::language_hint_from_path(&file_path);
+    let language = craic_language::language_support_for_id(
+        crate::ui::file_type::detect(&file_path, false).language,
+    );
     let comparison_right = Rc::clone(&request.right);
     let comparison_token = request.load_token;
 
@@ -365,7 +367,7 @@ fn show_svg(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
             read_svg_source(prefetched_bytes, &file_path).map(|(bytes, text, signature)| {
                 let allowlist = crate::spellcheck::SpellcheckAllowlist::default();
                 let spellcheck_issues = crate::spellcheck::check_document(
-                    &language,
+                    language,
                     Some(&file_path),
                     &text,
                     &allowlist,
