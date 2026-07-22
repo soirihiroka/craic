@@ -11,7 +11,14 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 type MountFn<K, S> = dyn Fn(usize, &K, &TreeRenderState<K, S>) -> gtk::Widget;
-type UpdateFn<K, S> = dyn Fn(usize, &gtk::Widget, &TreeRenderState<K, S>, &TreeRenderState<K, S>);
+// Updates normally mutate the mounted widget and return `None`. Returning a new widget asks the
+// tree to replace it so the keyed widget map never retains a handle to an unmounted widget.
+type UpdateFn<K, S> = dyn Fn(
+    usize,
+    &gtk::Widget,
+    &TreeRenderState<K, S>,
+    &TreeRenderState<K, S>,
+) -> Option<gtk::Widget>;
 type PointerPressFn<K, S> = dyn Fn(&gtk::GestureClick, f64, f64, f64, Option<TreeRow<K, S>>);
 
 pub struct TreeRenderer<K, S> {
@@ -46,7 +53,13 @@ impl<K, S> TreeRenderer<K, S> {
     pub fn new<M, U>(mount: M, update: U) -> Self
     where
         M: Fn(usize, &K, &TreeRenderState<K, S>) -> gtk::Widget + 'static,
-        U: Fn(usize, &gtk::Widget, &TreeRenderState<K, S>, &TreeRenderState<K, S>) + 'static,
+        U: Fn(
+                usize,
+                &gtk::Widget,
+                &TreeRenderState<K, S>,
+                &TreeRenderState<K, S>,
+            ) -> Option<gtk::Widget>
+            + 'static,
     {
         Self {
             mount: Rc::new(mount),
@@ -342,11 +355,22 @@ where
         for (index, (key, state)) in states.into_iter().enumerate() {
             let existing = { self.row_widgets.borrow().get(&key).cloned() };
             let widget = match existing {
-                Some(widget) => {
+                Some(mut widget) => {
                     let previous = self.row_states.borrow().get(&key).cloned();
                     if previous.as_ref() != Some(&state) {
                         if let Some(previous) = previous.as_ref() {
-                            (renderer.update)(index, &widget, previous, &state);
+                            if let Some(next_widget) =
+                                (renderer.update)(index, &widget, previous, &state)
+                            {
+                                // The tree owns replacement so removal and future updates use the
+                                // widget that is actually mounted for this key.
+                                self.list.insert_child_after(&next_widget, Some(&widget));
+                                self.list.remove(&widget);
+                                self.row_widgets
+                                    .borrow_mut()
+                                    .insert(key.clone(), next_widget.clone());
+                                widget = next_widget;
+                            }
                         }
                         stats.updated += 1;
                     }
@@ -401,12 +425,24 @@ where
         for (index, (key, state)) in states.into_iter().enumerate() {
             let existing = { self.sticky_widgets.borrow().get(&key).cloned() };
             let widget = match existing {
-                Some(widget) => {
+                Some(mut widget) => {
                     let previous = self.sticky_states.borrow().get(&key).cloned();
                     if previous.as_ref() != Some(&state)
                         && let Some(previous) = previous.as_ref()
                     {
-                        (renderer.update)(index, &widget, previous, &state);
+                        if let Some(next_widget) =
+                            (renderer.update)(index, &widget, previous, &state)
+                        {
+                            // Sticky rows use a separate keyed widget map and need the same handle
+                            // synchronization as rows in the scrolling list.
+                            self.sticky_layer.put(&next_widget, 0.0, state.y);
+                            next_widget.insert_after(&self.sticky_layer, Some(&widget));
+                            self.sticky_layer.remove(&widget);
+                            self.sticky_widgets
+                                .borrow_mut()
+                                .insert(key.clone(), next_widget.clone());
+                            widget = next_widget;
+                        }
                     }
                     if !widget_follows(&widget, previous_widget.as_ref()) {
                         widget.insert_after(&self.sticky_layer, previous_widget.as_ref());

@@ -857,6 +857,7 @@ fn render_container_tree(
                 render: state.clone(),
             };
             update_container_tree_row_widget(widget, previous, request);
+            None
         };
     tree.set_rows(rows, TreeRenderer::new(mount, update));
 

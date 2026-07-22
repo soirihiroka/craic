@@ -181,7 +181,7 @@ impl FileBrowser {
         let renderer = tree_view::TreeRenderer::new(
             move |index, _, state| mount_browser.row_widget(index, state),
             move |index, widget, previous, next| {
-                update_browser.update_row_widget(index, widget, previous, next);
+                update_browser.update_row_widget(index, widget, previous, next)
             },
         );
         let stats = self.tree.set_rows(tree_rows, renderer);
@@ -249,7 +249,7 @@ impl FileBrowser {
         widget: &gtk::Widget,
         previous: &tree_view::TreeRenderState<BrowserListRowKey, BrowserListRowRenderState>,
         next: &tree_view::TreeRenderState<BrowserListRowKey, BrowserListRowRenderState>,
-    ) {
+    ) -> Option<gtk::Widget> {
         if previous.sticky != next.sticky
             || previous.bottom != next.bottom
             || previous.width != next.width
@@ -280,8 +280,7 @@ impl FileBrowser {
                 },
             ) => {
                 if previous_deleting != deleting {
-                    replace_row_widget(widget, self.row_widget(index, next));
-                    return;
+                    return Some(self.row_widget(index, next));
                 }
                 self.update_tree_row_widget(
                     widget,
@@ -346,11 +345,14 @@ impl FileBrowser {
                 BrowserListRowRenderState::Transfer { .. },
                 BrowserListRowRenderState::Transfer { .. },
             ) => {
-                replace_row_widget(widget, self.row_widget(index, next));
+                // Progress rows are rebuilt as their spinner and label state changes. Let the
+                // keyed tree perform the swap so it continues tracking the mounted widget.
+                return Some(self.row_widget(index, next));
             }
             (BrowserListRowRenderState::RootGap, BrowserListRowRenderState::RootGap) => {}
-            _ => replace_row_widget(widget, self.row_widget(index, next)),
+            _ => return Some(self.row_widget(index, next)),
         }
+        None
     }
 
     fn update_tree_row_widget(
@@ -1258,19 +1260,6 @@ fn file_drag_source(browser: &Rc<FileBrowser>, path: FileNodePath) -> tree_view:
             move || browser.clear_internal_drag_paths()
         })
         .build()
-}
-
-fn replace_row_widget(widget: &gtk::Widget, next: gtk::Widget) {
-    let Some(parent) = widget.parent() else {
-        return;
-    };
-    if let Ok(list) = parent.clone().downcast::<gtk::Box>() {
-        list.insert_child_after(&next, Some(widget));
-        list.remove(widget);
-    } else if let Ok(layer) = parent.downcast::<gtk::Fixed>() {
-        layer.put(&next, 0.0, 0.0);
-        layer.remove(widget);
-    }
 }
 
 fn sync_transfer_progress(
