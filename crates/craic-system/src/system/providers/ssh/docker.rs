@@ -1,7 +1,7 @@
 use super::SshCommandRunner;
 use super::shell_quote;
 use crate::system::capabilities::docker::{ComposeFileAction, DockerAccess};
-use crate::system::capabilities::shell::ShellCommandSpec;
+use crate::system::capabilities::shell::{ShellCommandActivity, ShellCommandSpec};
 use crate::system::path::{WorkspacePath, WorkspaceRef};
 use std::path::Path;
 
@@ -119,10 +119,15 @@ impl DockerAccess for SshDockerAccess {
                 shell_quote(compose_file)
             ),
         };
-        Ok(ShellCommandSpec::new("ssh", self.workspace.root.clone())
+        let command = ShellCommandSpec::new("ssh", self.workspace.root.clone())
             .arg(self.host.clone())
             .arg("-t")
-            .arg(remote))
+            .arg(remote);
+        Ok(if action == ComposeFileAction::Logs {
+            command.activity(ShellCommandActivity::LogStream)
+        } else {
+            command
+        })
     }
 }
 

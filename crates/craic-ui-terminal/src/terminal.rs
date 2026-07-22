@@ -1458,6 +1458,7 @@ fn active_task_name(session: &TerminalSession) -> Option<String> {
         ShellCommandActivity::Command => foreground_process_name(&session.terminal)
             .or_else(|| process_name(child_pid.0 as libc::pid_t))
             .or_else(|| Some("The process".to_string())),
+        ShellCommandActivity::LogStream => None,
         ShellCommandActivity::LocalInteractiveShell => {
             active_shell_task_name(&session.terminal, child_pid)
         }

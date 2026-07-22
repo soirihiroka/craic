@@ -15,6 +15,7 @@ pub struct ShellCommandSpec {
 pub enum ShellCommandActivity {
     #[default]
     Command,
+    LogStream,
     LocalInteractiveShell,
     ReportedInteractiveShell,
 }
