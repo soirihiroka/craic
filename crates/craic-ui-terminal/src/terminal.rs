@@ -1,5 +1,5 @@
 use crate::config;
-use crate::system::capabilities::shell::ShellCommandSpec;
+use crate::system::capabilities::shell::{ShellCommandActivity, ShellCommandSpec};
 use crate::ui::components::{
     search::{SearchOption, SearchPanel},
     terminal as terminal_component,
@@ -54,7 +54,8 @@ struct TerminalSession {
     row: gtk::ListBoxRow,
     terminal: VteTerminal,
     child_pid: Rc<Cell<Option<glib::Pid>>>,
-    launch_kind: TerminalLaunchKind,
+    activity: ShellCommandActivity,
+    reported_task_name: Rc<RefCell<Option<String>>>,
     state: Rc<Cell<TerminalSessionState>>,
     exit_success: Rc<Cell<bool>>,
     auto_close_source: Rc<RefCell<Option<glib::SourceId>>>,
@@ -65,12 +66,6 @@ struct TerminalSearchOptions {
     case_sensitive: Rc<Cell<bool>>,
     whole_word: Rc<Cell<bool>>,
     regex: Rc<Cell<bool>>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TerminalLaunchKind {
-    Command,
-    Shell,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -250,7 +245,7 @@ impl TerminalPanel {
         self.create_session(
             title,
             command,
-            TerminalLaunchKind::Command,
+            ShellCommandActivity::Command,
             command.working_dir.to_string_lossy().as_ref(),
         )?;
         Ok(())
@@ -258,13 +253,14 @@ impl TerminalPanel {
 
     pub fn run_shell_command(&self, command: &ShellCommandSpec, title: &str) -> Result<(), String> {
         let launch_dir = command.working_dir.absolute.clone();
+        let activity = command.activity;
         let command = CommandSpec {
             program: command.program.clone(),
             args: command.args.clone(),
             working_dir: local_spawn_dir_for_shell_command(command),
         };
         self.set_visible(true);
-        self.create_session(title, &command, TerminalLaunchKind::Shell, &launch_dir)?;
+        self.create_session(title, &command, activity, &launch_dir)?;
         Ok(())
     }
 
@@ -402,13 +398,17 @@ impl TerminalPanel {
         &self,
         title: &str,
         command: &CommandSpec,
-        launch_kind: TerminalLaunchKind,
+        activity: ShellCommandActivity,
         launch_dir: &str,
     ) -> Result<TerminalSession, String> {
         let session_id = self.next_session_id.get();
         self.next_session_id.set(session_id + 1);
 
         let terminal = configured_terminal(config::load().font_sizes.shell);
+        let reported_task_name = Rc::new(RefCell::new(None));
+        if activity == ShellCommandActivity::ReportedInteractiveShell {
+            install_reported_shell_activity(&terminal, session_id, &reported_task_name);
+        }
         install_terminal_shortcuts(&terminal, &self.sessions, &self.search_panel);
         install_focus_tracking(&terminal, &self.focus_handlers);
         install_terminal_activation(&terminal, &self.activation_handlers);
@@ -536,7 +536,8 @@ impl TerminalPanel {
             row,
             terminal,
             child_pid,
-            launch_kind,
+            activity,
+            reported_task_name,
             state,
             exit_success,
             auto_close_source,
@@ -1452,12 +1453,38 @@ fn active_task_name(session: &TerminalSession) -> Option<String> {
     }
 
     let child_pid = session.child_pid.get()?;
-    match session.launch_kind {
-        TerminalLaunchKind::Command => foreground_process_name(&session.terminal)
+    match session.activity {
+        ShellCommandActivity::Command => foreground_process_name(&session.terminal)
             .or_else(|| process_name(child_pid.0 as libc::pid_t))
             .or_else(|| Some("The process".to_string())),
-        TerminalLaunchKind::Shell => active_shell_task_name(&session.terminal, child_pid),
+        ShellCommandActivity::LocalInteractiveShell => {
+            active_shell_task_name(&session.terminal, child_pid)
+        }
+        ShellCommandActivity::ReportedInteractiveShell => {
+            session.reported_task_name.borrow().clone()
+        }
     }
+}
+
+fn install_reported_shell_activity(
+    terminal: &VteTerminal,
+    session_id: u64,
+    task_name: &Rc<RefCell<Option<String>>>,
+) {
+    let task_name = task_name.clone();
+    terminal.connect_reported_activity_changed(move |active| {
+        let next_task_name = active.then(|| "A remote program".to_string());
+        if *task_name.borrow() == next_task_name {
+            return;
+        }
+
+        log::debug!(
+            "remote terminal activity changed session_id={} active={}",
+            session_id,
+            next_task_name.is_some()
+        );
+        task_name.replace(next_task_name);
+    });
 }
 
 fn active_shell_task_name(terminal: &VteTerminal, shell_pid: glib::Pid) -> Option<String> {
@@ -1466,10 +1493,29 @@ fn active_shell_task_name(terminal: &VteTerminal, shell_pid: glib::Pid) -> Optio
     let shell_pgid = process_group(shell_pid).unwrap_or(shell_pid);
 
     if foreground_pgid == shell_pgid {
-        return None;
+        return child_process_name(shell_pid);
     }
 
     process_name_for_group(foreground_pgid).or_else(|| Some("The foreground process".to_string()))
+}
+
+fn child_process_name(parent_pid: libc::pid_t) -> Option<String> {
+    fs::read_dir("/proc")
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok())
+        .find(|pid| process_parent(*pid) == Some(parent_pid))
+        .and_then(process_name)
+}
+
+fn process_parent(pid: libc::pid_t) -> Option<libc::pid_t> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    fields.get(1)?.parse().ok()
 }
 
 fn confirm_close_running_task(
@@ -1493,6 +1539,12 @@ fn confirm_close_running_task(
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
 
+    log::info!(
+        "terminal session close confirmation shown session_id={} task={}",
+        session_id,
+        task_name
+    );
+
     let parent = root
         .root()
         .and_then(|root| root.downcast::<gtk::Window>().ok());
@@ -1505,9 +1557,11 @@ fn confirm_close_running_task(
 
         move |response| {
             if response.as_str() != "close" {
+                log::info!("terminal session close cancelled session_id={}", session_id);
                 return;
             }
 
+            log::info!("terminal session close confirmed session_id={}", session_id);
             close_session(
                 session_id,
                 &root,

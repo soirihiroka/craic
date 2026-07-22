@@ -59,6 +59,7 @@ type OpenFailedCallback = Rc<dyn Fn(String)>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContainerFileAction {
     BuildImage,
+    ComposeLogs,
     ComposeUp,
     ComposePull,
     ComposeRestart,
@@ -922,6 +923,7 @@ impl BrowserTarget {
                 vec![ContainerFileAction::BuildImage]
             }
             Some(crate::ui::file_type::FileRole::Compose) => vec![
+                ContainerFileAction::ComposeLogs,
                 ContainerFileAction::ComposeUp,
                 ContainerFileAction::ComposePull,
                 ContainerFileAction::ComposeRestart,
@@ -1024,6 +1026,16 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
         target
             .container_actions()
             .contains(&ContainerFileAction::BuildImage),
+    );
+    let compose_logs = add_menu_action(&actions, "compose-logs", {
+        let browser = browser.clone();
+        let target = target.clone();
+        move || browser.run_container_file_action(&target, ContainerFileAction::ComposeLogs)
+    });
+    compose_logs.set_enabled(
+        target
+            .container_actions()
+            .contains(&ContainerFileAction::ComposeLogs),
     );
     let compose_up = add_menu_action(&actions, "compose-up", {
         let browser = browser.clone();

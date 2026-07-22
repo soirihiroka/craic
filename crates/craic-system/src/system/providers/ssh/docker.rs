@@ -91,6 +91,11 @@ impl DockerAccess for SshDockerAccess {
     ) -> Result<ShellCommandSpec, String> {
         let compose_file = compose_file.relative_or_empty();
         let remote = match action {
+            ComposeFileAction::Logs => format!(
+                "cd {} && docker compose -f {} logs --tail 1000 -f",
+                shell_quote(&self.workspace.root.absolute),
+                shell_quote(compose_file)
+            ),
             ComposeFileAction::Up => format!(
                 "cd {} && docker compose -f {} up -d --build",
                 shell_quote(&self.workspace.root.absolute),

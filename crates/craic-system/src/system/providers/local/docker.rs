@@ -104,6 +104,14 @@ impl DockerAccess for LocalDockerAccess {
         let compose_file = compose_file.relative_or_empty().to_string();
         let quoted_compose_file = shell_quote(&compose_file);
         let command = match action {
+            ComposeFileAction::Logs => ShellCommandSpec::new("docker", self.workspace.root.clone())
+                .arg("compose")
+                .arg("-f")
+                .arg(compose_file.as_str())
+                .arg("logs")
+                .arg("--tail")
+                .arg("1000")
+                .arg("-f"),
             ComposeFileAction::Up => ShellCommandSpec::new("docker", self.workspace.root.clone())
                 .arg("compose")
                 .arg("-f")
