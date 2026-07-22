@@ -102,6 +102,10 @@ where
         let Some(gpu) = gpu.as_mut() else {
             return gtk::glib::Propagation::Stop;
         };
+        // GTK binds and rotates GLArea framebuffer resources between render signals. Ganesh
+        // caches GL bindings, including the glyph-atlas texture, so it must be told that an
+        // external GL user changed the context state before every frame.
+        gpu.context.reset(None);
 
         let mut viewport = [0_i32; 4];
         let mut framebuffer = 0_i32;
