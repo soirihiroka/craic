@@ -3,6 +3,7 @@ use skia_safe::textlayout::{
     FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, TextStyle, TypefaceFontProvider,
 };
 use skia_safe::{Color, FontMgr, FontStyle};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -10,6 +11,7 @@ use std::fs;
 const TEXT_WIDTH_CACHE_ENTRY_LIMIT: usize = 8192;
 const TEXT_WIDTH_CACHE_BYTE_LIMIT: usize = 1024 * 1024;
 const TEXT_WIDTH_CACHE_MAX_TEXT_BYTES: usize = 1024;
+const TAB_REPLACEMENT: &str = "    ";
 const EDITOR_FONT_FAMILY: &str = "Craic Editor Mono";
 const FONT_FAMILIES: &[&str] = &[
     EDITOR_FONT_FAMILY,
@@ -179,6 +181,11 @@ pub fn draw_plain_text(
 
 fn paragraph(font_size: i32, text: &str, color: TextColor) -> Paragraph {
     FONT_COLLECTION.with(|fonts| {
+        let text = if text.contains('\t') {
+            Cow::Owned(text.replace('\t', TAB_REPLACEMENT))
+        } else {
+            Cow::Borrowed(text)
+        };
         let mut text_style = TextStyle::new();
         text_style
             .set_color(Color::from_argb(
@@ -194,7 +201,7 @@ fn paragraph(font_size: i32, text: &str, color: TextColor) -> Paragraph {
         paragraph_style.set_text_style(&text_style);
         let mut builder = ParagraphBuilder::new(&paragraph_style, fonts.clone());
         builder.push_style(&text_style);
-        builder.add_text(text);
+        builder.add_text(&text);
         builder.pop();
         let mut paragraph = builder.build();
         paragraph.layout(1_000_000.0);
