@@ -36,6 +36,8 @@ pub struct RightPane {
     pub root: gtk::Box,
     title_label: gtk::Label,
     subtitle_label: gtk::Label,
+    file_view_mode_switcher: gtk::Box,
+    file_code_button: gtk::ToggleButton,
     stack: gtk::Stack,
     preview_generation: Cell<u64>,
     pending_preview_loading: RefCell<Option<PendingPreviewLoading>>,
@@ -56,6 +58,7 @@ pub struct RightPane {
     pub file_font_preview: binary_preview::BinaryPreviewWidgets,
     pub file_pdf_preview: binary_preview::BinaryPreviewWidgets,
     pub file_sqlite_preview: Rc<super::provider::sqlite::SqlitePreview>,
+    file_csv_preview: Rc<super::provider::csv::CsvPreview>,
     pub file_safetensors_metadata_preview: gtk::TextView,
     status_label: gtk::Label,
 }
@@ -72,16 +75,41 @@ impl RightPane {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label"])
             .build();
-        let header = gtk::Box::builder()
+        let title_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(2)
+            .hexpand(true)
+            .build();
+        title_box.append(&title_label);
+        title_box.append(&subtitle_label);
+
+        let file_code_button = gtk::ToggleButton::builder()
+            .label("Code")
+            .active(true)
+            .build();
+        let file_table_button = gtk::ToggleButton::builder()
+            .label("Table")
+            .group(&file_code_button)
+            .build();
+        let file_view_mode_switcher = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        file_view_mode_switcher.add_css_class("linked");
+        file_view_mode_switcher.append(&file_code_button);
+        file_view_mode_switcher.append(&file_table_button);
+
+        let header = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
             .margin_top(10)
             .margin_bottom(10)
             .margin_start(14)
             .margin_end(14)
             .build();
-        header.append(&title_label);
-        header.append(&subtitle_label);
+        header.append(&title_box);
+        header.append(&file_view_mode_switcher);
 
         let file_editor = code_editor::CodeEditor::new("", "");
         file_editor.set_font_size(config::load().font_sizes.editor);
@@ -115,6 +143,7 @@ impl RightPane {
         let file_font_preview = binary_preview::BinaryPreviewWidgets::new("Font");
         let file_pdf_preview = binary_preview::BinaryPreviewWidgets::new("PDF");
         let file_sqlite_preview = super::provider::sqlite::SqlitePreview::new();
+        let file_csv_preview = super::provider::csv::CsvPreview::new();
         install_markdown_scroll_sync(&file_editor, &file_markdown_preview);
         let file_safetensors_metadata_preview = gtk::TextView::builder()
             .editable(false)
@@ -191,9 +220,36 @@ impl RightPane {
         stack.add_named(&file_font_preview.root, Some("font"));
         stack.add_named(&file_pdf_preview.root, Some("pdf"));
         stack.add_named(&file_sqlite_preview.root, Some("sqlite"));
+        stack.add_named(&file_csv_preview.root, Some("csv-table"));
         stack.add_named(&status_box, Some("status"));
         stack.add_named(&provider_loading, Some("provider-loading"));
         stack.set_visible_child_name("folder");
+
+        file_code_button.connect_toggled({
+            let stack = stack.clone();
+            let switcher = file_view_mode_switcher.clone();
+
+            move |button| {
+                if button.is_active() && switcher.is_visible() {
+                    log::debug!("csv preview display mode changed mode=code");
+                    stack.set_visible_child_name("editor");
+                }
+            }
+        });
+        file_table_button.connect_toggled({
+            let editor = file_editor.clone();
+            let preview = Rc::clone(&file_csv_preview);
+            let stack = stack.clone();
+            let switcher = file_view_mode_switcher.clone();
+
+            move |button| {
+                if button.is_active() && switcher.is_visible() {
+                    log::debug!("csv preview display mode changed mode=table");
+                    preview.set_source(&editor.document_text());
+                    stack.set_visible_child_name("csv-table");
+                }
+            }
+        });
 
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -207,6 +263,8 @@ impl RightPane {
             root,
             title_label,
             subtitle_label,
+            file_view_mode_switcher,
+            file_code_button,
             stack,
             preview_generation: Cell::new(0),
             pending_preview_loading: RefCell::new(None),
@@ -227,6 +285,7 @@ impl RightPane {
             file_font_preview,
             file_pdf_preview,
             file_sqlite_preview,
+            file_csv_preview,
             file_safetensors_metadata_preview,
             status_label,
         }
@@ -385,6 +444,7 @@ impl RightPane {
             .set_markdown_lint_issues(markdown_lint_issues);
         self.file_editor.set_spellcheck_issues(spellcheck_issues);
         self.clear_auxiliary_previews();
+        self.file_view_mode_switcher.set_visible(language == "csv");
     }
 
     pub fn show_media_preview(&self, file_path: &str, _subtitle: &str) {
@@ -522,13 +582,21 @@ impl RightPane {
         self.file_editor.clear_file_diff();
         self.file_editor.set_markdown_lint_issues(Vec::new());
         self.file_editor.set_spellcheck_issues(Vec::new());
+        self.clear_csv_preview();
     }
 
     fn clear_auxiliary_previews(&self) {
         self.file_media_preview.clear();
         self.file_sqlite_preview.clear();
+        self.clear_csv_preview();
         self.file_notebook_preview.clear();
         self.file_safetensors_metadata_preview.buffer().set_text("");
+    }
+
+    fn clear_csv_preview(&self) {
+        self.file_view_mode_switcher.set_visible(false);
+        self.file_code_button.set_active(true);
+        self.file_csv_preview.clear();
     }
 
     fn set_title(&self, file_path: &str, subtitle: &str) {
