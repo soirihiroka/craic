@@ -7,7 +7,7 @@ use super::{
     dispatch_page_command, pages::PageCommand, refresh, refresh_active_page,
     refresh_active_repo_metadata,
 };
-use crate::config::{ConfiguredWorkspace, WorkspaceProvider};
+use crate::config::ConfiguredWorkspace;
 use crate::git;
 use crate::system::SystemProviderRegistry;
 use crate::system::providers::local::LocalProvider;
@@ -259,26 +259,7 @@ fn open_workspace_here(
 }
 
 fn open_workspace_in_new_window(workspace: &ConfiguredWorkspace) -> Result<(), String> {
-    let path = local_workspace_launch_path(workspace)?;
-    launch_workspace_in_new_instance(&path)
-}
-
-fn local_workspace_launch_path(workspace: &ConfiguredWorkspace) -> Result<PathBuf, String> {
-    match &workspace.provider {
-        WorkspaceProvider::Local => {}
-        WorkspaceProvider::Ssh { .. } => {
-            return Err(
-                "Opening remote workspaces in a new window is not supported yet.".to_string(),
-            );
-        }
-    }
-
-    let path = crate::config::expand_config_path_for_ui(&workspace.path)
-        .unwrap_or_else(|| PathBuf::from(&workspace.path));
-    if !path.exists() {
-        return Err(format!("Workspace path does not exist: {}", path.display()));
-    }
-    Ok(path.canonicalize().unwrap_or(path))
+    launch_workspace_in_new_instance(workspace)
 }
 
 fn show_create_workspace_dialog(state: &Rc<AppState>) {
