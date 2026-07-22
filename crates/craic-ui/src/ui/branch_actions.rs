@@ -7,7 +7,6 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
-use std::thread;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -17,7 +16,6 @@ enum BranchCheckoutTarget {
         remote_branch: String,
         local_branch: String,
     },
-    PullRequest(u32),
 }
 
 impl BranchCheckoutTarget {
@@ -25,7 +23,6 @@ impl BranchCheckoutTarget {
         match self {
             Self::Local(branch) => branch.clone(),
             Self::Remote { remote_branch, .. } => remote_branch.clone(),
-            Self::PullRequest(number) => format!("pull request #{number}"),
         }
     }
 }
@@ -56,12 +53,6 @@ pub(super) fn connect_branch_actions(state: &Rc<AppState>) {
 
         move || show_merge_branch_dialog(&state)
     });
-
-    state.content.branch_picker.connect_opened({
-        let state = state.clone();
-
-        move || load_pull_requests(&state)
-    });
 }
 
 fn parse_branch_picker_id(id: &str) -> Option<BranchCheckoutTarget> {
@@ -78,12 +69,6 @@ fn parse_branch_picker_id(id: &str) -> Option<BranchCheckoutTarget> {
             remote_branch: remote_branch.to_string(),
             local_branch,
         });
-    }
-    if let Some(number) = id
-        .strip_prefix("pr:")
-        .and_then(|number| number.parse().ok())
-    {
-        return Some(BranchCheckoutTarget::PullRequest(number));
     }
     None
 }
@@ -149,9 +134,6 @@ fn checkout_target(
             remote_branch,
             local_branch,
         } => git_handle.checkout_remote_branch(remote_branch, local_branch, callback),
-        BranchCheckoutTarget::PullRequest(number) => {
-            git_handle.checkout_pull_request(*number, callback)
-        }
     }
 }
 
@@ -250,52 +232,6 @@ fn poll_branch_action_result(
                     "Git operation did not return a result.",
                 );
                 gtk::glib::ControlFlow::Break
-            }
-        }
-    });
-}
-
-fn load_pull_requests(state: &Rc<AppState>) {
-    let workspace_key = state.workspace_ref.borrow().id.to_string();
-    let system = state.system_ref.borrow().clone();
-    let workspace_ref = state.workspace_ref.borrow().clone();
-    let Some(github_access) = craic_vcs::github_access(&state.providers, &system, &workspace_ref)
-    else {
-        state
-            .content
-            .set_pull_requests_error("GitHub pull requests are unavailable for this workspace.");
-        return;
-    };
-
-    state.content.set_pull_requests_loading();
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(github_access.open_pull_requests());
-    });
-
-    gtk::glib::timeout_add_local(Duration::from_millis(100), {
-        let state = state.clone();
-        move || {
-            if !active_workspace_matches(&state, &workspace_key) {
-                return gtk::glib::ControlFlow::Break;
-            }
-
-            match receiver.try_recv() {
-                Ok(Ok(pull_requests)) => {
-                    state.content.set_pull_requests(pull_requests);
-                    gtk::glib::ControlFlow::Break
-                }
-                Ok(Err(err)) => {
-                    state.content.set_pull_requests_error(&err);
-                    gtk::glib::ControlFlow::Break
-                }
-                Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-                Err(TryRecvError::Disconnected) => {
-                    state
-                        .content
-                        .set_pull_requests_error("Pull request loader did not return a result.");
-                    gtk::glib::ControlFlow::Break
-                }
             }
         }
     });
@@ -614,7 +550,7 @@ fn append_merge_branch_group(
         return 0;
     }
 
-    let label = gtk::Label::builder()
+    let header = gtk::Label::builder()
         .label(title)
         .halign(gtk::Align::Start)
         .xalign(0.0)
@@ -623,15 +559,9 @@ fn append_merge_branch_group(
         .margin_start(12)
         .margin_end(12)
         .build();
-    label.add_css_class("heading");
-    let header = gtk::ListBoxRow::builder()
-        .child(&label)
-        .selectable(false)
-        .build();
-    header.set_activatable(false);
-    list.append(&header);
+    header.add_css_class("heading");
 
-    for branch in branches {
+    for (index, branch) in branches.iter().enumerate() {
         let icon = gtk::Image::builder()
             .icon_name(if branch.name == current_branch {
                 "object-select-symbolic"
@@ -659,6 +589,9 @@ fn append_merge_branch_group(
         content.append(&label);
         let row = gtk::ListBoxRow::builder().child(&content).build();
         row.set_widget_name(&branch.name);
+        if index == 0 {
+            row.set_header(Some(&header));
+        }
         list.append(&row);
         if selected == Some(branch.name.as_str()) {
             list.select_row(Some(&row));

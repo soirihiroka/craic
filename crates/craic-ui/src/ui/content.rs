@@ -1,6 +1,5 @@
 use super::{file_type, widgets};
 use crate::git::{RepositorySnapshot, WorkspaceSnapshot};
-use crate::github::PullRequestInfo;
 use crate::quick_action::{self, RunCommand, RunItem, RunTargetsSignature};
 use crate::system::WorkspacePath;
 use crate::system::capabilities::{
@@ -649,36 +648,6 @@ impl ContentPane {
     fn update_branch_picker(&self, snapshot: &RepositorySnapshot) {
         self.branch_picker.set_tab(branches_tab(snapshot));
     }
-
-    pub(super) fn set_pull_requests_loading(&self) {
-        self.branch_picker.set_tab(pull_requests_tab(
-            &[],
-            TabbedPickerStatus::Loading("Loading pull requests...".to_string()),
-        ));
-    }
-
-    pub(super) fn set_pull_requests(&self, pull_requests: Vec<PullRequestInfo>) {
-        log::debug!(
-            "branch picker pull requests updated count={}",
-            pull_requests.len()
-        );
-        self.branch_picker.set_tab(pull_requests_tab(
-            &pull_requests,
-            if pull_requests.is_empty() {
-                TabbedPickerStatus::Empty("No open pull requests.".to_string())
-            } else {
-                TabbedPickerStatus::Ready
-            },
-        ));
-    }
-
-    pub(super) fn set_pull_requests_error(&self, message: &str) {
-        log::warn!("branch picker pull request load failed: {message}");
-        self.branch_picker.set_tab(pull_requests_tab(
-            &[],
-            TabbedPickerStatus::Error(message.to_string()),
-        ));
-    }
 }
 
 fn handle_terminal_activation<C: RepositoryActionContext + 'static>(
@@ -869,21 +838,11 @@ fn empty_branch_tabs() -> Vec<TabbedPickerTab> {
             vec![TabbedPickerGroup::unlabelled(Vec::new())],
         )
         .status(TabbedPickerStatus::Empty("No branches found.".to_string())),
-        pull_requests_tab(
-            &[],
-            TabbedPickerStatus::Empty("Open a repository with GitHub pull requests.".to_string()),
-        ),
     ]
 }
 
 fn branch_picker_tabs(snapshot: &RepositorySnapshot) -> Vec<TabbedPickerTab> {
-    vec![
-        branches_tab(snapshot),
-        pull_requests_tab(
-            &[],
-            TabbedPickerStatus::Empty("Open the picker to load pull requests.".to_string()),
-        ),
-    ]
+    vec![branches_tab(snapshot)]
 }
 
 fn branches_tab(snapshot: &RepositorySnapshot) -> TabbedPickerTab {
@@ -945,41 +904,6 @@ fn branch_picker_item(branch: &crate::git::BranchInfo) -> TabbedPickerItem {
     };
     TabbedPickerItem::new(format!("branch:{}", branch.name), branch.name.clone(), icon)
         .selected(branch.is_current)
-}
-
-fn pull_requests_tab(
-    pull_requests: &[PullRequestInfo],
-    status: TabbedPickerStatus,
-) -> TabbedPickerTab {
-    let items = pull_requests
-        .iter()
-        .map(|pull_request| {
-            let subtitle = format!(
-                "#{} opened by {}{}",
-                pull_request.number,
-                pull_request.author,
-                if pull_request.is_draft {
-                    " · Draft"
-                } else {
-                    ""
-                }
-            );
-            TabbedPickerItem::new(
-                format!("pr:{}", pull_request.number),
-                pull_request.title.clone(),
-                "branch-fork-symbolic",
-            )
-            .subtitle(subtitle)
-        })
-        .collect::<Vec<_>>();
-
-    TabbedPickerTab::new(
-        "pull-requests",
-        "Pull requests",
-        vec![TabbedPickerGroup::unlabelled(items)],
-    )
-    .badge((!pull_requests.is_empty()).then_some(pull_requests.len()))
-    .status(status)
 }
 
 struct QuickActionButton {
