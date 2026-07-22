@@ -304,7 +304,7 @@ impl ContentPane {
     }
 
     pub fn refresh_run_targets(&self, repo_path: &Path) {
-        self.load_quick_action_config(repo_path);
+        self.set_quick_action_workspace(repo_path);
 
         let previous_signature = self.run_targets_signature.borrow().clone();
         let generation = self
@@ -388,6 +388,31 @@ impl ContentPane {
                 }
             }
         });
+    }
+
+    pub fn set_quick_action_workspace(&self, repo_path: &Path) {
+        if self
+            .quick_action_config_repo
+            .borrow()
+            .as_deref()
+            .is_some_and(|path| path == repo_path)
+        {
+            return;
+        }
+
+        self.run_target_refresh_generation.set(
+            self.run_target_refresh_generation
+                .get()
+                .wrapping_add(1)
+                .max(1),
+        );
+        self.run_targets.borrow_mut().clear();
+        self.run_targets_signature.borrow_mut().take();
+        log::info!(
+            "quick action workspace changed repo={}",
+            repo_path.display()
+        );
+        self.load_quick_action_config(repo_path);
     }
 
     pub fn clear_run_targets(&self) {

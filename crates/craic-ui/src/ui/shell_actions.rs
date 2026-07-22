@@ -205,6 +205,11 @@ fn set_active_workspace(state: &Rc<AppState>, workspace: ConfiguredWorkspace) {
     *state.repo_path.borrow_mut() = active.repo_path.clone();
     state.system_ref.replace(active.system_ref);
     state.workspace_ref.replace(active.workspace_ref);
+    if state.system_ref.borrow().provider_kind == crate::system::ProviderKind::Local {
+        state.content.set_quick_action_workspace(&active.repo_path);
+    } else {
+        state.content.clear_run_targets();
+    }
     for page in &state.pages {
         page.workspace_changed();
     }

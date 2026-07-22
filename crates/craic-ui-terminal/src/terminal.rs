@@ -421,6 +421,7 @@ impl TerminalPanel {
         let label = gtk::Label::builder()
             .label(title)
             .ellipsize(pango::EllipsizeMode::End)
+            .single_line_mode(true)
             .hexpand(true)
             .halign(gtk::Align::Fill)
             .xalign(0.0)
@@ -1289,7 +1290,7 @@ fn short_terminal_title(terminal: &VteTerminal, fallback_title: &str) -> String 
 }
 
 fn update_session_title(label: &gtk::Label, title: &str) {
-    label.set_label(title);
+    label.set_label(&terminal_title_text(title).unwrap_or_else(|| "Terminal".to_string()));
 }
 
 fn terminal_window_title(terminal: &VteTerminal) -> Option<String> {
