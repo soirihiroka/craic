@@ -18,14 +18,23 @@ use super::{
 };
 use crate::ui::{canvas_scroll, canvas_scrollbar};
 use adw::prelude::*;
+use skia_safe::canvas::SaveLayerRec;
+use skia_safe::svg::Dom;
+use skia_safe::{BlendMode, Color as SkiaColor, FontMgr, Paint, Rect, color_filters};
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 
 const FOLD_CONTROL_SIZE: f64 = 14.0;
+const FOLD_ICON: &[u8] = craic_ui_core::ui::PAN_DOWN_SYMBOLIC;
 const FOLD_ICON_COLLAPSED_ANGLE: f64 = -std::f64::consts::FRAC_PI_2;
 const FOLD_ICON_EXPANDED_ANGLE: f64 = 0.0;
 const FOLD_ICON_STATE_LIMIT: usize = 512;
+
+thread_local! {
+    static FOLD_ICON_DOM: RefCell<Option<Dom>> = RefCell::new(load_fold_icon());
+}
 
 pub type FontMetrics = canvas::FontMetrics;
 
@@ -1296,13 +1305,41 @@ fn draw_fold_toggle_icon(
     let _ = context.save();
     context.translate(rect.0 + rect.2 / 2.0, rect.1 + rect.3 / 2.0);
     context.rotate(angle);
-    context.set_source_rgba(color.red, color.green, color.blue, 1.0);
-    context.set_line_width(1.7);
-    context.move_to(-4.0, -2.0);
-    context.line_to(0.0, 2.0);
-    context.line_to(4.0, -2.0);
-    let _ = context.stroke();
+    context.translate(-FOLD_CONTROL_SIZE / 2.0, -FOLD_CONTROL_SIZE / 2.0);
+    FOLD_ICON_DOM.with(|slot| {
+        let dom = slot.borrow();
+        let Some(dom) = dom.as_ref() else {
+            return;
+        };
+        let tint = SkiaColor::from_argb(
+            255,
+            (color.red.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color.green.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color.blue.clamp(0.0, 1.0) * 255.0).round() as u8,
+        );
+        let mut paint = Paint::default();
+        paint.set_color_filter(color_filters::blend(tint, BlendMode::SrcIn));
+        let bounds = Rect::from_xywh(0.0, 0.0, FOLD_CONTROL_SIZE as f32, FOLD_CONTROL_SIZE as f32);
+        context
+            .canvas()
+            .save_layer(&SaveLayerRec::default().bounds(&bounds).paint(&paint));
+        dom.render(context.canvas());
+        context.canvas().restore();
+    });
     let _ = context.restore();
+}
+
+fn load_fold_icon() -> Option<Dom> {
+    match Dom::from_bytes(FOLD_ICON, FontMgr::empty()) {
+        Ok(mut dom) => {
+            dom.set_container_size((FOLD_CONTROL_SIZE as f32, FOLD_CONTROL_SIZE as f32));
+            Some(dom)
+        }
+        Err(error) => {
+            log::warn!("code_editor failed to load fold SVG with Skia: {error}");
+            None
+        }
+    }
 }
 
 fn fold_icon_angle(
