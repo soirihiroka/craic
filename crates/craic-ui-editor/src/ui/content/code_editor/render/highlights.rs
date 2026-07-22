@@ -1,10 +1,11 @@
 use super::super::super::skia_canvas;
+use super::text_width;
 use super::theme::{Color, EditorTheme};
-use super::{draw_plain_text, text_width};
 use crate::language_support::{HighlightRange, SyntaxIssue};
 use crate::markdown_lint::MarkdownLintIssue;
 use crate::spellcheck::SpellcheckIssue;
 use crate::ui::content::code_editor::EditorState;
+use crate::ui::content::code_editor::canvas::{self, StyledText, TextColor};
 use std::rc::Rc;
 
 pub fn draw_highlighted_slice(
@@ -13,13 +14,23 @@ pub fn draw_highlighted_slice(
     state: &Rc<EditorState>,
     source: &str,
     highlights: &[HighlightRange],
-    start: usize,
-    end: usize,
+    mut start: usize,
+    mut end: usize,
     mut x: f64,
     baseline: f64,
     max_x: f64,
     min_x: f64,
 ) {
+    if !state.wrap.get() && start < end {
+        let char_width = state.char_width.get().max(1.0);
+        let first_column = ((min_x - x) / char_width - 2.0).max(0.0);
+        let last_column = ((max_x - x) / char_width + 2.0).max(first_column + 1.0);
+        let slice = craic_text_layout::column_slice(&source[start..end], first_column, last_column);
+        x += slice.start_column * char_width;
+        start += slice.start;
+        end = start + slice.end.saturating_sub(slice.start);
+    }
+    let mut runs = Vec::new();
     let mut cursor = start;
     let first_range = highlights.partition_point(|range| range.end <= start);
     for range in &highlights[first_range..] {
@@ -37,36 +48,27 @@ pub fn draw_highlighted_slice(
         }
         if cursor < range_start {
             let plain = &source[cursor..range_start];
-            draw_plain_text(area, context, state, plain, x, baseline, (0.86, 0.86, 0.86));
-            x += text_width(area, state, plain);
+            runs.push(StyledText {
+                text: plain,
+                color: TextColor::rgb(0.86, 0.86, 0.86),
+            });
         }
         let segment = &source[range_start..range_end];
-        let segment_width = text_width(area, state, segment);
-        if x <= max_x && x + segment_width >= min_x {
-            draw_plain_text(
-                area,
-                context,
-                state,
-                segment,
-                x,
-                baseline,
-                range.style.color(),
-            );
-        }
-        x += segment_width;
+        let (red, green, blue) = range.style.color();
+        runs.push(StyledText {
+            text: segment,
+            color: TextColor::rgb(red, green, blue),
+        });
         cursor = range_end;
     }
     if cursor < end {
-        draw_plain_text(
-            area,
-            context,
-            state,
-            &source[cursor..end],
-            x,
-            baseline,
-            (0.86, 0.86, 0.86),
-        );
+        runs.push(StyledText {
+            text: &source[cursor..end],
+            color: TextColor::rgb(0.86, 0.86, 0.86),
+        });
     }
+    let _ = area;
+    canvas::draw_styled_text_headless(context, state.font_size.get(), &runs, x, baseline);
 }
 
 fn valid_highlight_range(source: &str, range: &HighlightRange) -> bool {

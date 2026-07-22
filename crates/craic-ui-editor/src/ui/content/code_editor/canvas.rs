@@ -11,6 +11,8 @@ use std::fs;
 const TEXT_WIDTH_CACHE_ENTRY_LIMIT: usize = 8192;
 const TEXT_WIDTH_CACHE_BYTE_LIMIT: usize = 1024 * 1024;
 const TEXT_WIDTH_CACHE_MAX_TEXT_BYTES: usize = 1024;
+const PARAGRAPH_CACHE_ENTRY_LIMIT: usize = 512;
+const PARAGRAPH_CACHE_BYTE_LIMIT: usize = 2 * 1024 * 1024;
 const TAB_REPLACEMENT: &str = "    ";
 const EDITOR_FONT_FAMILY: &str = "Craic Editor Mono";
 const FONT_FAMILIES: &[&str] = &[
@@ -31,6 +33,7 @@ const FONT_FAMILIES: &[&str] = &[
 thread_local! {
     static FONT_COLLECTION: FontCollection = build_font_collection();
     static FONT_METRIC_CACHE: RefCell<HashMap<i32, FontMetrics>> = RefCell::new(HashMap::new());
+    static PARAGRAPH_CACHE: RefCell<ParagraphCache> = RefCell::new(ParagraphCache::default());
 }
 
 #[derive(Clone, Copy)]
@@ -47,6 +50,12 @@ pub struct TextColor {
     pub green: f64,
     pub blue: f64,
     pub alpha: f64,
+}
+
+#[derive(Clone, Copy)]
+pub struct StyledText<'a> {
+    pub text: &'a str,
+    pub color: TextColor,
 }
 
 impl TextColor {
@@ -69,6 +78,20 @@ pub struct TextWidthCache {
     total_bytes: usize,
     widths: HashMap<String, f64>,
     insertion_order: VecDeque<String>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ParagraphKey {
+    font_size: i32,
+    text: String,
+    styles: Vec<(usize, [u8; 4])>,
+}
+
+#[derive(Default)]
+struct ParagraphCache {
+    total_bytes: usize,
+    paragraphs: HashMap<ParagraphKey, Paragraph>,
+    insertion_order: VecDeque<ParagraphKey>,
 }
 
 impl TextWidthCache {
@@ -98,6 +121,13 @@ impl TextWidthCache {
 
 pub fn measure_font_metrics(
     _area: &gtk::GLArea,
+    font_size: f64,
+    fallback_line_height: impl Fn(f64) -> f64,
+) -> FontMetrics {
+    measure_font_metrics_headless(font_size, fallback_line_height)
+}
+
+pub fn measure_font_metrics_headless(
     font_size: f64,
     fallback_line_height: impl Fn(f64) -> f64,
 ) -> FontMetrics {
@@ -137,6 +167,10 @@ pub fn cached_text_width(
     cache: &mut TextWidthCache,
     text: &str,
 ) -> f64 {
+    cached_text_width_headless(font_size, cache, text)
+}
+
+pub fn cached_text_width_headless(font_size: f64, cache: &mut TextWidthCache, text: &str) -> f64 {
     if text.is_empty() {
         return 0.0;
     }
@@ -166,17 +200,65 @@ pub fn draw_plain_text(
     baseline: f64,
     color: TextColor,
 ) {
+    draw_plain_text_headless(context, font_size, text, x, baseline, color);
+}
+
+pub fn draw_plain_text_headless(
+    context: &skia_canvas::Context<'_>,
+    font_size: f64,
+    text: &str,
+    x: f64,
+    baseline: f64,
+    color: TextColor,
+) {
     if text.is_empty() {
         return;
     }
-    let paragraph = paragraph(font_size_key(font_size), text, color);
-    paragraph.paint(
-        context.canvas(),
-        (
-            x as f32,
-            (baseline - paragraph.alphabetic_baseline() as f64) as f32,
-        ),
+    draw_styled_text_headless(
+        context,
+        font_size,
+        &[StyledText { text, color }],
+        x,
+        baseline,
     );
+}
+
+pub fn draw_styled_text_headless(
+    context: &skia_canvas::Context<'_>,
+    font_size: f64,
+    runs: &[StyledText<'_>],
+    x: f64,
+    baseline: f64,
+) {
+    if runs.is_empty() {
+        return;
+    }
+    let key = paragraph_key(font_size_key(font_size), runs);
+    if key.byte_len() > PARAGRAPH_CACHE_BYTE_LIMIT {
+        let paragraph = styled_paragraph(key.font_size, runs);
+        paragraph.paint(
+            context.canvas(),
+            (
+                x as f32,
+                (baseline - paragraph.alphabetic_baseline() as f64) as f32,
+            ),
+        );
+        return;
+    }
+    PARAGRAPH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.paragraphs.contains_key(&key) {
+            cache.insert(key.clone(), styled_paragraph(key.font_size, runs));
+        }
+        let paragraph = &cache.paragraphs[&key];
+        paragraph.paint(
+            context.canvas(),
+            (
+                x as f32,
+                (baseline - paragraph.alphabetic_baseline() as f64) as f32,
+            ),
+        );
+    });
 }
 
 fn paragraph(font_size: i32, text: &str, color: TextColor) -> Paragraph {
@@ -207,6 +289,96 @@ fn paragraph(font_size: i32, text: &str, color: TextColor) -> Paragraph {
         paragraph.layout(1_000_000.0);
         paragraph
     })
+}
+
+fn styled_paragraph(font_size: i32, runs: &[StyledText<'_>]) -> Paragraph {
+    FONT_COLLECTION.with(|fonts| {
+        let default_style = text_style(font_size, runs[0].color);
+        let mut paragraph_style = ParagraphStyle::new();
+        paragraph_style.set_text_style(&default_style);
+        let mut builder = ParagraphBuilder::new(&paragraph_style, fonts.clone());
+        for run in runs {
+            let style = text_style(font_size, run.color);
+            builder.push_style(&style);
+            if run.text.contains('\t') {
+                builder.add_text(&run.text.replace('\t', TAB_REPLACEMENT));
+            } else {
+                builder.add_text(run.text);
+            }
+            builder.pop();
+        }
+        let mut paragraph = builder.build();
+        paragraph.layout(1_000_000.0);
+        paragraph
+    })
+}
+
+fn paragraph_key(font_size: i32, runs: &[StyledText<'_>]) -> ParagraphKey {
+    let text_len = runs.iter().map(|run| run.text.len()).sum();
+    let mut text = String::with_capacity(text_len);
+    let mut styles = Vec::with_capacity(runs.len());
+    for run in runs {
+        text.push_str(run.text);
+        styles.push((
+            text.len(),
+            [
+                channel(run.color.alpha),
+                channel(run.color.red),
+                channel(run.color.green),
+                channel(run.color.blue),
+            ],
+        ));
+    }
+    ParagraphKey {
+        font_size,
+        text,
+        styles,
+    }
+}
+
+impl ParagraphCache {
+    fn insert(&mut self, key: ParagraphKey, paragraph: Paragraph) {
+        let key_bytes = key.byte_len();
+        while self.paragraphs.len() >= PARAGRAPH_CACHE_ENTRY_LIMIT
+            || self.total_bytes.saturating_add(key_bytes) > PARAGRAPH_CACHE_BYTE_LIMIT
+        {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                self.paragraphs.clear();
+                self.total_bytes = 0;
+                break;
+            };
+            if self.paragraphs.remove(&oldest).is_some() {
+                self.total_bytes = self.total_bytes.saturating_sub(oldest.text.len());
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(oldest.styles.len() * std::mem::size_of::<(usize, [u8; 4])>());
+            }
+        }
+        self.total_bytes = self.total_bytes.saturating_add(key_bytes);
+        self.insertion_order.push_back(key.clone());
+        self.paragraphs.insert(key, paragraph);
+    }
+}
+
+impl ParagraphKey {
+    fn byte_len(&self) -> usize {
+        self.text.len() + self.styles.len() * std::mem::size_of::<(usize, [u8; 4])>()
+    }
+}
+
+fn text_style(font_size: i32, color: TextColor) -> TextStyle {
+    let mut style = TextStyle::new();
+    style
+        .set_color(Color::from_argb(
+            channel(color.alpha),
+            channel(color.red),
+            channel(color.green),
+            channel(color.blue),
+        ))
+        .set_font_size(font_size as f32)
+        .set_font_style(FontStyle::normal())
+        .set_font_families(FONT_FAMILIES);
+    style
 }
 
 fn measure_text_width(font_size: i32, text: &str) -> f64 {

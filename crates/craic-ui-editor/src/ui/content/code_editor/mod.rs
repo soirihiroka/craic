@@ -1,3 +1,6 @@
+#[cfg(feature = "editor-bench")]
+#[doc(hidden)]
+pub mod bench_support;
 pub mod canvas;
 mod input;
 mod render;
@@ -35,6 +38,9 @@ const CELL_PADDING: f64 = 8.0;
 const MIN_CONTENT_WIDTH: i32 = 240;
 const MAX_HISTORY_SNAPSHOTS: usize = 200;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DocumentRevision(u64);
+
 #[derive(Clone)]
 pub struct CodeEditor {
     pub root: gtk::Box,
@@ -49,6 +55,7 @@ type ScrollCallback = Rc<dyn Fn(f64)>;
 
 struct EditorState {
     text: RefCell<TextBuffer>,
+    document_revision: Cell<u64>,
     language: RefCell<String>,
     font_size: Cell<f64>,
     char_width: Cell<f64>,
@@ -220,14 +227,7 @@ struct FoldIconState {
     target_angle: f64,
 }
 
-#[derive(Clone)]
-struct VisualLine {
-    source_line: usize,
-    start: usize,
-    end: usize,
-    wrap_index: usize,
-    folded: Option<usize>,
-}
+type VisualLine = craic_text_layout::VisualLine;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GutterSide {
@@ -244,6 +244,7 @@ struct LayoutCache {
     content_width: f64,
     content_height: f64,
     visual_lines: Vec<VisualLine>,
+    visual_spans: Vec<Option<(usize, usize)>>,
 }
 
 impl CodeEditor {
@@ -262,6 +263,7 @@ impl CodeEditor {
 
         let state = Rc::new(EditorState {
             text: RefCell::new(TextBuffer::new(text)),
+            document_revision: Cell::new(1),
             language: RefCell::new(language.to_string()),
             font_size: Cell::new(font_size),
             char_width: Cell::new(font_metrics.char_width),
@@ -464,6 +466,10 @@ impl CodeEditor {
         self.state.text.borrow().as_str().to_string()
     }
 
+    pub fn document_revision(&self) -> DocumentRevision {
+        DocumentRevision(self.state.document_revision.get())
+    }
+
     pub fn set_editable(&self, editable: bool) {
         self.state.editable.set(editable);
         self.area.set_focusable(true);
@@ -544,6 +550,9 @@ impl CodeEditor {
         if text_changed {
             input::dismiss_completion(&self.state);
             self.state.text.borrow_mut().set_text(text);
+            self.state
+                .document_revision
+                .set(self.state.document_revision.get().wrapping_add(1).max(1));
             self.state.cursor.set(text.len());
             self.state.selection.borrow_mut().take();
             self.state.undo_stack.borrow_mut().clear();

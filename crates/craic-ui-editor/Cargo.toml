@@ -4,10 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+editor-bench = []
+
 [dependencies]
 adw.workspace = true
 craic-config.workspace = true
 craic-language.workspace = true
+craic-text-layout.workspace = true
 craic-ui-core.workspace = true
 craic-vcs.workspace = true
 gdk4-wayland.workspace = true
@@ -16,3 +20,11 @@ gtk.workspace = true
 log.workspace = true
 skia-safe.workspace = true
 unicode-segmentation.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "code_editor_offscreen"
+harness = false
+required-features = ["editor-bench"]

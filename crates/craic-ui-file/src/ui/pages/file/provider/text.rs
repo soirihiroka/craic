@@ -5,6 +5,9 @@ use std::sync::mpsc;
 
 struct TextPreviewLoad {
     text: String,
+}
+
+struct TextDiagnostics {
     markdown_lint_issues: Vec<crate::markdown_lint::MarkdownLintIssue>,
     spellcheck_issues: Vec<crate::spellcheck::SpellcheckIssue>,
 }
@@ -34,40 +37,95 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
     let disk_signature = super::disk_signature(request.info);
     let writable = request.info.capabilities.writable;
     let language = crate::ui::content::code_editor::language_hint_from_path(&file_path);
-    let comparison_right = Rc::clone(&request.right);
-    let comparison_token = request.load_token;
+    let deferred_right = Rc::clone(&request.right);
+    let load_token = request.load_token;
 
     super::spawn_preview_load(
         Rc::clone(&request.right),
         request.load_token,
         file_path.clone(),
         move || {
-            super::super::repository_text_from_prefetch(prefetched_bytes, &file_path).map(|text| {
-                let allowlist = crate::spellcheck::manifest_allowlist_from_texts(&[(
-                    &file_path,
-                    text.as_str(),
-                )]);
-                let spellcheck_issues = crate::spellcheck::check_document(
-                    &language,
-                    Some(&file_path),
-                    &text,
-                    &allowlist,
-                );
-                let ignored_rules =
-                    crate::workspace_config::markdown_lint_ignored_rules_from_file_access(
-                        files.as_ref(),
-                    );
-                let markdown_lint_issues =
-                    super::super::markdown_lint_issues(&file_path, &text, &ignored_rules);
-                TextPreviewLoad {
-                    text,
-                    markdown_lint_issues,
-                    spellcheck_issues,
-                }
-            })
+            super::super::repository_text_from_prefetch(prefetched_bytes, &file_path)
+                .map(|text| TextPreviewLoad { text })
         },
         move |right, result| match result {
             Ok(load) => {
+                right.show_editor(
+                    &apply_node_path,
+                    &apply_file_path,
+                    &load.text,
+                    disk_signature,
+                    writable,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                );
+                right.file_view_split.set_end_child(None::<&gtk::Widget>);
+                if let Some((start, end)) = selection {
+                    right.file_editor.select_range(start, end);
+                }
+                let revision = right.file_editor.document_revision();
+                log::debug!(
+                    "text preview content displayed file_path={} bytes={} revision={revision:?}",
+                    apply_file_path,
+                    load.text.len(),
+                );
+
+                let diagnostics_source = load.text;
+                let diagnostics_path = apply_file_path.clone();
+                let diagnostics_language = language.clone();
+                let diagnostics_files = files.clone();
+                super::spawn_preview_load(
+                    Rc::clone(&deferred_right),
+                    load_token,
+                    diagnostics_path.clone(),
+                    move || {
+                        let allowlist = crate::spellcheck::manifest_allowlist_from_texts(&[(
+                            &diagnostics_path,
+                            diagnostics_source.as_str(),
+                        )]);
+                        let spellcheck_issues = crate::spellcheck::check_document(
+                            &diagnostics_language,
+                            Some(&diagnostics_path),
+                            &diagnostics_source,
+                            &allowlist,
+                        );
+                        let ignored_rules =
+                            crate::workspace_config::markdown_lint_ignored_rules_from_file_access(
+                                diagnostics_files.as_ref(),
+                            );
+                        let markdown_lint_issues = super::super::markdown_lint_issues(
+                            &diagnostics_path,
+                            &diagnostics_source,
+                            &ignored_rules,
+                        );
+                        TextDiagnostics {
+                            markdown_lint_issues,
+                            spellcheck_issues,
+                        }
+                    },
+                    move |right, diagnostics| {
+                        if right.file_editor.document_revision() != revision {
+                            log::debug!(
+                                "text preview diagnostics ignored reason=document-changed expected={revision:?} actual={:?}",
+                                right.file_editor.document_revision()
+                            );
+                            return;
+                        }
+                        log::debug!(
+                            "text preview diagnostics applied spellcheck={} markdown_lint={} revision={revision:?}",
+                            diagnostics.spellcheck_issues.len(),
+                            diagnostics.markdown_lint_issues.len(),
+                        );
+                        right
+                            .file_editor
+                            .set_spellcheck_issues(diagnostics.spellcheck_issues);
+                        right
+                            .file_editor
+                            .set_markdown_lint_issues(diagnostics.markdown_lint_issues);
+                    },
+                );
+
                 if let Some(git) = git.clone() {
                     let (sender, receiver) = mpsc::channel();
                     git.comparison(
@@ -76,49 +134,26 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
                             let _ = sender.send(result.ok());
                         }),
                     );
-                    let node_path = apply_node_path.clone();
-                    let file_path = apply_file_path.clone();
-                    let mut load = Some(load);
                     super::receive_preview_load(
-                        Rc::clone(&comparison_right),
-                        comparison_token,
+                        Rc::clone(&deferred_right),
+                        load_token,
                         apply_file_path.clone(),
                         receiver,
                         move |right, comparison: Option<FileComparison>| {
-                            let Some(load) = load.take() else {
+                            if right.file_editor.document_revision() != revision {
+                                log::debug!(
+                                    "text preview comparison ignored reason=document-changed expected={revision:?} actual={:?}",
+                                    right.file_editor.document_revision()
+                                );
                                 return;
-                            };
-                            right.show_editor(
-                                &node_path,
-                                &file_path,
-                                &load.text,
-                                disk_signature,
-                                writable,
-                                comparison.as_ref(),
-                                load.markdown_lint_issues,
-                                load.spellcheck_issues,
-                            );
-                            right.file_view_split.set_end_child(None::<&gtk::Widget>);
-                            if let Some((start, end)) = selection {
-                                right.file_editor.select_range(start, end);
                             }
+                            log::debug!(
+                                "text preview comparison applied rows={} revision={revision:?}",
+                                comparison.as_ref().map_or(0, |value| value.rows.len())
+                            );
+                            right.file_editor.set_file_diff(comparison.as_ref());
                         },
                     );
-                } else {
-                    right.show_editor(
-                        &apply_node_path,
-                        &apply_file_path,
-                        &load.text,
-                        disk_signature,
-                        writable,
-                        None,
-                        load.markdown_lint_issues,
-                        load.spellcheck_issues,
-                    );
-                    right.file_view_split.set_end_child(None::<&gtk::Widget>);
-                    if let Some((start, end)) = selection {
-                        right.file_editor.select_range(start, end);
-                    }
                 }
             }
             Err(message) => right.show_unavailable(&apply_file_path, &message),

@@ -185,6 +185,9 @@ fn status_for_token<'s>(token: &str, allowlist: &'s SpellcheckAllowlist) -> Opti
 
 fn spellcheck_spans(language: &str, path: Option<&str>, text: &str) -> Vec<(usize, usize)> {
     let language = language.to_ascii_lowercase();
+    if language == "csv" {
+        return Vec::new();
+    }
     if matches!(
         language.as_str(),
         "md" | "markdown" | "txt" | "text" | "rst" | "adoc"
