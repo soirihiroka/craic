@@ -8,7 +8,7 @@ A development environment made by me for me :D
 
 Any usage outside of my computer is out of scope and unsupported x3
 
-<img width="1207" height="764" alt="image" src="https://github.com/user-attachments/assets/511380e1-a28e-42b3-b03c-7896885072ce" />
+<img width="1227" height="811" alt="Screenshot From 2026-07-22 00-18-14" src="https://github.com/user-attachments/assets/0ce02b73-d09d-4262-83d3-ceaaefad4bc3" />
 
 ---
 
