@@ -1,1 +1,0 @@
-Avoid writing trivial functions.
