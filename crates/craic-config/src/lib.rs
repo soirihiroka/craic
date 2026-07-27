@@ -7,6 +7,7 @@ pub const MAX_FONT_SIZE: f64 = 32.0;
 pub const DEFAULT_SHELL_FONT_SIZE: f64 = 13.0;
 pub const DEFAULT_EDITOR_FONT_SIZE: f64 = 14.0;
 pub const DEFAULT_DIFF_FONT_SIZE: f64 = 13.0;
+pub const DEFAULT_AGENT_FONT_SIZE: f64 = 11.0;
 pub const DEFAULT_AGENT_PROVIDER_ID: &str = "opencode";
 
 const WORKSPACES_KEY: &str = "workspaces";
@@ -20,6 +21,7 @@ const OLLAMA_BASE_URL_KEY: &str = "ollama.base_url";
 const SHELL_FONT_SIZE_KEY: &str = "font_size.shell";
 const EDITOR_FONT_SIZE_KEY: &str = "font_size.editor";
 const DIFF_FONT_SIZE_KEY: &str = "font_size.diff";
+const AGENT_FONT_SIZE_KEY: &str = "font_size.agent";
 const COLOR_KEY: &str = "color";
 
 type ConfigMap = HashMap<String, toml::Value>;
@@ -66,6 +68,7 @@ pub struct FontSizes {
     pub shell: f64,
     pub editor: f64,
     pub diff: f64,
+    pub agent: f64,
 }
 
 impl Default for FontSizes {
@@ -74,6 +77,7 @@ impl Default for FontSizes {
             shell: DEFAULT_SHELL_FONT_SIZE,
             editor: DEFAULT_EDITOR_FONT_SIZE,
             diff: DEFAULT_DIFF_FONT_SIZE,
+            agent: DEFAULT_AGENT_FONT_SIZE,
         }
     }
 }
@@ -119,6 +123,10 @@ pub fn load() -> AppConfig {
         diff: normalize_font_size(
             config_f64(&config, DIFF_FONT_SIZE_KEY).unwrap_or(DEFAULT_DIFF_FONT_SIZE),
             DEFAULT_DIFF_FONT_SIZE,
+        ),
+        agent: normalize_font_size(
+            config_f64(&config, AGENT_FONT_SIZE_KEY).unwrap_or(DEFAULT_AGENT_FONT_SIZE),
+            DEFAULT_AGENT_FONT_SIZE,
         ),
     };
 
@@ -388,6 +396,13 @@ pub fn save_font_sizes(font_sizes: FontSizes) {
         DIFF_FONT_SIZE_KEY.to_string(),
         toml::Value::Float(normalize_font_size(font_sizes.diff, DEFAULT_DIFF_FONT_SIZE)),
     );
+    config.insert(
+        AGENT_FONT_SIZE_KEY.to_string(),
+        toml::Value::Float(normalize_font_size(
+            font_sizes.agent,
+            DEFAULT_AGENT_FONT_SIZE,
+        )),
+    );
     save_config_file(&config);
 }
 
@@ -406,6 +421,12 @@ pub fn save_editor_font_size(font_size: f64) {
 pub fn save_diff_font_size(font_size: f64) {
     let mut font_sizes = load().font_sizes;
     font_sizes.diff = normalize_font_size(font_size, DEFAULT_DIFF_FONT_SIZE);
+    save_font_sizes(font_sizes);
+}
+
+pub fn save_agent_font_size(font_size: f64) {
+    let mut font_sizes = load().font_sizes;
+    font_sizes.agent = normalize_font_size(font_size, DEFAULT_AGENT_FONT_SIZE);
     save_font_sizes(font_sizes);
 }
 

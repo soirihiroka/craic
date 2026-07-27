@@ -258,8 +258,15 @@ impl CodexChatView {
             .margin_start(14)
             .can_target(false)
             .build();
+        let composer_scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .hexpand(true)
+            .vexpand(true)
+            .child(&composer)
+            .build();
         let composer_overlay = gtk::Overlay::new();
-        composer_overlay.set_child(Some(&composer));
+        composer_overlay.set_child(Some(&composer_scroller));
         composer_overlay.add_overlay(&composer_placeholder);
         let composer_frame = gtk::Frame::builder()
             .hexpand(true)
@@ -311,13 +318,13 @@ impl CodexChatView {
         let context_button = add_context_menu(callbacks.clone());
         let send_button = gtk::Button::builder()
             .label("Send")
-            .tooltip_text("Send (Ctrl+Enter)")
+            .tooltip_text("Send (Enter)")
             .sensitive(false)
             .build();
         send_button.add_css_class("suggested-action");
         let steer_button = gtk::Button::builder()
             .icon_name("mail-send-symbolic")
-            .tooltip_text("Add instructions to the active turn (Ctrl+Enter)")
+            .tooltip_text("Add instructions to the active turn (Enter)")
             .visible(false)
             .build();
         steer_button.update_property(&[gtk::accessible::Property::Label("Steer active turn")]);
@@ -381,7 +388,7 @@ impl CodexChatView {
         transcript_area.append(&transcript_panel);
         let split = gtk::Paned::builder()
             .orientation(gtk::Orientation::Vertical)
-            .wide_handle(true)
+            .wide_handle(false)
             .resize_start_child(true)
             .resize_end_child(false)
             .shrink_start_child(true)
@@ -1131,12 +1138,17 @@ fn connect_composer(state: &Rc<CodexChatViewState>, drop_widget: &gtk::Frame) {
                     return glib::Propagation::Stop;
                 }
             }
-            if key != gdk::Key::Return || !modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+            if !matches!(key, gdk::Key::Return | gdk::Key::KP_Enter)
+                || modifiers.contains(gdk::ModifierType::SHIFT_MASK)
+            {
                 return glib::Propagation::Proceed;
             }
             let Some(state) = state.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            if !state.connected.get() || !state.composer_allowed.get() {
+                return glib::Propagation::Proceed;
+            }
             submit_composer(&state, state.turn_active.get());
             glib::Propagation::Stop
         }

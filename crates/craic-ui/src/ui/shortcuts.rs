@@ -71,6 +71,20 @@ const SHORTCUT_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Codex Chat",
+        &[
+            ("Send message", "Return"),
+            ("Insert newline", "<Shift>Return"),
+            ("Increase chat font size", "<Control>plus"),
+            ("Increase chat font size", "<Control>equal"),
+            ("Increase chat font size", "<Control>KP_Add"),
+            ("Decrease chat font size", "<Control>minus"),
+            ("Decrease chat font size", "<Control>underscore"),
+            ("Decrease chat font size", "<Control>KP_Subtract"),
+            ("Reset chat font size", "<Control>0"),
+        ],
+    ),
+    (
         "PDF Preview",
         &[
             ("Zoom in", "<Control>plus"),

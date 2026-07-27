@@ -105,14 +105,13 @@ pub(super) fn timeline_row(item: &TimelineItem) -> gtk::Widget {
         content.append(&expander);
     }
 
-    let card = gtk::Box::builder()
+    let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
-    card.add_css_class("card");
     if matches!(item.kind, TimelineItemKind::Error) {
-        card.add_css_class("error");
+        row.add_css_class("error");
     }
-    card.append(&content);
+    row.append(&content);
     let clamp = adw::Clamp::builder()
         .maximum_size(960)
         .tightening_threshold(720)
@@ -120,7 +119,7 @@ pub(super) fn timeline_row(item: &TimelineItem) -> gtk::Widget {
         .margin_bottom(6)
         .margin_start(12)
         .margin_end(12)
-        .child(&card)
+        .child(&row)
         .build();
     clamp.upcast()
 }

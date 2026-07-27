@@ -134,7 +134,7 @@ impl CodexThreadPicker {
             .build();
 
         let empty_spinner = adw::Spinner::new();
-        empty_spinner.set_size_request(24, 24);
+        empty_spinner.set_size_request(40, 40);
         empty_spinner.set_visible(false);
         let empty_title = gtk::Label::builder()
             .label("No Codex threads")
@@ -511,21 +511,22 @@ impl CodexThreadPicker {
         if let Some(error) = self.state.error.borrow().as_deref() {
             self.state.empty_title.set_label("Could not load threads");
             self.state.empty_description.set_label(error);
+            self.state.empty_description.set_visible(true);
         } else if loading {
-            self.state.empty_title.set_label("Loading Codex threads");
-            self.state
-                .empty_description
-                .set_label("Fetching conversation history…");
+            self.state.empty_title.set_label("Loading threads…");
+            self.state.empty_description.set_visible(false);
         } else if self.query().is_empty() {
             self.state.empty_title.set_label("No Codex threads");
             self.state
                 .empty_description
                 .set_label("Start a new conversation to create one.");
+            self.state.empty_description.set_visible(true);
         } else {
             self.state.empty_title.set_label("No matching threads");
             self.state
                 .empty_description
                 .set_label("Try a different search.");
+            self.state.empty_description.set_visible(true);
         }
     }
 }

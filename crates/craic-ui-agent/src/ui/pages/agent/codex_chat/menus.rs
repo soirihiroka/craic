@@ -9,10 +9,6 @@ pub(super) fn thread_command_menu(callbacks: Rc<RefCell<Vec<ActionCallback>>>) -
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(0)
-        .margin_top(3)
-        .margin_bottom(3)
-        .margin_start(4)
-        .margin_end(4)
         .build();
     for (label, icon_name, action) in [
         (
@@ -60,7 +56,7 @@ pub(super) fn thread_command_menu(callbacks: Rc<RefCell<Vec<ActionCallback>>>) -
             .build();
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
+            .spacing(4)
             .build();
         row.append(&icon);
         row.append(&label);
@@ -96,10 +92,6 @@ pub(super) fn add_context_menu(callbacks: Rc<RefCell<Vec<ActionCallback>>>) -> g
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(0)
-        .margin_top(3)
-        .margin_bottom(3)
-        .margin_start(4)
-        .margin_end(4)
         .build();
     for (label, icon_name, action) in [
         (
@@ -127,7 +119,7 @@ pub(super) fn add_context_menu(callbacks: Rc<RefCell<Vec<ActionCallback>>>) -> g
             .build();
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
+            .spacing(4)
             .build();
         row.append(&icon);
         row.append(&label);

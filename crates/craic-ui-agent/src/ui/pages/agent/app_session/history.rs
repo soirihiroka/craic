@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use craic_codex_app_server::protocol::RequestId;
+use craic_codex_app_server::{AppServerError, ConnectionState};
 use gtk::gio;
 use serde_json::{Value, json};
 
@@ -221,8 +222,15 @@ impl AppChatSessionInner {
     pub(super) fn load_thread_page(&self, append: bool) {
         let server = self.server.borrow();
         let Some(server) = server.as_ref() else {
-            self.picker
-                .set_error(Some("Codex App Server is not connected."));
+            if matches!(
+                *self.lifecycle.borrow(),
+                AppChatState::Connecting | AppChatState::Initializing | AppChatState::StartingThread
+            ) {
+                self.picker.set_loading(true);
+            } else {
+                self.picker
+                    .set_error(Some("Codex App Server is not connected."));
+            }
             return;
         };
         if !append {
@@ -262,6 +270,9 @@ impl AppChatSessionInner {
                     },
                 );
             }
+            Err(AppServerError::NotReady(
+                ConnectionState::Starting | ConnectionState::Initializing,
+            )) => self.picker.set_loading(true),
             Err(error) => self.picker.set_error(Some(&error.to_string())),
         }
     }

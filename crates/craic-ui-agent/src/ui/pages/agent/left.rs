@@ -1648,6 +1648,8 @@ fn title_label(title: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(title)
         .ellipsize(gtk::pango::EllipsizeMode::End)
+        .single_line_mode(true)
+        .lines(1)
         .width_chars(12)
         .max_width_chars(18)
         .xalign(0.0)
