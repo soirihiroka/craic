@@ -624,6 +624,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "craic-codex"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "craic-config"
 version = "0.1.0"
 dependencies = [
@@ -755,6 +765,7 @@ name = "craic-ui-agent"
 version = "0.1.0"
 dependencies = [
  "craic-agent",
+ "craic-codex",
  "craic-config",
  "craic-system",
  "craic-ui-core",

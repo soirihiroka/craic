@@ -1,9 +1,12 @@
 mod agent_shell_integration;
+mod app_session;
+mod codex_chat;
 mod left;
 mod prompts;
 mod provider;
 mod right;
 mod smart_summary;
+mod thread_picker;
 
 use super::{
     Page, PageBadge, PageCommand, PageCommandResult, PageContext, PageInitializeComplete,
@@ -13,7 +16,7 @@ use crate::git::WorkspaceSnapshot;
 use crate::ui::agent_history;
 use adw::prelude::*;
 use gtk::gio;
-use left::{AgentList, AgentListContextAction, AgentListSelection};
+use left::{AgentLaunch, AgentList, AgentListContextAction, AgentListSelection};
 use right::AgentChat;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -165,8 +168,12 @@ impl AgentPage {
         list.connect_new_chat({
             let chat = chat.clone();
 
-            move |provider| {
-                chat.start_chat(provider);
+            move |launch| {
+                if launch == AgentLaunch::App {
+                    chat.start_app();
+                } else if let Some(provider) = launch.terminal_provider() {
+                    chat.start_chat(provider);
+                }
             }
         });
 

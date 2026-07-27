@@ -1,4 +1,5 @@
 pub mod agy;
+pub mod app;
 pub mod codex;
 pub mod opencode;
 
@@ -114,12 +115,9 @@ pub fn all_providers() -> &'static [&'static dyn AgentProvider] {
     &PROVIDERS
 }
 
-pub fn default_provider() -> &'static dyn AgentProvider {
-    &codex::PROVIDER
-}
-
 pub fn is_default_agent_title(title: &str) -> bool {
     title == "New Chat"
+        || title == app::PROVIDER.default_title().as_str()
         || title == codex::PROVIDER.default_title().as_str()
         || title == agy::PROVIDER.default_title().as_str()
         || title == opencode::PROVIDER.default_title().as_str()

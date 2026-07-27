@@ -22,7 +22,7 @@ impl AgentProvider for Provider {
     }
 
     fn label(&self) -> &'static str {
-        "Codex"
+        "Codex CLI"
     }
 
     fn session_icon_name(&self) -> &'static str {
