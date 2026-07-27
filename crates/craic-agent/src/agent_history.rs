@@ -95,6 +95,25 @@ pub struct AgentSessionSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexThreadOverlay {
+    pub thread_id: String,
+    pub workspace_key: String,
+    pub task_description: Option<String>,
+    pub normalized_task_description: Option<String>,
+    pub tags: Vec<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexThreadOverlayUpsert {
+    pub thread_id: String,
+    pub workspace_key: String,
+    pub task_description: Option<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceTag {
     pub tag: String,
     pub session_count: usize,
@@ -140,7 +159,12 @@ pub fn default_title_should_persist(title: &str) -> bool {
     !title.is_empty()
         && !matches!(
             lower.as_str(),
-            "new chat" | "new codex chat" | "new agy chat" | "new opencode chat"
+            "new chat"
+                | "new app chat"
+                | "new codex chat"
+                | "new codex cli chat"
+                | "new agy chat"
+                | "new opencode chat"
         )
 }
 
@@ -386,6 +410,206 @@ pub fn update_session_summary(local_id: i64, summary: &AgentSessionSummary) -> R
         local_id,
         description.len(),
         summary.tags.len()
+    );
+    Ok(())
+}
+
+pub fn upsert_codex_thread_overlay(
+    input: CodexThreadOverlayUpsert,
+) -> Result<CodexThreadOverlay, String> {
+    let thread_id = input.thread_id.trim();
+    if thread_id.is_empty() {
+        return Err("Codex thread ID is empty.".to_string());
+    }
+    let workspace_key = input.workspace_key.trim();
+    if workspace_key.is_empty() {
+        return Err("Codex thread workspace key is empty.".to_string());
+    }
+
+    let task_description = input
+        .task_description
+        .as_deref()
+        .map(normalize_title)
+        .filter(|description| !description.is_empty());
+    let normalized_task_description = task_description.as_deref().map(normalize_title_for_match);
+    let tags = normalized_summary_tags(&input.tags);
+    let now = unix_now_ms();
+    let conn = history_connection().map_err(db_error)?;
+    let tx = conn.unchecked_transaction().map_err(db_error)?;
+    tx.execute(
+        "INSERT INTO codex_thread_overlays (
+            workspace_key, thread_id, task_description, normalized_task_description,
+            created_at_ms, updated_at_ms
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+         ON CONFLICT(workspace_key, thread_id) DO UPDATE SET
+            task_description = excluded.task_description,
+            normalized_task_description = excluded.normalized_task_description,
+            updated_at_ms = excluded.updated_at_ms",
+        params![
+            workspace_key,
+            thread_id,
+            task_description,
+            normalized_task_description,
+            now
+        ],
+    )
+    .map_err(db_error)?;
+    tx.execute(
+        "DELETE FROM codex_thread_tags WHERE workspace_key = ?1 AND thread_id = ?2",
+        params![workspace_key, thread_id],
+    )
+    .map_err(db_error)?;
+    for tag in &tags {
+        tx.execute(
+            "INSERT INTO codex_thread_tags (workspace_key, thread_id, tag, normalized_tag)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![workspace_key, thread_id, tag, normalize_tag(tag)],
+        )
+        .map_err(db_error)?;
+    }
+    tx.commit().map_err(db_error)?;
+
+    log::info!(
+        "Codex thread overlay saved workspace={} thread_id={} description_present={} tags={}",
+        workspace_key,
+        thread_id,
+        task_description.is_some(),
+        tags.len()
+    );
+    lookup_codex_thread_overlay(workspace_key, thread_id)?
+        .ok_or_else(|| "Codex thread overlay was not readable after upsert.".to_string())
+}
+
+pub fn lookup_codex_thread_overlay(
+    workspace_key: &str,
+    thread_id: &str,
+) -> Result<Option<CodexThreadOverlay>, String> {
+    let conn = history_connection().map_err(db_error)?;
+    let overlay = conn
+        .query_row(
+            "SELECT thread_id, workspace_key, task_description,
+                    normalized_task_description, created_at_ms, updated_at_ms
+             FROM codex_thread_overlays
+             WHERE workspace_key = ?1 AND thread_id = ?2",
+            params![workspace_key, thread_id],
+            codex_thread_overlay_from_db,
+        )
+        .optional()
+        .map_err(db_error)?;
+    overlay
+        .map(|overlay| load_codex_thread_overlay_tags(&conn, overlay))
+        .transpose()
+}
+
+pub fn update_codex_thread_overlay_tags(
+    workspace_key: &str,
+    thread_id: &str,
+    tags: &[String],
+) -> Result<CodexThreadOverlay, String> {
+    let workspace_key = workspace_key.trim();
+    if workspace_key.is_empty() {
+        return Err("Codex thread workspace key is empty.".to_string());
+    }
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return Err("Codex thread ID is empty.".to_string());
+    }
+
+    let tags = normalized_summary_tags(tags);
+    let now = unix_now_ms();
+    let conn = history_connection().map_err(db_error)?;
+    let tx = conn.unchecked_transaction().map_err(db_error)?;
+    tx.execute(
+        "INSERT INTO codex_thread_overlays (
+            workspace_key, thread_id, task_description, normalized_task_description,
+            created_at_ms, updated_at_ms
+         )
+         VALUES (?1, ?2, NULL, NULL, ?3, ?3)
+         ON CONFLICT(workspace_key, thread_id) DO UPDATE SET
+            updated_at_ms = excluded.updated_at_ms",
+        params![workspace_key, thread_id, now],
+    )
+    .map_err(db_error)?;
+    tx.execute(
+        "DELETE FROM codex_thread_tags WHERE workspace_key = ?1 AND thread_id = ?2",
+        params![workspace_key, thread_id],
+    )
+    .map_err(db_error)?;
+    for tag in &tags {
+        tx.execute(
+            "INSERT INTO codex_thread_tags (workspace_key, thread_id, tag, normalized_tag)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![workspace_key, thread_id, tag, normalize_tag(tag)],
+        )
+        .map_err(db_error)?;
+    }
+    tx.commit().map_err(db_error)?;
+
+    log::info!(
+        "Codex thread tags updated workspace={} thread_id={} tags={}",
+        workspace_key,
+        thread_id,
+        tags.len()
+    );
+    lookup_codex_thread_overlay(workspace_key, thread_id)?
+        .ok_or_else(|| "Codex thread overlay was not readable after updating tags.".to_string())
+}
+
+pub fn list_codex_thread_overlays(
+    workspace_key: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<CodexThreadOverlay>, String> {
+    let conn = history_connection().map_err(db_error)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT thread_id, workspace_key, task_description,
+                    normalized_task_description, created_at_ms, updated_at_ms
+             FROM codex_thread_overlays
+             WHERE workspace_key = ?1
+             ORDER BY updated_at_ms DESC, thread_id
+             LIMIT ?2 OFFSET ?3",
+        )
+        .map_err(db_error)?;
+    let overlays = stmt
+        .query_map(
+            params![workspace_key, limit as i64, offset as i64],
+            codex_thread_overlay_from_db,
+        )
+        .map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)?;
+    overlays
+        .into_iter()
+        .map(|overlay| load_codex_thread_overlay_tags(&conn, overlay))
+        .collect()
+}
+
+pub fn delete_codex_thread_overlay(workspace_key: &str, thread_id: &str) -> Result<(), String> {
+    let conn = history_connection().map_err(db_error)?;
+    let tx = conn.unchecked_transaction().map_err(db_error)?;
+    tx.execute(
+        "DELETE FROM codex_thread_tags WHERE workspace_key = ?1 AND thread_id = ?2",
+        params![workspace_key, thread_id],
+    )
+    .map_err(db_error)?;
+    let deleted = tx
+        .execute(
+            "DELETE FROM codex_thread_overlays WHERE workspace_key = ?1 AND thread_id = ?2",
+            params![workspace_key, thread_id],
+        )
+        .map_err(db_error)?;
+    if deleted == 0 {
+        return Err(format!(
+            "Codex thread overlay {thread_id} was not found in workspace {workspace_key}."
+        ));
+    }
+    tx.commit().map_err(db_error)?;
+    log::info!(
+        "Codex thread overlay deleted workspace={} thread_id={}",
+        workspace_key,
+        thread_id
     );
     Ok(())
 }
@@ -665,7 +889,29 @@ fn history_connection() -> Result<Connection, rusqlite::Error> {
             FOREIGN KEY(session_id) REFERENCES agent_sessions(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_agent_session_tags_workspace
-            ON agent_session_tags(normalized_tag, session_id);",
+            ON agent_session_tags(normalized_tag, session_id);
+        CREATE TABLE IF NOT EXISTS codex_thread_overlays (
+            workspace_key TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            task_description TEXT,
+            normalized_task_description TEXT,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(workspace_key, thread_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_thread_overlays_workspace_updated
+            ON codex_thread_overlays(workspace_key, updated_at_ms DESC, thread_id);
+        CREATE TABLE IF NOT EXISTS codex_thread_tags (
+            workspace_key TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            normalized_tag TEXT NOT NULL,
+            PRIMARY KEY(workspace_key, thread_id, normalized_tag),
+            FOREIGN KEY(workspace_key, thread_id)
+                REFERENCES codex_thread_overlays(workspace_key, thread_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_thread_tags_workspace
+            ON codex_thread_tags(workspace_key, normalized_tag, thread_id);",
     )?;
     ensure_history_columns(&conn)?;
     Ok(conn)
@@ -748,6 +994,42 @@ fn row_from_db(row: &rusqlite::Row<'_>) -> Result<AgentSessionRow, rusqlite::Err
         last_seen_at_ms: row.get(15)?,
         ended_at_ms: row.get(16)?,
     })
+}
+
+fn codex_thread_overlay_from_db(
+    row: &rusqlite::Row<'_>,
+) -> Result<CodexThreadOverlay, rusqlite::Error> {
+    Ok(CodexThreadOverlay {
+        thread_id: row.get(0)?,
+        workspace_key: row.get(1)?,
+        task_description: row.get(2)?,
+        normalized_task_description: row.get(3)?,
+        tags: Vec::new(),
+        created_at_ms: row.get(4)?,
+        updated_at_ms: row.get(5)?,
+    })
+}
+
+fn load_codex_thread_overlay_tags(
+    conn: &Connection,
+    mut overlay: CodexThreadOverlay,
+) -> Result<CodexThreadOverlay, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT tag
+             FROM codex_thread_tags
+             WHERE workspace_key = ?1 AND thread_id = ?2
+             ORDER BY lower(tag), tag",
+        )
+        .map_err(db_error)?;
+    overlay.tags = stmt
+        .query_map(params![overlay.workspace_key, overlay.thread_id], |row| {
+            row.get(0)
+        })
+        .map_err(db_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)?;
+    Ok(overlay)
 }
 
 pub fn new_session_uuid() -> String {

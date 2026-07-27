@@ -10,6 +10,7 @@ use std::sync::mpsc::{self, TryRecvError};
 
 use super::super::PageContext;
 use super::agent_shell_integration::{self, AgentNotification, AgentShellIntegration};
+use super::app_session::{AppChatSession, AppChatState};
 use super::prompts::{PromptBar, PromptSelection};
 use super::smart_summary;
 use super::{
@@ -124,6 +125,7 @@ pub struct AgentChat {
     search_options: TerminalSearchOptions,
     notebook: gtk::Notebook,
     sessions: Rc<RefCell<Vec<AgentSession>>>,
+    app_sessions: Rc<RefCell<Vec<AppChatSession>>>,
     next_session_id: Rc<Cell<u64>>,
     working_directory: Rc<RefCell<PathBuf>>,
     workspace_history: Rc<RefCell<agent_history::WorkspaceKey>>,
@@ -191,6 +193,7 @@ impl AgentChat {
             search_options: TerminalSearchOptions::new(),
             notebook,
             sessions: Rc::new(RefCell::new(Vec::new())),
+            app_sessions: Rc::new(RefCell::new(Vec::new())),
             next_session_id: Rc::new(Cell::new(1)),
             working_directory: Rc::new(RefCell::new(initial_workspace_path)),
             workspace_history: Rc::new(RefCell::new(initial_workspace_history)),
@@ -245,8 +248,14 @@ impl AgentChat {
             .iter()
             .map(|session| session.id)
             .collect::<Vec<_>>();
+        let app_session_ids = self
+            .app_sessions
+            .borrow()
+            .iter()
+            .map(AppChatSession::id)
+            .collect::<Vec<_>>();
 
-        if session_ids.is_empty() {
+        if session_ids.is_empty() && app_session_ids.is_empty() {
             return 0;
         }
 
@@ -254,7 +263,7 @@ impl AgentChat {
             "agent workspace changed; closing active sessions current_workspace={} next_workspace={} count={}",
             current_workspace_key,
             next_workspace_key,
-            session_ids.len()
+            session_ids.len() + app_session_ids.len()
         );
         for session_id in &session_ids {
             close_session(
@@ -265,15 +274,143 @@ impl AgentChat {
                 &self.history_callback,
             );
         }
-        session_ids.len()
+        for session_id in &app_session_ids {
+            close_app_session(
+                *session_id,
+                &self.app_sessions,
+                &self.notebook,
+                &self.close_callback,
+            );
+        }
+        session_ids.len() + app_session_ids.len()
     }
 
     pub fn show(&self) {
-        if self.sessions.borrow().is_empty() {
-            self.start_chat(provider::default_provider());
+        if self.sessions.borrow().is_empty() && self.app_sessions.borrow().is_empty() {
+            self.start_app();
         } else {
-            self.focus_active_terminal();
+            self.focus_active_session();
         }
+    }
+
+    pub fn start_app(&self) {
+        let session_id = self.reserve_session_id();
+        let session = match AppChatSession::new(session_id, self.ctx.clone()) {
+            Ok(session) => session,
+            Err(error) => {
+                self.ctx.show_error("Start Codex App Failed", &error);
+                return;
+            }
+        };
+        let page = session.root();
+        page.set_widget_name(&session_id.to_string());
+        let label = gtk::Label::builder()
+            .label(session.title())
+            .ellipsize(pango::EllipsizeMode::End)
+            .width_chars(12)
+            .max_width_chars(18)
+            .xalign(0.0)
+            .build();
+        let icon = gtk::Image::from_icon_name(provider::app::PROVIDER.session_icon_name());
+        icon.set_pixel_size(AGENT_ICON_PIXEL_SIZE);
+        let waiting_icon = gtk::Image::from_icon_name(WAITING_AGENT_SESSION_ICON);
+        waiting_icon.set_pixel_size(AGENT_ICON_PIXEL_SIZE);
+        let spinner = adw::Spinner::new();
+        spinner.set_size_request(AGENT_ICON_PIXEL_SIZE, AGENT_ICON_PIXEL_SIZE);
+        let icon_stack = gtk::Stack::new();
+        icon_stack.add_named(&icon, Some("icon"));
+        icon_stack.add_named(&waiting_icon, Some("waiting"));
+        icon_stack.add_named(&spinner, Some("spinner"));
+        icon_stack.set_visible_child_name("spinner");
+        let close_button = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Close session")
+            .valign(gtk::Align::Center)
+            .build();
+        close_button.add_css_class("flat");
+        close_button.add_css_class("circular");
+        let tab_label = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .margin_top(4)
+            .margin_bottom(4)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        tab_label.append(&icon_stack);
+        tab_label.append(&label);
+        tab_label.append(&close_button);
+
+        let page_num = self.notebook.append_page(&page, Some(&tab_label));
+        self.notebook.set_tab_reorderable(&page, true);
+        self.notebook.set_current_page(Some(page_num));
+        close_button.connect_clicked({
+            let sessions = self.app_sessions.clone();
+            let notebook = self.notebook.clone();
+            let root = self.root.clone();
+            let close_callback = self.close_callback.clone();
+            move |_| {
+                request_close_app_session(session_id, &root, &sessions, &notebook, &close_callback)
+            }
+        });
+        session.connect_title_changed({
+            let label = label.clone();
+            let title_callback = self.title_callback.clone();
+            move |session_id, title| {
+                label.set_text(&title);
+                label.set_tooltip_text(Some(&title));
+                if let Some(callback) = title_callback.borrow().clone() {
+                    callback(session_id, title);
+                }
+            }
+        });
+        session.connect_state_changed({
+            let icon_stack = icon_stack.clone();
+            let state_callback = self.state_callback.clone();
+            move |session_id, state| {
+                let agent_state = app_agent_session_state(&state);
+                icon_stack.set_visible_child_name(match agent_state {
+                    AgentSessionState::Active(AgentActiveState::Loading) => "spinner",
+                    AgentSessionState::Active(AgentActiveState::Asking) => "waiting",
+                    _ => "icon",
+                });
+                if let Some(callback) = state_callback.borrow().clone() {
+                    callback(session_id, &provider::app::PROVIDER, agent_state);
+                }
+            }
+        });
+        session.connect_history_changed({
+            let history_callback = self.history_callback.clone();
+            move |_| notify_history_changed(&history_callback)
+        });
+        session.connect_close_requested({
+            let sessions = Rc::downgrade(&self.app_sessions);
+            let notebook = self.notebook.clone();
+            let close_callback = self.close_callback.clone();
+            move |session_id| {
+                if let Some(sessions) = sessions.upgrade() {
+                    close_app_session(session_id, &sessions, &notebook, &close_callback);
+                }
+            }
+        });
+        self.app_sessions.borrow_mut().push(session.clone());
+        session.show();
+
+        if let Some(callback) = self.new_session_callback.borrow().clone() {
+            callback(
+                session_id,
+                &provider::app::PROVIDER,
+                session.title(),
+                None,
+                AgentSessionState::Active(AgentActiveState::NewChat),
+            );
+        }
+        notify_session_state_changed(
+            &self.state_callback,
+            session_id,
+            &provider::app::PROVIDER,
+            AgentSessionState::Active(AgentActiveState::Loading),
+        );
     }
 
     pub fn start_chat(&self, provider: &'static dyn AgentProvider) {
@@ -399,6 +536,14 @@ impl AgentChat {
     }
 
     pub fn show_session(&self, session_id: u64) -> bool {
+        if let Some(session) = app_session_by_id(&self.app_sessions, session_id) {
+            let root = session.root();
+            if let Some(page_num) = self.notebook.page_num(&root) {
+                self.notebook.set_current_page(Some(page_num));
+            }
+            session.focus();
+            return true;
+        }
         if let Some(session) = session_by_id(&self.sessions, session_id) {
             if let Some(page_num) = self.notebook.page_num(&session.root) {
                 self.notebook.set_current_page(Some(page_num));
@@ -412,11 +557,21 @@ impl AgentChat {
 
     pub fn add_file_reference(&self, file_path: &str) {
         self.show();
-        let Some(session) = self
+        let current_page = self
             .notebook
             .current_page()
-            .and_then(|page_num| self.notebook.nth_page(Some(page_num)))
-            .and_then(|page| session_by_page(&self.sessions, &page))
+            .and_then(|page_num| self.notebook.nth_page(Some(page_num)));
+        if let Some(session) = current_page
+            .as_ref()
+            .and_then(|page| app_session_by_page(&self.app_sessions, page))
+        {
+            session.add_mention(file_path.to_owned());
+            session.focus();
+            return;
+        }
+        let Some(session) = current_page
+            .as_ref()
+            .and_then(|page| session_by_page(&self.sessions, page))
         else {
             return;
         };
@@ -481,7 +636,8 @@ impl AgentChat {
     }
 
     pub fn running_session_count(&self) -> usize {
-        self.sessions
+        let terminal_count = self
+            .sessions
             .borrow()
             .iter()
             .filter(|session| match session.state.get() {
@@ -512,10 +668,27 @@ impl AgentChat {
                 }
                 TerminalSessionState::Exited | TerminalSessionState::Closing => false,
             })
-            .count()
+            .count();
+        terminal_count
+            + self
+                .app_sessions
+                .borrow()
+                .iter()
+                .filter(|session| session.running())
+                .count()
     }
 
     pub fn request_close_session(&self, session_id: u64) {
+        if app_session_by_id(&self.app_sessions, session_id).is_some() {
+            request_close_app_session(
+                session_id,
+                &self.root,
+                &self.app_sessions,
+                &self.notebook,
+                &self.close_callback,
+            );
+            return;
+        }
         request_close_session(
             session_id,
             &self.root,
@@ -563,6 +736,20 @@ impl AgentChat {
     }
 
     pub fn active_session_status(&self, session_id: u64) -> Option<ActiveSessionStatus> {
+        if let Some(session) = app_session_by_id(&self.app_sessions, session_id) {
+            return Some(ActiveSessionStatus {
+                session_id,
+                session_uuid: session.thread_id().unwrap_or_default(),
+                local_history_id: None,
+                provider_id: provider::app::PROVIDER.provider_id(),
+                title: session.title(),
+                terminal_state: app_chat_state_label(&session.state()),
+                active_state: match app_agent_session_state(&session.state()) {
+                    AgentSessionState::Active(state) => Some(state),
+                    AgentSessionState::Inactive(_) => None,
+                },
+            });
+        }
         let session = session_by_id(&self.sessions, session_id)?;
         Some(active_session_status(&session))
     }
@@ -572,6 +759,11 @@ impl AgentChat {
         session_id: u64,
         cli_session_id: &str,
     ) -> Result<i64, String> {
+        if app_session_by_id(&self.app_sessions, session_id).is_some() {
+            return Err(
+                "App sessions use Codex thread IDs and do not accept a CLI session ID.".to_owned(),
+            );
+        }
         let session = session_by_id(&self.sessions, session_id)
             .ok_or_else(|| format!("Agent session {session_id} is not active."))?;
         let local_id = ensure_agent_history_session(
@@ -585,6 +777,9 @@ impl AgentChat {
     }
 
     pub fn generate_active_session_summary(&self, session_id: u64) -> Result<(), String> {
+        if app_session_by_id(&self.app_sessions, session_id).is_some() {
+            return Err("App sessions use Codex's native thread preview and metadata.".to_owned());
+        }
         let session = session_by_id(&self.sessions, session_id)
             .ok_or_else(|| format!("Agent session {session_id} is not active."))?;
         start_smart_summary(
@@ -609,7 +804,9 @@ impl AgentChat {
     fn reserve_session_id(&self) -> u64 {
         self.sync_next_session_id_with_history();
         let mut session_id = self.next_session_id.get().max(1);
-        while session_by_id(&self.sessions, session_id).is_some() {
+        while session_by_id(&self.sessions, session_id).is_some()
+            || app_session_by_id(&self.app_sessions, session_id).is_some()
+        {
             session_id = session_id.saturating_add(1);
         }
         self.next_session_id.set(session_id.saturating_add(1));
@@ -637,12 +834,21 @@ impl AgentChat {
         }
     }
 
-    fn focus_active_terminal(&self) {
-        if let Some(session) = self
+    fn focus_active_session(&self) {
+        let current_page = self
             .notebook
             .current_page()
-            .and_then(|page_num| self.notebook.nth_page(Some(page_num)))
-            .and_then(|page| session_by_page(&self.sessions, &page))
+            .and_then(|page_num| self.notebook.nth_page(Some(page_num)));
+        if let Some(session) = current_page
+            .as_ref()
+            .and_then(|page| app_session_by_page(&self.app_sessions, page))
+        {
+            session.focus();
+            return;
+        }
+        if let Some(session) = current_page
+            .as_ref()
+            .and_then(|page| session_by_page(&self.sessions, page))
         {
             session.terminal.grab_focus();
         }
@@ -657,11 +863,20 @@ impl AgentChat {
 
     fn send_prompt_to_active_terminal(&self, content: &str) {
         self.show();
-        let Some(session) = self
+        let current_page = self
             .notebook
             .current_page()
-            .and_then(|page_num| self.notebook.nth_page(Some(page_num)))
-            .and_then(|page| session_by_page(&self.sessions, &page))
+            .and_then(|page_num| self.notebook.nth_page(Some(page_num)));
+        if let Some(session) = current_page
+            .as_ref()
+            .and_then(|page| app_session_by_page(&self.app_sessions, page))
+        {
+            session.add_prompt(content);
+            return;
+        }
+        let Some(session) = current_page
+            .as_ref()
+            .and_then(|page| session_by_page(&self.sessions, page))
         else {
             return;
         };
@@ -673,10 +888,15 @@ impl AgentChat {
     fn connect_controls(&self) {
         self.notebook.connect_switch_page({
             let sessions = self.sessions.clone();
+            let app_sessions = self.app_sessions.clone();
             let search_panel = self.search_panel.clone();
             let search_options = self.search_options.clone();
 
             move |_, page, _| {
+                if let Some(session) = app_session_by_page(&app_sessions, page) {
+                    session.focus();
+                    return;
+                }
                 if let Some(session) = session_by_page(&sessions, page) {
                     apply_terminal_search(
                         &session.terminal,
@@ -1634,11 +1854,7 @@ fn close_session(
         .current_page()
         .and_then(|page_num| notebook.nth_page(Some(page_num)))
         .and_then(|page| session_by_page(sessions, &page))
-        .or_else(|| sessions.borrow().last().cloned())
     {
-        if let Some(page_num) = notebook.page_num(&next_session.root) {
-            notebook.set_current_page(Some(page_num));
-        }
         next_session.terminal.grab_focus();
     }
 
@@ -1647,6 +1863,132 @@ fn close_session(
     }
 
     mark_agent_history_ended(&session, history_callback);
+}
+
+fn close_app_session(
+    session_id: u64,
+    sessions: &Rc<RefCell<Vec<AppChatSession>>>,
+    notebook: &gtk::Notebook,
+    close_callback: &Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
+) {
+    let session = {
+        let mut sessions = sessions.borrow_mut();
+        let Some(index) = sessions
+            .iter()
+            .position(|session| session.id() == session_id)
+        else {
+            return;
+        };
+        sessions.remove(index)
+    };
+    let root = session.root();
+    if let Some(page_num) = notebook.page_num(&root) {
+        notebook.remove_page(Some(page_num));
+    }
+    session.shutdown();
+    if let Some(callback) = close_callback.borrow().clone() {
+        callback(session_id);
+    }
+}
+
+fn request_close_app_session(
+    session_id: u64,
+    root: &gtk::Box,
+    sessions: &Rc<RefCell<Vec<AppChatSession>>>,
+    notebook: &gtk::Notebook,
+    close_callback: &Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
+) {
+    let Some(session) = app_session_by_id(sessions, session_id) else {
+        return;
+    };
+    if !matches!(
+        session.state(),
+        AppChatState::Connecting
+            | AppChatState::Initializing
+            | AppChatState::StartingThread
+            | AppChatState::Running
+            | AppChatState::AwaitingInput
+    ) {
+        close_app_session(session_id, sessions, notebook, close_callback);
+        return;
+    }
+
+    log::info!(
+        "native Codex close confirmation shown session_id={} state={:?}",
+        session_id,
+        session.state()
+    );
+    let dialog = adw::AlertDialog::builder()
+        .heading("Close Codex App Tab?")
+        .body("Codex is still connecting, working, or waiting for input. Closing this tab will stop its App Server process.")
+        .build();
+    dialog.add_response("cancel", "Keep Open");
+    dialog.add_response("close", "Close Tab");
+    dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let parent = root
+        .root()
+        .and_then(|root| root.downcast::<gtk::Window>().ok());
+    dialog.choose(parent.as_ref(), None::<&gio::Cancellable>, {
+        let sessions = sessions.clone();
+        let notebook = notebook.clone();
+        let close_callback = close_callback.clone();
+        move |response| {
+            if response.as_str() == "close" {
+                close_app_session(session_id, &sessions, &notebook, &close_callback);
+            }
+        }
+    });
+}
+
+fn app_session_by_id(
+    sessions: &Rc<RefCell<Vec<AppChatSession>>>,
+    session_id: u64,
+) -> Option<AppChatSession> {
+    sessions
+        .borrow()
+        .iter()
+        .find(|session| session.id() == session_id)
+        .cloned()
+}
+
+fn app_session_by_page(
+    sessions: &Rc<RefCell<Vec<AppChatSession>>>,
+    page: &gtk::Widget,
+) -> Option<AppChatSession> {
+    page.widget_name()
+        .parse::<u64>()
+        .ok()
+        .and_then(|session_id| app_session_by_id(sessions, session_id))
+}
+
+fn app_agent_session_state(state: &AppChatState) -> AgentSessionState {
+    match state {
+        AppChatState::Ready => AgentSessionState::Active(AgentActiveState::Idle),
+        AppChatState::AwaitingInput => AgentSessionState::Active(AgentActiveState::Asking),
+        AppChatState::Connecting
+        | AppChatState::Initializing
+        | AppChatState::StartingThread
+        | AppChatState::Running => AgentSessionState::Active(AgentActiveState::Loading),
+        AppChatState::Failed(_) | AppChatState::Closing | AppChatState::Closed => {
+            AgentSessionState::Inactive(AgentInactiveState::Dead)
+        }
+    }
+}
+
+fn app_chat_state_label(state: &AppChatState) -> &'static str {
+    match state {
+        AppChatState::Connecting => "Connecting",
+        AppChatState::Initializing => "Initializing",
+        AppChatState::StartingThread => "Starting thread",
+        AppChatState::Ready => "Ready",
+        AppChatState::Running => "Running",
+        AppChatState::AwaitingInput => "Needs input",
+        AppChatState::Failed(_) => "Failed",
+        AppChatState::Closing => "Closing",
+        AppChatState::Closed => "Closed",
+    }
 }
 
 fn session_by_id(

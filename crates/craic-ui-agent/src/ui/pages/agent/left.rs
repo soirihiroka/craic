@@ -37,6 +37,23 @@ pub enum AgentListSelection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentLaunch {
+    App,
+    CodexCli,
+    Agy,
+}
+
+impl AgentLaunch {
+    pub fn terminal_provider(self) -> Option<&'static dyn AgentProvider> {
+        match self {
+            AgentLaunch::App => None,
+            AgentLaunch::CodexCli => Some(&provider::codex::PROVIDER),
+            AgentLaunch::Agy => Some(&provider::agy::PROVIDER),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentListContextAction {
     ViewStatusHistory(i64),
     ViewStatusActive(u64),
@@ -54,14 +71,15 @@ struct AgentListContextTarget {
     local_id: Option<i64>,
     loaded: bool,
     has_summary: bool,
+    terminal_session: bool,
 }
 
 #[derive(Clone)]
 pub struct AgentList {
     pub root: gtk::Box,
-    codex_button: gtk::Button,
+    app_button: gtk::Button,
+    codex_cli_button: gtk::Button,
     agy_button: gtk::Button,
-    opencode_button: gtk::Button,
     search_panel: SearchPanel,
     list: gtk::ListBox,
     scroller: gtk::ScrolledWindow,
@@ -208,10 +226,9 @@ impl AgentList {
             "agent_list",
         );
 
-        let providers = provider::all_providers();
-        let codex_button = new_agent_button(providers[0]);
-        let agy_button = new_agent_button(providers[1]);
-        let opencode_button = new_agent_button(providers[2]);
+        let app_button = new_agent_button("App");
+        let codex_cli_button = new_agent_button(provider::codex::PROVIDER.label());
+        let agy_button = new_agent_button(provider::agy::PROVIDER.label());
 
         let search_panel = SearchPanel::new("Search agents");
         search_panel.set_options_visible(false);
@@ -224,9 +241,9 @@ impl AgentList {
             .margin_top(8)
             .margin_bottom(8)
             .build();
-        bottom_bar.append(&codex_button);
+        bottom_bar.append(&app_button);
+        bottom_bar.append(&codex_cli_button);
         bottom_bar.append(&agy_button);
-        bottom_bar.append(&opencode_button);
 
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -238,9 +255,9 @@ impl AgentList {
 
         let agent_list = Self {
             root,
-            codex_button,
+            app_button,
+            codex_cli_button,
             agy_button,
-            opencode_button,
             search_panel,
             list,
             scroller,
@@ -271,9 +288,9 @@ impl AgentList {
         agent_list.install_search_shortcuts(&agent_list.root);
         agent_list.install_search_shortcuts(&agent_list.list);
         agent_list.install_search_shortcuts(&agent_list.scroller);
-        agent_list.install_search_shortcuts(&agent_list.codex_button);
+        agent_list.install_search_shortcuts(&agent_list.app_button);
+        agent_list.install_search_shortcuts(&agent_list.codex_cli_button);
         agent_list.install_search_shortcuts(&agent_list.agy_button);
-        agent_list.install_search_shortcuts(&agent_list.opencode_button);
         agent_list.connect_selection();
         agent_list.connect_context_menu();
         agent_list.connect_auto_paging();
@@ -447,27 +464,26 @@ impl AgentList {
 
     pub fn connect_new_chat<F>(&self, callback: F)
     where
-        F: Fn(&'static dyn AgentProvider) + 'static,
+        F: Fn(AgentLaunch) + 'static,
     {
         let callback = Rc::new(callback);
-        let providers = provider::all_providers();
 
-        self.codex_button.connect_clicked({
+        self.app_button.connect_clicked({
             let callback = callback.clone();
 
             move |_| {
-                callback(providers[0]);
+                callback(AgentLaunch::App);
             }
         });
-        self.agy_button.connect_clicked({
+        self.codex_cli_button.connect_clicked({
             let callback = callback.clone();
 
             move |_| {
-                callback(providers[1]);
+                callback(AgentLaunch::CodexCli);
             }
         });
-        self.opencode_button.connect_clicked(move |_| {
-            callback(providers[2]);
+        self.agy_button.connect_clicked(move |_| {
+            callback(AgentLaunch::Agy);
         });
     }
 
@@ -1121,6 +1137,7 @@ impl AgentList {
                 local_id: Some(local_id),
                 loaded: false,
                 has_summary: self.history_row_has_summary(local_id),
+                terminal_session: true,
             }),
             RowIdentity::Active(session_id) => self
                 .active_sessions
@@ -1134,6 +1151,7 @@ impl AgentList {
                     has_summary: session
                         .local_history_id
                         .is_some_and(|local_id| self.history_row_has_summary(local_id)),
+                    terminal_session: session.provider.provider_id() != "codex-app",
                 }),
             RowIdentity::Header => None,
         }
@@ -1198,11 +1216,19 @@ fn agent_session_context_menu_sections(
         "Generate Summary"
     };
 
-    let mut session_items = vec![
-        ActionMenuItem::new("View Status", view_action, true),
-        ActionMenuItem::new(summary_label, summary_action, target.loaded),
-        ActionMenuItem::new("Set Session ID...", set_session_id_action, true),
-    ];
+    let mut session_items = vec![ActionMenuItem::new("View Status", view_action, true)];
+    if target.terminal_session {
+        session_items.push(ActionMenuItem::new(
+            summary_label,
+            summary_action,
+            target.loaded,
+        ));
+        session_items.push(ActionMenuItem::new(
+            "Set Session ID...",
+            set_session_id_action,
+            true,
+        ));
+    }
     if let Some(local_id) = target.local_id {
         session_items.push(ActionMenuItem::new(
             "Unload Session",
@@ -1253,11 +1279,11 @@ impl TimelineRow<'_> {
     }
 }
 
-fn new_agent_button(provider: &'static dyn AgentProvider) -> gtk::Button {
+fn new_agent_button(label_text: &str) -> gtk::Button {
     let icon = gtk::Image::from_icon_name("list-add-symbolic");
     icon.set_pixel_size(AGENT_ICON_PIXEL_SIZE);
 
-    let label = gtk::Label::new(Some(provider.label()));
+    let label = gtk::Label::new(Some(label_text));
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -1268,7 +1294,7 @@ fn new_agent_button(provider: &'static dyn AgentProvider) -> gtk::Button {
 
     let button = gtk::Button::builder()
         .child(&content)
-        .tooltip_text(format!("New {} chat", provider.label()))
+        .tooltip_text(format!("New {label_text} chat"))
         .halign(gtk::Align::Center)
         .build();
     button.add_css_class("flat");
@@ -1836,6 +1862,9 @@ fn active_session_missing_cli_session_id(
     session: &ActiveSessionInfo,
     history_rows: &[AgentSessionRow],
 ) -> bool {
+    if session.provider.provider_id() == "codex-app" {
+        return false;
+    }
     if let Some(row) = active_session_history_row(session, history_rows) {
         return cli_session_id_is_missing(row.cli_session_id.as_deref());
     }
