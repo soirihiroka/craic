@@ -249,7 +249,6 @@ impl CodexChatView {
             .hexpand(true)
             .vexpand(true)
             .build();
-        composer.set_size_request(-1, 92);
         let composer_placeholder = gtk::Label::builder()
             .label("Message Codex…")
             .css_classes(["dim-label"])
@@ -372,7 +371,6 @@ impl CodexChatView {
             .hexpand(true)
             .child(&composer_content)
             .build();
-        composer_clamp.set_size_request(-1, 144);
 
         let transcript_area = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -381,14 +379,13 @@ impl CodexChatView {
             .build();
         transcript_area.append(&progress_revealer);
         transcript_area.append(&transcript_panel);
-        transcript_area.set_size_request(-1, 180);
         let split = gtk::Paned::builder()
             .orientation(gtk::Orientation::Vertical)
             .wide_handle(true)
             .resize_start_child(true)
             .resize_end_child(false)
-            .shrink_start_child(false)
-            .shrink_end_child(false)
+            .shrink_start_child(true)
+            .shrink_end_child(true)
             .start_child(&transcript_area)
             .end_child(&composer_clamp)
             .hexpand(true)
