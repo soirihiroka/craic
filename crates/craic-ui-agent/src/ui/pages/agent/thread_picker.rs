@@ -12,7 +12,6 @@ pub(crate) struct ThreadPickerRow {
     pub thread_id: String,
     pub title: String,
     pub preview: String,
-    pub cwd: Option<String>,
     pub model: Option<String>,
     pub updated_at_ms: i64,
     pub status: Option<String>,
@@ -32,12 +31,6 @@ impl ThreadPickerRow {
             self.title = "Untitled Codex thread".to_string();
         }
         self.preview = normalized_text(&self.preview);
-        self.cwd = self
-            .cwd
-            .as_deref()
-            .map(str::trim)
-            .filter(|cwd| !cwd.is_empty())
-            .map(str::to_owned);
         self.model = self
             .model
             .as_deref()
@@ -63,13 +56,6 @@ impl ThreadPickerRow {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ThreadPickerWorkspaceScope {
-    #[default]
-    CurrentWorkspace,
-    AllWorkspaces,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ThreadPickerSort {
     #[default]
     Updated,
@@ -80,7 +66,6 @@ pub(crate) enum ThreadPickerSort {
 pub(crate) enum ThreadPickerAction {
     SearchChanged(String),
     ArchivedChanged(bool),
-    WorkspaceScopeChanged(ThreadPickerWorkspaceScope),
     SortChanged(ThreadPickerSort),
     Resume(String),
     Fork(String),
@@ -124,7 +109,6 @@ pub(crate) struct CodexThreadPicker {
     pub root: gtk::Box,
     search_entry: gtk::SearchEntry,
     archived_toggle: gtk::ToggleButton,
-    workspace_scope: gtk::DropDown,
     sort: gtk::DropDown,
     suppress_search: Rc<Cell<bool>>,
     state: Rc<PickerState>,
@@ -194,8 +178,6 @@ impl CodexThreadPicker {
             .label("Archived")
             .tooltip_text("Show archived Codex threads")
             .build();
-        let workspace_scope = gtk::DropDown::from_strings(&["This Workspace", "All Workspaces"]);
-        workspace_scope.set_tooltip_text(Some("Choose which workspaces to search"));
         let sort = gtk::DropDown::from_strings(&["Recently Updated", "Recently Created"]);
         sort.set_tooltip_text(Some("Choose how Codex threads are ordered"));
         let header = gtk::Box::builder()
@@ -217,13 +199,6 @@ impl CodexThreadPicker {
             .margin_start(12)
             .margin_end(12)
             .build();
-        filters.append(
-            &gtk::Label::builder()
-                .label("Scope")
-                .css_classes(["dim-label", "caption"])
-                .build(),
-        );
-        filters.append(&workspace_scope);
         filters.append(
             &gtk::Label::builder()
                 .label("Sort")
@@ -288,7 +263,6 @@ impl CodexThreadPicker {
             root,
             search_entry,
             archived_toggle,
-            workspace_scope,
             sort,
             suppress_search: Rc::new(Cell::new(false)),
             state,
@@ -352,13 +326,6 @@ impl CodexThreadPicker {
 
     pub fn archived_only(&self) -> bool {
         self.archived_toggle.is_active()
-    }
-
-    pub fn workspace_scope(&self) -> ThreadPickerWorkspaceScope {
-        match self.workspace_scope.selected() {
-            1 => ThreadPickerWorkspaceScope::AllWorkspaces,
-            _ => ThreadPickerWorkspaceScope::CurrentWorkspace,
-        }
     }
 
     pub fn sort(&self) -> ThreadPickerSort {
@@ -434,16 +401,6 @@ impl CodexThreadPicker {
                 picker.emit(ThreadPickerAction::ArchivedChanged(toggle.is_active()));
             }
         });
-        self.workspace_scope.connect_selected_notify({
-            let picker = self.clone();
-
-            move |_| {
-                picker.reset_for_filter_change();
-                picker.emit(ThreadPickerAction::WorkspaceScopeChanged(
-                    picker.workspace_scope(),
-                ));
-            }
-        });
         self.sort.connect_selected_notify({
             let picker = self.clone();
 
@@ -469,7 +426,11 @@ impl CodexThreadPicker {
                 let Some(row) = picker.thread_at(position) else {
                     return;
                 };
-                picker.emit(ThreadPickerAction::Resume(row.thread_id));
+                picker.emit(if row.archived {
+                    ThreadPickerAction::Unarchive(row.thread_id)
+                } else {
+                    ThreadPickerAction::Resume(row.thread_id)
+                });
             }
         });
         scroller.connect_edge_reached({
@@ -660,7 +621,7 @@ fn thread_row(row: &ThreadPickerRow, callbacks: &Rc<RefCell<Vec<ActionCallback>>
     }
 
     let resume_button = gtk::Button::builder()
-        .label("Resume")
+        .label(if row.archived { "Unarchive" } else { "Resume" })
         .valign(gtk::Align::Center)
         .build();
     resume_button.add_css_class("suggested-action");
@@ -668,7 +629,18 @@ fn thread_row(row: &ThreadPickerRow, callbacks: &Rc<RefCell<Vec<ActionCallback>>
         let callbacks = callbacks.clone();
         let thread_id = row.thread_id.clone();
 
-        move |_| emit_to(&callbacks, ThreadPickerAction::Resume(thread_id.clone()))
+        let archived = row.archived;
+
+        move |_| {
+            emit_to(
+                &callbacks,
+                if archived {
+                    ThreadPickerAction::Unarchive(thread_id.clone())
+                } else {
+                    ThreadPickerAction::Resume(thread_id.clone())
+                },
+            )
+        }
     });
     let menu_button = thread_menu_button(row, callbacks);
     let actions = gtk::Box::builder()
@@ -777,11 +749,8 @@ fn thread_menu_button(
 
 fn thread_metadata(row: &ThreadPickerRow) -> Vec<String> {
     let mut metadata = Vec::new();
-    if let Some(cwd) = row.cwd.as_deref() {
-        metadata.push(workspace_label(cwd));
-    }
     if let Some(model) = row.model.as_ref() {
-        metadata.push(model.clone());
+        metadata.push(format!("Provider: {model}"));
     }
     if let Some(status) = row.status.as_ref() {
         metadata.push(status.clone());
@@ -790,15 +759,6 @@ fn thread_metadata(row: &ThreadPickerRow) -> Vec<String> {
         metadata.push("Archived".to_string());
     }
     metadata
-}
-
-fn workspace_label(cwd: &str) -> String {
-    std::path::Path::new(cwd)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(cwd)
-        .to_string()
 }
 
 fn emit_to(callbacks: &Rc<RefCell<Vec<ActionCallback>>>, action: ThreadPickerAction) {

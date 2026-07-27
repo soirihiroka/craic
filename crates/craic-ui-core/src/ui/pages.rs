@@ -84,6 +84,7 @@ pub enum PageCommand {
     AddFileToAgent(String),
     OpenAgentSession(u64),
     OpenCommit(String),
+    ShowChanges,
     ClearSelection,
 }
 

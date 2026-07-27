@@ -624,7 +624,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "craic-codex"
+name = "craic-codex-app-server"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -765,7 +765,7 @@ name = "craic-ui-agent"
 version = "0.1.0"
 dependencies = [
  "craic-agent",
- "craic-codex",
+ "craic-codex-app-server",
  "craic-config",
  "craic-system",
  "craic-ui-core",
