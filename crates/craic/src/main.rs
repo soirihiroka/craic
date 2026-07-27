@@ -9,10 +9,23 @@ use craic_config as config;
 const APP_ID: &str = "dev.craic.Craic";
 
 fn main() -> glib::ExitCode {
+    let (renderer, renderer_source) = match std::env::var_os("GSK_RENDERER") {
+        Some(renderer) => (renderer, "environment"),
+        None => {
+            // SAFETY: this is the first operation in `main`, before GTK initialization or any
+            // application thread is created, so no other thread can access the process environment.
+            unsafe { std::env::set_var("GSK_RENDERER", "gl") };
+            (OsString::from("gl"), "craic-default")
+        }
+    };
     let launch_start = Instant::now();
     let crash_log_dir = craic_ui::install_crash_log();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     log::info!("startup process begin app_id={APP_ID}");
+    log::info!(
+        "startup renderer configured renderer={} source={renderer_source}",
+        renderer.to_string_lossy()
+    );
     if let Some(crash_log_dir) = crash_log_dir {
         log::info!(
             "crash dump directory initialized path={}",
