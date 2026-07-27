@@ -262,18 +262,27 @@ fn structured_user_input(params: &Value) -> Option<RequestUserInput> {
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    Some(RequestUserInput { questions })
+    Some(RequestUserInput {
+        questions,
+        // Match Codex's native client behavior: the value currently enables
+        // the client-side grace/countdown policy; its numeric duration is
+        // reserved for a future server-controlled policy.
+        auto_resolution: params
+            .get("autoResolutionMs")
+            .is_some_and(|value| !value.is_null()),
+    })
 }
 
 fn auto_resolution_description(params: &Value) -> String {
-    params
+    if params
         .get("autoResolutionMs")
-        .and_then(Value::as_u64)
-        .map(|milliseconds| {
-            let seconds = milliseconds.div_ceil(1_000);
-            format!("Codex may continue automatically if unanswered after {seconds} seconds.")
-        })
-        .unwrap_or_default()
+        .is_some_and(|value| !value.is_null())
+    {
+        "Codex will continue automatically if this remains unanswered. Interacting with an answer pauses auto-resolution."
+            .to_owned()
+    } else {
+        String::new()
+    }
 }
 
 fn legacy_user_input_request(request_id: &str, params: &Value) -> PendingRequest {

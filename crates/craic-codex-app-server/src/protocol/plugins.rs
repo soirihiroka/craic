@@ -92,3 +92,83 @@ pub struct MarketplaceUpgradeParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marketplace_name: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginShareDiscoverability {
+    #[serde(rename = "LISTED")]
+    Listed,
+    #[serde(rename = "UNLISTED")]
+    Unlisted,
+    #[serde(rename = "PRIVATE")]
+    Private,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginShareUpdateDiscoverability {
+    #[serde(rename = "UNLISTED")]
+    Unlisted,
+    #[serde(rename = "PRIVATE")]
+    Private,
+    #[serde(rename = "LISTED")]
+    Listed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginSharePrincipalType {
+    User,
+    Group,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginShareTargetRole {
+    Reader,
+    Editor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginShareTarget {
+    pub principal_type: PluginSharePrincipalType,
+    pub principal_id: String,
+    pub role: PluginShareTargetRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginShareSaveParams {
+    pub plugin_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discoverability: Option<PluginShareDiscoverability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_targets: Option<Vec<PluginShareTarget>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginShareUpdateTargetsParams {
+    pub remote_plugin_id: String,
+    pub discoverability: PluginShareUpdateDiscoverability,
+    pub share_targets: Vec<PluginShareTarget>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginShareListParams {}
+
+macro_rules! remote_plugin_id_params {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            pub struct $name {
+                pub remote_plugin_id: String,
+            }
+        )+
+    };
+}
+
+remote_plugin_id_params!(PluginShareCheckoutParams, PluginShareDeleteParams);

@@ -391,17 +391,17 @@ impl AppChatSessionInner {
             .as_ref()
             .and_then(|model| self.model_supports_personality.borrow().get(model).copied())
             .unwrap_or(true);
-        let options = supported
-            .then(|| {
-                ["friendly", "pragmatic", "none"]
-                    .into_iter()
-                    .map(|id| SelectorOption {
-                        id: id.to_owned(),
-                        label: title_case(id),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let options = if supported {
+            ["friendly", "pragmatic", "none"]
+                .into_iter()
+                .map(|id| SelectorOption {
+                    id: id.to_owned(),
+                    label: title_case(id),
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let selected = self
             .selected_values
             .borrow()

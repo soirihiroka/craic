@@ -764,6 +764,7 @@ dependencies = [
 name = "craic-ui-agent"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "craic-agent",
  "craic-codex-app-server",
  "craic-config",

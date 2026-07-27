@@ -75,6 +75,33 @@ use crate::protocol::ThreadUnsubscribeParams;
 use crate::protocol::TurnInterruptParams;
 use crate::protocol::TurnStartParams;
 use crate::protocol::TurnSteerParams;
+use crate::protocol::{
+    CancelLoginAccountParams, CollaborationModeListParams, CommandExecParams,
+    CommandExecResizeParams, CommandExecTerminateParams, CommandExecWriteParams,
+    ConfigBatchWriteParams, ConfigReadParams, ConfigValueWriteParams, EnvironmentAddParams,
+    EnvironmentInfoParams, EnvironmentStatusParams, FsCopyParams, FsCreateDirectoryParams,
+    FsGetMetadataParams, FsReadDirectoryParams, FsReadFileParams, FsRemoveParams, FsUnwatchParams,
+    FsWatchParams, FsWriteFileParams, FuzzyFileSearchParams, FuzzyFileSearchSessionStartParams,
+    FuzzyFileSearchSessionStopParams, FuzzyFileSearchSessionUpdateParams, GetAuthStatusParams,
+    GetConversationSummaryParams, GitDiffToRemoteParams, LoginAccountParams, ModelListParams,
+    ModelProviderCapabilitiesReadParams, PermissionProfileListParams, ProcessKillParams,
+    ProcessResizePtyParams, ProcessSpawnParams, ProcessWriteStdinParams,
+};
+use crate::protocol::{
+    ConsumeAccountRateLimitResetCreditParams, ExternalAgentConfigDetectParams,
+    ExternalAgentConfigImportParams, FeedbackUploadParams, MockExperimentalMethodParams,
+    PluginShareCheckoutParams, PluginShareDeleteParams, PluginShareListParams,
+    PluginShareSaveParams, PluginShareUpdateTargetsParams, RemoteControlClientsListParams,
+    RemoteControlClientsRevokeParams, RemoteControlDisableParams, RemoteControlEnableParams,
+    RemoteControlPairingStartParams, RemoteControlPairingStatusParams,
+    SendAddCreditsNudgeEmailParams, ThreadApproveGuardianDeniedActionParams,
+    ThreadDecrementElicitationParams, ThreadForkParams, ThreadIncrementElicitationParams,
+    ThreadInjectItemsParams, ThreadItemsListParams, ThreadLoadedListParams,
+    ThreadMemoryModeSetParams, ThreadRealtimeAppendAudioParams, ThreadRealtimeAppendSpeechParams,
+    ThreadRealtimeAppendTextParams, ThreadRealtimeListVoicesParams, ThreadRealtimeStartParams,
+    ThreadRealtimeStopParams, ThreadSearchOccurrencesParams, ThreadSearchParams,
+    WindowsSandboxSetupStartParams,
+};
 use crate::transport::{
     INITIALIZE_REQUEST_ID, ProcessCommand, WriterCommand, emit_event, enqueue_value, lock,
     run_process_waiter, run_stderr_reader, run_stdout_reader, run_writer, set_state,
@@ -606,6 +633,485 @@ impl AppServer {
 
     pub fn account_usage_read(&self) -> Result<RequestId, AppServerError> {
         self.send_request_without_params("account/usage/read")
+    }
+
+    pub fn model_list(&self, params: ModelListParams) -> Result<RequestId, AppServerError> {
+        self.send_request("model/list", params)
+    }
+
+    pub fn model_provider_capabilities_read(
+        &self,
+        params: ModelProviderCapabilitiesReadParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("modelProvider/capabilities/read", params)
+    }
+
+    pub fn collaboration_mode_list(
+        &self,
+        params: CollaborationModeListParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("collaborationMode/list", params)
+    }
+
+    pub fn permission_profile_list(
+        &self,
+        params: PermissionProfileListParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("permissionProfile/list", params)
+    }
+
+    pub fn config_read(&self, params: ConfigReadParams) -> Result<RequestId, AppServerError> {
+        self.send_request("config/read", params)
+    }
+
+    pub fn config_value_write(
+        &self,
+        params: ConfigValueWriteParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("config/value/write", params)
+    }
+
+    pub fn config_batch_write(
+        &self,
+        params: ConfigBatchWriteParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("config/batchWrite", params)
+    }
+
+    pub fn config_requirements_read(&self) -> Result<RequestId, AppServerError> {
+        self.send_request_without_params("configRequirements/read")
+    }
+
+    pub fn get_auth_status(
+        &self,
+        params: GetAuthStatusParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("getAuthStatus", params)
+    }
+
+    pub fn account_login_start(
+        &self,
+        params: LoginAccountParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("account/login/start", params)
+    }
+
+    pub fn account_login_cancel(
+        &self,
+        params: CancelLoginAccountParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("account/login/cancel", params)
+    }
+
+    pub fn account_logout(&self) -> Result<RequestId, AppServerError> {
+        self.send_request_without_params("account/logout")
+    }
+
+    pub fn account_workspace_messages_read(&self) -> Result<RequestId, AppServerError> {
+        self.send_request_without_params("account/workspaceMessages/read")
+    }
+
+    pub fn fuzzy_file_search(
+        &self,
+        params: FuzzyFileSearchParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("fuzzyFileSearch", params)
+    }
+
+    pub fn fuzzy_file_search_session_start(
+        &self,
+        params: FuzzyFileSearchSessionStartParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("fuzzyFileSearch/sessionStart", params)
+    }
+
+    pub fn fuzzy_file_search_session_update(
+        &self,
+        params: FuzzyFileSearchSessionUpdateParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("fuzzyFileSearch/sessionUpdate", params)
+    }
+
+    pub fn fuzzy_file_search_session_stop(
+        &self,
+        params: FuzzyFileSearchSessionStopParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("fuzzyFileSearch/sessionStop", params)
+    }
+
+    pub fn git_diff_to_remote(
+        &self,
+        params: GitDiffToRemoteParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("gitDiffToRemote", params)
+    }
+
+    pub fn get_conversation_summary(
+        &self,
+        params: GetConversationSummaryParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("getConversationSummary", params)
+    }
+
+    pub fn command_exec(&self, params: CommandExecParams) -> Result<RequestId, AppServerError> {
+        self.send_request("command/exec", params)
+    }
+
+    pub fn command_exec_write(
+        &self,
+        params: CommandExecWriteParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("command/exec/write", params)
+    }
+
+    pub fn command_exec_terminate(
+        &self,
+        params: CommandExecTerminateParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("command/exec/terminate", params)
+    }
+
+    pub fn command_exec_resize(
+        &self,
+        params: CommandExecResizeParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("command/exec/resize", params)
+    }
+
+    pub fn process_spawn(&self, params: ProcessSpawnParams) -> Result<RequestId, AppServerError> {
+        self.send_request("process/spawn", params)
+    }
+
+    pub fn process_write_stdin(
+        &self,
+        params: ProcessWriteStdinParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("process/writeStdin", params)
+    }
+
+    pub fn process_kill(&self, params: ProcessKillParams) -> Result<RequestId, AppServerError> {
+        self.send_request("process/kill", params)
+    }
+
+    pub fn process_resize_pty(
+        &self,
+        params: ProcessResizePtyParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("process/resizePty", params)
+    }
+
+    pub fn fs_read_file(&self, params: FsReadFileParams) -> Result<RequestId, AppServerError> {
+        self.send_request("fs/readFile", params)
+    }
+
+    pub fn fs_write_file(&self, params: FsWriteFileParams) -> Result<RequestId, AppServerError> {
+        self.send_request("fs/writeFile", params)
+    }
+
+    pub fn fs_create_directory(
+        &self,
+        params: FsCreateDirectoryParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("fs/createDirectory", params)
+    }
+
+    pub fn fs_get_metadata(
+        &self,
+        params: FsGetMetadataParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("fs/getMetadata", params)
+    }
+
+    pub fn fs_read_directory(
+        &self,
+        params: FsReadDirectoryParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("fs/readDirectory", params)
+    }
+
+    pub fn fs_remove(&self, params: FsRemoveParams) -> Result<RequestId, AppServerError> {
+        self.send_request("fs/remove", params)
+    }
+
+    pub fn fs_copy(&self, params: FsCopyParams) -> Result<RequestId, AppServerError> {
+        self.send_request("fs/copy", params)
+    }
+
+    pub fn fs_watch(&self, params: FsWatchParams) -> Result<RequestId, AppServerError> {
+        self.send_request("fs/watch", params)
+    }
+
+    pub fn fs_unwatch(&self, params: FsUnwatchParams) -> Result<RequestId, AppServerError> {
+        self.send_request("fs/unwatch", params)
+    }
+
+    pub fn environment_add(
+        &self,
+        params: EnvironmentAddParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("environment/add", params)
+    }
+
+    pub fn environment_info(
+        &self,
+        params: EnvironmentInfoParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("environment/info", params)
+    }
+
+    pub fn environment_status(
+        &self,
+        params: EnvironmentStatusParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("environment/status", params)
+    }
+
+    pub fn account_rate_limit_reset_credit_consume(
+        &self,
+        params: ConsumeAccountRateLimitResetCreditParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("account/rateLimitResetCredit/consume", params)
+    }
+
+    pub fn account_send_add_credits_nudge_email(
+        &self,
+        params: SendAddCreditsNudgeEmailParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("account/sendAddCreditsNudgeEmail", params)
+    }
+
+    pub fn external_agent_config_detect(
+        &self,
+        params: ExternalAgentConfigDetectParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("externalAgentConfig/detect", params)
+    }
+
+    pub fn external_agent_config_import(
+        &self,
+        params: ExternalAgentConfigImportParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("externalAgentConfig/import", params)
+    }
+
+    pub fn external_agent_config_import_read_histories(&self) -> Result<RequestId, AppServerError> {
+        self.send_request_without_params("externalAgentConfig/import/readHistories")
+    }
+
+    pub fn feedback_upload(
+        &self,
+        params: FeedbackUploadParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("feedback/upload", params)
+    }
+
+    pub fn memory_reset(&self) -> Result<RequestId, AppServerError> {
+        self.send_request_without_params("memory/reset")
+    }
+
+    pub fn mock_experimental_method(
+        &self,
+        params: MockExperimentalMethodParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("mock/experimentalMethod", params)
+    }
+
+    pub fn plugin_share_save(
+        &self,
+        params: PluginShareSaveParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("plugin/share/save", params)
+    }
+
+    pub fn plugin_share_update_targets(
+        &self,
+        params: PluginShareUpdateTargetsParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("plugin/share/updateTargets", params)
+    }
+
+    pub fn plugin_share_list(
+        &self,
+        params: PluginShareListParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("plugin/share/list", params)
+    }
+
+    pub fn plugin_share_checkout(
+        &self,
+        params: PluginShareCheckoutParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("plugin/share/checkout", params)
+    }
+
+    pub fn plugin_share_delete(
+        &self,
+        params: PluginShareDeleteParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("plugin/share/delete", params)
+    }
+
+    pub fn remote_control_enable(
+        &self,
+        params: Option<RemoteControlEnableParams>,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("remoteControl/enable", params)
+    }
+
+    pub fn remote_control_disable(
+        &self,
+        params: Option<RemoteControlDisableParams>,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("remoteControl/disable", params)
+    }
+
+    pub fn remote_control_status_read(&self) -> Result<RequestId, AppServerError> {
+        self.send_request_without_params("remoteControl/status/read")
+    }
+
+    pub fn remote_control_pairing_start(
+        &self,
+        params: RemoteControlPairingStartParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("remoteControl/pairing/start", params)
+    }
+
+    pub fn remote_control_pairing_status(
+        &self,
+        params: RemoteControlPairingStatusParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("remoteControl/pairing/status", params)
+    }
+
+    pub fn remote_control_clients_list(
+        &self,
+        params: RemoteControlClientsListParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("remoteControl/client/list", params)
+    }
+
+    pub fn remote_control_clients_revoke(
+        &self,
+        params: RemoteControlClientsRevokeParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("remoteControl/client/revoke", params)
+    }
+
+    pub fn thread_fork(&self, params: ThreadForkParams) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/fork", params)
+    }
+
+    pub fn thread_increment_elicitation(
+        &self,
+        params: ThreadIncrementElicitationParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/increment_elicitation", params)
+    }
+
+    pub fn thread_decrement_elicitation(
+        &self,
+        params: ThreadDecrementElicitationParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/decrement_elicitation", params)
+    }
+
+    pub fn thread_approve_guardian_denied_action(
+        &self,
+        params: ThreadApproveGuardianDeniedActionParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/approveGuardianDeniedAction", params)
+    }
+
+    pub fn thread_search(&self, params: ThreadSearchParams) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/search", params)
+    }
+
+    pub fn thread_search_occurrences(
+        &self,
+        params: ThreadSearchOccurrencesParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/searchOccurrences", params)
+    }
+
+    pub fn thread_loaded_list(
+        &self,
+        params: ThreadLoadedListParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/loaded/list", params)
+    }
+
+    pub fn thread_items_list(
+        &self,
+        params: ThreadItemsListParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/items/list", params)
+    }
+
+    pub fn thread_inject_items(
+        &self,
+        params: ThreadInjectItemsParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/inject_items", params)
+    }
+
+    pub fn thread_memory_mode_set(
+        &self,
+        params: ThreadMemoryModeSetParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/memoryMode/set", params)
+    }
+
+    pub fn thread_realtime_start(
+        &self,
+        params: ThreadRealtimeStartParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/realtime/start", params)
+    }
+
+    pub fn thread_realtime_append_audio(
+        &self,
+        params: ThreadRealtimeAppendAudioParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/realtime/appendAudio", params)
+    }
+
+    pub fn thread_realtime_append_text(
+        &self,
+        params: ThreadRealtimeAppendTextParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/realtime/appendText", params)
+    }
+
+    pub fn thread_realtime_append_speech(
+        &self,
+        params: ThreadRealtimeAppendSpeechParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/realtime/appendSpeech", params)
+    }
+
+    pub fn thread_realtime_stop(
+        &self,
+        params: ThreadRealtimeStopParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/realtime/stop", params)
+    }
+
+    pub fn thread_realtime_list_voices(
+        &self,
+        params: ThreadRealtimeListVoicesParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("thread/realtime/listVoices", params)
+    }
+
+    pub fn windows_sandbox_setup_start(
+        &self,
+        params: WindowsSandboxSetupStartParams,
+    ) -> Result<RequestId, AppServerError> {
+        self.send_request("windowsSandbox/setupStart", params)
+    }
+
+    pub fn windows_sandbox_readiness(&self) -> Result<RequestId, AppServerError> {
+        self.send_request_without_params("windowsSandbox/readiness")
     }
 
     pub fn review_start(&self, params: ReviewStartParams) -> Result<RequestId, AppServerError> {

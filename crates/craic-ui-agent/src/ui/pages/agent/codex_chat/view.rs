@@ -4,7 +4,8 @@ use super::transcript::{pending_request_row, timeline_row};
 use super::{
     ChatConnectionStatus, ChatSelector, CodexChatAction, CollaborationParticipantStatus,
     CollaborationProgress, ComposerAttachment, ComposerAttachmentKind, ComposerSubmission,
-    PendingRequest, PlanProgress, PlanStepStatus, SelectorOption, TimelineItem, TokenUsage,
+    PendingRequest, PlanProgress, PlanStepStatus, QueueDirection, QueuedSubmission, SelectorOption,
+    TimelineItem, TokenUsage,
 };
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -60,6 +61,8 @@ struct CodexChatViewState {
     collaboration_progress_box: gtk::Box,
     composer: gtk::TextView,
     composer_placeholder: gtk::Label,
+    queued_submissions_box: gtk::Box,
+    queued_submissions_list: gtk::ListBox,
     attachment_flow: gtk::FlowBox,
     attachments: RefCell<Vec<ComposerAttachment>>,
     send_button: gtk::Button,
@@ -154,6 +157,8 @@ impl CodexChatView {
         usage_icon.set_tooltip_text(Some("Context usage is not available yet"));
         let usage_progress = gtk::ProgressBar::builder()
             .fraction(0.0)
+            .show_text(true)
+            .text("—")
             .width_request(72)
             .valign(gtk::Align::Center)
             .tooltip_text("Token usage is not available yet")
@@ -163,34 +168,40 @@ impl CodexChatView {
         let tools_menu_button = codex_tools_menu(callbacks.clone());
         tools_menu_button.set_sensitive(false);
 
-        let (selector_row, selectors) = selector_controls();
-        let toolbar = gtk::Box::builder()
+        let (primary_selectors, secondary_selectors, selectors) = selector_controls();
+        let primary_toolbar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
             .margin_top(4)
+            .margin_bottom(2)
+            .margin_start(8)
+            .margin_end(8)
+            .build();
+        primary_toolbar.append(&status_icon);
+        primary_toolbar.append(&status_label);
+        primary_toolbar.append(&usage_icon);
+        primary_toolbar.append(&usage_progress);
+        primary_toolbar.append(&primary_selectors);
+        let toolbar_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        toolbar_spacer.set_hexpand(true);
+        primary_toolbar.append(&toolbar_spacer);
+        primary_toolbar.append(&tools_menu_button);
+        primary_toolbar.append(&thread_menu_button);
+        let secondary_toolbar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .margin_top(2)
             .margin_bottom(4)
             .margin_start(8)
             .margin_end(8)
             .build();
-        toolbar.append(&status_icon);
-        toolbar.append(&status_label);
-        toolbar.append(&usage_icon);
-        toolbar.append(&usage_progress);
-        toolbar.append(&selector_row);
-        toolbar.append(&tools_menu_button);
-        toolbar.append(&thread_menu_button);
-        let toolbar_scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Automatic)
-            .vscrollbar_policy(gtk::PolicyType::Never)
-            .propagate_natural_height(true)
-            .hexpand(true)
-            .child(&toolbar)
-            .build();
+        secondary_toolbar.append(&secondary_selectors);
 
         let header = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
-        header.append(&toolbar_scroller);
+        header.append(&primary_toolbar);
+        header.append(&secondary_toolbar);
 
         let plan_progress_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -256,6 +267,40 @@ impl CodexChatView {
             .child(&composer_overlay)
             .build();
 
+        let queued_submissions_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .show_separators(true)
+            .build();
+        queued_submissions_list.add_css_class("boxed-list");
+        let queued_scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .propagate_natural_height(true)
+            .max_content_height(136)
+            .child(&queued_submissions_list)
+            .build();
+        let queue_heading = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .build();
+        let queue_icon = gtk::Image::from_icon_name("view-list-symbolic");
+        queue_icon.set_pixel_size(14);
+        queue_heading.append(&queue_icon);
+        queue_heading.append(
+            &gtk::Label::builder()
+                .label("Queued follow-ups")
+                .css_classes(["caption", "dim-label"])
+                .xalign(0.0)
+                .build(),
+        );
+        let queued_submissions_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .visible(false)
+            .build();
+        queued_submissions_box.append(&queue_heading);
+        queued_submissions_box.append(&queued_scroller);
+
         let attachment_flow = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .column_spacing(4)
@@ -317,6 +362,7 @@ impl CodexChatView {
             .margin_start(12)
             .margin_end(12)
             .build();
+        composer_content.append(&queued_submissions_box);
         composer_content.append(&attachment_flow);
         composer_content.append(&composer_frame);
         composer_content.append(&action_row);
@@ -380,6 +426,8 @@ impl CodexChatView {
             collaboration_progress_box,
             composer,
             composer_placeholder,
+            queued_submissions_box,
+            queued_submissions_list,
             attachment_flow,
             attachments: RefCell::new(Vec::new()),
             send_button,
@@ -463,6 +511,102 @@ impl CodexChatView {
     }
 
     pub fn focus_composer(&self) {
+        self.state.composer.grab_focus();
+    }
+
+    pub fn set_queued_submissions(&self, submissions: &[QueuedSubmission]) {
+        while let Some(child) = self.state.queued_submissions_list.first_child() {
+            self.state.queued_submissions_list.remove(&child);
+        }
+        self.state
+            .queued_submissions_box
+            .set_visible(!submissions.is_empty());
+        let last_index = submissions.len().saturating_sub(1);
+        for (index, submission) in submissions.iter().enumerate() {
+            let row_content = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(4)
+                .margin_top(3)
+                .margin_bottom(3)
+                .margin_start(6)
+                .margin_end(4)
+                .build();
+            let icon = gtk::Image::from_icon_name("mail-send-symbolic");
+            icon.set_pixel_size(12);
+            let preview = gtk::Label::builder()
+                .label(if submission.preview.trim().is_empty() {
+                    "Queued follow-up"
+                } else {
+                    submission.preview.trim()
+                })
+                .tooltip_text(&submission.preview)
+                .css_classes(["caption"])
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .max_width_chars(52)
+                .build();
+            row_content.append(&icon);
+            row_content.append(&preview);
+            for (icon_name, tooltip, action, visible) in [
+                (
+                    "document-edit-symbolic",
+                    "Edit queued follow-up",
+                    CodexChatAction::EditQueued(submission.id.clone()),
+                    true,
+                ),
+                (
+                    "go-up-symbolic",
+                    "Move queued follow-up up",
+                    CodexChatAction::MoveQueued {
+                        id: submission.id.clone(),
+                        direction: QueueDirection::Up,
+                    },
+                    index > 0,
+                ),
+                (
+                    "go-down-symbolic",
+                    "Move queued follow-up down",
+                    CodexChatAction::MoveQueued {
+                        id: submission.id.clone(),
+                        direction: QueueDirection::Down,
+                    },
+                    index < last_index,
+                ),
+                (
+                    "user-trash-symbolic",
+                    "Remove queued follow-up",
+                    CodexChatAction::RemoveQueued(submission.id.clone()),
+                    true,
+                ),
+            ] {
+                let button = gtk::Button::builder()
+                    .icon_name(icon_name)
+                    .tooltip_text(tooltip)
+                    .visible(visible)
+                    .valign(gtk::Align::Center)
+                    .build();
+                button.add_css_class("flat");
+                button.update_property(&[gtk::accessible::Property::Label(tooltip)]);
+                button.connect_clicked({
+                    let callbacks = self.state.callbacks.clone();
+                    move |_| emit_action(&callbacks, action.clone())
+                });
+                row_content.append(&button);
+            }
+            let row = gtk::ListBoxRow::builder()
+                .activatable(false)
+                .selectable(false)
+                .child(&row_content)
+                .build();
+            self.state.queued_submissions_list.append(&row);
+        }
+    }
+
+    pub fn restore_submission_for_editing(&self, submission: ComposerSubmission) {
+        self.state.composer.buffer().set_text(&submission.text);
+        self.state.attachments.replace(submission.attachments);
+        sync_attachment_chips(&self.state);
         self.state.composer.grab_focus();
     }
 
@@ -603,6 +747,7 @@ impl CodexChatView {
                 .usage_icon
                 .set_tooltip_text(Some("Context usage is not available yet"));
             self.state.usage_progress.set_fraction(0.0);
+            self.state.usage_progress.set_text(Some("—"));
             self.state
                 .usage_progress
                 .set_tooltip_text(Some("Token usage is not available yet"));
@@ -610,17 +755,33 @@ impl CodexChatView {
         };
 
         let context = usage.context_limit.filter(|limit| *limit > 0);
-        let summary = context.map_or_else(
-            || format!("Active context: {} tokens", usage.last_total_tokens),
-            |limit| {
+        const BASELINE_TOKENS: u64 = 12_000;
+        let remaining = context.map(|limit| {
+            let effective_window = limit.saturating_sub(BASELINE_TOKENS);
+            let used = usage.last_total_tokens.saturating_sub(BASELINE_TOKENS);
+            let remaining = effective_window.saturating_sub(used);
+            let fraction = if effective_window == 0 {
+                0.0
+            } else {
+                (remaining as f64 / effective_window as f64).clamp(0.0, 1.0)
+            };
+            (remaining, effective_window, fraction)
+        });
+        let summary = remaining.map_or_else(
+            || "Context remaining: unknown".to_owned(),
+            |(_, _, fraction)| format!("{:.0}% context remaining", fraction * 100.0),
+        );
+        let remaining_detail = remaining.map_or_else(
+            || "Context remaining: unknown".to_owned(),
+            |(remaining, effective_window, fraction)| {
                 format!(
-                    "Active context: {} / {limit} tokens",
-                    usage.last_total_tokens
+                    "Context remaining: {remaining} / {effective_window} tokens ({:.0}%)",
+                    fraction * 100.0
                 )
             },
         );
         let detail = format!(
-            "Active context: {}{}\n\nCumulative usage\nInput: {}\nCache write input: {}\nCached input: {}\nOutput: {}\nReasoning output: {}\nTotal: {}",
+            "{remaining_detail}\nActive context: {}{}\n\nCumulative usage\nInput: {}\nCache write input: {}\nCached input: {}\nOutput: {}\nReasoning output: {}\nTotal: {}",
             usage.last_total_tokens,
             context.map_or_else(String::new, |limit| format!(" / {limit}")),
             usage.input_tokens,
@@ -630,19 +791,17 @@ impl CodexChatView {
             usage.reasoning_output_tokens,
             usage.total_tokens,
         );
-        let fraction = context.map_or(0.0, |limit| {
-            const BASELINE_TOKENS: u64 = 12_000;
-            if limit <= BASELINE_TOKENS {
-                return 0.0;
-            }
-            let effective_limit = limit - BASELINE_TOKENS;
-            let effective_used = usage.last_total_tokens.saturating_sub(BASELINE_TOKENS);
-            (effective_used as f64 / effective_limit as f64).clamp(0.0, 1.0)
-        });
+        let fraction = remaining.map_or(0.0, |(_, _, fraction)| fraction);
         self.state.usage_label.set_text(&summary);
         self.state.usage_label.set_tooltip_text(Some(&detail));
         self.state.usage_icon.set_tooltip_text(Some(&detail));
         self.state.usage_progress.set_fraction(fraction);
+        self.state
+            .usage_progress
+            .set_text(Some(&remaining.map_or_else(
+                || "—".to_owned(),
+                |(_, _, fraction)| format!("{:.0}%", fraction * 100.0),
+            )));
         self.state.usage_progress.set_tooltip_text(Some(&detail));
     }
 
@@ -803,8 +962,12 @@ fn transcript_factory(callbacks: Rc<RefCell<Vec<ActionCallback>>>) -> gtk::Signa
 }
 
 // Transcript and pending-request widgets live in `transcript.rs`.
-fn selector_controls() -> (gtk::Box, HashMap<ChatSelector, SelectorControl>) {
-    let row = gtk::Box::builder()
+fn selector_controls() -> (gtk::Box, gtk::Box, HashMap<ChatSelector, SelectorControl>) {
+    let primary = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    let secondary = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
         .build();
@@ -843,7 +1006,17 @@ fn selector_controls() -> (gtk::Box, HashMap<ChatSelector, SelectorControl>) {
             .build();
         control_box.append(&icon);
         control_box.append(&dropdown);
-        row.append(&control_box);
+        if matches!(
+            selector,
+            ChatSelector::Model
+                | ChatSelector::Reasoning
+                | ChatSelector::Personality
+                | ChatSelector::Permissions
+        ) {
+            primary.append(&control_box);
+        } else {
+            secondary.append(&control_box);
+        }
         controls.insert(
             selector,
             SelectorControl {
@@ -853,7 +1026,7 @@ fn selector_controls() -> (gtk::Box, HashMap<ChatSelector, SelectorControl>) {
             },
         );
     }
-    (row, controls)
+    (primary, secondary, controls)
 }
 
 fn connect_selector_controls(state: &Rc<CodexChatViewState>) {
@@ -926,6 +1099,41 @@ fn connect_composer(state: &Rc<CodexChatViewState>, drop_widget: &gtk::Frame) {
     keys.connect_key_pressed({
         let state = Rc::downgrade(state);
         move |_, key, _, modifiers| {
+            if matches!(key, gdk::Key::v | gdk::Key::V)
+                && modifiers.contains(gdk::ModifierType::CONTROL_MASK)
+            {
+                let Some(state) = state.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                if !state.connected.get() || !state.composer_allowed.get() {
+                    return glib::Propagation::Proceed;
+                }
+                let clipboard = state.composer.clipboard();
+                let formats = clipboard.formats();
+                let has_image = formats.contains_type(gdk::Texture::static_type())
+                    || formats
+                        .mime_types()
+                        .iter()
+                        .any(|mime_type| mime_type.starts_with("image/"));
+                if has_image {
+                    let callbacks = state.callbacks.clone();
+                    clipboard.read_texture_async(None::<&gio::Cancellable>, move |result| {
+                        match result {
+                            Ok(Some(texture)) => emit_action(
+                                &callbacks,
+                                CodexChatAction::PastedClipboardImage {
+                                    png_bytes: texture.save_to_png_bytes().as_ref().to_vec(),
+                                },
+                            ),
+                            Ok(None) => {}
+                            Err(error) => {
+                                log::warn!("failed reading pasted clipboard image: {error}")
+                            }
+                        }
+                    });
+                    return glib::Propagation::Stop;
+                }
+            }
             if key != gdk::Key::Return || !modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
                 return glib::Propagation::Proceed;
             }
@@ -971,7 +1179,7 @@ fn submit_composer(state: &Rc<CodexChatViewState>, steer: bool) {
     if !state.connected.get() || !state.composer_allowed.get() {
         return;
     }
-    if steer != state.turn_active.get() {
+    if steer && !state.turn_active.get() {
         return;
     }
     let buffer = state.composer.buffer();
@@ -988,6 +1196,8 @@ fn submit_composer(state: &Rc<CodexChatViewState>, steer: bool) {
         &state.callbacks,
         if steer {
             CodexChatAction::Steer(submission)
+        } else if state.turn_active.get() {
+            CodexChatAction::Queue(submission)
         } else {
             CodexChatAction::Submit(submission)
         },
@@ -1005,9 +1215,14 @@ fn update_action_sensitivity(state: &CodexChatViewState) {
         .is_empty();
     let has_input = has_text || !state.attachments.borrow().is_empty();
     let can_submit = state.connected.get() && state.composer_allowed.get() && has_input;
+    state.send_button.set_sensitive(can_submit);
     state
         .send_button
-        .set_sensitive(can_submit && !state.turn_active.get());
+        .set_tooltip_text(Some(if state.turn_active.get() {
+            "Queue follow-up"
+        } else {
+            "Send (Ctrl+Enter)"
+        }));
     let turn_controls_visible = state.connected.get() && state.turn_active.get();
     let can_steer = can_submit && state.turn_active.get();
     state.steer_button.set_visible(can_steer);
@@ -1035,6 +1250,7 @@ fn sync_attachment_chips(state: &Rc<CodexChatViewState>) {
             ComposerAttachmentKind::Audio => "audio-x-generic-symbolic",
             ComposerAttachmentKind::Mention if workspace_folder => "folder-open-symbolic",
             ComposerAttachmentKind::Mention => "document-open-symbolic",
+            ComposerAttachmentKind::Skill => "applications-education-symbolic",
         };
         let icon = gtk::Image::from_icon_name(icon_name);
         icon.set_pixel_size(12);
@@ -1043,8 +1259,13 @@ fn sync_attachment_chips(state: &Rc<CodexChatViewState>) {
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty())
             .unwrap_or(&attachment.label);
+        let display_label = if matches!(&attachment.kind, ComposerAttachmentKind::Skill) {
+            attachment.label.as_str()
+        } else {
+            basename
+        };
         let label = gtk::Label::builder()
-            .label(basename)
+            .label(display_label)
             .css_classes(["caption"])
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(16)
@@ -1084,8 +1305,13 @@ fn sync_attachment_chips(state: &Rc<CodexChatViewState>) {
             ComposerAttachmentKind::Mention | ComposerAttachmentKind::File => {
                 "Workspace file reference"
             }
+            ComposerAttachmentKind::Skill => "Skill",
         };
-        let tooltip = format!("{context_kind}\n{}", attachment.reference);
+        let tooltip = if matches!(&attachment.kind, ComposerAttachmentKind::Skill) {
+            format!("Skill: {}", attachment.label)
+        } else {
+            format!("{context_kind}\n{}", attachment.reference)
+        };
         let chip = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(2)

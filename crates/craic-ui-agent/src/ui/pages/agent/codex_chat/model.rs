@@ -38,6 +38,7 @@ pub enum ComposerAttachmentKind {
     Image,
     Audio,
     Mention,
+    Skill,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +53,18 @@ pub struct ComposerAttachment {
 pub struct ComposerSubmission {
     pub text: String,
     pub attachments: Vec<ComposerAttachment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedSubmission {
+    pub id: String,
+    pub preview: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueDirection {
+    Up,
+    Down,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -190,6 +203,7 @@ pub struct RequestUserInputQuestion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestUserInput {
     pub questions: Vec<RequestUserInputQuestion>,
+    pub auto_resolution: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -354,10 +368,20 @@ pub enum CodexChatAction {
     OpenChanges,
     Submit(ComposerSubmission),
     Steer(ComposerSubmission),
+    Queue(ComposerSubmission),
+    EditQueued(String),
+    RemoveQueued(String),
+    MoveQueued {
+        id: String,
+        direction: QueueDirection,
+    },
     Interrupt,
     ChooseAttachment,
     ChooseMention,
     ChooseMentionFolder,
+    PastedClipboardImage {
+        png_bytes: Vec<u8>,
+    },
     FilesDropped(Vec<String>),
     AttachmentRemoved(String),
     SelectorChanged {

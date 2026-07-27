@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 adw.workspace = true
+base64.workspace = true
 craic-agent.workspace = true
 craic-config.workspace = true
 craic-codex-app-server.workspace = true
