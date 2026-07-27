@@ -88,6 +88,7 @@ struct CodexChatViewState {
     callbacks: Rc<RefCell<Vec<ActionCallback>>>,
     connected: Cell<bool>,
     turn_active: Cell<bool>,
+    turn_steerable: Cell<bool>,
     composer_allowed: Cell<bool>,
 }
 
@@ -222,25 +223,29 @@ impl CodexChatView {
 
         let plan_progress_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
+            .spacing(8)
             .visible(false)
             .build();
         let collaboration_progress_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
+            .spacing(8)
             .visible(false)
             .build();
         let progress_content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(10)
-            .margin_top(10)
-            .margin_bottom(10)
+            .spacing(12)
+            .margin_top(12)
+            .margin_bottom(12)
             .margin_start(12)
             .margin_end(12)
             .build();
-        progress_content.add_css_class("card");
         progress_content.append(&plan_progress_box);
         progress_content.append(&collaboration_progress_box);
+        let progress_card = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        progress_card.add_css_class("card");
+        progress_card.append(&progress_content);
         let progress_clamp = adw::Clamp::builder()
             .maximum_size(960)
             .tightening_threshold(720)
@@ -248,7 +253,7 @@ impl CodexChatView {
             .margin_bottom(6)
             .margin_start(12)
             .margin_end(12)
-            .child(&progress_content)
+            .child(&progress_card)
             .build();
         let progress_revealer = gtk::Revealer::builder()
             .transition_type(gtk::RevealerTransitionType::SlideDown)
@@ -282,13 +287,9 @@ impl CodexChatView {
             .vexpand(true)
             .child(&composer)
             .build();
-        let composer_overlay = gtk::Overlay::new();
+        let composer_overlay = gtk::Overlay::builder().hexpand(true).vexpand(true).build();
         composer_overlay.set_child(Some(&composer_scroller));
         composer_overlay.add_overlay(&composer_placeholder);
-        let composer_frame = gtk::Frame::builder()
-            .hexpand(true)
-            .child(&composer_overlay)
-            .build();
 
         let queued_submissions_list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
@@ -340,12 +341,12 @@ impl CodexChatView {
             .build();
         send_button.add_css_class("suggested-action");
         let steer_button = gtk::Button::builder()
-            .icon_name("mail-send-symbolic")
-            .tooltip_text("Add instructions to the active turn (Enter)")
+            .icon_name("go-jump-symbolic")
+            .tooltip_text("Steer the active turn (Enter)")
             .visible(false)
             .build();
         steer_button.update_property(&[gtk::accessible::Property::Label("Steer active turn")]);
-        steer_button.add_css_class("flat");
+        steer_button.add_css_class("suggested-action");
         let interrupt_button = gtk::Button::builder()
             .icon_name("media-playback-stop-symbolic")
             .tooltip_text("Interrupt the active turn")
@@ -384,15 +385,17 @@ impl CodexChatView {
             .margin_bottom(8)
             .margin_start(12)
             .margin_end(12)
+            .vexpand(true)
             .build();
         composer_content.append(&queued_submissions_box);
         composer_content.append(&attachment_flow);
-        composer_content.append(&composer_frame);
+        composer_content.append(&composer_overlay);
         composer_content.append(&action_row);
         let composer_clamp = adw::Clamp::builder()
             .maximum_size(960)
             .tightening_threshold(720)
             .hexpand(true)
+            .vexpand(true)
             .child(&composer_content)
             .build();
 
@@ -461,11 +464,12 @@ impl CodexChatView {
             callbacks,
             connected: Cell::new(false),
             turn_active: Cell::new(false),
+            turn_steerable: Cell::new(true),
             composer_allowed: Cell::new(true),
         });
 
         connect_selector_controls(&state);
-        connect_composer(&state, &composer_frame);
+        connect_composer(&state, &composer_overlay);
         connect_font_size_shortcuts(&root);
 
         Self { root, state }
@@ -523,6 +527,11 @@ impl CodexChatView {
 
     pub fn set_turn_active(&self, active: bool) {
         self.state.turn_active.set(active);
+        update_action_sensitivity(&self.state);
+    }
+
+    pub fn set_turn_steerable(&self, steerable: bool) {
+        self.state.turn_steerable.set(steerable);
         update_action_sensitivity(&self.state);
     }
 
@@ -1153,7 +1162,7 @@ fn connect_font_size_shortcuts(root: &gtk::Box) {
     root.add_controller(keys);
 }
 
-fn connect_composer(state: &Rc<CodexChatViewState>, drop_widget: &gtk::Frame) {
+fn connect_composer(state: &Rc<CodexChatViewState>, drop_widget: &gtk::Overlay) {
     state.composer.buffer().connect_changed({
         let state = Rc::downgrade(state);
         move |_| {
@@ -1237,7 +1246,10 @@ fn connect_composer(state: &Rc<CodexChatViewState>, drop_widget: &gtk::Frame) {
             if !state.connected.get() || !state.composer_allowed.get() {
                 return glib::Propagation::Proceed;
             }
-            submit_composer(&state, state.turn_active.get());
+            submit_composer(
+                &state,
+                state.turn_active.get() && state.turn_steerable.get(),
+            );
             glib::Propagation::Stop
         }
     });
@@ -1312,16 +1324,33 @@ fn update_action_sensitivity(state: &CodexChatViewState) {
         .is_empty();
     let has_input = has_text || !state.attachments.borrow().is_empty();
     let can_submit = state.connected.get() && state.composer_allowed.get() && has_input;
+    if state.turn_active.get() {
+        state.send_button.set_label("Queue");
+        state.send_button.remove_css_class("suggested-action");
+        state.send_button.add_css_class("flat");
+        state
+            .composer_placeholder
+            .set_text(if state.turn_steerable.get() {
+                "Steer this turn or queue a follow-up…"
+            } else {
+                "Queue a follow-up for the next turn…"
+            });
+    } else {
+        state.send_button.set_label("Send");
+        state.send_button.remove_css_class("flat");
+        state.send_button.add_css_class("suggested-action");
+        state.composer_placeholder.set_text("Message Codex…");
+    }
     state.send_button.set_sensitive(can_submit);
     state
         .send_button
         .set_tooltip_text(Some(if state.turn_active.get() {
-            "Queue follow-up"
+            "Queue for the next turn"
         } else {
-            "Send (Ctrl+Enter)"
+            "Send (Enter)"
         }));
     let turn_controls_visible = state.connected.get() && state.turn_active.get();
-    let can_steer = can_submit && state.turn_active.get();
+    let can_steer = can_submit && state.turn_active.get() && state.turn_steerable.get();
     state.steer_button.set_visible(can_steer);
     state.steer_button.set_sensitive(can_steer);
     state.interrupt_button.set_visible(turn_controls_visible);

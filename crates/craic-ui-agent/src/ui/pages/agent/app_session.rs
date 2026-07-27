@@ -525,9 +525,11 @@ impl AppChatSessionInner {
                 if let Some(turn_id) = result.pointer("/turn/id").and_then(Value::as_str) {
                     self.active_turn_id.replace(Some(turn_id.to_owned()));
                 }
+                self.view.set_turn_steerable(method == Some("turn/start"));
                 self.set_state(AppChatState::Running);
                 self.view.set_turn_active(true);
             }
+            Some("thread/compact/start") => self.view.set_turn_steerable(false),
             Some("thread/archive")
             | Some("thread/unarchive")
             | Some("thread/delete")
@@ -546,6 +548,12 @@ impl AppChatSessionInner {
         };
         self.thread_id.replace(Some(thread_id.to_owned()));
         if self.active_turn_id.borrow().is_some() {
+            self.view.set_turn_steerable(
+                result
+                    .pointer("/thread/canAcceptDirectInput")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+            );
             self.set_state(AppChatState::Running);
             self.view.set_turn_active(true);
         } else {
@@ -885,7 +893,6 @@ impl AppChatSessionInner {
             return false;
         }
         let client_id = self.next_id("user");
-        let mut extra = self.turn_settings();
         let result = {
             let server = self.server.borrow();
             let Some(server) = server.as_ref() else {
@@ -901,9 +908,13 @@ impl AppChatSessionInner {
                     client_user_message_id: Some(client_id.clone()),
                     input,
                     expected_turn_id,
-                    extra,
+                    // `turn/steer` accepts input for the in-flight turn, not
+                    // the model/personality/permission overrides used by
+                    // `turn/start`.
+                    extra: Default::default(),
                 })
             } else {
+                let mut extra = self.turn_settings();
                 server.turn_start(TurnStartParams {
                     thread_id,
                     client_user_message_id: Some(client_id.clone()),
@@ -941,6 +952,9 @@ impl AppChatSessionInner {
             self.persist_overlay(Some(title));
         }
         self.set_state(AppChatState::Running);
+        if !steer {
+            self.view.set_turn_steerable(true);
+        }
         self.view.set_turn_active(true);
         true
     }
