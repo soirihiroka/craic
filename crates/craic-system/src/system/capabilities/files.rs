@@ -1,6 +1,7 @@
 use crate::system::path::{ArchiveFormat, FileNodePath, WorkspaceRef};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -363,6 +364,19 @@ pub struct FileReadRequest {
     pub cancel_requested: Option<FileCancellation>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileDownloadDestination {
+    File(PathBuf),
+    Folder(PathBuf),
+}
+
+#[derive(Clone, Debug)]
+pub struct FileDownloadRequest {
+    pub sources: Vec<FileNodePath>,
+    pub destination: FileDownloadDestination,
+    pub cancel_requested: Option<FileCancellation>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileWriteMode {
     CreateNew,
@@ -576,6 +590,18 @@ pub trait FileAccess: Send + Sync {
         path.to_workspace_path(&self.workspace())
             .map(|path| path.absolute)
             .unwrap_or_else(|| path.display())
+    }
+
+    fn local_path(&self, _path: &FileNodePath) -> Option<PathBuf> {
+        None
+    }
+
+    fn supports_download(&self) -> bool {
+        false
+    }
+
+    fn download_to_local(&self, _request: FileDownloadRequest) -> Result<Vec<PathBuf>, String> {
+        Err("Downloading files is unavailable for this workspace.".to_string())
     }
 
     fn list_dirs(&self, paths: &[FileNodePath]) -> Result<Vec<DirectoryListing>, String>;

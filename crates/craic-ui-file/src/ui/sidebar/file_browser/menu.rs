@@ -8,15 +8,25 @@ pub fn repository_row_menu(
     target: &BrowserTarget,
     terminal_available: bool,
     container_actions_available: bool,
+    download_available: bool,
 ) -> ContextMenuBuilder {
     if target.is_dir {
-        repository_folder_menu(target, terminal_available)
+        repository_folder_menu(target, terminal_available, download_available)
     } else {
-        repository_file_menu(target, terminal_available, container_actions_available)
+        repository_file_menu(
+            target,
+            terminal_available,
+            container_actions_available,
+            download_available,
+        )
     }
 }
 
-fn repository_folder_menu(target: &BrowserTarget, terminal_available: bool) -> ContextMenuBuilder {
+fn repository_folder_menu(
+    target: &BrowserTarget,
+    terminal_available: bool,
+    download_available: bool,
+) -> ContextMenuBuilder {
     let is_root = target.is_root();
     let mut menu = context_menu::builder("repo_file")
         .item("New File...", "new-file")
@@ -30,6 +40,9 @@ fn repository_folder_menu(target: &BrowserTarget, terminal_available: bool) -> C
         if target.executable {
             menu = menu.item("Run in Integrated Terminal", "run-terminal");
         }
+    }
+    if download_available {
+        menu = menu.item("Download...", "download");
     }
     menu = menu.separator();
     if !is_root {
@@ -55,6 +68,7 @@ fn repository_file_menu(
     target: &BrowserTarget,
     terminal_available: bool,
     container_actions_available: bool,
+    download_available: bool,
 ) -> ContextMenuBuilder {
     let mut menu = context_menu::builder("repo_file")
         .item("Open", "open")
@@ -62,6 +76,9 @@ fn repository_file_menu(
         .item("Open Containing Folder", "open-containing-folder");
     if terminal_available {
         menu = menu.item("Open in Integrated Terminal", "open-terminal");
+    }
+    if download_available {
+        menu = menu.item("Download...", "download");
     }
     menu = menu
         .item("Add File to Chat", "add-to-chat")
