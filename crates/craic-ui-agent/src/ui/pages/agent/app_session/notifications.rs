@@ -93,6 +93,7 @@ impl AppChatSessionInner {
                 if let Some(item) = params.get("item") {
                     if item.get("type").and_then(Value::as_str) == Some("contextCompaction") {
                         self.view.set_usage(None);
+                        self.view.set_turn_steerable(false);
                     }
                     self.upsert_timeline(timeline_from_item(item, false));
                     self.update_collaboration_progress(item, false);
