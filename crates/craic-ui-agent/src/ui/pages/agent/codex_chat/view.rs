@@ -13,7 +13,22 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::config;
+
 const TRANSCRIPT_FOLLOW_DISTANCE: f64 = 72.0;
+thread_local! {
+    static CHAT_FONT_PROVIDER: gtk::CssProvider = {
+        let provider = gtk::CssProvider::new();
+        if let Some(display) = gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 2,
+            );
+        }
+        provider
+    };
+}
 const CHAT_SELECTORS: [ChatSelector; 8] = [
     ChatSelector::Model,
     ChatSelector::Reasoning,
@@ -43,6 +58,8 @@ struct CodexChatViewState {
     model: gio::ListStore,
     timeline_indices: RefCell<HashMap<String, u32>>,
     pending_indices: RefCell<HashMap<String, u32>>,
+    queued_timeline_updates: RefCell<Vec<TimelineItem>>,
+    timeline_flush_scheduled: Cell<bool>,
     transcript_stack: gtk::Stack,
     transcript_scroller: gtk::ScrolledWindow,
     status_icon: gtk::Image,
@@ -404,6 +421,8 @@ impl CodexChatView {
             .hexpand(true)
             .vexpand(true)
             .build();
+        root.add_css_class("codex-native-chat");
+        apply_chat_font_size(config::load().font_sizes.agent);
         root.append(&header);
         root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         root.append(&split);
@@ -412,6 +431,8 @@ impl CodexChatView {
             model,
             timeline_indices: RefCell::new(HashMap::new()),
             pending_indices: RefCell::new(HashMap::new()),
+            queued_timeline_updates: RefCell::new(Vec::new()),
+            timeline_flush_scheduled: Cell::new(false),
             transcript_stack,
             transcript_scroller,
             status_icon,
@@ -445,6 +466,7 @@ impl CodexChatView {
 
         connect_selector_controls(&state);
         connect_composer(&state, &composer_frame);
+        connect_font_size_shortcuts(&root);
 
         Self { root, state }
     }
@@ -629,6 +651,10 @@ impl CodexChatView {
     }
 
     pub fn upsert_timeline_item(&self, item: TimelineItem) {
+        self.state
+            .queued_timeline_updates
+            .borrow_mut()
+            .retain(|queued| queued.id != item.id);
         let follow = adjustment_is_near_bottom(&self.state.transcript_scroller);
         let existing = self.state.timeline_indices.borrow().get(&item.id).copied();
         let object = glib::BoxedAnyObject::new(TranscriptEntry::Timeline(item.clone()));
@@ -648,6 +674,27 @@ impl CodexChatView {
         if follow || existing.is_none() {
             scroll_transcript_to_end(&self.state.transcript_scroller);
         }
+    }
+
+    pub fn queue_timeline_item(&self, item: TimelineItem) {
+        let mut queued = self.state.queued_timeline_updates.borrow_mut();
+        if let Some(existing) = queued.iter_mut().find(|queued| queued.id == item.id) {
+            *existing = item;
+        } else {
+            queued.push(item);
+        }
+        drop(queued);
+        if self.state.timeline_flush_scheduled.replace(true) {
+            return;
+        }
+        let view = self.clone();
+        glib::idle_add_local_once(move || {
+            view.state.timeline_flush_scheduled.set(false);
+            let updates = view.state.queued_timeline_updates.take();
+            for item in updates {
+                view.upsert_timeline_item(item);
+            }
+        });
     }
 
     pub fn upsert_pending_request(&self, request: PendingRequest) {
@@ -690,6 +737,7 @@ impl CodexChatView {
         self.state.model.remove_all();
         self.state.timeline_indices.borrow_mut().clear();
         self.state.pending_indices.borrow_mut().clear();
+        self.state.queued_timeline_updates.borrow_mut().clear();
         self.state.transcript_stack.set_visible_child_name("empty");
     }
 
@@ -1063,6 +1111,46 @@ fn connect_selector_controls(state: &Rc<CodexChatViewState>) {
             }
         });
     }
+}
+
+fn apply_chat_font_size(font_size: f64) {
+    CHAT_FONT_PROVIDER.with(|provider| {
+        provider.load_from_data(&format!(
+            ".codex-native-chat {{ font-size: {font_size:.1}pt; }}"
+        ));
+    });
+}
+
+fn connect_font_size_shortcuts(root: &gtk::Box) {
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed(move |_, key, _, modifiers| {
+        if !modifiers.contains(gdk::ModifierType::CONTROL_MASK)
+            || modifiers.contains(gdk::ModifierType::ALT_MASK)
+        {
+            return glib::Propagation::Proceed;
+        }
+        let current = config::load().font_sizes.agent;
+        let requested = if matches!(key, gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add) {
+            current + 1.0
+        } else if matches!(
+            key,
+            gdk::Key::minus | gdk::Key::underscore | gdk::Key::KP_Subtract
+        ) {
+            current - 1.0
+        } else if matches!(key, gdk::Key::_0 | gdk::Key::KP_0) {
+            config::DEFAULT_AGENT_FONT_SIZE
+        } else {
+            return glib::Propagation::Proceed;
+        };
+        let next = config::normalize_font_size(requested, config::DEFAULT_AGENT_FONT_SIZE);
+        if (next - current).abs() > f64::EPSILON {
+            apply_chat_font_size(next);
+            config::save_agent_font_size(next);
+        }
+        glib::Propagation::Stop
+    });
+    root.add_controller(keys);
 }
 
 fn connect_composer(state: &Rc<CodexChatViewState>, drop_widget: &gtk::Frame) {

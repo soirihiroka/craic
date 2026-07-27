@@ -90,18 +90,36 @@ pub(super) fn timeline_row(item: &TimelineItem) -> gtk::Widget {
         content.append(&body);
     }
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
-        let detail_label = gtk::Label::builder()
-            .label(detail)
-            .xalign(0.0)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .selectable(true)
-            .css_classes(["monospace"])
-            .build();
+        let detail_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let expander = gtk::Expander::builder()
             .label("Details")
-            .child(&detail_label)
+            .child(&detail_content)
             .build();
+        let detail = detail.to_owned();
+        let detail_materialized = Cell::new(false);
+        expander.connect_notify_local(Some("expanded"), move |expander, _| {
+            if !expander.is_expanded() || detail_materialized.replace(true) {
+                return;
+            }
+            let detail_label = gtk::Label::builder()
+                .label(&detail)
+                .xalign(0.0)
+                .yalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .selectable(true)
+                .css_classes(["monospace"])
+                .build();
+            let detail_scroller = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vscrollbar_policy(gtk::PolicyType::Automatic)
+                .propagate_natural_height(true)
+                .min_content_height(64)
+                .max_content_height(320)
+                .child(&detail_label)
+                .build();
+            detail_content.append(&detail_scroller);
+        });
         content.append(&expander);
     }
 

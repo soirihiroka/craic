@@ -470,7 +470,7 @@ impl AppChatSessionInner {
         detail.push_str(if stdin.is_empty() { "<empty>" } else { stdin });
         let item = item.clone();
         drop(timeline);
-        self.view.upsert_timeline_item(item);
+        self.view.queue_timeline_item(item);
     }
 
     fn apply_mcp_tool_progress(&self, params: &Value) {
@@ -959,7 +959,11 @@ impl AppChatSessionInner {
         }
         let item = item.clone();
         drop(timeline);
-        self.view.upsert_timeline_item(item);
+        if completed {
+            self.view.upsert_timeline_item(item);
+        } else {
+            self.view.queue_timeline_item(item);
+        }
     }
 
     fn apply_world_writable_warning(&self, params: &Value) {
@@ -1176,7 +1180,7 @@ impl AppChatSessionInner {
         }
         let item = item.clone();
         drop(timeline);
-        self.view.upsert_timeline_item(item);
+        self.view.queue_timeline_item(item);
     }
 
     fn apply_process_exit(&self, params: &Value) {
@@ -1271,7 +1275,7 @@ impl AppChatSessionInner {
         }
         let item = item.clone();
         drop(timeline);
-        self.view.upsert_timeline_item(item);
+        self.view.queue_timeline_item(item);
     }
 
     fn apply_patch_snapshot(&self, params: &Value) {

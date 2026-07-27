@@ -33,7 +33,8 @@ use super::codex_chat::{
     TimelineItemStatus,
 };
 use super::thread_picker::CodexThreadPicker;
-use crate::system::ProviderKind;
+use crate::system::capabilities::shell::ShellAccess;
+use crate::system::{ProviderKind, WorkspaceRef};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_EVENTS_PER_POLL: usize = 256;
@@ -123,18 +124,28 @@ struct AppChatSessionInner {
 
 impl AppChatSession {
     pub(crate) fn new(id: u64, ctx: PageContext) -> Result<Self, String> {
-        let config = app_server_config(&ctx)?;
+        let shell = ctx
+            .shell()
+            .ok_or_else(|| "Shell access is unavailable for this workspace".to_owned())?;
+        let provider_kind = ctx.system_ref().provider_kind;
+        let workspace = ctx.workspace_ref();
         let view = CodexChatView::new();
         let picker = CodexThreadPicker::new();
         view.set_connection_status(ChatConnectionStatus::Connecting);
         view.set_composer_enabled(false);
         set_initial_selector_options(&view);
 
-        let workspace = ctx.workspace_ref();
         let content = gtk::Stack::builder().hexpand(true).vexpand(true).build();
+        let loading_spinner = adw::Spinner::builder()
+            .width_request(48)
+            .height_request(48)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .build();
+        content.add_named(&loading_spinner, Some("loading"));
         content.add_named(&view.root, Some("chat"));
         content.add_named(&picker.root, Some("threads"));
-        content.set_visible_child_name("chat");
+        content.set_visible_child_name("loading");
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .hexpand(true)
@@ -142,10 +153,17 @@ impl AppChatSession {
             .build();
         root.append(&content);
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let startup_workspace = workspace.clone();
         std::thread::Builder::new()
             .name(format!("codex-app-session-start-{id}"))
             .spawn(move || {
-                let result = AppServer::spawn(config).map_err(|error| error.to_string());
+                log::info!("native Codex startup worker started session_id={id}");
+                let result = app_server_config(shell.as_ref(), &startup_workspace, provider_kind)
+                    .and_then(|config| AppServer::spawn(config).map_err(|error| error.to_string()));
+                log::info!(
+                    "native Codex startup worker finished session_id={id} success={}",
+                    result.is_ok()
+                );
                 let _ = startup_tx.send(result);
             })
             .map_err(|error| format!("Failed to start Codex App Server worker: {error}"))?;
@@ -211,10 +229,10 @@ impl AppChatSession {
     }
 
     pub(crate) fn focus(&self) {
-        if self.inner.content.visible_child_name().as_deref() == Some("threads") {
-            self.inner.picker.focus_search();
-        } else {
-            self.inner.view.focus_composer();
+        match self.inner.content.visible_child_name().as_deref() {
+            Some("threads") => self.inner.picker.focus_search(),
+            Some("chat") => self.inner.view.focus_composer(),
+            _ => {}
         }
     }
 
@@ -423,35 +441,30 @@ impl AppChatSessionInner {
         self.set_state(AppChatState::StartingThread);
         self.view
             .set_connection_status(ChatConnectionStatus::Initializing);
-        let server = self.server.borrow();
-        let Some(server) = server.as_ref() else {
-            return;
-        };
-        let _ = server.send_raw_request("model/list", Some(json!({})));
-        let _ = server.send_raw_request(
-            "config/read",
-            Some(json!({ "includeLayers": false, "cwd": self.workspace_root })),
-        );
-        let _ = server.send_raw_request(
-            "permissionProfile/list",
-            Some(json!({ "cwd": self.workspace_root })),
-        );
-        let _ = server.send_raw_request("collaborationMode/list", Some(json!({})));
-        if self.content.visible_child_name().as_deref() == Some("threads") {
-            drop(server);
-            self.load_thread_page(false);
+        {
             let server = self.server.borrow();
             let Some(server) = server.as_ref() else {
                 return;
             };
-            if let Err(error) = server.thread_start(ThreadStartParams {
-                cwd: Some(self.workspace_root.clone()),
-                ..Default::default()
-            }) {
-                self.fail(error.to_string());
-            }
-            return;
+            let _ = server.send_raw_request("model/list", Some(json!({})));
+            let _ = server.send_raw_request(
+                "config/read",
+                Some(json!({ "includeLayers": false, "cwd": self.workspace_root })),
+            );
+            let _ = server.send_raw_request(
+                "permissionProfile/list",
+                Some(json!({ "cwd": self.workspace_root })),
+            );
+            let _ = server.send_raw_request("collaborationMode/list", Some(json!({})));
         }
+        let picker_visible = self.content.visible_child_name().as_deref() == Some("threads");
+        if picker_visible {
+            self.load_thread_page(false);
+        }
+        let server = self.server.borrow();
+        let Some(server) = server.as_ref() else {
+            return;
+        };
         if let Err(error) = server.thread_start(ThreadStartParams {
             cwd: Some(self.workspace_root.clone()),
             ..Default::default()
@@ -471,11 +484,9 @@ impl AppChatSessionInner {
                     self.load_thread_history(&result);
                 }
                 self.thread_became_ready(&result);
-                if method == Some("thread/start")
-                    && self.content.visible_child_name().as_deref() == Some("threads")
+                if method != Some("thread/start")
+                    || self.content.visible_child_name().as_deref() != Some("threads")
                 {
-                    self.load_thread_page(false);
-                } else {
                     self.hide_thread_picker();
                 }
             }
@@ -1004,6 +1015,8 @@ impl AppChatSessionInner {
         self.view.set_composer_enabled(false);
         if self.content.visible_child_name().as_deref() == Some("threads") {
             self.picker.set_error(Some(&message));
+        } else {
+            self.content.set_visible_child_name("chat");
         }
         self.set_state(AppChatState::Failed(message));
         self.clear_pending_requests();
@@ -1310,9 +1323,16 @@ impl Drop for AppChatSessionInner {
         if let Some(source) = self.poll_source.get_mut().take() {
             source.remove();
         }
-        if let Some(mut server) = self.server.get_mut().take() {
-            server.shutdown();
+        self.startup.get_mut().take();
+        if self.server.get_mut().is_some() {
+            log::warn!(
+                "native Codex session dropped before shutdown completed session_id={}",
+                self.id
+            );
         }
+        // `AppServer::drop` initiates shutdown and detaches its worker handles. Holding the
+        // value until this scope ends keeps this fallback non-blocking for GTK's main thread.
+        let _server = self.server.get_mut().take();
         for path in self
             .temporary_attachments
             .get_mut()
@@ -1332,11 +1352,11 @@ impl Drop for AppChatSessionInner {
     }
 }
 
-fn app_server_config(ctx: &PageContext) -> Result<AppServerConfig, String> {
-    let shell = ctx
-        .shell()
-        .ok_or_else(|| "Shell access is unavailable for this workspace".to_owned())?;
-    let workspace = ctx.workspace_ref();
+fn app_server_config(
+    shell: &dyn ShellAccess,
+    workspace: &WorkspaceRef,
+    provider_kind: ProviderKind,
+) -> Result<AppServerConfig, String> {
     let codex = shell
         .which("codex")?
         .ok_or_else(|| "Codex is not installed on this workspace target".to_owned())?;
@@ -1350,7 +1370,7 @@ fn app_server_config(ctx: &PageContext) -> Result<AppServerConfig, String> {
     let mut config = AppServerConfig {
         program: app.program,
         args: app.args,
-        cwd: (ctx.system_ref().provider_kind == ProviderKind::Local)
+        cwd: (provider_kind == ProviderKind::Local)
             .then(|| PathBuf::from(app.working_dir.absolute)),
         version_command: Some((version.program, version.args)),
         ..AppServerConfig::default()
