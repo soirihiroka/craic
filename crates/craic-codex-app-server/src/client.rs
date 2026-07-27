@@ -111,7 +111,7 @@ use crate::version::check_codex_version;
 pub struct AppServer {
     command_tx: Option<SyncSender<WriterCommand>>,
     process_tx: Option<SyncSender<ProcessCommand>>,
-    event_tx: mpsc::Sender<AppServerEvent>,
+    event_tx: SyncSender<AppServerEvent>,
     event_queue_saturated: Arc<AtomicBool>,
     events_rx: Receiver<AppServerEvent>,
     state: Arc<Mutex<ConnectionState>>,
@@ -132,11 +132,14 @@ impl AppServer {
             check_codex_version(&mut command).map_err(AppServerError::Version)?;
         }
 
-        let capacity = config.channel_capacity.max(1);
+        let command_capacity = config.channel_capacity.max(1);
+        // Startup publishes Starting and Initializing before the receiver can be returned to the
+        // caller, so the lossless event queue must hold at least those two lifecycle events.
+        let event_capacity = config.channel_capacity.max(2);
         let state = Arc::new(Mutex::new(ConnectionState::Starting));
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let (command_tx, command_rx) = mpsc::sync_channel(capacity);
-        let (event_tx, events_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(command_capacity);
+        let (event_tx, events_rx) = mpsc::sync_channel(event_capacity);
         let (process_tx, process_rx) = mpsc::sync_channel(2);
         let event_queue_saturated = Arc::new(AtomicBool::new(false));
 
@@ -285,11 +288,23 @@ impl AppServer {
     }
 
     pub fn try_recv(&self) -> Result<AppServerEvent, TryRecvError> {
-        self.events_rx.try_recv()
+        match self.events_rx.try_recv() {
+            Err(TryRecvError::Empty) => {
+                self.event_queue_saturated.store(false, Ordering::Relaxed);
+                Err(TryRecvError::Empty)
+            }
+            result => result,
+        }
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<AppServerEvent, RecvTimeoutError> {
-        self.events_rx.recv_timeout(timeout)
+        match self.events_rx.recv_timeout(timeout) {
+            Err(RecvTimeoutError::Timeout) => {
+                self.event_queue_saturated.store(false, Ordering::Relaxed);
+                Err(RecvTimeoutError::Timeout)
+            }
+            result => result,
+        }
     }
 
     pub fn send_request<P: Serialize>(
@@ -1134,6 +1149,19 @@ impl AppServer {
         if self.threads.is_empty() {
             return;
         }
+        self.initiate_shutdown();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+
+    fn initiate_shutdown(&mut self) {
+        // Event producers may be applying bounded backpressure. Disconnect their receiver before
+        // joining them so every blocked send wakes up instead of deadlocking shutdown.
+        let (closed_event_tx, closed_events_rx) = mpsc::sync_channel(1);
+        drop(closed_event_tx);
+        drop(std::mem::replace(&mut self.events_rx, closed_events_rx));
+
         let current = self.state();
         if !matches!(current, ConnectionState::Stopped | ConnectionState::Crashed) {
             *lock(&self.state) = ConnectionState::Stopping;
@@ -1146,13 +1174,10 @@ impl AppServer {
         }
 
         if let Some(command_tx) = self.command_tx.take() {
-            let _ = command_tx.send(WriterCommand::Shutdown);
+            let _ = command_tx.try_send(WriterCommand::Shutdown);
         }
         if let Some(process_tx) = self.process_tx.take() {
-            let _ = process_tx.send(ProcessCommand::GracefulShutdown(self.shutdown_timeout));
-        }
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
+            let _ = process_tx.try_send(ProcessCommand::GracefulShutdown(self.shutdown_timeout));
         }
     }
 
@@ -1194,6 +1219,10 @@ impl AppServer {
 
 impl Drop for AppServer {
     fn drop(&mut self) {
-        self.shutdown();
+        if !self.threads.is_empty() {
+            log::info!("Codex App Server dropped; scheduling non-blocking shutdown");
+            self.initiate_shutdown();
+            self.threads.clear();
+        }
     }
 }

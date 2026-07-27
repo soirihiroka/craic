@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStderr, ChildStdout};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,7 +44,7 @@ pub(crate) fn run_writer(
     mut stdin: impl Write,
     commands: Receiver<WriterCommand>,
     state: Arc<Mutex<ConnectionState>>,
-    events: mpsc::Sender<AppServerEvent>,
+    events: SyncSender<AppServerEvent>,
     saturated: Arc<AtomicBool>,
     process: SyncSender<ProcessCommand>,
 ) {
@@ -83,7 +83,7 @@ pub(crate) fn run_stdout_reader(
     process: SyncSender<ProcessCommand>,
     state: Arc<Mutex<ConnectionState>>,
     pending: Arc<Mutex<HashMap<RequestId, String>>>,
-    events: mpsc::Sender<AppServerEvent>,
+    events: SyncSender<AppServerEvent>,
     saturated: Arc<AtomicBool>,
 ) {
     let mut reader = BufReader::new(stdout);
@@ -136,7 +136,7 @@ fn route_message(
     process: &SyncSender<ProcessCommand>,
     state: &Arc<Mutex<ConnectionState>>,
     pending: &Arc<Mutex<HashMap<RequestId, String>>>,
-    events: &mpsc::Sender<AppServerEvent>,
+    events: &SyncSender<AppServerEvent>,
     saturated: &Arc<AtomicBool>,
 ) {
     let has_method = value.get("method").is_some();
@@ -170,17 +170,18 @@ fn route_message(
                 if response.id == RequestId::Integer(INITIALIZE_REQUEST_ID) {
                     match serde_json::from_value::<InitializeResult>(response.result.clone()) {
                         Ok(initialize) => {
-                            if commands
-                                .send(WriterCommand::InitializeAck(initialize))
-                                .is_err()
+                            if let Err(error) =
+                                commands.try_send(WriterCommand::InitializeAck(initialize))
                             {
-                                initialization_failed(
-                                    state,
-                                    events,
-                                    saturated,
-                                    process,
-                                    "writer disconnected before initialized acknowledgement",
-                                );
+                                let message = match error {
+                                    TrySendError::Full(_) => {
+                                        "writer queue full before initialized acknowledgement"
+                                    }
+                                    TrySendError::Disconnected(_) => {
+                                        "writer disconnected before initialized acknowledgement"
+                                    }
+                                };
+                                initialization_failed(state, events, saturated, process, message);
                             }
                         }
                         Err(error) => initialization_failed(
@@ -240,7 +241,7 @@ fn route_message(
 
 pub(crate) fn run_stderr_reader(
     stderr: ChildStderr,
-    events: mpsc::Sender<AppServerEvent>,
+    events: SyncSender<AppServerEvent>,
     saturated: Arc<AtomicBool>,
 ) {
     let mut reader = BufReader::new(stderr);
@@ -275,7 +276,7 @@ pub(crate) fn run_process_waiter(
     mut child: Child,
     commands: Receiver<ProcessCommand>,
     state: Arc<Mutex<ConnectionState>>,
-    events: mpsc::Sender<AppServerEvent>,
+    events: SyncSender<AppServerEvent>,
     saturated: Arc<AtomicBool>,
     process_group_id: u32,
 ) {
@@ -359,7 +360,7 @@ fn terminate_process_group(child: &mut Child, _process_group_id: u32) -> std::io
 
 fn transport_failed(
     state: &Arc<Mutex<ConnectionState>>,
-    events: &mpsc::Sender<AppServerEvent>,
+    events: &SyncSender<AppServerEvent>,
     saturated: &Arc<AtomicBool>,
     process: &SyncSender<ProcessCommand>,
     error: std::io::Error,
@@ -375,7 +376,7 @@ fn transport_failed(
 
 fn initialization_failed(
     state: &Arc<Mutex<ConnectionState>>,
-    events: &mpsc::Sender<AppServerEvent>,
+    events: &SyncSender<AppServerEvent>,
     saturated: &Arc<AtomicBool>,
     process: &SyncSender<ProcessCommand>,
     message: &str,
@@ -391,7 +392,7 @@ fn initialization_failed(
 
 pub(crate) fn set_state(
     state: &Arc<Mutex<ConnectionState>>,
-    events: &mpsc::Sender<AppServerEvent>,
+    events: &SyncSender<AppServerEvent>,
     saturated: &Arc<AtomicBool>,
     next: ConnectionState,
 ) {
@@ -406,12 +407,23 @@ pub(crate) fn set_state(
 }
 
 pub(crate) fn emit_event(
-    sender: &mpsc::Sender<AppServerEvent>,
+    sender: &SyncSender<AppServerEvent>,
     saturated: &AtomicBool,
     event: AppServerEvent,
 ) {
-    let _ = sender.send(event);
-    saturated.store(false, Ordering::Relaxed);
+    match sender.try_send(event) {
+        Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+        Err(TrySendError::Full(event)) => {
+            if !saturated.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "Codex App Server event queue is saturated; applying transport backpressure"
+                );
+            }
+            // This only blocks a dedicated transport worker. Shutdown drops the event receiver
+            // before joining workers, which wakes this send with Disconnected.
+            let _ = sender.send(event);
+        }
+    }
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

@@ -224,7 +224,9 @@ impl AppChatSessionInner {
         let Some(server) = server.as_ref() else {
             if matches!(
                 *self.lifecycle.borrow(),
-                AppChatState::Connecting | AppChatState::Initializing | AppChatState::StartingThread
+                AppChatState::Connecting
+                    | AppChatState::Initializing
+                    | AppChatState::StartingThread
             ) {
                 self.picker.set_loading(true);
             } else {
