@@ -1,16 +1,18 @@
 use super::{SshCommandRunner, remote_workspace_path, shell_quote, workspace_path_for_remote};
 use crate::system::capabilities::files::{
-    DirectoryListing, FileAccess, FileCopyRequest, FileDeleteRequest, FileKind, FileMoveRequest,
-    FileNodeCapabilities, FileNodeInfo, FileOperation, FileOperationCallback, FileOperationError,
-    FileOperationErrorKind, FileOperationEvent, FileOperationProgress, FileRead, FileReadRequest,
-    FileSearchMatch, FileSearchOutput, FileSearchQuery, FileSignature, FileWatchCallback,
-    FileWatchRequest, FileWatchSubscription, FileWriteMode, FileWritePayload, FileWriteRequest,
+    DirectoryListing, FileAccess, FileCopyRequest, FileDeleteRequest, FileDownloadDestination,
+    FileDownloadRequest, FileKind, FileMoveRequest, FileNodeCapabilities, FileNodeInfo,
+    FileOperation, FileOperationCallback, FileOperationError, FileOperationErrorKind,
+    FileOperationEvent, FileOperationProgress, FileRead, FileReadRequest, FileSearchMatch,
+    FileSearchOutput, FileSearchQuery, FileSignature, FileWatchCallback, FileWatchRequest,
+    FileWatchSubscription, FileWriteMode, FileWritePayload, FileWriteRequest,
     file_operation_canceled,
 };
 use crate::system::path::{ArchiveFormat, FileNodePath, SystemRef, WorkspacePath, WorkspaceRef};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -662,6 +664,80 @@ impl FileAccess for SshFileAccess {
 
     fn root(&self) -> FileNodePath {
         self.workspace.root_node_path(&self.system)
+    }
+
+    fn supports_download(&self) -> bool {
+        true
+    }
+
+    fn download_to_local(&self, request: FileDownloadRequest) -> Result<Vec<PathBuf>, String> {
+        if request.sources.is_empty() {
+            return Err("Select at least one remote file to download.".to_string());
+        }
+        if matches!(request.destination, FileDownloadDestination::File(_))
+            && request.sources.len() != 1
+        {
+            return Err("Choose a folder when downloading multiple items.".to_string());
+        }
+
+        let resolved = request
+            .sources
+            .iter()
+            .map(|path| self.resolve_native_node(path, "download"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_paths = match &request.destination {
+            FileDownloadDestination::File(path) => vec![path.clone()],
+            FileDownloadDestination::Folder(folder) => resolved
+                .iter()
+                .map(|source| {
+                    let name = source.path.file_name().ok_or_else(|| {
+                        "Downloading the workspace root is unsupported.".to_string()
+                    })?;
+                    Ok(folder.join(name))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        };
+        if let FileDownloadDestination::Folder(folder) = &request.destination {
+            if !folder.is_dir() {
+                return Err(format!(
+                    "Download destination is not a folder: {}",
+                    folder.display()
+                ));
+            }
+            let unique_output_paths = output_paths
+                .iter()
+                .collect::<std::collections::HashSet<_>>();
+            if unique_output_paths.len() != output_paths.len() {
+                return Err(
+                    "Selected remote items contain duplicate names. Download them separately."
+                        .to_string(),
+                );
+            }
+            if let Some(existing) = output_paths.iter().find(|path| path.exists()) {
+                return Err(format!("{} already exists.", existing.display()));
+            }
+        } else if let Some(parent) = output_paths[0].parent()
+            && !parent.is_dir()
+        {
+            return Err(format!(
+                "Download destination folder does not exist: {}",
+                parent.display()
+            ));
+        }
+
+        let remote_paths = resolved
+            .iter()
+            .map(|source| source.remote_path.clone())
+            .collect::<Vec<_>>();
+        let destination = match &request.destination {
+            FileDownloadDestination::File(path) | FileDownloadDestination::Folder(path) => path,
+        };
+        self.runner.download_paths(
+            &remote_paths,
+            destination,
+            request.cancel_requested.as_deref(),
+        )?;
+        Ok(output_paths)
     }
 
     fn info(&self, path: &FileNodePath) -> Result<FileNodeInfo, String> {

@@ -64,6 +64,10 @@ impl FileBrowser {
         );
         self.selected_node_path
             .replace(Some(search_match.node_path.clone()));
+        self.selected_node_paths
+            .replace(std::collections::HashSet::from([search_match
+                .node_path
+                .clone()]));
         self.selected_search_match
             .replace(Some(search_match.selection_key()));
         self.refresh_browser_row_state();

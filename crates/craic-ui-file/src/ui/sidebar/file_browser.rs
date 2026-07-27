@@ -77,6 +77,7 @@ pub struct FileBrowser {
     expanded_dirs: RefCell<HashSet<FileNodePath>>,
     active_folder: RefCell<FileNodePath>,
     selected_node_path: Rc<RefCell<Option<FileNodePath>>>,
+    selected_node_paths: RefCell<HashSet<FileNodePath>>,
     selected_search_match: RefCell<Option<SearchSelectionKey>>,
     search_collapsed_dirs: RefCell<HashSet<FileNodePath>>,
     search_query: Rc<RefCell<String>>,
@@ -177,6 +178,7 @@ impl FileBrowser {
             expanded_dirs: RefCell::new(HashSet::new()),
             active_folder: RefCell::new(root_node_path),
             selected_node_path: Rc::new(RefCell::new(None)),
+            selected_node_paths: RefCell::new(HashSet::new()),
             selected_search_match: RefCell::new(None),
             search_collapsed_dirs: RefCell::new(HashSet::new()),
             search_query: Rc::new(RefCell::new(String::new())),
@@ -299,6 +301,7 @@ impl FileBrowser {
             self.expanded_dirs.borrow_mut().clear();
             self.active_folder.replace(self.root_node_path());
             self.selected_node_path.borrow_mut().take();
+            self.selected_node_paths.borrow_mut().clear();
             self.selected_search_match.borrow_mut().take();
             self.pending_new_entry.borrow_mut().take();
             self.pending_rename_entry.borrow_mut().take();
@@ -353,7 +356,8 @@ impl FileBrowser {
         let parent = node_path.parent().unwrap_or_else(|| self.root_node_path());
         self.active_folder.replace(parent.clone());
         expand_parent_folders(&self.expanded_dirs, &parent);
-        self.selected_node_path.replace(Some(node_path));
+        self.selected_node_path.replace(Some(node_path.clone()));
+        self.selected_node_paths.replace(HashSet::from([node_path]));
         self.selected_search_match.borrow_mut().take();
         let rows = self.visible_rows();
         let status_signatures = self.changed_file_statuses.borrow();
@@ -711,16 +715,118 @@ impl FileBrowser {
 
     pub fn set_selected_node_path(self: &Rc<Self>, selected: Option<FileNodePath>) {
         if *self.selected_node_path.borrow() == selected
+            && self.selected_node_paths.borrow().len() <= usize::from(selected.is_some())
             && self.selected_search_match.borrow().is_none()
         {
             return;
         }
+        let callback_path = selected.clone().unwrap_or_else(|| self.root_node_path());
+        self.selected_node_path.replace(selected.clone());
+        let mut selected_paths = self.selected_node_paths.borrow_mut();
+        selected_paths.clear();
+        if let Some(selected) = selected {
+            selected_paths.insert(selected);
+        }
+        drop(selected_paths);
+        self.selected_search_match.borrow_mut().take();
+        self.refresh_browser_row_state();
+        self.emit_selected_node_path(callback_path);
+        self.focus_selected_row();
+    }
+
+    fn toggle_selected_node_path(self: &Rc<Self>, path: FileNodePath) {
+        let selected = {
+            let mut paths = self.selected_node_paths.borrow_mut();
+            if !paths.remove(&path) {
+                paths.insert(path.clone());
+                Some(path)
+            } else if self.selected_node_path.borrow().as_ref() == Some(&path) {
+                paths.iter().min_by_key(|path| path.display()).cloned()
+            } else {
+                self.selected_node_path.borrow().clone()
+            }
+        };
         let callback_path = selected.clone().unwrap_or_else(|| self.root_node_path());
         self.selected_node_path.replace(selected);
         self.selected_search_match.borrow_mut().take();
         self.refresh_browser_row_state();
         self.emit_selected_node_path(callback_path);
         self.focus_selected_row();
+    }
+
+    fn select_node_path_range(self: &Rc<Self>, path: FileNodePath, additive: bool) {
+        let Some(anchor) = self.selected_node_path.borrow().clone() else {
+            self.set_selected_node_path(Some(path));
+            return;
+        };
+        let visible_paths = self
+            .list_rows
+            .borrow()
+            .iter()
+            .filter_map(|row| match row {
+                rows::BrowserListRow::Tree(row) => Some(row.node_path.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let Some(anchor_index) = visible_paths
+            .iter()
+            .position(|candidate| candidate == &anchor)
+        else {
+            self.set_selected_node_path(Some(path));
+            return;
+        };
+        let Some(path_index) = visible_paths
+            .iter()
+            .position(|candidate| candidate == &path)
+        else {
+            self.set_selected_node_path(Some(path));
+            return;
+        };
+        let (start, end) = if anchor_index <= path_index {
+            (anchor_index, path_index)
+        } else {
+            (path_index, anchor_index)
+        };
+        let mut selected_paths = self.selected_node_paths.borrow_mut();
+        if !additive {
+            selected_paths.clear();
+        }
+        selected_paths.extend(visible_paths[start..=end].iter().cloned());
+        drop(selected_paths);
+
+        self.selected_node_path.replace(Some(path.clone()));
+        self.selected_search_match.borrow_mut().take();
+        self.refresh_browser_row_state();
+        self.emit_selected_node_path(path);
+        self.focus_selected_row();
+    }
+
+    fn select_node_path_for_context(self: &Rc<Self>, path: FileNodePath) {
+        if !self.selected_node_paths.borrow().contains(&path) {
+            self.set_selected_node_path(Some(path));
+        }
+    }
+
+    fn selected_paths_for_target(&self, target: &BrowserTarget) -> Vec<FileNodePath> {
+        self.selected_paths_for_node_path(&target.node_path)
+    }
+
+    fn selected_paths_for_node_path(&self, target: &FileNodePath) -> Vec<FileNodePath> {
+        let mut paths = if self.selected_node_paths.borrow().contains(target) {
+            self.selected_node_paths.borrow().iter().cloned().collect()
+        } else {
+            vec![target.clone()]
+        };
+        paths.retain(|path| !path.is_root());
+        paths.sort_by_key(|path| (path.nodes.len(), path.display()));
+        let mut roots = Vec::new();
+        for path in paths {
+            if roots.iter().any(|root| path.is_child_of(root)) {
+                continue;
+            }
+            roots.push(path);
+        }
+        roots
     }
 
     pub fn emit_selected_node_path(&self, node_path: FileNodePath) {
@@ -1017,6 +1123,16 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
         move || browser.add_to_chat(&target)
     });
     add_to_chat.set_enabled(!target.is_dir && target.capabilities.readable);
+    let download = add_menu_action(&actions, "download", {
+        let browser = browser.clone();
+        let target = target.clone();
+        let parent_window = parent_window.clone();
+        move || browser.download_targets(&target, parent_window.as_ref())
+    });
+    let download_available = browser.file_access.borrow().supports_download()
+        && !target.is_root()
+        && target.capabilities.readable;
+    download.set_enabled(download_available);
     let build_image = add_menu_action(&actions, "build-image", {
         let browser = browser.clone();
         let target = target.clone();
@@ -1131,13 +1247,13 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
     let terminal_available = browser.terminal_actions_available.get() && target.capabilities.native;
     let container_actions_available =
         browser.container_actions_available.get() && target.capabilities.native;
-    menu::repository_row_menu(&target, terminal_available, container_actions_available).popup(
-        parent,
-        x,
-        y,
-        &actions,
-        &browser.active_context_menu,
-    );
+    menu::repository_row_menu(
+        &target,
+        terminal_available,
+        container_actions_available,
+        download_available,
+    )
+    .popup(parent, x, y, &actions, &browser.active_context_menu);
 }
 
 fn add_menu_action<F>(group: &gio::SimpleActionGroup, name: &str, activate: F) -> gio::SimpleAction

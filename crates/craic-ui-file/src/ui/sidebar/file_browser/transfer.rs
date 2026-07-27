@@ -2,13 +2,14 @@ use super::rows;
 use super::{BrowserTarget, FileBrowser, should_skip};
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{
-    FileAccess, FileCopyRequest, FileDeleteRequest, FileKind, FileMoveRequest, FileOperation,
-    FileOperationEvent, FileOperationProgress, FileRead, FileReadRequest, FileWriteMode,
-    FileWritePayload, FileWriteRequest,
+    FileAccess, FileCopyRequest, FileDeleteRequest, FileDownloadDestination, FileDownloadRequest,
+    FileKind, FileMoveRequest, FileOperation, FileOperationEvent, FileOperationProgress, FileRead,
+    FileReadRequest, FileWriteMode, FileWritePayload, FileWriteRequest,
 };
 use crate::system::capabilities::open::{DesktopOpenActivation, DesktopOpenTargetKind};
 use adw::prelude::*;
-use gtk::gdk;
+use craic_ui_core::ui::command_mailbox;
+use gtk::{gdk, gio};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -157,11 +158,14 @@ impl FileBrowser {
         available_actions: gdk::DragAction,
         modifiers: gdk::ModifierType,
     ) -> Option<TransferOperation> {
-        if self.internal_drag_paths.borrow().is_none() && shared_drag_clipboard().is_none() {
-            return None;
-        }
-
-        let operation = if copy_drag_modifier(modifiers) {
+        let source_access = if self.internal_drag_paths.borrow().is_some() {
+            self.file_access.borrow().clone()
+        } else {
+            shared_drag_clipboard()?.source_access
+        };
+        let operation = if !Arc::ptr_eq(&source_access, &self.file_access.borrow())
+            || copy_drag_modifier(modifiers)
+        {
             TransferOperation::Copy
         } else {
             TransferOperation::Move
@@ -623,6 +627,102 @@ impl FileBrowser {
         } else {
             self.set_selected_node_path(Some(target.node_path.clone()));
         }
+    }
+
+    pub fn download_targets(self: &Rc<Self>, target: &BrowserTarget, parent: Option<&gtk::Window>) {
+        let sources = self.selected_paths_for_target(target);
+        if sources.is_empty() || !self.file_access.borrow().supports_download() {
+            return;
+        }
+
+        if sources.len() == 1 && !target.is_dir {
+            let Some(name) = sources[0].file_name() else {
+                return;
+            };
+            let dialog = gtk::FileDialog::builder()
+                .title("Download File")
+                .accept_label("Download")
+                .initial_name(name)
+                .modal(true)
+                .build();
+            dialog.save(parent, None::<&gio::Cancellable>, {
+                let browser = self.clone();
+
+                move |result| {
+                    let Ok(file) = result else {
+                        return;
+                    };
+                    let Some(destination) = file.path() else {
+                        browser.show_error(
+                            "Download Failed",
+                            "Choose a destination on the local filesystem.",
+                        );
+                        return;
+                    };
+                    browser.start_download(sources, FileDownloadDestination::File(destination));
+                }
+            });
+            return;
+        }
+
+        let dialog = gtk::FileDialog::builder()
+            .title("Choose Download Folder")
+            .accept_label("Download")
+            .modal(true)
+            .build();
+        dialog.select_folder(parent, None::<&gio::Cancellable>, {
+            let browser = self.clone();
+
+            move |result| {
+                let Ok(folder) = result else {
+                    return;
+                };
+                let Some(destination) = folder.path() else {
+                    browser.show_error(
+                        "Download Failed",
+                        "Choose a destination on the local filesystem.",
+                    );
+                    return;
+                };
+                browser.start_download(sources, FileDownloadDestination::Folder(destination));
+            }
+        });
+    }
+
+    fn start_download(
+        self: &Rc<Self>,
+        sources: Vec<FileNodePath>,
+        destination: FileDownloadDestination,
+    ) {
+        let file_access = self.file_access.borrow().clone();
+        let count = sources.len();
+        let result_command = command_mailbox::once({
+            let browser = self.clone();
+
+            move |result: Result<Vec<PathBuf>, String>| match result {
+                Ok(paths) => {
+                    let message = if paths.len() == 1 {
+                        format!("Downloaded {}.", paths[0].display())
+                    } else {
+                        format!("Downloaded {} items.", paths.len())
+                    };
+                    browser.notify_open_message(&message);
+                }
+                Err(err) if err == TRANSFER_CANCELED_MESSAGE => {
+                    log::info!("remote download canceled count={count}");
+                }
+                Err(err) => browser.show_error("Download Failed", &err),
+            }
+        });
+        thread::spawn(move || {
+            log::info!("remote download worker start count={count}");
+            let result = file_access.download_to_local(FileDownloadRequest {
+                sources,
+                destination,
+                cancel_requested: None,
+            });
+            result_command.send(result);
+        });
     }
 
     pub fn copy_target(&self, target: &BrowserTarget, operation: TransferOperation) {
@@ -1360,6 +1460,46 @@ fn transfer_workspace_paths(
     cancel_requested: Arc<AtomicBool>,
     mut progress: impl FnMut(TransferProgressUpdate),
 ) -> Result<Vec<FileNodePath>, String> {
+    if operation == TransferOperation::Copy
+        && source_access.supports_download()
+        && let Some(local_folder) = destination_access.local_path(&target_folder)
+    {
+        let mut destinations = Vec::with_capacity(sources.len());
+        for source in &sources {
+            check_transfer_canceled(cancel_requested.as_ref())?;
+            let name = file_name_for_transfer(source)?;
+            let destination = target_folder.join_child(name);
+            if destination_access.info(&destination).is_ok() {
+                return Err(format!("{} already exists.", destination.display()));
+            }
+            destinations.push(destination);
+        }
+        if let Some(destination) = destinations.first() {
+            progress(TransferProgressUpdate {
+                current_path: Some(destination.clone()),
+                copied_bytes: 0,
+                total_bytes: 0,
+                copied_files: 0,
+                total_files: sources.len() as u64,
+            });
+        }
+        source_access.download_to_local(FileDownloadRequest {
+            sources,
+            destination: FileDownloadDestination::Folder(local_folder),
+            cancel_requested: Some(cancel_requested),
+        })?;
+        if let Some(destination) = destinations.last() {
+            progress(TransferProgressUpdate {
+                current_path: Some(destination.clone()),
+                copied_bytes: 0,
+                total_bytes: 0,
+                copied_files: destinations.len() as u64,
+                total_files: destinations.len() as u64,
+            });
+        }
+        return Ok(destinations);
+    }
+
     let mut destinations = Vec::new();
     let total_files = sources.len() as u64;
     let mut copied_files = 0u64;

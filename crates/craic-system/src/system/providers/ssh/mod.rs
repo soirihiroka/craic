@@ -23,8 +23,14 @@ use crate::system::provider::{
     ProviderWorkspaceEntry, ProviderWorkspaceListRequest, ProviderWorkspaceSource, SystemProvider,
 };
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::Duration;
 
 const SSH_WORKSPACE_LIST_SCRIPT: &str = include_str!("scripts/list_workspaces.sh");
 const SSH_RESOLVE_PATH_SCRIPT: &str = include_str!("scripts/resolve_path.sh");
@@ -500,6 +506,103 @@ impl SshCommandRunner {
             resolved
         );
         Ok(resolved)
+    }
+
+    pub fn download_paths(
+        &self,
+        remote_paths: &[String],
+        destination: &Path,
+        cancel_requested: Option<&AtomicBool>,
+    ) -> Result<(), String> {
+        if remote_paths.is_empty() {
+            return Err("No remote paths were selected for download.".to_string());
+        }
+
+        log::info!(
+            "scp download start provider={} sources={} destination={}",
+            self.label,
+            remote_paths.len(),
+            destination.display()
+        );
+        let mut command = Command::new("scp");
+        command
+            .arg("-p")
+            .arg("-r")
+            .arg("-o")
+            .arg("ControlMaster=auto")
+            .arg("-o")
+            .arg("ControlPersist=5m")
+            .arg("-o")
+            .arg(format!(
+                "ControlPath=/tmp/craic-ssh-{}-%r@%h:%p",
+                sanitize_id(&self.host)
+            ));
+        for remote_path in remote_paths {
+            command.arg(format!("{}:{remote_path}", self.host));
+        }
+        command
+            .arg(destination)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let mut child = command
+            .spawn()
+            .map_err(|err| format!("Failed to start scp download: {err}"))?;
+        let stderr_reader = child.stderr.take().map(|mut stderr| {
+            thread::spawn(move || {
+                let mut output = Vec::new();
+                stderr.read_to_end(&mut output).map(|_| output)
+            })
+        });
+        let status = loop {
+            if cancel_requested.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                log::info!(
+                    "scp download canceled provider={} sources={}",
+                    self.label,
+                    remote_paths.len()
+                );
+                return Err("Transfer canceled.".to_string());
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => thread::sleep(Duration::from_millis(100)),
+                Err(err) => return Err(format!("Failed to wait for scp download: {err}")),
+            }
+        };
+        let stderr = stderr_reader
+            .map(|reader| {
+                reader
+                    .join()
+                    .map_err(|_| "SCP error reader stopped unexpectedly.".to_string())?
+                    .map_err(|err| format!("Failed to read scp download error output: {err}"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+        if !status.success() {
+            log::warn!(
+                "scp download failed provider={} sources={} status={} stderr={}",
+                self.label,
+                remote_paths.len(),
+                status,
+                stderr
+            );
+            return Err(if stderr.is_empty() {
+                format!("scp download failed with status {status}")
+            } else {
+                format!("scp download failed: {stderr}")
+            });
+        }
+
+        log::info!(
+            "scp download complete provider={} sources={} destination={}",
+            self.label,
+            remote_paths.len(),
+            destination.display()
+        );
+        Ok(())
     }
 }
 

@@ -1375,6 +1375,10 @@ impl FileAccess for LocalFileAccess {
         self.root_node()
     }
 
+    fn local_path(&self, path: &FileNodePath) -> Option<PathBuf> {
+        self.local_path_for_node(path).ok()
+    }
+
     fn watch(
         &self,
         request: FileWatchRequest,

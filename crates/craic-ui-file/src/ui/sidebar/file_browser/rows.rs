@@ -879,7 +879,7 @@ impl FileBrowser {
     }
 
     fn browser_list_row_render_state(&self, row: &BrowserListRow) -> BrowserListRowRenderState {
-        let selected = self.selected_node_path.borrow().clone();
+        let selected_paths = self.selected_node_paths.borrow();
         let selected_search_match = self.selected_search_match.borrow().clone();
         let drop_target = self.current_drop_target_folder();
 
@@ -888,7 +888,7 @@ impl FileBrowser {
                 row: row.clone(),
                 expanded: self.tree_row_expanded(row),
                 selected: selected_search_match.is_none()
-                    && selected.as_ref() == Some(&row.node_path),
+                    && selected_paths.contains(&row.node_path),
                 drop_target: drop_target.as_ref() == Some(&row.node_path),
                 status: self.changed_file_statuses.borrow().get(&row.path).cloned(),
                 transfer_progress: self.transfer_progress_for_path(&row.node_path),
@@ -902,7 +902,7 @@ impl FileBrowser {
             BrowserListRow::Loading(row) => BrowserListRowRenderState::Loading(row.clone()),
             BrowserListRow::Transfer(row) => BrowserListRowRenderState::Transfer {
                 row: row.clone(),
-                selected: selected_search_match.is_none() && selected.as_ref() == Some(&row.path),
+                selected: selected_search_match.is_none() && selected_paths.contains(&row.path),
                 progress: self.transfer_progress_for_path(&row.path),
             },
             BrowserListRow::Search(search_match) => BrowserListRowRenderState::Search {
@@ -1152,8 +1152,34 @@ fn tree_primary_click_handler(
 ) -> impl Fn(&gtk::Button, &gtk::GestureClick, f64, f64) + 'static {
     let browser = browser.clone();
 
-    move |_, _, _, _| {
+    move |_, gesture, _, _| {
         browser.queue_cancel_pending_new_entry();
+        let modifiers = gesture.current_event_state();
+        if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+            browser.select_node_path_range(
+                row.node_path.clone(),
+                modifiers.contains(gdk::ModifierType::CONTROL_MASK),
+            );
+            browser.active_folder.replace(if row.is_dir {
+                row.node_path.clone()
+            } else {
+                row.node_path
+                    .parent()
+                    .unwrap_or_else(|| browser.root_node_path())
+            });
+            return;
+        }
+        if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+            browser.toggle_selected_node_path(row.node_path.clone());
+            browser.active_folder.replace(if row.is_dir {
+                row.node_path.clone()
+            } else {
+                row.node_path
+                    .parent()
+                    .unwrap_or_else(|| browser.root_node_path())
+            });
+            return;
+        }
         if !browser.search_query.borrow().is_empty() && row.tree_role == TreeRowRole::Branch {
             browser.set_selected_node_path(Some(row.node_path.clone()));
             browser.active_folder.replace(row.node_path.clone());
@@ -1193,7 +1219,7 @@ fn tree_secondary_click_handler(
 
     move |parent, gesture, x, y| {
         browser.queue_cancel_pending_new_entry();
-        browser.set_selected_node_path(Some(row.node_path.clone()));
+        browser.select_node_path_for_context(row.node_path.clone());
         browser.active_folder.replace(if row.is_dir {
             row.node_path.clone()
         } else {
@@ -1220,7 +1246,8 @@ fn file_drag_source(browser: &Rc<FileBrowser>, path: FileNodePath) -> tree_view:
                     return None;
                 }
 
-                browser.set_internal_drag_paths(vec![path.clone()]);
+                let paths = browser.selected_paths_for_node_path(&path);
+                browser.set_internal_drag_paths(paths);
                 let bytes = gtk::glib::Bytes::from_owned(path.display().into_bytes());
                 let app_provider =
                     gdk::ContentProvider::for_bytes(super::APP_FILE_TRANSFER_MIME_TYPE, &bytes);
@@ -1244,7 +1271,10 @@ fn file_drag_source(browser: &Rc<FileBrowser>, path: FileNodePath) -> tree_view:
             let browser = browser.clone();
             let path = path.clone();
 
-            move || browser.set_internal_drag_paths(vec![path.clone()])
+            move || {
+                let paths = browser.selected_paths_for_node_path(&path);
+                browser.set_internal_drag_paths(paths);
+            }
         })
         .on_cancel({
             let browser = browser.clone();

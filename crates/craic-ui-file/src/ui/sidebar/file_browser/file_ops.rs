@@ -116,6 +116,7 @@ impl FileBrowser {
         }));
         self.pending_rename_entry.borrow_mut().take();
         self.selected_node_path.replace(None);
+        self.selected_node_paths.borrow_mut().clear();
         self.selected_search_match.borrow_mut().take();
         self.active_folder.replace(folder.clone());
         if !folder.is_root() {
@@ -323,6 +324,8 @@ impl FileBrowser {
         }));
         self.selected_node_path
             .replace(Some(target.node_path.clone()));
+        self.selected_node_paths
+            .replace(std::collections::HashSet::from([target.node_path.clone()]));
         self.selected_search_match.borrow_mut().take();
         let folder = target
             .node_path
@@ -624,8 +627,17 @@ impl FileBrowser {
         if active_folder_affected(&self.active_folder.borrow(), target) {
             self.active_folder.replace(parent);
         }
+        self.selected_node_paths
+            .borrow_mut()
+            .retain(|path| !target_affects_path(path, target));
         if target_affects_selection(self.selected_node_path.borrow().as_ref(), target) {
-            self.selected_node_path.borrow_mut().take();
+            let next_selected = self
+                .selected_node_paths
+                .borrow()
+                .iter()
+                .min_by_key(|path| path.display())
+                .cloned();
+            self.selected_node_path.replace(next_selected);
             self.selected_search_match.borrow_mut().take();
         }
 
