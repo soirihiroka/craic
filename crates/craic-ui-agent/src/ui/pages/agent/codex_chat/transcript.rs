@@ -7,7 +7,8 @@ use super::{
     StructuredRequestResponse, TimelineItem, TimelineItemKind, TimelineItemStatus,
 };
 use adw::prelude::*;
-use std::cell::RefCell;
+use gtk::glib;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -386,6 +387,9 @@ fn append_user_input_request(
     request_id: &str,
     input: &RequestUserInput,
 ) {
+    const AUTO_RESOLUTION_GRACE_SECONDS: u64 = 60;
+    const AUTO_RESOLUTION_COUNTDOWN_SECONDS: u64 = 60;
+
     let controls = Rc::new(
         input
             .questions
@@ -393,6 +397,13 @@ fn append_user_input_request(
             .map(|question| append_user_input_question(content, question))
             .collect::<Vec<_>>(),
     );
+    let auto_resolution_snoozed = Rc::new(Cell::new(false));
+    let auto_resolution_label = gtk::Label::builder()
+        .css_classes(["caption", "error"])
+        .xalign(1.0)
+        .halign(gtk::Align::End)
+        .visible(false)
+        .build();
     let submit = gtk::Button::with_label("Submit answers");
     submit.add_css_class("suggested-action");
     let update_submit: Rc<dyn Fn()> = {
@@ -403,7 +414,14 @@ fn append_user_input_request(
         })
     };
     for control in controls.iter() {
-        control.connect_changed(update_submit.clone());
+        let update_submit = update_submit.clone();
+        let auto_resolution_snoozed = auto_resolution_snoozed.clone();
+        let auto_resolution_label = auto_resolution_label.clone();
+        control.connect_changed(Rc::new(move || {
+            auto_resolution_snoozed.set(true);
+            auto_resolution_label.set_visible(false);
+            update_submit();
+        }));
     }
     update_submit();
     submit.connect_clicked({
@@ -428,6 +446,43 @@ fn append_user_input_request(
         }
     });
     submit.set_halign(gtk::Align::End);
+    if input.auto_resolution {
+        content.append(&auto_resolution_label);
+        let elapsed = Rc::new(Cell::new(0_u64));
+        let content = content.downgrade();
+        let callbacks = callbacks.clone();
+        let request_id = request_id.to_owned();
+        glib::timeout_add_seconds_local(1, move || {
+            let Some(content) = content.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !content.is_sensitive() || auto_resolution_snoozed.get() {
+                auto_resolution_label.set_visible(false);
+                return glib::ControlFlow::Break;
+            }
+            let elapsed_seconds = elapsed.get().saturating_add(1);
+            elapsed.set(elapsed_seconds);
+            if elapsed_seconds <= AUTO_RESOLUTION_GRACE_SECONDS {
+                return glib::ControlFlow::Continue;
+            }
+            let countdown_elapsed = elapsed_seconds - AUTO_RESOLUTION_GRACE_SECONDS;
+            if countdown_elapsed < AUTO_RESOLUTION_COUNTDOWN_SECONDS {
+                let remaining = AUTO_RESOLUTION_COUNTDOWN_SECONDS - countdown_elapsed;
+                auto_resolution_label.set_label(&format!("Auto-resolves in {remaining}s"));
+                auto_resolution_label.set_visible(true);
+                return glib::ControlFlow::Continue;
+            }
+            resolve_structured_request(
+                &content,
+                &callbacks,
+                &request_id,
+                StructuredRequestResponse::UserInput {
+                    answers: BTreeMap::new(),
+                },
+            );
+            glib::ControlFlow::Break
+        });
+    }
     content.append(&submit);
 }
 
@@ -489,10 +544,10 @@ fn append_user_input_question(
         }
         let other = question.allows_other.then(|| {
             let button = gtk::CheckButton::with_label("Other");
-            if question.selection_mode == RequestSelectionMode::Single {
-                if let Some(group) = group.as_ref() {
-                    button.set_group(Some(group));
-                }
+            if question.selection_mode == RequestSelectionMode::Single
+                && let Some(group) = group.as_ref()
+            {
+                button.set_group(Some(group));
             }
             let entry = request_text_entry(question.is_secret, Some("Enter another response"));
             entry.set_sensitive(false);

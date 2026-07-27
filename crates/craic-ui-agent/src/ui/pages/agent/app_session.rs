@@ -6,6 +6,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod history;
+mod notifications;
 mod settings;
 mod tools;
 
@@ -20,20 +22,18 @@ use craic_codex_app_server::{
 use gtk::{gio, glib};
 use serde_json::{Value, json};
 
+use self::history::PickerRequest;
 use self::settings::{DEFAULT_SERVICE_TIER_ID, ModelServiceTiers, set_initial_selector_options};
 
 use super::super::{PageCommand, PageContext};
 use super::codex_chat::{
     ChatConnectionStatus, ChatSelector, CodexChatAction, CodexChatView, CollaborationParticipant,
-    CollaborationParticipantStatus, CollaborationProgress, ComposerAttachment,
-    ComposerAttachmentKind, ComposerSubmission, PendingRequestResponse, PlanProgress, PlanStep,
-    PlanStepStatus, SelectorOption, TimelineItem, TimelineItemKind, TimelineItemStatus, TokenUsage,
+    ComposerAttachment, ComposerAttachmentKind, ComposerSubmission, PendingRequestResponse,
+    QueueDirection, QueuedSubmission, SelectorOption, TimelineItem, TimelineItemKind,
+    TimelineItemStatus,
 };
-use super::thread_picker::{
-    CodexThreadPicker, ThreadPickerAction, ThreadPickerRow, ThreadPickerSort,
-};
+use super::thread_picker::CodexThreadPicker;
 use crate::system::ProviderKind;
-use crate::ui::agent_history::{self, CodexThreadOverlay, CodexThreadOverlayUpsert};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_EVENTS_PER_POLL: usize = 256;
@@ -67,13 +67,9 @@ struct PendingServerRequest {
     params: Value,
 }
 
-struct PickerRequest {
-    query: String,
-    append: bool,
-    archived: bool,
-    sort: ThreadPickerSort,
-    cursor: Option<String>,
-    generation: u64,
+struct QueuedTurn {
+    id: String,
+    submission: ComposerSubmission,
 }
 
 #[derive(Clone, Copy)]
@@ -116,6 +112,8 @@ struct AppChatSessionInner {
     turns_request: RefCell<Option<RequestId>>,
     tool_requests: RefCell<HashMap<RequestId, tools::ToolRequest>>,
     thread_operations: RefCell<HashMap<RequestId, (String, String)>>,
+    queued_turns: RefCell<Vec<QueuedTurn>>,
+    temporary_attachments: RefCell<HashMap<String, PathBuf>>,
     next_local_id: Cell<u64>,
     closing: Cell<bool>,
     title_callback: RefCell<Option<TitleCallback>>,
@@ -186,6 +184,8 @@ impl AppChatSession {
             turns_request: RefCell::new(None),
             tool_requests: RefCell::new(HashMap::new()),
             thread_operations: RefCell::new(HashMap::new()),
+            queued_turns: RefCell::new(Vec::new()),
+            temporary_attachments: RefCell::new(HashMap::new()),
             next_local_id: Cell::new(1),
             closing: Cell::new(false),
             title_callback: RefCell::new(None),
@@ -295,15 +295,6 @@ impl AppChatSessionInner {
         });
     }
 
-    fn connect_picker_actions(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        self.picker.connect_action(move |action| {
-            if let Some(session) = weak.upgrade() {
-                session.handle_picker_action(action);
-            }
-        });
-    }
-
     fn start_polling(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
         let source = glib::timeout_add_local(EVENT_POLL_INTERVAL, move || {
@@ -384,37 +375,15 @@ impl AppChatSessionInner {
                 self.handle_response(method.as_deref(), &response.id, response.result)
             }
             AppServerEvent::ErrorResponse { response, method } => {
-                self.thread_operations.borrow_mut().remove(&response.id);
+                self.handle_history_error(&response.id, method.as_deref(), &response.error.message);
                 if self.handle_tool_error(&response.id, &response.error.message) {
                     return;
                 }
                 let operation = method.as_deref().unwrap_or("request");
                 self.push_error(format!("{operation} failed: {}", response.error.message));
-                if method.as_deref() == Some("thread/turns/list")
-                    && self.turns_request.borrow().as_ref() == Some(&response.id)
-                {
-                    self.turns_request.borrow_mut().take();
-                    self.view.set_older_turns_loading(false);
-                }
-                if method.as_deref() == Some("thread/list") {
-                    let request = self.picker_requests.borrow_mut().remove(&response.id);
-                    if request.is_some_and(|request| {
-                        request.generation == self.picker_generation.get()
-                            && request.query == self.picker.query()
-                            && request.archived == self.picker.archived_only()
-                            && request.sort == self.picker.sort()
-                            && request.cursor == *self.picker_cursor.borrow()
-                    }) {
-                        self.picker.set_error(Some(&response.error.message));
-                    }
-                }
                 match method.as_deref() {
                     Some("thread/start") => self.fail(response.error.message),
-                    Some("thread/resume") | Some("thread/fork") => {
-                        self.content.set_visible_child_name("threads");
-                        self.picker.set_loading(false);
-                        self.picker.set_error(Some(&response.error.message));
-                    }
+                    Some("thread/resume") | Some("thread/fork") => {}
                     Some("turn/start") | Some("review/start") => {
                         self.active_turn_id.borrow_mut().take();
                         self.clear_pending_requests();
@@ -534,19 +503,7 @@ impl AppChatSessionInner {
             | Some("thread/delete")
             | Some("thread/name/set")
             | Some("thread/metadata/update") => {
-                if let Some((operation, thread_id)) =
-                    self.thread_operations.borrow_mut().remove(request_id)
-                    && operation == "thread/delete"
-                    && let Err(error) =
-                        agent_history::delete_codex_thread_overlay(&self.workspace_key, &thread_id)
-                {
-                    log::warn!(
-                        "failed deleting Codex thread overlay session_id={} thread_id={}: {error}",
-                        self.id,
-                        thread_id
-                    );
-                }
-                self.load_thread_page(false);
+                self.apply_thread_operation_response(request_id);
             }
             _ => {}
         }
@@ -616,9 +573,22 @@ impl AppChatSessionInner {
 
     fn handle_action(self: &Rc<Self>, action: CodexChatAction) {
         match action {
-            CodexChatAction::Submit(submission) => self.submit(submission, false),
-            CodexChatAction::Steer(submission) => self.submit(submission, true),
+            CodexChatAction::Submit(submission) => {
+                self.submit(submission, false);
+            }
+            CodexChatAction::Steer(submission) => {
+                self.submit(submission, true);
+            }
+            CodexChatAction::Queue(submission) => self.queue_submission(submission),
+            CodexChatAction::EditQueued(id) => self.edit_queued_submission(&id),
+            CodexChatAction::RemoveQueued(id) => self.remove_queued_submission(&id),
+            CodexChatAction::MoveQueued { id, direction } => {
+                self.move_queued_submission(&id, direction)
+            }
             CodexChatAction::Interrupt => self.interrupt(),
+            CodexChatAction::PastedClipboardImage { png_bytes } => {
+                self.add_pasted_clipboard_image(&png_bytes)
+            }
             CodexChatAction::FilesDropped(paths) => {
                 for path in paths {
                     self.add_attachment(path, false);
@@ -668,159 +638,10 @@ impl AppChatSessionInner {
             CodexChatAction::OpenChanges => {
                 self.ctx.dispatch_command(PageCommand::ShowChanges);
             }
-            CodexChatAction::AttachmentRemoved(_) => {}
-        }
-    }
-
-    fn handle_picker_action(self: &Rc<Self>, action: ThreadPickerAction) {
-        match action {
-            ThreadPickerAction::SearchChanged(_) => self.load_thread_page(false),
-            ThreadPickerAction::ArchivedChanged(_) => self.load_thread_page(false),
-            ThreadPickerAction::SortChanged(_) => self.load_thread_page(false),
-            ThreadPickerAction::LoadMore => self.load_thread_page(true),
-            ThreadPickerAction::Resume(thread_id) => {
-                self.prepare_thread_switch();
-                self.send_thread_operation(
-                    "thread/resume",
-                    &thread_id,
-                    json!({
-                        "excludeTurns": true,
-                        "initialTurnsPage": {
-                            "limit": 100,
-                            "sortDirection": "desc",
-                            "itemsView": "full"
-                        }
-                    }),
-                );
-            }
-            ThreadPickerAction::Fork(thread_id) => {
-                self.prepare_thread_switch();
-                self.send_thread_operation("thread/fork", &thread_id, json!({}));
-            }
-            ThreadPickerAction::Rename {
-                thread_id,
-                current_name,
-            } => self.prompt_thread_rename(thread_id, current_name),
-            ThreadPickerAction::EditTags { thread_id, tags } => {
-                self.prompt_thread_tags(thread_id, tags)
-            }
-            ThreadPickerAction::Archive(thread_id) => {
-                self.send_thread_operation("thread/archive", &thread_id, json!({}));
-            }
-            ThreadPickerAction::Unarchive(thread_id) => {
-                self.send_thread_operation("thread/unarchive", &thread_id, json!({}));
-            }
-            ThreadPickerAction::Delete(thread_id) => {
-                self.confirm_thread_delete(thread_id);
-            }
-            ThreadPickerAction::Pin(thread_id) => self.send_thread_operation(
-                "thread/metadata/update",
-                &thread_id,
-                json!({ "isPinned": true }),
-            ),
-            ThreadPickerAction::Unpin(thread_id) => self.send_thread_operation(
-                "thread/metadata/update",
-                &thread_id,
-                json!({ "isPinned": false }),
-            ),
-            ThreadPickerAction::Cancel => {
-                if self.thread_id.borrow().is_some() {
-                    self.hide_thread_picker();
-                }
+            CodexChatAction::AttachmentRemoved(attachment_id) => {
+                self.remove_temporary_attachment(&attachment_id)
             }
         }
-    }
-
-    fn prompt_thread_rename(self: &Rc<Self>, thread_id: String, current_name: String) {
-        let dialog = adw::AlertDialog::builder()
-            .heading("Rename Codex Thread")
-            .body("Choose the name shown in Codex thread history.")
-            .build();
-        let entry = gtk::Entry::builder()
-            .text(&current_name)
-            .placeholder_text("Thread name")
-            .activates_default(true)
-            .build();
-        dialog.set_extra_child(Some(&entry));
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("rename", "Rename");
-        dialog.set_default_response(Some("rename"));
-        dialog.set_close_response("cancel");
-
-        let parent = self.root.root().and_downcast::<gtk::Window>();
-        let weak = Rc::downgrade(self);
-        dialog.choose(
-            parent.as_ref(),
-            None::<&gio::Cancellable>,
-            move |response| {
-                if response.as_str() != "rename" {
-                    return;
-                }
-                let name = entry.text().trim().to_owned();
-                if name.is_empty() {
-                    return;
-                }
-                if let Some(session) = weak.upgrade() {
-                    session.send_thread_operation(
-                        "thread/name/set",
-                        &thread_id,
-                        json!({ "name": name }),
-                    );
-                }
-            },
-        );
-    }
-
-    fn prompt_thread_tags(self: &Rc<Self>, thread_id: String, tags: Vec<String>) {
-        let dialog = adw::AlertDialog::builder()
-            .heading("Edit Thread Tags")
-            .body("Separate tags with commas. Tags are stored locally for this workspace.")
-            .build();
-        let entry = gtk::Entry::builder()
-            .text(tags.join(", "))
-            .placeholder_text("bug, frontend, follow-up")
-            .activates_default(true)
-            .build();
-        dialog.set_extra_child(Some(&entry));
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("save", "Save");
-        dialog.set_default_response(Some("save"));
-        dialog.set_close_response("cancel");
-
-        let parent = self.root.root().and_downcast::<gtk::Window>();
-        let weak = Rc::downgrade(self);
-        dialog.choose(
-            parent.as_ref(),
-            None::<&gio::Cancellable>,
-            move |response| {
-                if response.as_str() != "save" {
-                    return;
-                }
-                let tags = entry
-                    .text()
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|tag| !tag.is_empty())
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                let Some(session) = weak.upgrade() else {
-                    return;
-                };
-                match agent_history::update_codex_thread_overlay_tags(
-                    &session.workspace_key,
-                    &thread_id,
-                    &tags,
-                ) {
-                    Ok(_) => {
-                        session.load_thread_page(false);
-                        if let Some(callback) = session.history_callback.borrow().clone() {
-                            callback(session.id);
-                        }
-                    }
-                    Err(error) => session.picker.set_error(Some(&error)),
-                }
-            },
-        );
     }
 
     fn prompt_review(self: &Rc<Self>) {
@@ -920,53 +741,130 @@ impl AppChatSessionInner {
         );
     }
 
-    fn confirm_thread_delete(self: &Rc<Self>, thread_id: String) {
-        let dialog = adw::AlertDialog::builder()
-            .heading("Delete Codex Thread?")
-            .body("This permanently deletes the thread and its local history metadata.")
-            .build();
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("delete", "Delete Thread");
-        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-
-        let parent = self.root.root().and_downcast::<gtk::Window>();
-        let weak = Rc::downgrade(self);
-        dialog.choose(
-            parent.as_ref(),
-            None::<&gio::Cancellable>,
-            move |response| {
-                if response.as_str() != "delete" {
-                    return;
-                }
-                if let Some(session) = weak.upgrade() {
-                    session.send_thread_operation("thread/delete", &thread_id, json!({}));
-                }
-            },
-        );
+    fn queue_submission(&self, submission: ComposerSubmission) {
+        if submission_inputs(&submission).is_empty() {
+            return;
+        }
+        self.queued_turns.borrow_mut().push(QueuedTurn {
+            id: self.next_id("queued-turn"),
+            submission,
+        });
+        self.sync_queued_submissions();
     }
 
-    fn submit(&self, submission: ComposerSubmission, steer: bool) {
+    fn edit_queued_submission(&self, id: &str) {
+        let Some(index) = self
+            .queued_turns
+            .borrow()
+            .iter()
+            .position(|queued| queued.id == id)
+        else {
+            return;
+        };
+        let queued = self.queued_turns.borrow_mut().remove(index);
+        self.sync_queued_submissions();
+        self.view.restore_submission_for_editing(queued.submission);
+    }
+
+    fn remove_queued_submission(&self, id: &str) {
+        let Some(index) = self
+            .queued_turns
+            .borrow()
+            .iter()
+            .position(|queued| queued.id == id)
+        else {
+            return;
+        };
+        let queued = self.queued_turns.borrow_mut().remove(index);
+        for attachment in queued.submission.attachments {
+            self.remove_temporary_attachment(&attachment.id);
+        }
+        self.sync_queued_submissions();
+    }
+
+    fn move_queued_submission(&self, id: &str, direction: QueueDirection) {
+        let Some(index) = self
+            .queued_turns
+            .borrow()
+            .iter()
+            .position(|queued| queued.id == id)
+        else {
+            return;
+        };
+        let destination = match direction {
+            QueueDirection::Up => index.checked_sub(1),
+            QueueDirection::Down => {
+                (index + 1 < self.queued_turns.borrow().len()).then_some(index + 1)
+            }
+        };
+        let Some(destination) = destination else {
+            return;
+        };
+        self.queued_turns.borrow_mut().swap(index, destination);
+        self.sync_queued_submissions();
+    }
+
+    fn sync_queued_submissions(&self) {
+        let queued = self
+            .queued_turns
+            .borrow()
+            .iter()
+            .map(|queued| {
+                let full_preview = submission_display_text(&queued.submission)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut preview = full_preview.chars().take(120).collect::<String>();
+                if preview.chars().count() < full_preview.chars().count() {
+                    preview.push('…');
+                }
+                QueuedSubmission {
+                    id: queued.id.clone(),
+                    preview,
+                }
+            })
+            .collect::<Vec<_>>();
+        self.view.set_queued_submissions(&queued);
+    }
+
+    pub(super) fn submit_next_queued(&self) {
+        if self.active_turn_id.borrow().is_some() || !self.pending_requests.borrow().is_empty() {
+            return;
+        }
+        let queued = {
+            let mut turns = self.queued_turns.borrow_mut();
+            if turns.is_empty() {
+                return;
+            }
+            turns.remove(0)
+        };
+        self.sync_queued_submissions();
+        if !self.submit(queued.submission.clone(), false) {
+            self.queued_turns.borrow_mut().insert(0, queued);
+            self.sync_queued_submissions();
+        }
+    }
+
+    fn submit(&self, submission: ComposerSubmission, steer: bool) -> bool {
         let Some(thread_id) = self.thread_id.borrow().clone() else {
             self.push_error("The Codex thread is not ready yet".to_owned());
-            return;
+            return false;
         };
         let input = submission_inputs(&submission);
         if input.is_empty() {
-            return;
+            return false;
         }
         let client_id = self.next_id("user");
         let mut extra = self.turn_settings();
         let result = {
             let server = self.server.borrow();
             let Some(server) = server.as_ref() else {
-                return;
+                return false;
             };
             if steer {
                 let Some(expected_turn_id) = self.active_turn_id.borrow().clone() else {
                     self.push_error("There is no active turn to steer".to_owned());
-                    return;
+                    return false;
                 };
                 server.turn_steer(TurnSteerParams {
                     thread_id,
@@ -993,7 +891,7 @@ impl AppChatSessionInner {
         };
         if let Err(error) = result {
             self.push_error(error.to_string());
-            return;
+            return false;
         }
 
         let body = submission_display_text(&submission);
@@ -1005,14 +903,16 @@ impl AppChatSessionInner {
             detail: None,
             status: TimelineItemStatus::Completed,
         });
-        if !steer && self.title.borrow().as_str() == "New Codex chat" {
-            if let Some(title) = concise_title(&submission.text) {
-                self.set_title(&title);
-                self.persist_overlay(Some(title));
-            }
+        if !steer
+            && self.title.borrow().as_str() == "New Codex chat"
+            && let Some(title) = concise_title(&submission.text)
+        {
+            self.set_title(&title);
+            self.persist_overlay(Some(title));
         }
         self.set_state(AppChatState::Running);
         self.view.set_turn_active(true);
+        true
     }
 
     fn interrupt(&self) {
@@ -1089,505 +989,6 @@ impl AppChatSessionInner {
 }
 
 impl AppChatSessionInner {
-    fn show_thread_picker(&self) {
-        self.content.set_visible_child_name("threads");
-        self.picker.set_query("");
-        self.picker.focus_search();
-        self.load_thread_page(false);
-    }
-
-    fn hide_thread_picker(&self) {
-        self.content.set_visible_child_name("chat");
-        self.view.focus_composer();
-    }
-
-    fn load_thread_page(&self, append: bool) {
-        let server = self.server.borrow();
-        let Some(server) = server.as_ref() else {
-            self.picker
-                .set_error(Some("Codex App Server is not connected."));
-            return;
-        };
-        if !append {
-            self.picker_cursor.borrow_mut().take();
-        }
-        let query = self.picker.query();
-        let cursor = self.picker_cursor.borrow().clone();
-        let archived = self.picker.archived_only();
-        let sort = self.picker.sort();
-        let sort_key = match sort {
-            ThreadPickerSort::Updated => "updated_at",
-            ThreadPickerSort::Created => "created_at",
-        };
-        let generation = self.picker_generation.get().wrapping_add(1);
-        self.picker_generation.set(generation);
-        self.picker.set_loading(true);
-        let params = json!({
-            "cursor": cursor,
-            "limit": 50,
-            "sortKey": sort_key,
-            "sortDirection": "desc",
-            "cwd": self.workspace_root,
-            "searchTerm": (!query.is_empty()).then_some(query.clone()),
-            "archived": archived
-        });
-        match server.send_raw_request("thread/list", Some(params)) {
-            Ok(request_id) => {
-                self.picker_requests.borrow_mut().insert(
-                    request_id,
-                    PickerRequest {
-                        query,
-                        append,
-                        archived,
-                        sort,
-                        cursor,
-                        generation,
-                    },
-                );
-            }
-            Err(error) => self.picker.set_error(Some(&error.to_string())),
-        }
-    }
-
-    fn apply_thread_list(&self, request_id: &RequestId, result: &Value) {
-        let Some(request) = self.picker_requests.borrow_mut().remove(request_id) else {
-            return;
-        };
-        if request.generation != self.picker_generation.get()
-            || self.picker.query() != request.query
-            || self.picker.archived_only() != request.archived
-            || self.picker.sort() != request.sort
-            || *self.picker_cursor.borrow() != request.cursor
-        {
-            return;
-        }
-        let overlays =
-            match agent_history::list_codex_thread_overlays(&self.workspace_key, 10_000, 0) {
-                Ok(overlays) => overlays
-                    .into_iter()
-                    .map(|overlay| (overlay.thread_id.clone(), overlay))
-                    .collect::<HashMap<_, _>>(),
-                Err(error) => {
-                    log::warn!(
-                        "failed loading Codex thread overlays session_id={}: {error}",
-                        self.id
-                    );
-                    HashMap::new()
-                }
-            };
-        let rows = result
-            .get("data")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|thread| self.thread_picker_row(thread, &overlays, request.archived))
-            .collect::<Vec<_>>();
-        let next_cursor = result
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let has_more = next_cursor.is_some();
-        self.picker_cursor.replace(next_cursor);
-        if request.append {
-            self.picker.append_rows(rows, has_more);
-        } else {
-            self.picker.set_rows(rows, has_more);
-        }
-    }
-
-    fn thread_picker_row(
-        &self,
-        thread: &Value,
-        overlays: &HashMap<String, CodexThreadOverlay>,
-        archived: bool,
-    ) -> Option<ThreadPickerRow> {
-        let thread_id = thread.get("id")?.as_str()?.to_owned();
-        let overlay = overlays.get(&thread_id);
-        let preview = thread
-            .get("preview")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let title = thread
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| overlay.and_then(|overlay| overlay.task_description.clone()))
-            .filter(|title| !title.trim().is_empty())
-            .unwrap_or_else(|| preview.clone());
-        Some(ThreadPickerRow {
-            thread_id,
-            title,
-            preview,
-            model: thread
-                .get("model")
-                .or_else(|| thread.get("modelProvider"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            updated_at_ms: thread
-                .get("updatedAt")
-                .and_then(Value::as_i64)
-                .unwrap_or_default()
-                .saturating_mul(1_000),
-            status: thread
-                .pointer("/status/type")
-                .and_then(Value::as_str)
-                .map(title_case),
-            tags: overlay
-                .map(|overlay| overlay.tags.clone())
-                .unwrap_or_default(),
-            archived,
-            pinned: thread
-                .get("isPinned")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        })
-    }
-
-    fn send_thread_operation(&self, method: &str, thread_id: &str, extra: Value) {
-        let mut params = extra.as_object().cloned().unwrap_or_default();
-        params.insert("threadId".to_owned(), Value::String(thread_id.to_owned()));
-        let server = self.server.borrow();
-        let Some(server) = server.as_ref() else {
-            return;
-        };
-        match server.send_raw_request(method, Some(Value::Object(params))) {
-            Ok(request_id) => {
-                self.thread_operations
-                    .borrow_mut()
-                    .insert(request_id, (method.to_owned(), thread_id.to_owned()));
-            }
-            Err(error) => {
-                self.push_error(error.to_string());
-                self.picker.set_error(Some(&error.to_string()));
-            }
-        }
-    }
-
-    fn prepare_thread_switch(&self) {
-        if self.active_turn_id.borrow().is_some() {
-            self.interrupt();
-        }
-        if let Some(thread_id) = self.thread_id.borrow_mut().take()
-            && let Some(server) = self.server.borrow().as_ref()
-        {
-            let _ = server
-                .send_raw_request("thread/unsubscribe", Some(json!({ "threadId": thread_id })));
-        }
-        self.active_turn_id.borrow_mut().take();
-        self.set_state(AppChatState::StartingThread);
-        self.timeline.borrow_mut().clear();
-        self.clear_pending_requests();
-        self.tool_requests.borrow_mut().clear();
-        self.view.clear_timeline();
-        self.view.set_usage(None);
-        self.turns_cursor.borrow_mut().take();
-        self.turns_request.borrow_mut().take();
-        self.view.set_older_turns_available(false);
-        self.view.set_older_turns_loading(false);
-        self.view.set_turn_active(false);
-        self.view.set_composer_enabled(false);
-        self.set_title("New Codex chat");
-        self.picker.set_loading(true);
-    }
-
-    fn load_thread_history(&self, result: &Value) {
-        self.timeline.borrow_mut().clear();
-        self.view.clear_timeline();
-        let initial_page = result.get("initialTurnsPage");
-        let turns = initial_page
-            .and_then(|page| page.get("data"))
-            .and_then(Value::as_array)
-            .or_else(|| result.pointer("/thread/turns").and_then(Value::as_array));
-        let mut turns = turns.cloned().unwrap_or_default();
-        if initial_page.is_some() {
-            turns.reverse();
-        }
-        let next_cursor = initial_page
-            .and_then(|page| page.get("nextCursor"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        self.turns_cursor.replace(next_cursor.clone());
-        self.view.set_older_turns_available(next_cursor.is_some());
-        self.view.set_older_turns_loading(false);
-        for turn in &turns {
-            for item in turn
-                .get("items")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                self.upsert_timeline(timeline_from_item(item, true));
-            }
-            if turn.get("status").and_then(Value::as_str) == Some("inProgress") {
-                if let Some(turn_id) = turn.get("id").and_then(Value::as_str) {
-                    self.active_turn_id.replace(Some(turn_id.to_owned()));
-                    self.view.set_turn_active(true);
-                }
-            }
-        }
-    }
-
-    fn load_older_turns(&self) {
-        if self.turns_request.borrow().is_some() {
-            return;
-        }
-        let (Some(thread_id), Some(cursor)) = (
-            self.thread_id.borrow().clone(),
-            self.turns_cursor.borrow().clone(),
-        ) else {
-            self.view.set_older_turns_available(false);
-            return;
-        };
-        let server = self.server.borrow();
-        let Some(server) = server.as_ref() else {
-            return;
-        };
-        self.view.set_older_turns_loading(true);
-        match server.send_raw_request(
-            "thread/turns/list",
-            Some(json!({
-                "threadId": thread_id,
-                "cursor": cursor,
-                "limit": 100,
-                "sortDirection": "desc",
-                "itemsView": "full"
-            })),
-        ) {
-            Ok(request_id) => {
-                self.turns_request.replace(Some(request_id));
-            }
-            Err(error) => {
-                self.view.set_older_turns_loading(false);
-                self.push_error(error.to_string());
-            }
-        }
-    }
-
-    fn apply_older_turns(&self, request_id: &RequestId, result: &Value) {
-        if self.turns_request.borrow().as_ref() != Some(request_id) {
-            return;
-        }
-        self.turns_request.borrow_mut().take();
-        let mut turns = result
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        turns.reverse();
-        let mut items = Vec::new();
-        for turn in &turns {
-            for item in turn
-                .get("items")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let item = timeline_from_item(item, true);
-                if !self.timeline.borrow().contains_key(&item.id) {
-                    self.timeline
-                        .borrow_mut()
-                        .insert(item.id.clone(), item.clone());
-                    items.push(item);
-                }
-            }
-        }
-        let next_cursor = result
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        self.turns_cursor.replace(next_cursor.clone());
-        self.view.prepend_timeline_items(&items);
-        self.view.set_older_turns_loading(false);
-        self.view.set_older_turns_available(next_cursor.is_some());
-    }
-
-    fn handle_notification(&self, method: &str, params: Option<Value>) {
-        let params = params.unwrap_or(Value::Null);
-        if matches!(
-            method,
-            "thread/name/updated"
-                | "thread/archived"
-                | "thread/unarchived"
-                | "thread/deleted"
-                | "thread/started"
-        ) && self.content.visible_child_name().as_deref() == Some("threads")
-        {
-            self.load_thread_page(false);
-        }
-        if self.targets_other_thread(&params) {
-            return;
-        }
-        match method {
-            "thread/name/updated" => {
-                if let Some(name) = params.get("threadName").and_then(Value::as_str) {
-                    self.set_title(name);
-                    self.persist_overlay(Some(name.to_owned()));
-                }
-            }
-            "thread/settings/updated" => self.apply_thread_settings(&params),
-            "thread/status/changed" => match params.pointer("/status/type").and_then(Value::as_str)
-            {
-                Some("idle") => {
-                    self.active_turn_id.borrow_mut().take();
-                    self.clear_pending_requests();
-                    self.view.set_turn_active(false);
-                    self.set_state(AppChatState::Ready);
-                }
-                Some("active") => {
-                    let waiting = params
-                        .pointer("/status/activeFlags")
-                        .and_then(Value::as_array)
-                        .is_some_and(|flags| {
-                            flags.iter().any(|flag| {
-                                matches!(
-                                    flag.as_str(),
-                                    Some("waitingOnApproval" | "waitingOnUserInput")
-                                )
-                            })
-                        });
-                    self.view.set_turn_active(true);
-                    self.set_state(if waiting {
-                        AppChatState::AwaitingInput
-                    } else {
-                        AppChatState::Running
-                    });
-                }
-                Some("systemError") => {
-                    self.fail("Codex thread entered a system-error state".to_owned());
-                }
-                _ => {}
-            },
-            "turn/started" => {
-                if let Some(turn_id) = params.pointer("/turn/id").and_then(Value::as_str) {
-                    self.active_turn_id.replace(Some(turn_id.to_owned()));
-                }
-                self.set_state(AppChatState::Running);
-                self.view.set_turn_active(true);
-            }
-            "turn/completed" => {
-                let status = params
-                    .pointer("/turn/status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("completed");
-                if status == "failed"
-                    && let Some(message) = params
-                        .pointer("/turn/error/message")
-                        .and_then(Value::as_str)
-                {
-                    self.push_error(message.to_owned());
-                }
-                self.active_turn_id.borrow_mut().take();
-                self.clear_pending_requests();
-                self.view.set_turn_active(false);
-                self.view.set_plan_progress(None);
-                self.collaboration.borrow_mut().clear();
-                self.view.set_collaboration_progress(None);
-                self.set_state(AppChatState::Ready);
-            }
-            "item/started" => {
-                if let Some(item) = params.get("item") {
-                    if item.get("type").and_then(Value::as_str) == Some("contextCompaction") {
-                        self.view.set_usage(None);
-                    }
-                    self.upsert_timeline(timeline_from_item(item, false));
-                    self.update_collaboration_progress(item, false);
-                }
-            }
-            "item/completed" => {
-                if let Some(item) = params.get("item") {
-                    self.upsert_timeline(timeline_from_item(item, true));
-                    self.update_collaboration_progress(item, true);
-                }
-            }
-            "item/agentMessage/delta"
-            | "item/plan/delta"
-            | "item/reasoning/summaryTextDelta"
-            | "item/reasoning/textDelta"
-            | "item/commandExecution/outputDelta"
-            | "item/fileChange/outputDelta" => self.append_delta(method, &params),
-            "item/fileChange/patchUpdated" => self.apply_patch_snapshot(&params),
-            "turn/diff/updated" => self.upsert_timeline(TimelineItem {
-                id: format!(
-                    "turn-diff:{}",
-                    params
-                        .get("turnId")
-                        .and_then(Value::as_str)
-                        .unwrap_or("current")
-                ),
-                kind: TimelineItemKind::FileChange,
-                title: Some("Turn changes".to_owned()),
-                body: params
-                    .get("diff")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                detail: None,
-                status: TimelineItemStatus::Running,
-            }),
-            "turn/plan/updated" => self.apply_plan(&params),
-            "thread/tokenUsage/updated" => self.apply_token_usage(&params),
-            "serverRequest/resolved" => {
-                if let Some(request_id) = params.get("requestId").and_then(request_id_key_value) {
-                    self.pending_requests.borrow_mut().remove(&request_id);
-                    self.view.resolve_pending_request(&request_id);
-                    self.restore_state_after_pending_requests();
-                }
-            }
-            "error" => {
-                let message = params
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Codex reported an error");
-                if params.get("willRetry").and_then(Value::as_bool) == Some(true) {
-                    self.push_warning("Codex is retrying", message.to_owned());
-                } else {
-                    self.push_error(message.to_owned());
-                }
-            }
-            "warning" | "guardianWarning" => self.push_warning(
-                if method == "guardianWarning" {
-                    "Guardian warning"
-                } else {
-                    "Codex warning"
-                },
-                params
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Codex reported a warning")
-                    .to_owned(),
-            ),
-            "deprecationNotice" | "configWarning" => {
-                let title = params.get("summary").and_then(Value::as_str).unwrap_or(
-                    if method == "configWarning" {
-                        "Configuration warning"
-                    } else {
-                        "Deprecated Codex feature"
-                    },
-                );
-                let details = params
-                    .get("details")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                self.push_warning(title, details.to_owned());
-            }
-            "thread/compacted" => self.upsert_timeline(TimelineItem {
-                id: self.next_id("compaction"),
-                kind: TimelineItemKind::Compaction,
-                title: Some("Context compacted".to_owned()),
-                body: "Codex compacted this conversation's context.".to_owned(),
-                detail: None,
-                status: TimelineItemStatus::Completed,
-            }),
-            "thread/closed" | "thread/deleted" | "thread/archived" => {
-                if self.notification_is_current_thread(&params) {
-                    self.request_session_close();
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn handle_server_request(&self, request: Request) {
         if request
             .params
@@ -1690,235 +1091,6 @@ impl AppChatSessionInner {
         }
     }
 
-    fn append_delta(&self, method: &str, params: &Value) {
-        let Some(item_id) = params.get("itemId").and_then(Value::as_str) else {
-            return;
-        };
-        let delta = params
-            .get("delta")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if delta.is_empty() {
-            return;
-        }
-        let mut timeline = self.timeline.borrow_mut();
-        let item = timeline
-            .entry(item_id.to_owned())
-            .or_insert_with(|| TimelineItem {
-                id: item_id.to_owned(),
-                kind: delta_kind(method),
-                title: delta_title(method),
-                body: String::new(),
-                detail: None,
-                status: TimelineItemStatus::Running,
-            });
-        if matches!(
-            method,
-            "item/commandExecution/outputDelta"
-                | "item/fileChange/outputDelta"
-                | "item/reasoning/textDelta"
-        ) {
-            item.detail.get_or_insert_with(String::new).push_str(delta);
-        } else {
-            item.body.push_str(delta);
-        }
-        let item = item.clone();
-        drop(timeline);
-        self.view.upsert_timeline_item(item);
-    }
-
-    fn apply_patch_snapshot(&self, params: &Value) {
-        let Some(item_id) = params.get("itemId").and_then(Value::as_str) else {
-            return;
-        };
-        let detail = params
-            .get("patch")
-            .or_else(|| params.get("changes"))
-            .map(compact_json)
-            .unwrap_or_default();
-        let mut timeline = self.timeline.borrow_mut();
-        let item = timeline
-            .entry(item_id.to_owned())
-            .or_insert_with(|| TimelineItem {
-                id: item_id.to_owned(),
-                kind: TimelineItemKind::FileChange,
-                title: Some("File changes".to_owned()),
-                body: String::new(),
-                detail: None,
-                status: TimelineItemStatus::Running,
-            });
-        item.detail = Some(detail);
-        let item = item.clone();
-        drop(timeline);
-        self.view.upsert_timeline_item(item);
-    }
-
-    fn apply_plan(&self, params: &Value) {
-        let turn_id = params
-            .get("turnId")
-            .and_then(Value::as_str)
-            .unwrap_or("current");
-        let steps = params
-            .get("plan")
-            .and_then(Value::as_array)
-            .map(|steps| {
-                steps
-                    .iter()
-                    .map(|step| {
-                        let marker = match step.get("status").and_then(Value::as_str) {
-                            Some("completed") => "✓",
-                            Some("inProgress") => "→",
-                            _ => "·",
-                        };
-                        format!(
-                            "{marker} {}",
-                            step.get("step")
-                                .and_then(Value::as_str)
-                                .unwrap_or("Unnamed step")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        self.upsert_timeline(TimelineItem {
-            id: format!("turn-plan:{turn_id}"),
-            kind: TimelineItemKind::Plan,
-            title: Some("Plan".to_owned()),
-            body: steps,
-            detail: params
-                .get("explanation")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            status: TimelineItemStatus::Running,
-        });
-        let progress = params
-            .get("plan")
-            .and_then(Value::as_array)
-            .map(|steps| PlanProgress {
-                title: Some("Plan".to_owned()),
-                summary: params
-                    .get("explanation")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                steps: steps
-                    .iter()
-                    .enumerate()
-                    .map(|(index, step)| PlanStep {
-                        id: format!("{turn_id}:{index}"),
-                        label: step
-                            .get("step")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Unnamed step")
-                            .to_owned(),
-                        detail: None,
-                        status: match step.get("status").and_then(Value::as_str) {
-                            Some("inProgress") => PlanStepStatus::InProgress,
-                            Some("completed") => PlanStepStatus::Completed,
-                            Some("failed") => PlanStepStatus::Failed,
-                            _ => PlanStepStatus::Pending,
-                        },
-                    })
-                    .collect(),
-            });
-        self.view.set_plan_progress(progress);
-    }
-
-    fn apply_token_usage(&self, params: &Value) {
-        let Some(total) = params.pointer("/tokenUsage/total") else {
-            return;
-        };
-        let last = params.pointer("/tokenUsage/last").unwrap_or(total);
-        self.view.set_usage(Some(TokenUsage {
-            input_tokens: nonnegative_u64(total.get("inputTokens")),
-            cache_write_input_tokens: nonnegative_u64(total.get("cacheWriteInputTokens")),
-            cached_input_tokens: nonnegative_u64(total.get("cachedInputTokens")),
-            output_tokens: nonnegative_u64(total.get("outputTokens")),
-            reasoning_output_tokens: nonnegative_u64(total.get("reasoningOutputTokens")),
-            total_tokens: nonnegative_u64(total.get("totalTokens")),
-            last_total_tokens: nonnegative_u64(last.get("totalTokens")),
-            context_limit: params
-                .pointer("/tokenUsage/modelContextWindow")
-                .and_then(Value::as_i64)
-                .and_then(|value| u64::try_from(value).ok())
-                .or(self.context_window_fallback.get()),
-        }));
-    }
-
-    fn update_collaboration_progress(&self, item: &Value, completed: bool) {
-        if item.get("type").and_then(Value::as_str) != Some("collabAgentToolCall") {
-            return;
-        }
-        let Some(call_id) = item.get("id").and_then(Value::as_str) else {
-            return;
-        };
-        let receivers = item
-            .get("receiverThreadIds")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>();
-        let agents_states = item.get("agentsStates").and_then(Value::as_object);
-        for receiver in receivers.iter().copied().chain(
-            agents_states
-                .into_iter()
-                .flat_map(|states| states.keys().map(String::as_str))
-                .filter(|receiver| !receivers.contains(receiver)),
-        ) {
-            let state = agents_states.and_then(|states| states.get(receiver));
-            let status_name = state
-                .and_then(|state| state.get("status"))
-                .and_then(Value::as_str)
-                .or_else(|| item.get("status").and_then(Value::as_str));
-            let status = match status_name {
-                Some("errored" | "failed" | "notFound") => CollaborationParticipantStatus::Failed,
-                Some("completed" | "shutdown") if completed => {
-                    CollaborationParticipantStatus::Completed
-                }
-                Some("running" | "inProgress") => CollaborationParticipantStatus::Working,
-                _ if completed => CollaborationParticipantStatus::Completed,
-                _ => CollaborationParticipantStatus::Pending,
-            };
-            let id = format!("{call_id}:{receiver}");
-            let detail = state
-                .and_then(|state| state.get("message"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| {
-                    item.get("prompt")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .or_else(|| Some(format!("Thread {receiver}")));
-            self.collaboration.borrow_mut().insert(
-                id.clone(),
-                CollaborationParticipant {
-                    id,
-                    label: item
-                        .get("tool")
-                        .and_then(Value::as_str)
-                        .map(title_case)
-                        .unwrap_or_else(|| "Subagent".to_owned()),
-                    detail,
-                    status,
-                },
-            );
-        }
-        let mut participants = self
-            .collaboration
-            .borrow()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        participants.sort_by(|left, right| left.id.cmp(&right.id));
-        self.view
-            .set_collaboration_progress(Some(CollaborationProgress {
-                title: Some("Collaboration".to_owned()),
-                participants,
-            }));
-    }
-
     fn choose_context(self: &Rc<Self>, selection: ComposerContextSelection) {
         let dialog = gtk::FileDialog::builder()
             .title(match selection {
@@ -1985,86 +1157,56 @@ impl AppChatSessionInner {
         });
     }
 
-    fn thread_command(&self, method: &str, extra: Value) {
-        let Some(thread_id) = self.thread_id.borrow().clone() else {
+    fn add_pasted_clipboard_image(&self, png_bytes: &[u8]) {
+        if png_bytes.is_empty() {
+            self.push_error("The clipboard image was empty".to_owned());
+            return;
+        }
+        let attachment_id = self.next_id("clipboard-image");
+        let filename = format!(
+            "craic-codex-clipboard-{}-{}-{}.png",
+            std::process::id(),
+            self.id,
+            self.next_local_id.get()
+        );
+        let path = std::env::temp_dir().join(filename);
+        if let Err(error) = std::fs::write(&path, png_bytes) {
+            self.push_error(format!("Failed to save the pasted image: {error}"));
+            return;
+        }
+        self.temporary_attachments
+            .borrow_mut()
+            .insert(attachment_id.clone(), path.clone());
+        self.view.add_attachment(ComposerAttachment {
+            id: attachment_id,
+            label: "Pasted image".to_owned(),
+            kind: ComposerAttachmentKind::Image,
+            reference: path.to_string_lossy().into_owned(),
+        });
+    }
+
+    fn remove_temporary_attachment(&self, attachment_id: &str) {
+        let Some(path) = self
+            .temporary_attachments
+            .borrow_mut()
+            .remove(attachment_id)
+        else {
             return;
         };
-        let mut params = extra.as_object().cloned().unwrap_or_default();
-        params.insert("threadId".to_owned(), Value::String(thread_id));
-        if let Some(server) = self.server.borrow().as_ref()
-            && let Err(error) = server.send_raw_request(method, Some(Value::Object(params)))
+        if let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
         {
-            self.push_error(error.to_string());
+            log::warn!(
+                "failed removing temporary Codex attachment session_id={} path={}: {error}",
+                self.id,
+                path.display()
+            );
         }
     }
 
     fn request_session_close(&self) {
         if let Some(callback) = self.close_callback.borrow().clone() {
             callback(self.id);
-        }
-    }
-
-    fn notification_is_current_thread(&self, params: &Value) -> bool {
-        let Some(notified_thread_id) = params.get("threadId").and_then(Value::as_str) else {
-            return false;
-        };
-        self.thread_id.borrow().as_deref() == Some(notified_thread_id)
-    }
-
-    fn targets_other_thread(&self, params: &Value) -> bool {
-        let Some(notified_thread_id) = params.get("threadId").and_then(Value::as_str) else {
-            return false;
-        };
-        match self.thread_id.borrow().as_deref() {
-            Some(thread_id) => thread_id != notified_thread_id,
-            None => *self.lifecycle.borrow() == AppChatState::StartingThread,
-        }
-    }
-
-    fn persist_overlay(&self, task_description: Option<String>) {
-        let Some(thread_id) = self.thread_id.borrow().clone() else {
-            return;
-        };
-        let existing = match agent_history::lookup_codex_thread_overlay(
-            &self.workspace_key,
-            &thread_id,
-        ) {
-            Ok(existing) => existing,
-            Err(error) => {
-                log::warn!(
-                    "failed reading Codex thread overlay before update session_id={} thread_id={}: {error}",
-                    self.id,
-                    thread_id
-                );
-                return;
-            }
-        };
-        let task_description = task_description
-            .or_else(|| {
-                (self.title.borrow().as_str() != "New Codex chat")
-                    .then(|| self.title.borrow().clone())
-            })
-            .or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|overlay| overlay.task_description.clone())
-            });
-        let tags = existing.map(|overlay| overlay.tags).unwrap_or_default();
-        match agent_history::upsert_codex_thread_overlay(CodexThreadOverlayUpsert {
-            thread_id,
-            workspace_key: self.workspace_key.clone(),
-            task_description,
-            tags,
-        }) {
-            Ok(_) => {
-                if let Some(callback) = self.history_callback.borrow().clone() {
-                    callback(self.id);
-                }
-            }
-            Err(error) => log::warn!(
-                "failed to persist Codex thread overlay session_id={}: {error}",
-                self.id
-            ),
         }
     }
 
@@ -2149,6 +1291,22 @@ impl Drop for AppChatSessionInner {
         if let Some(mut server) = self.server.get_mut().take() {
             server.shutdown();
         }
+        for path in self
+            .temporary_attachments
+            .get_mut()
+            .drain()
+            .map(|(_, path)| path)
+        {
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!(
+                    "failed removing temporary Codex attachment session_id={} path={}: {error}",
+                    self.id,
+                    path.display()
+                );
+            }
+        }
     }
 }
 
@@ -2167,12 +1325,14 @@ fn app_server_config(ctx: &PageContext) -> Result<AppServerConfig, String> {
     ];
     let app = shell.fast_command(&workspace.root, &codex, &app_args)?;
     let version = shell.fast_command(&workspace.root, &codex, &["--version".to_owned()])?;
-    let mut config = AppServerConfig::default();
-    config.program = app.program;
-    config.args = app.args;
-    config.cwd = (ctx.system_ref().provider_kind == ProviderKind::Local)
-        .then(|| PathBuf::from(app.working_dir.absolute));
-    config.version_command = Some((version.program, version.args));
+    let mut config = AppServerConfig {
+        program: app.program,
+        args: app.args,
+        cwd: (ctx.system_ref().provider_kind == ProviderKind::Local)
+            .then(|| PathBuf::from(app.working_dir.absolute)),
+        version_command: Some((version.program, version.args)),
+        ..AppServerConfig::default()
+    };
     config.capabilities.experimental_api = true;
     config.capabilities.mcp_server_openai_form_elicitation = true;
     Ok(config)
@@ -2192,11 +1352,16 @@ fn submission_inputs(submission: &ComposerSubmission) -> Vec<UserInput> {
             ComposerAttachmentKind::Audio => input.push(UserInput::LocalAudio {
                 path: PathBuf::from(&attachment.reference),
             }),
-            ComposerAttachmentKind::File
-            | ComposerAttachmentKind::Mention => input.push(UserInput::Mention {
+            ComposerAttachmentKind::Skill => input.push(UserInput::Skill {
                 name: attachment.label.clone(),
-                path: attachment.reference.clone(),
+                path: PathBuf::from(&attachment.reference),
             }),
+            ComposerAttachmentKind::File | ComposerAttachmentKind::Mention => {
+                input.push(UserInput::Mention {
+                    name: attachment.label.clone(),
+                    path: attachment.reference.clone(),
+                })
+            }
         }
     }
     input
@@ -2218,325 +1383,11 @@ fn submission_display_text(submission: &ComposerSubmission) -> String {
 
 use super::codex_requests::{pending_request_from_server, response_for_server_request};
 
-fn timeline_from_item(item: &Value, completed: bool) -> TimelineItem {
-    let item_type = item
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let id = (item_type == "userMessage")
-        .then(|| item.get("clientId").and_then(Value::as_str))
-        .flatten()
-        .or_else(|| item.get("id").and_then(Value::as_str))
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("unknown:{:016x}", stable_hash(&item.to_string())));
-    let (kind, title, body, detail) = match item_type {
-        "userMessage" => (
-            TimelineItemKind::UserMessage,
-            None,
-            user_message_text(item.get("content")),
-            None,
-        ),
-        "agentMessage" => (
-            TimelineItemKind::AssistantMessage,
-            None,
-            item.get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            None,
-        ),
-        "plan" => (
-            TimelineItemKind::Plan,
-            Some("Plan".to_owned()),
-            item.get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            None,
-        ),
-        "reasoning" => (
-            TimelineItemKind::Reasoning,
-            Some("Reasoning".to_owned()),
-            flattened_text(item.get("summary")),
-            nonempty(flattened_text(item.get("content"))),
-        ),
-        "hookPrompt" => (
-            TimelineItemKind::DeveloperMessage,
-            Some("Hook prompt".to_owned()),
-            item.get("fragments")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|fragment| fragment.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            None,
-        ),
-        "commandExecution" => (
-            TimelineItemKind::Command,
-            Some("Command".to_owned()),
-            item.get("command")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            item.get("aggregatedOutput")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        ),
-        "fileChange" => (
-            TimelineItemKind::FileChange,
-            Some("File changes".to_owned()),
-            file_change_summary(item),
-            item.get("changes").map(compact_json),
-        ),
-        "mcpToolCall" => (
-            TimelineItemKind::McpTool,
-            Some(format!(
-                "{} / {}",
-                item.get("server").and_then(Value::as_str).unwrap_or("MCP"),
-                item.get("tool").and_then(Value::as_str).unwrap_or("tool")
-            )),
-            item.get("arguments").map(compact_json).unwrap_or_default(),
-            item.get("result")
-                .or_else(|| item.get("error"))
-                .map(compact_json),
-        ),
-        "dynamicToolCall" => (
-            TimelineItemKind::Tool,
-            Some(
-                item.get("namespace")
-                    .and_then(Value::as_str)
-                    .filter(|namespace| !namespace.is_empty())
-                    .map(|namespace| {
-                        format!(
-                            "{namespace} / {}",
-                            item.get("tool").and_then(Value::as_str).unwrap_or("tool")
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        item.get("tool")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Dynamic tool")
-                            .to_owned()
-                    }),
-            ),
-            item.get("arguments").map(compact_json).unwrap_or_default(),
-            item.get("contentItems").map(compact_json),
-        ),
-        "collabAgentToolCall" => (
-            TimelineItemKind::Collaboration,
-            Some("Collaboration".to_owned()),
-            item.get("prompt")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    item.get("tool")
-                        .and_then(Value::as_str)
-                        .map(title_case)
-                        .unwrap_or_else(|| "Agent activity".to_owned())
-                }),
-            Some(compact_json(item)),
-        ),
-        "subAgentActivity" => (
-            TimelineItemKind::Collaboration,
-            Some(format!(
-                "Subagent {}",
-                item.get("kind")
-                    .and_then(Value::as_str)
-                    .map(title_case)
-                    .unwrap_or_else(|| "activity".to_owned())
-            )),
-            item.get("agentPath")
-                .and_then(Value::as_str)
-                .unwrap_or("Subagent")
-                .to_owned(),
-            item.get("agentThreadId")
-                .and_then(Value::as_str)
-                .map(|thread_id| format!("Thread {thread_id}")),
-        ),
-        "webSearch" => (
-            TimelineItemKind::Web,
-            Some("Web search".to_owned()),
-            item.get("query")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            item.get("results").map(compact_json),
-        ),
-        "imageView" => (
-            TimelineItemKind::Image,
-            Some("Image".to_owned()),
-            item.get("path")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            None,
-        ),
-        "imageGeneration" => (
-            TimelineItemKind::Image,
-            Some("Generated image".to_owned()),
-            item.get("savedPath")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    item.get("result")
-                        .and_then(Value::as_str)
-                        .filter(|result| !result.starts_with("data:"))
-                })
-                .unwrap_or("Image generated")
-                .to_owned(),
-            item.get("revisedPrompt")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        ),
-        "enteredReviewMode" | "exitedReviewMode" => (
-            TimelineItemKind::Review,
-            Some("Review".to_owned()),
-            item.get("review")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            None,
-        ),
-        "contextCompaction" => (
-            TimelineItemKind::Compaction,
-            Some("Context compaction".to_owned()),
-            "Codex compacted the conversation context.".to_owned(),
-            None,
-        ),
-        "sleep" => (
-            TimelineItemKind::Tool,
-            Some("Waiting".to_owned()),
-            item.get("durationMs")
-                .and_then(Value::as_u64)
-                .map(|duration| format!("Waiting for {duration} ms"))
-                .unwrap_or_default(),
-            None,
-        ),
-        other => (
-            TimelineItemKind::Unknown(other.to_owned()),
-            Some(title_case(other)),
-            compact_json(item),
-            None,
-        ),
-    };
-    TimelineItem {
-        id,
-        kind,
-        title,
-        body,
-        detail,
-        status: timeline_status(item.get("status").and_then(Value::as_str), completed),
-    }
-}
-
-fn timeline_status(status: Option<&str>, completed: bool) -> TimelineItemStatus {
-    match status {
-        Some("failed" | "declined") => TimelineItemStatus::Failed,
-        Some("interrupted" | "cancelled") => TimelineItemStatus::Interrupted,
-        Some("completed") => TimelineItemStatus::Completed,
-        Some("inProgress" | "running") => TimelineItemStatus::Running,
-        _ if completed => TimelineItemStatus::Completed,
-        _ => TimelineItemStatus::Running,
-    }
-}
-
-fn delta_kind(method: &str) -> TimelineItemKind {
-    match method {
-        "item/agentMessage/delta" => TimelineItemKind::AssistantMessage,
-        "item/plan/delta" => TimelineItemKind::Plan,
-        method if method.starts_with("item/reasoning/") => TimelineItemKind::Reasoning,
-        "item/commandExecution/outputDelta" => TimelineItemKind::Command,
-        "item/fileChange/outputDelta" => TimelineItemKind::FileChange,
-        _ => TimelineItemKind::Unknown(method.to_owned()),
-    }
-}
-
-fn delta_title(method: &str) -> Option<String> {
-    match method {
-        "item/plan/delta" => Some("Plan".to_owned()),
-        method if method.starts_with("item/reasoning/") => Some("Reasoning".to_owned()),
-        "item/commandExecution/outputDelta" => Some("Command".to_owned()),
-        "item/fileChange/outputDelta" => Some("File changes".to_owned()),
-        _ => None,
-    }
-}
-
 fn request_id_key(id: &RequestId) -> String {
     match id {
         RequestId::Integer(id) => format!("integer:{id}"),
         RequestId::String(id) => format!("string:{id}"),
     }
-}
-
-fn request_id_key_value(value: &Value) -> Option<String> {
-    match value {
-        Value::Number(number) => number.as_i64().map(|id| format!("integer:{id}")),
-        Value::String(id) => Some(format!("string:{id}")),
-        _ => None,
-    }
-}
-
-fn user_message_text(content: Option<&Value>) -> String {
-    content
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|input| match input.get("type").and_then(Value::as_str) {
-            Some("text") => input.get("text").and_then(Value::as_str).map(str::to_owned),
-            Some("image") => Some("[Image]".to_owned()),
-            Some("localImage") => Some(format!(
-                "[Image: {}]",
-                input.get("path").and_then(Value::as_str).unwrap_or("image")
-            )),
-            Some("audio") | Some("localAudio") => Some("[Audio]".to_owned()),
-            Some("skill") | Some("mention") => Some(format!(
-                "[{}]",
-                input
-                    .get("name")
-                    .or_else(|| input.get("path"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("Attachment")
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn flattened_text(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::String(value)) => value.clone(),
-        Some(Value::Array(values)) => values
-            .iter()
-            .filter_map(|value| match value {
-                Value::String(value) => Some(value.clone()),
-                Value::Object(object) => object
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
-
-fn file_change_summary(item: &Value) -> String {
-    item.get("changes")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|change| {
-            let path = change.get("path")?.as_str()?;
-            let kind = change
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("update");
-            Some(format!("{kind}: {path}"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn compact_json(value: &Value) -> String {
@@ -2562,10 +1413,6 @@ fn concise_title(prompt: &str) -> Option<String> {
         title.push('…');
     }
     Some(title)
-}
-
-fn nonempty(value: String) -> Option<String> {
-    (!value.is_empty()).then_some(value)
 }
 
 fn attachment_kind(reference: &str) -> ComposerAttachmentKind {
@@ -2598,20 +1445,4 @@ fn title_case(value: &str) -> String {
         })
         .collect::<Vec<_>>();
     words.join(" ")
-}
-
-fn stable_hash(value: &str) -> u64 {
-    value
-        .as_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        })
-}
-
-fn nonnegative_u64(value: Option<&Value>) -> u64 {
-    value
-        .and_then(Value::as_i64)
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or_default()
 }
