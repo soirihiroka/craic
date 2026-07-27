@@ -101,7 +101,6 @@ struct AppChatSessionInner {
     dirty_selectors: RefCell<HashSet<ChatSelector>>,
     model_reasoning: RefCell<HashMap<String, Vec<SelectorOption>>>,
     model_service_tiers: RefCell<HashMap<String, ModelServiceTiers>>,
-    model_supports_personality: RefCell<HashMap<String, bool>>,
     context_window_fallback: Cell<Option<u64>>,
     collaboration_modes: RefCell<HashMap<String, Value>>,
     collaboration: RefCell<HashMap<String, CollaborationParticipant>>,
@@ -173,7 +172,6 @@ impl AppChatSession {
             dirty_selectors: RefCell::new(HashSet::new()),
             model_reasoning: RefCell::new(HashMap::new()),
             model_service_tiers: RefCell::new(HashMap::new()),
-            model_supports_personality: RefCell::new(HashMap::new()),
             context_window_fallback: Cell::new(None),
             collaboration_modes: RefCell::new(HashMap::new()),
             collaboration: RefCell::new(HashMap::new()),
@@ -439,6 +437,21 @@ impl AppChatSessionInner {
             Some(json!({ "cwd": self.workspace_root })),
         );
         let _ = server.send_raw_request("collaborationMode/list", Some(json!({})));
+        if self.content.visible_child_name().as_deref() == Some("threads") {
+            drop(server);
+            self.load_thread_page(false);
+            let server = self.server.borrow();
+            let Some(server) = server.as_ref() else {
+                return;
+            };
+            if let Err(error) = server.thread_start(ThreadStartParams {
+                cwd: Some(self.workspace_root.clone()),
+                ..Default::default()
+            }) {
+                self.fail(error.to_string());
+            }
+            return;
+        }
         if let Err(error) = server.thread_start(ThreadStartParams {
             cwd: Some(self.workspace_root.clone()),
             ..Default::default()
@@ -458,7 +471,13 @@ impl AppChatSessionInner {
                     self.load_thread_history(&result);
                 }
                 self.thread_became_ready(&result);
-                self.hide_thread_picker();
+                if method == Some("thread/start")
+                    && self.content.visible_child_name().as_deref() == Some("threads")
+                {
+                    self.load_thread_page(false);
+                } else {
+                    self.hide_thread_picker();
+                }
             }
             Some("thread/read") | Some("thread/rollback") => {
                 self.active_turn_id.borrow_mut().take();
@@ -983,6 +1002,9 @@ impl AppChatSessionInner {
         self.view
             .set_connection_status(ChatConnectionStatus::Failed(message.clone()));
         self.view.set_composer_enabled(false);
+        if self.content.visible_child_name().as_deref() == Some("threads") {
+            self.picker.set_error(Some(&message));
+        }
         self.set_state(AppChatState::Failed(message));
         self.clear_pending_requests();
     }

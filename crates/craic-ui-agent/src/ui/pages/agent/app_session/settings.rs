@@ -21,7 +21,6 @@ impl AppChatSessionInner {
         let mut options = Vec::new();
         let mut reasoning_by_model = HashMap::new();
         let mut service_tiers_by_model = HashMap::new();
-        let mut personality_by_model = HashMap::new();
         let mut catalog_default = None;
         for model in models {
             let Some(id) = model
@@ -53,11 +52,6 @@ impl AppChatSessionInner {
                 })
                 .collect::<Vec<_>>();
             reasoning_by_model.insert(id.to_owned(), reasoning);
-            if let Some(supports_personality) =
-                model.get("supportsPersonality").and_then(Value::as_bool)
-            {
-                personality_by_model.insert(id.to_owned(), supports_personality);
-            }
             let mut service_tiers = vec![SelectorOption {
                 id: DEFAULT_SERVICE_TIER_ID.to_owned(),
                 label: "Standard".to_owned(),
@@ -95,8 +89,6 @@ impl AppChatSessionInner {
         }
         self.model_reasoning.replace(reasoning_by_model);
         self.model_service_tiers.replace(service_tiers_by_model);
-        self.model_supports_personality
-            .replace(personality_by_model);
         let selected = self
             .selected_values
             .borrow()
@@ -382,33 +374,28 @@ impl AppChatSessionInner {
     }
 
     pub(super) fn update_personality_options(&self) {
-        let selected_model = self
-            .selected_values
-            .borrow()
-            .get(&ChatSelector::Model)
-            .cloned();
-        let supported = selected_model
-            .as_ref()
-            .and_then(|model| self.model_supports_personality.borrow().get(model).copied())
-            .unwrap_or(true);
-        let options = if supported {
-            ["friendly", "pragmatic", "none"]
-                .into_iter()
-                .map(|id| SelectorOption {
-                    id: id.to_owned(),
-                    label: title_case(id),
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        // Codex's model cache currently loses the personality placeholders used to derive
+        // `supportsPersonality`, so cached model-list responses can incorrectly report false.
+        // The App Server still accepts personality in thread settings and turn settings.
+        let options = ["friendly", "pragmatic", "none"]
+            .into_iter()
+            .map(|id| SelectorOption {
+                id: id.to_owned(),
+                label: title_case(id),
+            })
+            .collect::<Vec<_>>();
         let selected = self
             .selected_values
             .borrow()
             .get(&ChatSelector::Personality)
-            .cloned();
+            .cloned()
+            .filter(|selected| options.iter().any(|option| option.id == *selected))
+            .unwrap_or_else(|| "pragmatic".to_owned());
+        self.selected_values
+            .borrow_mut()
+            .insert(ChatSelector::Personality, selected.clone());
         self.view
-            .set_selector_options(ChatSelector::Personality, &options, selected.as_deref());
+            .set_selector_options(ChatSelector::Personality, &options, Some(&selected));
     }
 
     pub(super) fn update_selector(&self, selector: ChatSelector, value: Option<String>) {

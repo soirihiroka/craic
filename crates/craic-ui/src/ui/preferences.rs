@@ -186,20 +186,24 @@ pub(super) fn show_preferences_window(
     let shell_font_row = font_size_row("Shell Font Size", app_config.font_sizes.shell);
     let editor_font_row = font_size_row("Text Editor Font Size", app_config.font_sizes.editor);
     let diff_font_row = font_size_row("Diff Font Size", app_config.font_sizes.diff);
+    let agent_font_row = font_size_row("Agents Chat Font Size", app_config.font_sizes.agent);
     font_group.add(&shell_font_row);
     font_group.add(&editor_font_row);
     font_group.add(&diff_font_row);
+    font_group.add(&agent_font_row);
 
     let save_font_sizes = Rc::new({
         let shell_font_row = shell_font_row.clone();
         let editor_font_row = editor_font_row.clone();
         let diff_font_row = diff_font_row.clone();
+        let agent_font_row = agent_font_row.clone();
 
         move || {
             config::save_font_sizes(FontSizes {
                 shell: shell_font_row.value(),
                 editor: editor_font_row.value(),
                 diff: diff_font_row.value(),
+                agent: agent_font_row.value(),
             });
         }
     });
@@ -213,6 +217,10 @@ pub(super) fn show_preferences_window(
         move |_| save_font_sizes()
     });
     diff_font_row.connect_value_notify({
+        let save_font_sizes = save_font_sizes.clone();
+        move |_| save_font_sizes()
+    });
+    agent_font_row.connect_value_notify({
         let save_font_sizes = save_font_sizes.clone();
         move |_| save_font_sizes()
     });
