@@ -11,7 +11,6 @@ pub enum ChatConnectionStatus {
     Connecting,
     Initializing,
     Ready,
-    Reconnecting,
     Failed(String),
 }
 
@@ -19,9 +18,12 @@ pub enum ChatConnectionStatus {
 pub enum ChatSelector {
     Model,
     Reasoning,
+    ReasoningSummary,
     Personality,
     Permissions,
     Collaboration,
+    ServiceTier,
+    ApprovalReviewer,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,7 +38,6 @@ pub enum ComposerAttachmentKind {
     Image,
     Audio,
     Mention,
-    Other,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,13 +62,11 @@ pub enum TimelineItemKind {
     Reasoning,
     Plan,
     Command,
-    CommandOutput,
     FileChange,
     Tool,
     McpTool,
     Web,
     Image,
-    Audio,
     Collaboration,
     Review,
     Compaction,
@@ -78,7 +77,6 @@ pub enum TimelineItemKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimelineItemStatus {
-    Pending,
     Running,
     Completed,
     Failed,
@@ -96,18 +94,14 @@ pub struct TimelineItem {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChatTimelineEntry {
-    Item(TimelineItem),
-    PendingRequest(PendingRequest),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input_tokens: u64,
+    pub cache_write_input_tokens: u64,
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
     pub total_tokens: u64,
+    pub last_total_tokens: u64,
     pub context_limit: Option<u64>,
 }
 
@@ -164,7 +158,6 @@ pub enum PendingRequestKind {
     McpElicitation,
     McpForm(McpFormRequest),
     McpUrl(McpUrlRequest),
-    DynamicTool,
     DynamicToolOutput(DynamicToolRequest),
     TokenRefresh,
     Unknown(String),
@@ -205,6 +198,8 @@ pub enum McpFormFieldKind {
         default: Option<String>,
         placeholder: Option<String>,
         format: Option<String>,
+        minimum_length: Option<u32>,
+        maximum_length: Option<u32>,
         secret: bool,
     },
     Number {
@@ -214,12 +209,14 @@ pub enum McpFormFieldKind {
         integer: bool,
     },
     Boolean {
-        default: bool,
+        default: Option<bool>,
     },
     Select {
         options: Vec<StructuredRequestOption>,
         multiple: bool,
         defaults: Vec<String>,
+        minimum_items: Option<u64>,
+        maximum_items: Option<u64>,
     },
 }
 
@@ -338,10 +335,17 @@ impl PendingRequestResponse {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodexChatAction {
-    NewThread,
-    OpenThread,
-    ResumeThread,
+    LoadOlderTurns,
     ShowHistory,
+    ShowThreadGoal,
+    RunShellCommand,
+    ShowBackgroundTerminals,
+    ShowSkills,
+    ShowMcpServers,
+    ShowApps,
+    ShowPlugins,
+    ShowExperimentalFeatures,
+    ShowAccountUsage,
     ForkThread,
     ArchiveThread,
     CompactThread,
@@ -353,6 +357,7 @@ pub enum CodexChatAction {
     Interrupt,
     ChooseAttachment,
     ChooseMention,
+    ChooseMentionFolder,
     FilesDropped(Vec<String>),
     AttachmentRemoved(String),
     SelectorChanged {

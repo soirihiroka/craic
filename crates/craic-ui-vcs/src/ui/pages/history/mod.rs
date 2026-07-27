@@ -254,7 +254,8 @@ impl Page for HistoryPage {
             PageCommand::OpenSearchMatch { .. }
             | PageCommand::OpenFileLocation { .. }
             | PageCommand::AddFileToAgent(_)
-            | PageCommand::OpenAgentSession(_) => PageCommandResult::Ignored,
+            | PageCommand::OpenAgentSession(_)
+            | PageCommand::ShowChanges => PageCommandResult::Ignored,
         }
     }
 }

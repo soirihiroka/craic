@@ -692,7 +692,8 @@ impl Page for FilePage {
             }
             PageCommand::AddFileToAgent(_)
             | PageCommand::OpenAgentSession(_)
-            | PageCommand::OpenCommit(_) => PageCommandResult::Ignored,
+            | PageCommand::OpenCommit(_)
+            | PageCommand::ShowChanges => PageCommandResult::Ignored,
         }
     }
 }

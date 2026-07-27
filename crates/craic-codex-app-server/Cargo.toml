@@ -1,5 +1,5 @@
 [package]
-name = "craic-codex"
+name = "craic-codex-app-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

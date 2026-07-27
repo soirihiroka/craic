@@ -195,6 +195,9 @@ impl Page for LazyChangesPage {
     }
 
     fn handle_command(&self, command: &PageCommand) -> PageCommandResult {
+        if matches!(command, PageCommand::ShowChanges) {
+            return PageCommandResult::HandledAndActivate;
+        }
         self.state
             .page
             .borrow()

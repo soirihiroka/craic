@@ -15,7 +15,7 @@ cairo = { package = "cairo-rs", version = "0.22", features = ["freetype"] }
 criterion = "0.7"
 craic-agent = { path = "crates/craic-agent" }
 craic-config = { path = "crates/craic-config" }
-craic-codex = { path = "crates/craic-codex" }
+craic-codex-app-server = { path = "crates/craic-codex-app-server" }
 craic-dynamic-data = { path = "crates/craic-dynamic-data" }
 craic-file-support = { path = "crates/craic-file-support" }
 craic-language = { path = "crates/craic-language" }

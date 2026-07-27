@@ -6,25 +6,32 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod settings;
+mod tools;
+
 use adw::prelude::*;
-use craic_codex::protocol::{
+use craic_codex_app_server::protocol::{
     Request, RequestId, RpcError, ThreadStartParams, TurnInterruptParams, TurnStartParams,
     TurnSteerParams, UserInput,
 };
-use craic_codex::{AppServer, AppServerConfig, AppServerEvent, ConnectionState, ExitStatus};
+use craic_codex_app_server::{
+    AppServer, AppServerConfig, AppServerEvent, ConnectionState, ExitStatus,
+};
 use gtk::{gio, glib};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
-use super::super::PageContext;
+use self::settings::{DEFAULT_SERVICE_TIER_ID, ModelServiceTiers, set_initial_selector_options};
+
+use super::super::{PageCommand, PageContext};
 use super::codex_chat::{
     ChatConnectionStatus, ChatSelector, CodexChatAction, CodexChatView, CollaborationParticipant,
     CollaborationParticipantStatus, CollaborationProgress, ComposerAttachment,
-    ComposerAttachmentKind, ComposerSubmission, PendingRequest, PendingRequestKind,
-    PendingRequestResponse, PlanProgress, PlanStep, PlanStepStatus, RequestOption,
-    RequestOptionStyle, SelectorOption, TimelineItem, TimelineItemKind, TimelineItemStatus,
-    TokenUsage,
+    ComposerAttachmentKind, ComposerSubmission, PendingRequestResponse, PlanProgress, PlanStep,
+    PlanStepStatus, SelectorOption, TimelineItem, TimelineItemKind, TimelineItemStatus, TokenUsage,
 };
-use super::thread_picker::{CodexThreadPicker, ThreadPickerAction, ThreadPickerRow};
+use super::thread_picker::{
+    CodexThreadPicker, ThreadPickerAction, ThreadPickerRow, ThreadPickerSort,
+};
 use crate::system::ProviderKind;
 use crate::ui::agent_history::{self, CodexThreadOverlay, CodexThreadOverlayUpsert};
 
@@ -64,12 +71,21 @@ struct PickerRequest {
     query: String,
     append: bool,
     archived: bool,
+    sort: ThreadPickerSort,
     cursor: Option<String>,
     generation: u64,
 }
 
+#[derive(Clone, Copy)]
+enum ComposerContextSelection {
+    Media,
+    WorkspaceFile,
+    WorkspaceFolder,
+}
+
 struct AppChatSessionInner {
     id: u64,
+    ctx: PageContext,
     root: gtk::Box,
     content: gtk::Stack,
     view: CodexChatView,
@@ -88,11 +104,17 @@ struct AppChatSessionInner {
     selected_values: RefCell<HashMap<ChatSelector, String>>,
     dirty_selectors: RefCell<HashSet<ChatSelector>>,
     model_reasoning: RefCell<HashMap<String, Vec<SelectorOption>>>,
+    model_service_tiers: RefCell<HashMap<String, ModelServiceTiers>>,
+    model_supports_personality: RefCell<HashMap<String, bool>>,
+    context_window_fallback: Cell<Option<u64>>,
     collaboration_modes: RefCell<HashMap<String, Value>>,
     collaboration: RefCell<HashMap<String, CollaborationParticipant>>,
     picker_cursor: RefCell<Option<String>>,
     picker_requests: RefCell<HashMap<RequestId, PickerRequest>>,
     picker_generation: Cell<u64>,
+    turns_cursor: RefCell<Option<String>>,
+    turns_request: RefCell<Option<RequestId>>,
+    tool_requests: RefCell<HashMap<RequestId, tools::ToolRequest>>,
     thread_operations: RefCell<HashMap<RequestId, (String, String)>>,
     next_local_id: Cell<u64>,
     closing: Cell<bool>,
@@ -133,6 +155,7 @@ impl AppChatSession {
 
         let inner = Rc::new(AppChatSessionInner {
             id,
+            ctx,
             root,
             content,
             view,
@@ -151,11 +174,17 @@ impl AppChatSession {
             selected_values: RefCell::new(HashMap::new()),
             dirty_selectors: RefCell::new(HashSet::new()),
             model_reasoning: RefCell::new(HashMap::new()),
+            model_service_tiers: RefCell::new(HashMap::new()),
+            model_supports_personality: RefCell::new(HashMap::new()),
+            context_window_fallback: Cell::new(None),
             collaboration_modes: RefCell::new(HashMap::new()),
             collaboration: RefCell::new(HashMap::new()),
             picker_cursor: RefCell::new(None),
             picker_requests: RefCell::new(HashMap::new()),
             picker_generation: Cell::new(0),
+            turns_cursor: RefCell::new(None),
+            turns_request: RefCell::new(None),
+            tool_requests: RefCell::new(HashMap::new()),
             thread_operations: RefCell::new(HashMap::new()),
             next_local_id: Cell::new(1),
             closing: Cell::new(false),
@@ -356,14 +385,24 @@ impl AppChatSessionInner {
             }
             AppServerEvent::ErrorResponse { response, method } => {
                 self.thread_operations.borrow_mut().remove(&response.id);
+                if self.handle_tool_error(&response.id, &response.error.message) {
+                    return;
+                }
                 let operation = method.as_deref().unwrap_or("request");
                 self.push_error(format!("{operation} failed: {}", response.error.message));
+                if method.as_deref() == Some("thread/turns/list")
+                    && self.turns_request.borrow().as_ref() == Some(&response.id)
+                {
+                    self.turns_request.borrow_mut().take();
+                    self.view.set_older_turns_loading(false);
+                }
                 if method.as_deref() == Some("thread/list") {
                     let request = self.picker_requests.borrow_mut().remove(&response.id);
                     if request.is_some_and(|request| {
                         request.generation == self.picker_generation.get()
                             && request.query == self.picker.query()
                             && request.archived == self.picker.archived_only()
+                            && request.sort == self.picker.sort()
                             && request.cursor == *self.picker_cursor.borrow()
                     }) {
                         self.picker.set_error(Some(&response.error.message));
@@ -440,6 +479,9 @@ impl AppChatSessionInner {
     }
 
     fn handle_response(&self, method: Option<&str>, request_id: &RequestId, result: Value) {
+        if self.handle_tool_response(request_id, &result) {
+            return;
+        }
         match method {
             Some("thread/start") | Some("thread/resume") | Some("thread/fork") => {
                 self.thread_operations.borrow_mut().remove(request_id);
@@ -456,11 +498,31 @@ impl AppChatSessionInner {
                 self.hide_thread_picker();
             }
             Some("thread/list") => self.apply_thread_list(request_id, &result),
+            Some("thread/turns/list") => self.apply_older_turns(request_id, &result),
             Some("model/list") => self.apply_model_catalog(&result),
             Some("config/read") => self.apply_config_defaults(&result),
             Some("permissionProfile/list") => self.apply_permission_profiles(&result),
             Some("collaborationMode/list") => self.apply_collaboration_modes(&result),
             Some("turn/start") | Some("review/start") => {
+                if method == Some("review/start")
+                    && let Some(review_thread_id) =
+                        result.get("reviewThreadId").and_then(Value::as_str)
+                {
+                    self.prepare_thread_switch();
+                    self.send_thread_operation(
+                        "thread/resume",
+                        review_thread_id,
+                        json!({
+                            "excludeTurns": true,
+                            "initialTurnsPage": {
+                                "limit": 100,
+                                "sortDirection": "desc",
+                                "itemsView": "full"
+                            }
+                        }),
+                    );
+                    return;
+                }
                 if let Some(turn_id) = result.pointer("/turn/id").and_then(Value::as_str) {
                     self.active_turn_id.replace(Some(turn_id.to_owned()));
                 }
@@ -470,6 +532,7 @@ impl AppChatSessionInner {
             Some("thread/archive")
             | Some("thread/unarchive")
             | Some("thread/delete")
+            | Some("thread/name/set")
             | Some("thread/metadata/update") => {
                 if let Some((operation, thread_id)) =
                     self.thread_operations.borrow_mut().remove(request_id)
@@ -515,6 +578,8 @@ impl AppChatSessionInner {
         for (selector, pointer) in [
             (ChatSelector::Model, "/model"),
             (ChatSelector::Reasoning, "/reasoningEffort"),
+            (ChatSelector::ServiceTier, "/serviceTier"),
+            (ChatSelector::ApprovalReviewer, "/approvalsReviewer"),
             (ChatSelector::Permissions, "/activePermissionProfile/id"),
         ] {
             if let Some(value) = result.pointer(pointer).and_then(Value::as_str) {
@@ -523,6 +588,15 @@ impl AppChatSessionInner {
                     .insert(selector, value.to_owned());
             }
         }
+        if result.get("serviceTier").is_some_and(Value::is_null) {
+            self.selected_values.borrow_mut().insert(
+                ChatSelector::ServiceTier,
+                DEFAULT_SERVICE_TIER_ID.to_owned(),
+            );
+        }
+        self.update_reasoning_options();
+        self.update_service_tier_options();
+        self.update_personality_options();
         self.persist_overlay(None);
     }
 
@@ -550,30 +624,41 @@ impl AppChatSessionInner {
                     self.add_attachment(path, false);
                 }
             }
-            CodexChatAction::ChooseAttachment => self.choose_file(false),
-            CodexChatAction::ChooseMention => self.choose_file(true),
+            CodexChatAction::ChooseAttachment => {
+                self.choose_context(ComposerContextSelection::Media)
+            }
+            CodexChatAction::ChooseMention => {
+                self.choose_context(ComposerContextSelection::WorkspaceFile)
+            }
+            CodexChatAction::ChooseMentionFolder => {
+                self.choose_context(ComposerContextSelection::WorkspaceFolder)
+            }
             CodexChatAction::SelectorChanged { selector, value } => {
                 self.update_selector(selector, value)
             }
+            CodexChatAction::LoadOlderTurns => self.load_older_turns(),
+            CodexChatAction::ShowThreadGoal => self.prompt_thread_goal(),
+            CodexChatAction::RunShellCommand => self.prompt_shell_command(),
+            CodexChatAction::ShowBackgroundTerminals => self.load_background_terminals(),
+            CodexChatAction::ShowSkills => self.load_skills(),
+            CodexChatAction::ShowMcpServers => self.load_mcp_servers(),
+            CodexChatAction::ShowApps => self.load_apps(),
+            CodexChatAction::ShowPlugins => self.load_plugins(),
+            CodexChatAction::ShowExperimentalFeatures => self.load_experimental_features(),
+            CodexChatAction::ShowAccountUsage => self.load_account_usage(),
             CodexChatAction::ResolveRequest {
                 request_id,
                 response,
             } => self.resolve_request(&request_id, response),
-            CodexChatAction::NewThread => self.start_new_thread(),
             CodexChatAction::ArchiveThread => self.thread_command("thread/archive", json!({})),
             CodexChatAction::CompactThread => {
                 self.thread_command("thread/compact/start", json!({}))
             }
-            CodexChatAction::StartReview => self.thread_command(
-                "review/start",
-                json!({ "target": { "type": "uncommittedChanges" } }),
-            ),
+            CodexChatAction::StartReview => self.prompt_review(),
             CodexChatAction::UndoLastTurn => {
                 self.thread_command("thread/rollback", json!({ "numTurns": 1 }))
             }
-            CodexChatAction::OpenThread
-            | CodexChatAction::ResumeThread
-            | CodexChatAction::ShowHistory => self.show_thread_picker(),
+            CodexChatAction::ShowHistory => self.show_thread_picker(),
             CodexChatAction::ForkThread => {
                 if let Some(thread_id) = self.thread_id.borrow().clone() {
                     self.prepare_thread_switch();
@@ -581,7 +666,7 @@ impl AppChatSessionInner {
                 }
             }
             CodexChatAction::OpenChanges => {
-                self.thread_command("thread/read", json!({ "includeTurns": true }));
+                self.ctx.dispatch_command(PageCommand::ShowChanges);
             }
             CodexChatAction::AttachmentRemoved(_) => {}
         }
@@ -591,6 +676,7 @@ impl AppChatSessionInner {
         match action {
             ThreadPickerAction::SearchChanged(_) => self.load_thread_page(false),
             ThreadPickerAction::ArchivedChanged(_) => self.load_thread_page(false),
+            ThreadPickerAction::SortChanged(_) => self.load_thread_page(false),
             ThreadPickerAction::LoadMore => self.load_thread_page(true),
             ThreadPickerAction::Resume(thread_id) => {
                 self.prepare_thread_switch();
@@ -598,9 +684,10 @@ impl AppChatSessionInner {
                     "thread/resume",
                     &thread_id,
                     json!({
+                        "excludeTurns": true,
                         "initialTurnsPage": {
                             "limit": 100,
-                            "sortDirection": "asc",
+                            "sortDirection": "desc",
                             "itemsView": "full"
                         }
                     }),
@@ -609,6 +696,13 @@ impl AppChatSessionInner {
             ThreadPickerAction::Fork(thread_id) => {
                 self.prepare_thread_switch();
                 self.send_thread_operation("thread/fork", &thread_id, json!({}));
+            }
+            ThreadPickerAction::Rename {
+                thread_id,
+                current_name,
+            } => self.prompt_thread_rename(thread_id, current_name),
+            ThreadPickerAction::EditTags { thread_id, tags } => {
+                self.prompt_thread_tags(thread_id, tags)
             }
             ThreadPickerAction::Archive(thread_id) => {
                 self.send_thread_operation("thread/archive", &thread_id, json!({}));
@@ -635,6 +729,195 @@ impl AppChatSessionInner {
                 }
             }
         }
+    }
+
+    fn prompt_thread_rename(self: &Rc<Self>, thread_id: String, current_name: String) {
+        let dialog = adw::AlertDialog::builder()
+            .heading("Rename Codex Thread")
+            .body("Choose the name shown in Codex thread history.")
+            .build();
+        let entry = gtk::Entry::builder()
+            .text(&current_name)
+            .placeholder_text("Thread name")
+            .activates_default(true)
+            .build();
+        dialog.set_extra_child(Some(&entry));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("rename", "Rename");
+        dialog.set_default_response(Some("rename"));
+        dialog.set_close_response("cancel");
+
+        let parent = self.root.root().and_downcast::<gtk::Window>();
+        let weak = Rc::downgrade(self);
+        dialog.choose(
+            parent.as_ref(),
+            None::<&gio::Cancellable>,
+            move |response| {
+                if response.as_str() != "rename" {
+                    return;
+                }
+                let name = entry.text().trim().to_owned();
+                if name.is_empty() {
+                    return;
+                }
+                if let Some(session) = weak.upgrade() {
+                    session.send_thread_operation(
+                        "thread/name/set",
+                        &thread_id,
+                        json!({ "name": name }),
+                    );
+                }
+            },
+        );
+    }
+
+    fn prompt_thread_tags(self: &Rc<Self>, thread_id: String, tags: Vec<String>) {
+        let dialog = adw::AlertDialog::builder()
+            .heading("Edit Thread Tags")
+            .body("Separate tags with commas. Tags are stored locally for this workspace.")
+            .build();
+        let entry = gtk::Entry::builder()
+            .text(tags.join(", "))
+            .placeholder_text("bug, frontend, follow-up")
+            .activates_default(true)
+            .build();
+        dialog.set_extra_child(Some(&entry));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("save", "Save");
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+
+        let parent = self.root.root().and_downcast::<gtk::Window>();
+        let weak = Rc::downgrade(self);
+        dialog.choose(
+            parent.as_ref(),
+            None::<&gio::Cancellable>,
+            move |response| {
+                if response.as_str() != "save" {
+                    return;
+                }
+                let tags = entry
+                    .text()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let Some(session) = weak.upgrade() else {
+                    return;
+                };
+                match agent_history::update_codex_thread_overlay_tags(
+                    &session.workspace_key,
+                    &thread_id,
+                    &tags,
+                ) {
+                    Ok(_) => {
+                        session.load_thread_page(false);
+                        if let Some(callback) = session.history_callback.borrow().clone() {
+                            callback(session.id);
+                        }
+                    }
+                    Err(error) => session.picker.set_error(Some(&error)),
+                }
+            },
+        );
+    }
+
+    fn prompt_review(self: &Rc<Self>) {
+        let dialog = adw::AlertDialog::builder()
+            .heading("Start Code Review")
+            .body("Choose what Codex should review and where the review should run.")
+            .build();
+        let target_labels = gtk::StringList::new(&[
+            "Uncommitted changes",
+            "Against base branch",
+            "Commit",
+            "Custom instructions",
+        ]);
+        let target = gtk::DropDown::builder().model(&target_labels).build();
+        let value = gtk::Entry::builder()
+            .placeholder_text("No additional value required")
+            .sensitive(false)
+            .hexpand(true)
+            .build();
+        target.connect_selected_notify({
+            let value = value.clone();
+            move |target| match target.selected() {
+                0 => {
+                    value.set_sensitive(false);
+                    value.set_placeholder_text(Some("No additional value required"));
+                }
+                1 => {
+                    value.set_sensitive(true);
+                    value.set_placeholder_text(Some("Base branch, for example main"));
+                }
+                2 => {
+                    value.set_sensitive(true);
+                    value.set_placeholder_text(Some("Commit SHA"));
+                }
+                _ => {
+                    value.set_sensitive(true);
+                    value.set_placeholder_text(Some("What should Codex review?"));
+                }
+            }
+        });
+        let delivery_labels = gtk::StringList::new(&["Inline", "Detached thread"]);
+        let delivery = gtk::DropDown::builder()
+            .model(&delivery_labels)
+            .selected(0)
+            .build();
+        let fields = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .build();
+        fields.append(
+            &gtk::Label::builder()
+                .label("Review target")
+                .xalign(0.0)
+                .build(),
+        );
+        fields.append(&target);
+        fields.append(&value);
+        fields.append(&gtk::Label::builder().label("Delivery").xalign(0.0).build());
+        fields.append(&delivery);
+        dialog.set_extra_child(Some(&fields));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("start", "Start Review");
+        dialog.set_default_response(Some("start"));
+        dialog.set_close_response("cancel");
+
+        let parent = self.root.root().and_downcast::<gtk::Window>();
+        let weak = Rc::downgrade(self);
+        dialog.choose(
+            parent.as_ref(),
+            None::<&gio::Cancellable>,
+            move |response| {
+                if response.as_str() != "start" {
+                    return;
+                }
+                let input = value.text().trim().to_owned();
+                let review_target = match target.selected() {
+                    0 => json!({ "type": "uncommittedChanges" }),
+                    1 if !input.is_empty() => json!({ "type": "baseBranch", "branch": input }),
+                    2 if !input.is_empty() => {
+                        json!({ "type": "commit", "sha": input, "title": null })
+                    }
+                    3 if !input.is_empty() => {
+                        json!({ "type": "custom", "instructions": input })
+                    }
+                    _ => return,
+                };
+                if let Some(session) = weak.upgrade() {
+                    session.thread_command(
+                        "review/start",
+                        json!({
+                            "target": review_target,
+                            "delivery": if delivery.selected() == 1 { "detached" } else { "inline" }
+                        }),
+                    );
+                }
+            },
+        );
     }
 
     fn confirm_thread_delete(self: &Rc<Self>, thread_id: String) {
@@ -746,24 +1029,6 @@ impl AppChatSessionInner {
         }
     }
 
-    fn start_new_thread(&self) {
-        self.hide_thread_picker();
-        self.prepare_thread_switch();
-        self.set_title("New Codex chat");
-        self.set_state(AppChatState::StartingThread);
-        self.view
-            .set_connection_status(ChatConnectionStatus::Initializing);
-        self.view.set_composer_enabled(false);
-        if let Some(server) = self.server.borrow().as_ref()
-            && let Err(error) = server.thread_start(ThreadStartParams {
-                cwd: Some(self.workspace_root.clone()),
-                ..Default::default()
-            })
-        {
-            self.fail(error.to_string());
-        }
-    }
-
     fn shutdown(&self) {
         if self.closing.replace(true) {
             return;
@@ -849,13 +1114,18 @@ impl AppChatSessionInner {
         let query = self.picker.query();
         let cursor = self.picker_cursor.borrow().clone();
         let archived = self.picker.archived_only();
+        let sort = self.picker.sort();
+        let sort_key = match sort {
+            ThreadPickerSort::Updated => "updated_at",
+            ThreadPickerSort::Created => "created_at",
+        };
         let generation = self.picker_generation.get().wrapping_add(1);
         self.picker_generation.set(generation);
         self.picker.set_loading(true);
         let params = json!({
             "cursor": cursor,
             "limit": 50,
-            "sortKey": "updated_at",
+            "sortKey": sort_key,
             "sortDirection": "desc",
             "cwd": self.workspace_root,
             "searchTerm": (!query.is_empty()).then_some(query.clone()),
@@ -869,6 +1139,7 @@ impl AppChatSessionInner {
                         query,
                         append,
                         archived,
+                        sort,
                         cursor,
                         generation,
                     },
@@ -885,6 +1156,7 @@ impl AppChatSessionInner {
         if request.generation != self.picker_generation.get()
             || self.picker.query() != request.query
             || self.picker.archived_only() != request.archived
+            || self.picker.sort() != request.sort
             || *self.picker_cursor.borrow() != request.cursor
         {
             return;
@@ -1006,7 +1278,13 @@ impl AppChatSessionInner {
         self.set_state(AppChatState::StartingThread);
         self.timeline.borrow_mut().clear();
         self.clear_pending_requests();
+        self.tool_requests.borrow_mut().clear();
         self.view.clear_timeline();
+        self.view.set_usage(None);
+        self.turns_cursor.borrow_mut().take();
+        self.turns_request.borrow_mut().take();
+        self.view.set_older_turns_available(false);
+        self.view.set_older_turns_loading(false);
         self.view.set_turn_active(false);
         self.view.set_composer_enabled(false);
         self.set_title("New Codex chat");
@@ -1016,11 +1294,23 @@ impl AppChatSessionInner {
     fn load_thread_history(&self, result: &Value) {
         self.timeline.borrow_mut().clear();
         self.view.clear_timeline();
-        let turns = result
-            .pointer("/initialTurnsPage/data")
+        let initial_page = result.get("initialTurnsPage");
+        let turns = initial_page
+            .and_then(|page| page.get("data"))
             .and_then(Value::as_array)
             .or_else(|| result.pointer("/thread/turns").and_then(Value::as_array));
-        for turn in turns.into_iter().flatten() {
+        let mut turns = turns.cloned().unwrap_or_default();
+        if initial_page.is_some() {
+            turns.reverse();
+        }
+        let next_cursor = initial_page
+            .and_then(|page| page.get("nextCursor"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.turns_cursor.replace(next_cursor.clone());
+        self.view.set_older_turns_available(next_cursor.is_some());
+        self.view.set_older_turns_loading(false);
+        for turn in &turns {
             for item in turn
                 .get("items")
                 .and_then(Value::as_array)
@@ -1038,19 +1328,136 @@ impl AppChatSessionInner {
         }
     }
 
+    fn load_older_turns(&self) {
+        if self.turns_request.borrow().is_some() {
+            return;
+        }
+        let (Some(thread_id), Some(cursor)) = (
+            self.thread_id.borrow().clone(),
+            self.turns_cursor.borrow().clone(),
+        ) else {
+            self.view.set_older_turns_available(false);
+            return;
+        };
+        let server = self.server.borrow();
+        let Some(server) = server.as_ref() else {
+            return;
+        };
+        self.view.set_older_turns_loading(true);
+        match server.send_raw_request(
+            "thread/turns/list",
+            Some(json!({
+                "threadId": thread_id,
+                "cursor": cursor,
+                "limit": 100,
+                "sortDirection": "desc",
+                "itemsView": "full"
+            })),
+        ) {
+            Ok(request_id) => {
+                self.turns_request.replace(Some(request_id));
+            }
+            Err(error) => {
+                self.view.set_older_turns_loading(false);
+                self.push_error(error.to_string());
+            }
+        }
+    }
+
+    fn apply_older_turns(&self, request_id: &RequestId, result: &Value) {
+        if self.turns_request.borrow().as_ref() != Some(request_id) {
+            return;
+        }
+        self.turns_request.borrow_mut().take();
+        let mut turns = result
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        turns.reverse();
+        let mut items = Vec::new();
+        for turn in &turns {
+            for item in turn
+                .get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let item = timeline_from_item(item, true);
+                if !self.timeline.borrow().contains_key(&item.id) {
+                    self.timeline
+                        .borrow_mut()
+                        .insert(item.id.clone(), item.clone());
+                    items.push(item);
+                }
+            }
+        }
+        let next_cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.turns_cursor.replace(next_cursor.clone());
+        self.view.prepend_timeline_items(&items);
+        self.view.set_older_turns_loading(false);
+        self.view.set_older_turns_available(next_cursor.is_some());
+    }
+
     fn handle_notification(&self, method: &str, params: Option<Value>) {
         let params = params.unwrap_or(Value::Null);
+        if matches!(
+            method,
+            "thread/name/updated"
+                | "thread/archived"
+                | "thread/unarchived"
+                | "thread/deleted"
+                | "thread/started"
+        ) && self.content.visible_child_name().as_deref() == Some("threads")
+        {
+            self.load_thread_page(false);
+        }
         if self.targets_other_thread(&params) {
             return;
         }
         match method {
             "thread/name/updated" => {
-                if let Some(name) = params.get("name").and_then(Value::as_str) {
+                if let Some(name) = params.get("threadName").and_then(Value::as_str) {
                     self.set_title(name);
                     self.persist_overlay(Some(name.to_owned()));
                 }
             }
             "thread/settings/updated" => self.apply_thread_settings(&params),
+            "thread/status/changed" => match params.pointer("/status/type").and_then(Value::as_str)
+            {
+                Some("idle") => {
+                    self.active_turn_id.borrow_mut().take();
+                    self.clear_pending_requests();
+                    self.view.set_turn_active(false);
+                    self.set_state(AppChatState::Ready);
+                }
+                Some("active") => {
+                    let waiting = params
+                        .pointer("/status/activeFlags")
+                        .and_then(Value::as_array)
+                        .is_some_and(|flags| {
+                            flags.iter().any(|flag| {
+                                matches!(
+                                    flag.as_str(),
+                                    Some("waitingOnApproval" | "waitingOnUserInput")
+                                )
+                            })
+                        });
+                    self.view.set_turn_active(true);
+                    self.set_state(if waiting {
+                        AppChatState::AwaitingInput
+                    } else {
+                        AppChatState::Running
+                    });
+                }
+                Some("systemError") => {
+                    self.fail("Codex thread entered a system-error state".to_owned());
+                }
+                _ => {}
+            },
             "turn/started" => {
                 if let Some(turn_id) = params.pointer("/turn/id").and_then(Value::as_str) {
                     self.active_turn_id.replace(Some(turn_id.to_owned()));
@@ -1080,6 +1487,9 @@ impl AppChatSessionInner {
             }
             "item/started" => {
                 if let Some(item) = params.get("item") {
+                    if item.get("type").and_then(Value::as_str) == Some("contextCompaction") {
+                        self.view.set_usage(None);
+                    }
                     self.upsert_timeline(timeline_from_item(item, false));
                     self.update_collaboration_progress(item, false);
                 }
@@ -1129,7 +1539,37 @@ impl AppChatSessionInner {
                     .pointer("/error/message")
                     .and_then(Value::as_str)
                     .unwrap_or("Codex reported an error");
-                self.push_error(message.to_owned());
+                if params.get("willRetry").and_then(Value::as_bool) == Some(true) {
+                    self.push_warning("Codex is retrying", message.to_owned());
+                } else {
+                    self.push_error(message.to_owned());
+                }
+            }
+            "warning" | "guardianWarning" => self.push_warning(
+                if method == "guardianWarning" {
+                    "Guardian warning"
+                } else {
+                    "Codex warning"
+                },
+                params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex reported a warning")
+                    .to_owned(),
+            ),
+            "deprecationNotice" | "configWarning" => {
+                let title = params.get("summary").and_then(Value::as_str).unwrap_or(
+                    if method == "configWarning" {
+                        "Configuration warning"
+                    } else {
+                        "Deprecated Codex feature"
+                    },
+                );
+                let details = params
+                    .get("details")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                self.push_warning(title, details.to_owned());
             }
             "thread/compacted" => self.upsert_timeline(TimelineItem {
                 id: self.next_id("compaction"),
@@ -1142,8 +1582,6 @@ impl AppChatSessionInner {
             "thread/closed" | "thread/deleted" | "thread/archived" => {
                 if self.notification_is_current_thread(&params) {
                     self.request_session_close();
-                } else if self.content.visible_child_name().as_deref() == Some("threads") {
-                    self.load_thread_page(false);
                 }
             }
             _ => {}
@@ -1390,51 +1828,83 @@ impl AppChatSessionInner {
         let Some(total) = params.pointer("/tokenUsage/total") else {
             return;
         };
+        let last = params.pointer("/tokenUsage/last").unwrap_or(total);
         self.view.set_usage(Some(TokenUsage {
             input_tokens: nonnegative_u64(total.get("inputTokens")),
+            cache_write_input_tokens: nonnegative_u64(total.get("cacheWriteInputTokens")),
             cached_input_tokens: nonnegative_u64(total.get("cachedInputTokens")),
             output_tokens: nonnegative_u64(total.get("outputTokens")),
             reasoning_output_tokens: nonnegative_u64(total.get("reasoningOutputTokens")),
             total_tokens: nonnegative_u64(total.get("totalTokens")),
+            last_total_tokens: nonnegative_u64(last.get("totalTokens")),
             context_limit: params
                 .pointer("/tokenUsage/modelContextWindow")
                 .and_then(Value::as_i64)
-                .and_then(|value| u64::try_from(value).ok()),
+                .and_then(|value| u64::try_from(value).ok())
+                .or(self.context_window_fallback.get()),
         }));
     }
 
     fn update_collaboration_progress(&self, item: &Value, completed: bool) {
-        if item.get("type").and_then(Value::as_str) != Some("collabToolCall") {
+        if item.get("type").and_then(Value::as_str) != Some("collabAgentToolCall") {
             return;
         }
-        let Some(id) = item.get("id").and_then(Value::as_str) else {
+        let Some(call_id) = item.get("id").and_then(Value::as_str) else {
             return;
         };
-        let status = match item.get("status").and_then(Value::as_str) {
-            Some("failed") => CollaborationParticipantStatus::Failed,
-            Some("completed") if completed => CollaborationParticipantStatus::Completed,
-            Some("inProgress") => CollaborationParticipantStatus::Working,
-            _ if completed => CollaborationParticipantStatus::Completed,
-            _ => CollaborationParticipantStatus::Pending,
-        };
-        self.collaboration.borrow_mut().insert(
-            id.to_owned(),
-            CollaborationParticipant {
-                id: id.to_owned(),
-                label: item
-                    .get("agentStatus")
-                    .and_then(Value::as_str)
-                    .or_else(|| item.get("tool").and_then(Value::as_str))
-                    .unwrap_or("Subagent")
-                    .to_owned(),
-                detail: item
-                    .get("newThreadId")
-                    .or_else(|| item.get("receiverThreadId"))
-                    .and_then(Value::as_str)
-                    .map(|thread_id| format!("Thread {thread_id}")),
-                status,
-            },
-        );
+        let receivers = item
+            .get("receiverThreadIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let agents_states = item.get("agentsStates").and_then(Value::as_object);
+        for receiver in receivers.iter().copied().chain(
+            agents_states
+                .into_iter()
+                .flat_map(|states| states.keys().map(String::as_str))
+                .filter(|receiver| !receivers.contains(receiver)),
+        ) {
+            let state = agents_states.and_then(|states| states.get(receiver));
+            let status_name = state
+                .and_then(|state| state.get("status"))
+                .and_then(Value::as_str)
+                .or_else(|| item.get("status").and_then(Value::as_str));
+            let status = match status_name {
+                Some("errored" | "failed" | "notFound") => CollaborationParticipantStatus::Failed,
+                Some("completed" | "shutdown") if completed => {
+                    CollaborationParticipantStatus::Completed
+                }
+                Some("running" | "inProgress") => CollaborationParticipantStatus::Working,
+                _ if completed => CollaborationParticipantStatus::Completed,
+                _ => CollaborationParticipantStatus::Pending,
+            };
+            let id = format!("{call_id}:{receiver}");
+            let detail = state
+                .and_then(|state| state.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    item.get("prompt")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .or_else(|| Some(format!("Thread {receiver}")));
+            self.collaboration.borrow_mut().insert(
+                id.clone(),
+                CollaborationParticipant {
+                    id,
+                    label: item
+                        .get("tool")
+                        .and_then(Value::as_str)
+                        .map(title_case)
+                        .unwrap_or_else(|| "Subagent".to_owned()),
+                    detail,
+                    status,
+                },
+            );
+        }
         let mut participants = self
             .collaboration
             .borrow()
@@ -1449,339 +1919,33 @@ impl AppChatSessionInner {
             }));
     }
 
-    fn apply_model_catalog(&self, result: &Value) {
-        let Some(models) = result.get("data").and_then(Value::as_array) else {
-            return;
-        };
-        let mut options = Vec::new();
-        let mut reasoning_by_model = HashMap::new();
-        let mut catalog_default = None;
-        for model in models {
-            let Some(id) = model
-                .get("model")
-                .or_else(|| model.get("id"))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            let label = model
-                .get("displayName")
-                .and_then(Value::as_str)
-                .unwrap_or(id);
-            options.push(SelectorOption {
-                id: id.to_owned(),
-                label: label.to_owned(),
-            });
-            let reasoning = model
-                .get("supportedReasoningEfforts")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|effort| {
-                    let id = effort.get("reasoningEffort")?.as_str()?;
-                    Some(SelectorOption {
-                        id: id.to_owned(),
-                        label: title_case(id),
-                    })
-                })
-                .collect::<Vec<_>>();
-            reasoning_by_model.insert(id.to_owned(), reasoning);
-            if model.get("isDefault").and_then(Value::as_bool) == Some(true) {
-                catalog_default = Some(id.to_owned());
-            }
-        }
-        self.model_reasoning.replace(reasoning_by_model);
-        let selected = self
-            .selected_values
-            .borrow()
-            .get(&ChatSelector::Model)
-            .cloned()
-            .or(catalog_default);
-        if let Some(selected) = selected.as_ref() {
-            self.selected_values
-                .borrow_mut()
-                .insert(ChatSelector::Model, selected.clone());
-        }
-        self.view
-            .set_selector_options(ChatSelector::Model, &options, selected.as_deref());
-        self.update_reasoning_options();
-    }
-
-    fn apply_config_defaults(&self, result: &Value) {
-        let config = result.get("config").unwrap_or(result);
-        let defaults = [
-            (ChatSelector::Model, &["model"][..]),
-            (
-                ChatSelector::Reasoning,
-                &["model_reasoning_effort", "modelReasoningEffort"][..],
-            ),
-            (ChatSelector::Personality, &["personality"][..]),
-            (
-                ChatSelector::Permissions,
-                &["permissions", "default_permissions", "defaultPermissions"][..],
-            ),
-        ];
-        for (selector, keys) in defaults {
-            if let Some(value) = keys
-                .iter()
-                .find_map(|key| config.get(key).and_then(Value::as_str))
-            {
-                self.selected_values
-                    .borrow_mut()
-                    .insert(selector, value.to_owned());
-            }
-        }
-        self.update_reasoning_options();
-        for selector in [ChatSelector::Personality] {
-            if let Some(selected) = self.selected_values.borrow().get(&selector).cloned() {
-                let options = match selector {
-                    ChatSelector::Personality => ["friendly", "pragmatic", "none"],
-                    _ => unreachable!(),
-                }
-                .into_iter()
-                .map(|id| SelectorOption {
-                    id: id.to_owned(),
-                    label: title_case(id),
-                })
-                .collect::<Vec<_>>();
-                self.view
-                    .set_selector_options(selector, &options, Some(&selected));
-            }
-        }
-    }
-
-    fn apply_permission_profiles(&self, result: &Value) {
-        let options = result
-            .get("data")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|profile| profile.get("allowed").and_then(Value::as_bool) != Some(false))
-            .filter_map(|profile| {
-                let id = profile.get("id")?.as_str()?;
-                Some(SelectorOption {
-                    id: id.to_owned(),
-                    label: permission_label(id),
-                })
-            })
-            .collect::<Vec<_>>();
-        let selected = self
-            .selected_values
-            .borrow()
-            .get(&ChatSelector::Permissions)
-            .cloned()
-            .or_else(|| options.first().map(|option| option.id.clone()));
-        if let Some(selected) = selected.as_ref() {
-            self.selected_values
-                .borrow_mut()
-                .insert(ChatSelector::Permissions, selected.clone());
-        }
-        self.view
-            .set_selector_options(ChatSelector::Permissions, &options, selected.as_deref());
-    }
-
-    fn apply_collaboration_modes(&self, result: &Value) {
-        let mut modes = HashMap::new();
-        let options = result
-            .get("data")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|mode| {
-                let name = mode.get("name")?.as_str()?.to_owned();
-                modes.insert(name.clone(), mode.clone());
-                Some(SelectorOption {
-                    id: name.clone(),
-                    label: name,
-                })
-            })
-            .collect::<Vec<_>>();
-        self.collaboration_modes.replace(modes);
-        let selected = options
-            .iter()
-            .find(|option| option.id.eq_ignore_ascii_case("default"))
-            .or_else(|| options.first())
-            .map(|option| option.id.clone());
-        if let Some(selected) = selected.as_ref() {
-            self.selected_values
-                .borrow_mut()
-                .entry(ChatSelector::Collaboration)
-                .or_insert_with(|| selected.clone());
-        }
-        let selected = self
-            .selected_values
-            .borrow()
-            .get(&ChatSelector::Collaboration)
-            .cloned();
-        self.view
-            .set_selector_options(ChatSelector::Collaboration, &options, selected.as_deref());
-    }
-
-    fn apply_thread_settings(&self, params: &Value) {
-        let settings = params.get("threadSettings").unwrap_or(params);
-        for (selector, key) in [
-            (ChatSelector::Model, "model"),
-            (ChatSelector::Reasoning, "effort"),
-            (ChatSelector::Personality, "personality"),
-        ] {
-            if let Some(value) = settings.get(key).and_then(Value::as_str) {
-                self.selected_values
-                    .borrow_mut()
-                    .insert(selector, value.to_owned());
-            }
-        }
-        if let Some(value) = settings
-            .pointer("/activePermissionProfile/id")
-            .and_then(Value::as_str)
-        {
-            self.selected_values
-                .borrow_mut()
-                .insert(ChatSelector::Permissions, value.to_owned());
-        }
-    }
-
-    fn update_reasoning_options(&self) {
-        let selected_model = self
-            .selected_values
-            .borrow()
-            .get(&ChatSelector::Model)
-            .cloned();
-        let options = selected_model
-            .as_ref()
-            .and_then(|model| self.model_reasoning.borrow().get(model).cloned())
-            .unwrap_or_else(|| {
-                ["low", "medium", "high", "xhigh", "max", "ultra"]
-                    .into_iter()
-                    .map(|id| SelectorOption {
-                        id: id.to_owned(),
-                        label: title_case(id),
-                    })
-                    .collect()
-            });
-        let selected = self
-            .selected_values
-            .borrow()
-            .get(&ChatSelector::Reasoning)
-            .cloned()
-            .filter(|selected| options.iter().any(|option| option.id == *selected))
-            .or_else(|| options.first().map(|option| option.id.clone()));
-        if let Some(selected) = selected.as_ref() {
-            self.selected_values
-                .borrow_mut()
-                .insert(ChatSelector::Reasoning, selected.clone());
-        }
-        self.view
-            .set_selector_options(ChatSelector::Reasoning, &options, selected.as_deref());
-    }
-
-    fn update_selector(&self, selector: ChatSelector, value: Option<String>) {
-        self.dirty_selectors.borrow_mut().insert(selector);
-        let Some(value) = value else {
-            self.selected_values.borrow_mut().remove(&selector);
-            return;
-        };
-        self.selected_values
-            .borrow_mut()
-            .insert(selector, value.clone());
-        if selector == ChatSelector::Model {
-            self.update_reasoning_options();
-        }
-        let Some(thread_id) = self.thread_id.borrow().clone() else {
-            return;
-        };
-        let field = match selector {
-            ChatSelector::Model => json!({ "model": value }),
-            ChatSelector::Reasoning => json!({ "effort": value }),
-            ChatSelector::Personality => json!({ "personality": value }),
-            ChatSelector::Permissions => json!({ "permissions": value }),
-            ChatSelector::Collaboration => {
-                let Some(mode) = self.collaboration_mode(&value) else {
-                    return;
-                };
-                json!({ "collaborationMode": mode })
-            }
-        };
-        let mut params = field.as_object().cloned().unwrap_or_default();
-        params.insert("threadId".to_owned(), Value::String(thread_id));
-        if let Some(server) = self.server.borrow().as_ref()
-            && let Err(error) =
-                server.send_raw_request("thread/settings/update", Some(Value::Object(params)))
-        {
-            self.push_error(error.to_string());
-        }
-    }
-
-    fn collaboration_mode(&self, name: &str) -> Option<Value> {
-        let mask = self.collaboration_modes.borrow().get(name)?.clone();
-        let mode = mask.get("mode")?.as_str()?;
-        let model = mask
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                self.selected_values
-                    .borrow()
-                    .get(&ChatSelector::Model)
-                    .cloned()
-            })?;
-        let effort = match mask.get("reasoning_effort") {
-            Some(Value::String(value)) => Some(Value::String(value.clone())),
-            Some(Value::Null) => None,
-            _ => self
-                .selected_values
-                .borrow()
-                .get(&ChatSelector::Reasoning)
-                .cloned()
-                .map(Value::String),
-        };
-        Some(json!({
-            "mode": mode,
-            "settings": {
-                "model": model,
-                "reasoning_effort": effort,
-                "developer_instructions": null
-            }
-        }))
-    }
-
-    fn turn_settings(&self) -> Map<String, Value> {
-        let selected = self.selected_values.borrow().clone();
-        let dirty = self.dirty_selectors.borrow();
-        let mut settings = Map::new();
-        for (selector, field) in [
-            (ChatSelector::Model, "model"),
-            (ChatSelector::Reasoning, "effort"),
-            (ChatSelector::Personality, "personality"),
-            (ChatSelector::Permissions, "permissions"),
-        ] {
-            if dirty.contains(&selector)
-                && let Some(value) = selected.get(&selector)
-            {
-                settings.insert(field.to_owned(), Value::String(value.clone()));
-            }
-        }
-        if dirty.contains(&ChatSelector::Collaboration)
-            && let Some(name) = selected.get(&ChatSelector::Collaboration)
-            && let Some(mode) = self.collaboration_mode(name)
-        {
-            settings.insert("collaborationMode".to_owned(), mode);
-        }
-        settings
-    }
-
-    fn choose_file(self: &Rc<Self>, mention: bool) {
+    fn choose_context(self: &Rc<Self>, selection: ComposerContextSelection) {
         let dialog = gtk::FileDialog::builder()
-            .title(if mention {
-                "Mention File"
-            } else {
-                "Attach File"
+            .title(match selection {
+                ComposerContextSelection::Media => "Attach Image or Audio",
+                ComposerContextSelection::WorkspaceFile => "Reference Workspace File",
+                ComposerContextSelection::WorkspaceFolder => "Reference Workspace Folder",
             })
-            .accept_label(if mention { "Mention" } else { "Attach" })
+            .accept_label(match selection {
+                ComposerContextSelection::Media => "Attach",
+                ComposerContextSelection::WorkspaceFile
+                | ComposerContextSelection::WorkspaceFolder => "Reference",
+            })
             .modal(true)
             .build();
+        if matches!(selection, ComposerContextSelection::Media) {
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("Images and audio"));
+            filter.add_mime_type("image/*");
+            filter.add_mime_type("audio/*");
+            let filters = gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&filter);
+            dialog.set_filters(Some(&filters));
+            dialog.set_default_filter(Some(&filter));
+        }
         let parent = self.view.root.root().and_downcast::<gtk::Window>();
         let weak = Rc::downgrade(self);
-        dialog.open(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+        let selected = move |result: Result<gio::File, glib::Error>| {
             let (Some(session), Ok(file)) = (weak.upgrade(), result) else {
                 return;
             };
@@ -1789,8 +1953,16 @@ impl AppChatSessionInner {
                 .path()
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_else(|| file.uri().to_string());
-            session.add_attachment(reference, mention);
-        });
+            session.add_attachment(
+                reference,
+                !matches!(selection, ComposerContextSelection::Media),
+            );
+        };
+        if matches!(selection, ComposerContextSelection::WorkspaceFolder) {
+            dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, selected);
+        } else {
+            dialog.open(parent.as_ref(), None::<&gio::Cancellable>, selected);
+        }
     }
 
     fn add_attachment(&self, reference: String, mention: bool) {
@@ -1925,6 +2097,17 @@ impl AppChatSessionInner {
         });
     }
 
+    fn push_warning(&self, title: &str, message: String) {
+        self.upsert_timeline(TimelineItem {
+            id: self.next_id("warning"),
+            kind: TimelineItemKind::Warning,
+            title: Some(title.to_owned()),
+            body: message,
+            detail: None,
+            status: TimelineItemStatus::Completed,
+        });
+    }
+
     fn clear_pending_requests(&self) {
         for request_id in self
             .pending_requests
@@ -1991,35 +2174,8 @@ fn app_server_config(ctx: &PageContext) -> Result<AppServerConfig, String> {
         .then(|| PathBuf::from(app.working_dir.absolute));
     config.version_command = Some((version.program, version.args));
     config.capabilities.experimental_api = true;
+    config.capabilities.mcp_server_openai_form_elicitation = true;
     Ok(config)
-}
-
-fn set_initial_selector_options(view: &CodexChatView) {
-    view.set_selector_options(ChatSelector::Model, &[], None);
-    view.set_selector_options(
-        ChatSelector::Reasoning,
-        &["low", "medium", "high", "xhigh", "max", "ultra"]
-            .into_iter()
-            .map(|id| SelectorOption {
-                id: id.to_owned(),
-                label: title_case(id),
-            })
-            .collect::<Vec<_>>(),
-        None,
-    );
-    view.set_selector_options(
-        ChatSelector::Personality,
-        &["friendly", "pragmatic", "none"]
-            .into_iter()
-            .map(|id| SelectorOption {
-                id: id.to_owned(),
-                label: title_case(id),
-            })
-            .collect::<Vec<_>>(),
-        None,
-    );
-    view.set_selector_options(ChatSelector::Permissions, &[], None);
-    view.set_selector_options(ChatSelector::Collaboration, &[], None);
 }
 
 fn submission_inputs(submission: &ComposerSubmission) -> Vec<UserInput> {
@@ -2037,8 +2193,7 @@ fn submission_inputs(submission: &ComposerSubmission) -> Vec<UserInput> {
                 path: PathBuf::from(&attachment.reference),
             }),
             ComposerAttachmentKind::File
-            | ComposerAttachmentKind::Mention
-            | ComposerAttachmentKind::Other => input.push(UserInput::Mention {
+            | ComposerAttachmentKind::Mention => input.push(UserInput::Mention {
                 name: attachment.label.clone(),
                 path: attachment.reference.clone(),
             }),
@@ -2061,297 +2216,7 @@ fn submission_display_text(submission: &ComposerSubmission) -> String {
     lines.join("\n")
 }
 
-fn pending_request_from_server(request_id: &str, method: &str, params: &Value) -> PendingRequest {
-    match method {
-        "item/commandExecution/requestApproval" => PendingRequest {
-            request_id: request_id.to_owned(),
-            kind: PendingRequestKind::Approval,
-            title: "Run command?".to_owned(),
-            description: approval_description(params, "Codex wants to run a command."),
-            options: approval_options(params, true),
-            allows_text: false,
-            text_placeholder: None,
-        },
-        "item/fileChange/requestApproval" => PendingRequest {
-            request_id: request_id.to_owned(),
-            kind: PendingRequestKind::Approval,
-            title: "Apply file changes?".to_owned(),
-            description: approval_description(params, "Codex wants to modify files."),
-            options: approval_options(params, false),
-            allows_text: false,
-            text_placeholder: None,
-        },
-        "item/permissions/requestApproval" => PendingRequest {
-            request_id: request_id.to_owned(),
-            kind: PendingRequestKind::Approval,
-            title: "Grant additional permissions?".to_owned(),
-            description: approval_description(params, "Codex requested additional access."),
-            options: vec![
-                request_option(
-                    "grant",
-                    "Grant for this turn",
-                    RequestOptionStyle::Suggested,
-                ),
-                request_option(
-                    "grant-session",
-                    "Grant for session",
-                    RequestOptionStyle::Default,
-                ),
-                request_option("decline", "Decline", RequestOptionStyle::Destructive),
-            ],
-            allows_text: false,
-            text_placeholder: None,
-        },
-        "item/tool/requestUserInput" => {
-            let questions = params
-                .get("questions")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let first = questions.first().cloned().unwrap_or(Value::Null);
-            let multiple = questions.len() > 1;
-            let options = if multiple {
-                Vec::new()
-            } else {
-                first
-                    .get("options")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|option| option.get("label").and_then(Value::as_str))
-                    .map(|label| request_option(label, label, RequestOptionStyle::Default))
-                    .collect::<Vec<_>>()
-            };
-            let mut description = questions
-                .iter()
-                .map(|question| {
-                    let id = question
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("answer");
-                    let prompt = question
-                        .get("question")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Codex needs input");
-                    format!("{id}: {prompt}")
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            if multiple {
-                description.push_str(
-                    "\n\nEnter a JSON object mapping each question id to a string or string array.",
-                );
-            }
-            if questions
-                .iter()
-                .any(|question| question.get("isSecret").and_then(Value::as_bool) == Some(true))
-            {
-                description.push_str("\n\nSecret input is not masked in this interface.");
-            }
-            PendingRequest {
-                request_id: request_id.to_owned(),
-                kind: PendingRequestKind::UserInput,
-                title: first
-                    .get("header")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Codex needs input")
-                    .to_owned(),
-                description,
-                allows_text: multiple
-                    || options.is_empty()
-                    || first.get("isOther").and_then(Value::as_bool) == Some(true),
-                options,
-                text_placeholder: Some(if multiple {
-                    r#"{"question_id":"answer"}"#.to_owned()
-                } else {
-                    "Enter your response".to_owned()
-                }),
-            }
-        }
-        "mcpServer/elicitation/request" => PendingRequest {
-            request_id: request_id.to_owned(),
-            kind: PendingRequestKind::McpElicitation,
-            title: format!(
-                "{} needs input",
-                params
-                    .get("serverName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("An MCP server")
-            ),
-            description: {
-                let message = params
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("The MCP server requested structured input.");
-                params
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .map(|url| format!("{message}\n\nURL: {url}"))
-                    .unwrap_or_else(|| message.to_owned())
-            },
-            options: if params.get("mode").and_then(Value::as_str) == Some("url") {
-                vec![
-                    request_option("accept", "Acknowledge URL", RequestOptionStyle::Suggested),
-                    request_option("decline", "Decline", RequestOptionStyle::Default),
-                    request_option("cancel", "Cancel", RequestOptionStyle::Destructive),
-                ]
-            } else {
-                vec![
-                    request_option("decline", "Decline", RequestOptionStyle::Default),
-                    request_option("cancel", "Cancel", RequestOptionStyle::Destructive),
-                ]
-            },
-            allows_text: params.get("mode").and_then(Value::as_str) != Some("url"),
-            text_placeholder: Some("Enter a value or JSON object".to_owned()),
-        },
-        "item/tool/call" => PendingRequest {
-            request_id: request_id.to_owned(),
-            kind: PendingRequestKind::DynamicTool,
-            title: format!(
-                "Dynamic tool: {}",
-                params
-                    .get("tool")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-            ),
-            description: params
-                .get("arguments")
-                .map(compact_json)
-                .unwrap_or_default(),
-            options: vec![request_option(
-                "fail",
-                "Report unavailable",
-                RequestOptionStyle::Destructive,
-            )],
-            allows_text: true,
-            text_placeholder: Some("Return tool output as text".to_owned()),
-        },
-        "account/chatgptAuthTokens/refresh" => PendingRequest {
-            request_id: request_id.to_owned(),
-            kind: PendingRequestKind::TokenRefresh,
-            title: "Authentication refresh requested".to_owned(),
-            description: "The configured App Server requested new authentication tokens."
-                .to_owned(),
-            options: vec![request_option(
-                "unavailable",
-                "Cannot refresh",
-                RequestOptionStyle::Destructive,
-            )],
-            allows_text: false,
-            text_placeholder: None,
-        },
-        _ => PendingRequest {
-            request_id: request_id.to_owned(),
-            kind: PendingRequestKind::Unknown(method.to_owned()),
-            title: "Codex request".to_owned(),
-            description: format!("{method}\n{}", compact_json(params)),
-            options: vec![request_option(
-                "unsupported",
-                "Report unsupported",
-                RequestOptionStyle::Destructive,
-            )],
-            allows_text: false,
-            text_placeholder: None,
-        },
-    }
-}
-
-fn response_for_server_request(
-    method: &str,
-    params: &Value,
-    response: PendingRequestResponse,
-) -> Result<Value, String> {
-    let value = match response {
-        PendingRequestResponse::Option(value) | PendingRequestResponse::Text(value) => value,
-    };
-    let result = match method {
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            let decision =
-                serde_json::from_str::<Value>(&value).unwrap_or_else(|_| Value::String(value));
-            json!({ "decision": decision })
-        }
-        "item/permissions/requestApproval" => match value.as_str() {
-            "grant" => {
-                json!({ "permissions": params.get("permissions").cloned().unwrap_or_else(|| json!({})), "scope": "turn" })
-            }
-            "grant-session" => {
-                json!({ "permissions": params.get("permissions").cloned().unwrap_or_else(|| json!({})), "scope": "session" })
-            }
-            _ => json!({ "permissions": {}, "scope": "turn" }),
-        },
-        "item/tool/requestUserInput" => {
-            let questions = params
-                .get("questions")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|question| question.get("id").and_then(Value::as_str))
-                .collect::<Vec<_>>();
-            let answers = if questions.len() > 1 {
-                let parsed = serde_json::from_str::<Value>(&value).map_err(|error| {
-                    format!("Enter answers as a JSON object keyed by question id: {error}")
-                })?;
-                let object = parsed.as_object().ok_or_else(|| {
-                    "Enter answers as a JSON object keyed by question id".to_owned()
-                })?;
-                let mut answers = Map::new();
-                for question_id in questions {
-                    let answer = object.get(question_id).ok_or_else(|| {
-                        format!("The JSON response is missing question id {question_id}")
-                    })?;
-                    let values = match answer {
-                        Value::String(answer) => vec![answer.clone()],
-                        Value::Array(answers)
-                            if answers.iter().all(|answer| answer.is_string()) =>
-                        {
-                            answers
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_owned)
-                                .collect()
-                        }
-                        _ => {
-                            return Err(format!(
-                                "Answer {question_id} must be a string or string array"
-                            ));
-                        }
-                    };
-                    answers.insert(question_id.to_owned(), json!({ "answers": values }));
-                }
-                answers
-            } else {
-                questions
-                    .into_iter()
-                    .map(|question_id| {
-                        (
-                            question_id.to_owned(),
-                            json!({ "answers": [value.clone()] }),
-                        )
-                    })
-                    .collect::<Map<String, Value>>()
-            };
-            json!({ "answers": answers })
-        }
-        "mcpServer/elicitation/request" => match value.as_str() {
-            "decline" | "cancel" => json!({ "action": value, "content": null, "_meta": null }),
-            "accept" => json!({ "action": "accept", "content": null, "_meta": null }),
-            _ => json!({
-                "action": "accept",
-                "content": serde_json::from_str::<Value>(&value).unwrap_or(Value::String(value)),
-                "_meta": null
-            }),
-        },
-        "item/tool/call" => {
-            let success = value != "fail";
-            json!({
-                "contentItems": if success { vec![json!({ "type": "inputText", "text": value })] } else { Vec::<Value>::new() },
-                "success": success
-            })
-        }
-        _ => return Err(format!("Unsupported Codex server request: {method}")),
-    };
-    Ok(result)
-}
+use super::codex_requests::{pending_request_from_server, response_for_server_request};
 
 fn timeline_from_item(item: &Value, completed: bool) -> TimelineItem {
     let item_type = item
@@ -2395,6 +2260,18 @@ fn timeline_from_item(item: &Value, completed: bool) -> TimelineItem {
             flattened_text(item.get("summary")),
             nonempty(flattened_text(item.get("content"))),
         ),
+        "hookPrompt" => (
+            TimelineItemKind::DeveloperMessage,
+            Some("Hook prompt".to_owned()),
+            item.get("fragments")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|fragment| fragment.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None,
+        ),
         "commandExecution" => (
             TimelineItemKind::Command,
             Some("Command".to_owned()),
@@ -2424,14 +2301,58 @@ fn timeline_from_item(item: &Value, completed: bool) -> TimelineItem {
                 .or_else(|| item.get("error"))
                 .map(compact_json),
         ),
-        "collabToolCall" => (
+        "dynamicToolCall" => (
+            TimelineItemKind::Tool,
+            Some(
+                item.get("namespace")
+                    .and_then(Value::as_str)
+                    .filter(|namespace| !namespace.is_empty())
+                    .map(|namespace| {
+                        format!(
+                            "{namespace} / {}",
+                            item.get("tool").and_then(Value::as_str).unwrap_or("tool")
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        item.get("tool")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Dynamic tool")
+                            .to_owned()
+                    }),
+            ),
+            item.get("arguments").map(compact_json).unwrap_or_default(),
+            item.get("contentItems").map(compact_json),
+        ),
+        "collabAgentToolCall" => (
             TimelineItemKind::Collaboration,
             Some("Collaboration".to_owned()),
-            item.get("tool")
+            item.get("prompt")
                 .and_then(Value::as_str)
-                .unwrap_or("Agent activity")
-                .to_owned(),
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    item.get("tool")
+                        .and_then(Value::as_str)
+                        .map(title_case)
+                        .unwrap_or_else(|| "Agent activity".to_owned())
+                }),
             Some(compact_json(item)),
+        ),
+        "subAgentActivity" => (
+            TimelineItemKind::Collaboration,
+            Some(format!(
+                "Subagent {}",
+                item.get("kind")
+                    .and_then(Value::as_str)
+                    .map(title_case)
+                    .unwrap_or_else(|| "activity".to_owned())
+            )),
+            item.get("agentPath")
+                .and_then(Value::as_str)
+                .unwrap_or("Subagent")
+                .to_owned(),
+            item.get("agentThreadId")
+                .and_then(Value::as_str)
+                .map(|thread_id| format!("Thread {thread_id}")),
         ),
         "webSearch" => (
             TimelineItemKind::Web,
@@ -2450,6 +2371,22 @@ fn timeline_from_item(item: &Value, completed: bool) -> TimelineItem {
                 .unwrap_or_default()
                 .to_owned(),
             None,
+        ),
+        "imageGeneration" => (
+            TimelineItemKind::Image,
+            Some("Generated image".to_owned()),
+            item.get("savedPath")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    item.get("result")
+                        .and_then(Value::as_str)
+                        .filter(|result| !result.starts_with("data:"))
+                })
+                .unwrap_or("Image generated")
+                .to_owned(),
+            item.get("revisedPrompt")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         ),
         "enteredReviewMode" | "exitedReviewMode" => (
             TimelineItemKind::Review,
@@ -2521,105 +2458,6 @@ fn delta_title(method: &str) -> Option<String> {
         "item/commandExecution/outputDelta" => Some("Command".to_owned()),
         "item/fileChange/outputDelta" => Some("File changes".to_owned()),
         _ => None,
-    }
-}
-
-fn approval_description(params: &Value, fallback: &str) -> String {
-    let mut parts = Vec::new();
-    if let Some(reason) = params.get("reason").and_then(Value::as_str) {
-        parts.push(reason.to_owned());
-    }
-    if let Some(command) = params.get("command").and_then(Value::as_str) {
-        parts.push(command.to_owned());
-    }
-    if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
-        parts.push(format!("Working directory: {cwd}"));
-    }
-    if parts.is_empty() {
-        fallback.to_owned()
-    } else {
-        parts.join("\n\n")
-    }
-}
-
-fn approval_options(params: &Value, command: bool) -> Vec<RequestOption> {
-    let decisions = params
-        .get("availableDecisions")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|decision| {
-                    if let Some(decision) = decision.as_str() {
-                        return Some(request_option(
-                            decision,
-                            decision_label(decision),
-                            decision_style(decision),
-                        ));
-                    }
-                    let id = serde_json::to_string(decision).ok()?;
-                    let label = if decision.get("acceptWithExecpolicyAmendment").is_some() {
-                        "Allow and remember command"
-                    } else if decision.get("applyNetworkPolicyAmendment").is_some() {
-                        "Apply network policy"
-                    } else {
-                        "Apply proposed policy"
-                    };
-                    Some(request_option(&id, label, RequestOptionStyle::Suggested))
-                })
-                .collect::<Vec<_>>()
-        })
-        .filter(|decisions| !decisions.is_empty());
-    decisions.unwrap_or_else(|| {
-        let mut options = vec![
-            request_option("accept", "Allow once", RequestOptionStyle::Suggested),
-            request_option(
-                "acceptForSession",
-                "Allow for session",
-                RequestOptionStyle::Default,
-            ),
-        ];
-        if !command {
-            options[0].label = "Apply once".to_owned();
-            options[1].label = "Apply for session".to_owned();
-        }
-        options.push(request_option(
-            "decline",
-            "Decline",
-            RequestOptionStyle::Destructive,
-        ));
-        options.push(request_option(
-            "cancel",
-            "Cancel turn",
-            RequestOptionStyle::Destructive,
-        ));
-        options
-    })
-}
-
-fn request_option(id: &str, label: &str, style: RequestOptionStyle) -> RequestOption {
-    RequestOption {
-        id: id.to_owned(),
-        label: label.to_owned(),
-        style,
-    }
-}
-
-fn decision_label(decision: &str) -> &str {
-    match decision {
-        "accept" => "Allow once",
-        "acceptForSession" => "Allow for session",
-        "decline" => "Decline",
-        "cancel" => "Cancel turn",
-        _ => decision,
-    }
-}
-
-fn decision_style(decision: &str) -> RequestOptionStyle {
-    match decision {
-        "accept" => RequestOptionStyle::Suggested,
-        "decline" | "cancel" => RequestOptionStyle::Destructive,
-        _ => RequestOptionStyle::Default,
     }
 }
 
@@ -2745,15 +2583,6 @@ fn attachment_kind(reference: &str) -> ComposerAttachmentKind {
         ComposerAttachmentKind::Audio
     } else {
         ComposerAttachmentKind::File
-    }
-}
-
-fn permission_label(id: &str) -> String {
-    match id {
-        ":read-only" => "Read only".to_owned(),
-        ":workspace" => "Workspace".to_owned(),
-        ":full-access" => "Full access".to_owned(),
-        _ => title_case(id.trim_start_matches(':')),
     }
 }
 

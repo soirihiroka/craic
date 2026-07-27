@@ -1,6 +1,7 @@
 mod agent_shell_integration;
 mod app_session;
 mod codex_chat;
+mod codex_requests;
 mod left;
 mod prompts;
 mod provider;
