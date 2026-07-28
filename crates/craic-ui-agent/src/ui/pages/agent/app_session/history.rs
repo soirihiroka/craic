@@ -389,6 +389,12 @@ impl AppChatSessionInner {
             }
             Err(error) => {
                 self.push_error(error.to_string());
+                if matches!(method, "thread/resume" | "thread/fork") {
+                    self.clear_local_history_identity();
+                    self.set_state(AppChatState::Ready);
+                    self.content.set_visible_child_name("threads");
+                    self.picker.set_loading(false);
+                }
                 self.picker.set_error(Some(&error.to_string()));
             }
         }
@@ -424,6 +430,7 @@ impl AppChatSessionInner {
         self.view.set_turn_active(false);
         self.view.set_composer_enabled(false);
         self.set_title("New Codex chat");
+        self.clear_local_history_identity();
         self.picker.set_loading(true);
     }
 
@@ -577,6 +584,8 @@ impl AppChatSessionInner {
             }
         }
         if matches!(method, Some("thread/resume" | "thread/fork")) {
+            self.clear_local_history_identity();
+            self.set_state(AppChatState::Ready);
             self.content.set_visible_child_name("threads");
             self.picker.set_loading(false);
             self.picker.set_error(Some(message));
@@ -616,6 +625,9 @@ impl AppChatSessionInner {
         let Some(thread_id) = self.thread_id.borrow().clone() else {
             return;
         };
+        if let Some(callback) = self.thread_callback.borrow().clone() {
+            callback(self.id, thread_id.clone(), self.title.borrow().clone());
+        }
         let existing = match agent_history::lookup_codex_thread_overlay(
             &self.workspace_key,
             &thread_id,
@@ -656,6 +668,24 @@ impl AppChatSessionInner {
                 "failed to persist Codex thread overlay session_id={}: {error}",
                 self.id
             ),
+        }
+    }
+
+    fn clear_local_history_identity(&self) {
+        let Some(local_id) = self.local_history_id.take() else {
+            return;
+        };
+        if let Err(error) = agent_history::mark_ended(local_id) {
+            log::warn!(
+                "failed marking switched Codex App session ended session_id={} local_id={local_id}: {error}",
+                self.id
+            );
+        }
+        if let Some(callback) = self.thread_callback.borrow().clone() {
+            callback(self.id, String::new(), self.title.borrow().clone());
+        }
+        if let Some(callback) = self.history_callback.borrow().clone() {
+            callback(self.id);
         }
     }
 }

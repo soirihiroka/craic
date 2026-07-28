@@ -44,6 +44,7 @@ const MAX_RENDERED_JSON_BYTES: usize = 24 * 1024;
 type TitleCallback = Rc<dyn Fn(u64, String)>;
 type StateCallback = Rc<dyn Fn(u64, AppChatState)>;
 type SessionCallback = Rc<dyn Fn(u64)>;
+type ThreadCallback = Rc<dyn Fn(u64, String, String)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AppChatState {
@@ -95,6 +96,8 @@ struct AppChatSessionInner {
     poll_source: RefCell<Option<glib::SourceId>>,
     lifecycle: RefCell<AppChatState>,
     thread_id: RefCell<Option<String>>,
+    resume_thread_id: RefCell<Option<String>>,
+    local_history_id: Cell<Option<i64>>,
     active_turn_id: RefCell<Option<String>>,
     title: RefCell<String>,
     timeline: RefCell<HashMap<String, TimelineItem>>,
@@ -121,10 +124,31 @@ struct AppChatSessionInner {
     state_callback: RefCell<Option<StateCallback>>,
     close_callback: RefCell<Option<SessionCallback>>,
     history_callback: RefCell<Option<SessionCallback>>,
+    thread_callback: RefCell<Option<ThreadCallback>>,
 }
 
 impl AppChatSession {
     pub(crate) fn new(id: u64, ctx: PageContext) -> Result<Self, String> {
+        Self::new_with_thread(id, ctx, None, None, "New Codex chat")
+    }
+
+    pub(crate) fn resume(
+        id: u64,
+        ctx: PageContext,
+        thread_id: String,
+        local_history_id: i64,
+        title: &str,
+    ) -> Result<Self, String> {
+        Self::new_with_thread(id, ctx, Some(thread_id), Some(local_history_id), title)
+    }
+
+    fn new_with_thread(
+        id: u64,
+        ctx: PageContext,
+        resume_thread_id: Option<String>,
+        local_history_id: Option<i64>,
+        title: &str,
+    ) -> Result<Self, String> {
         let shell = ctx
             .shell()
             .ok_or_else(|| "Shell access is unavailable for this workspace".to_owned())?;
@@ -183,8 +207,10 @@ impl AppChatSession {
             poll_source: RefCell::new(None),
             lifecycle: RefCell::new(AppChatState::Connecting),
             thread_id: RefCell::new(None),
+            resume_thread_id: RefCell::new(resume_thread_id),
+            local_history_id: Cell::new(local_history_id),
             active_turn_id: RefCell::new(None),
-            title: RefCell::new("New Codex chat".to_owned()),
+            title: RefCell::new(title.to_owned()),
             timeline: RefCell::new(HashMap::new()),
             pending_requests: RefCell::new(HashMap::new()),
             selected_values: RefCell::new(HashMap::new()),
@@ -209,6 +235,7 @@ impl AppChatSession {
             state_callback: RefCell::new(None),
             close_callback: RefCell::new(None),
             history_callback: RefCell::new(None),
+            thread_callback: RefCell::new(None),
         });
         inner.connect_view_actions();
         inner.connect_picker_actions();
@@ -269,6 +296,14 @@ impl AppChatSession {
         self.inner.thread_id.borrow().clone()
     }
 
+    pub(crate) fn local_history_id(&self) -> Option<i64> {
+        self.inner.local_history_id.get()
+    }
+
+    pub(crate) fn set_local_history_id(&self, local_history_id: i64) {
+        self.inner.local_history_id.set(Some(local_history_id));
+    }
+
     pub(crate) fn connect_title_changed<F>(&self, callback: F)
     where
         F: Fn(u64, String) + 'static,
@@ -295,6 +330,13 @@ impl AppChatSession {
         F: Fn(u64) + 'static,
     {
         self.inner.history_callback.replace(Some(Rc::new(callback)));
+    }
+
+    pub(crate) fn connect_thread_changed<F>(&self, callback: F)
+    where
+        F: Fn(u64, String, String) + 'static,
+    {
+        self.inner.thread_callback.replace(Some(Rc::new(callback)));
     }
 
     pub(crate) fn shutdown(&self) {
@@ -461,6 +503,21 @@ impl AppChatSessionInner {
         let picker_visible = self.content.visible_child_name().as_deref() == Some("threads");
         if picker_visible {
             self.load_thread_page(false);
+        }
+        if let Some(thread_id) = self.resume_thread_id.borrow_mut().take() {
+            self.send_thread_operation(
+                "thread/resume",
+                &thread_id,
+                json!({
+                    "excludeTurns": true,
+                    "initialTurnsPage": {
+                        "limit": 100,
+                        "sortDirection": "desc",
+                        "itemsView": "full"
+                    }
+                }),
+            );
+            return;
         }
         let server = self.server.borrow();
         let Some(server) = server.as_ref() else {
@@ -948,6 +1005,7 @@ impl AppChatSessionInner {
             detail: None,
             status: TimelineItemStatus::Completed,
         });
+        self.view.scroll_transcript_to_end();
         if !steer
             && self.title.borrow().as_str() == "New Codex chat"
             && let Some(title) = concise_title(&submission.text)

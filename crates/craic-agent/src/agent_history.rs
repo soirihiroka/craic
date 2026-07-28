@@ -222,6 +222,120 @@ pub fn upsert_session(input: AgentSessionUpsert) -> Result<AgentSessionRow, Stri
     .ok_or_else(|| "agent session row was not readable after upsert".to_string())
 }
 
+pub fn upsert_restorable_session(
+    input: AgentSessionUpsert,
+    external_session_id: &str,
+) -> Result<AgentSessionRow, String> {
+    let title = normalize_title(&input.title);
+    let external_session_id = external_session_id.trim();
+    if title.is_empty() || external_session_id.is_empty() {
+        return Err("restorable agent session title or external id is empty".to_string());
+    }
+
+    let normalized_title = format!(
+        "{} [{}]",
+        normalize_title_for_match(&title),
+        external_session_id.to_ascii_lowercase()
+    );
+    let now = unix_now_ms();
+    let conn = history_connection().map_err(db_error)?;
+    let existing_id = conn
+        .query_row(
+            "SELECT id
+             FROM agent_sessions
+             WHERE provider = ?1
+               AND workspace_key = ?2
+               AND cli_session_id = ?3
+             ORDER BY id DESC
+             LIMIT 1",
+            params![
+                input.provider_id,
+                input.workspace.key(),
+                external_session_id
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if let Some(existing_id) = existing_id {
+        conn.execute(
+            "UPDATE agent_sessions
+             SET session_uuid = ?2,
+                 git_remote_url = ?3,
+                 repo_path = ?4,
+                 title = ?5,
+                 normalized_title = ?6,
+                 cli_session_id = ?2,
+                 restore_state = ?7,
+                 metadata_json = ?8,
+                 updated_at_ms = ?9,
+                 last_seen_at_ms = ?9,
+                 ended_at_ms = NULL
+             WHERE id = ?1",
+            params![
+                existing_id,
+                external_session_id,
+                input.workspace.git_remote_url(),
+                input.workspace.repo_path().to_string_lossy(),
+                title,
+                normalized_title,
+                RestoreState::Restorable.as_str(),
+                json!({ "native_app_session": true }).to_string(),
+                now,
+            ],
+        )
+        .map_err(db_error)?;
+        return lookup_by_title(
+            &conn,
+            input.workspace.key(),
+            &input.provider_id,
+            &normalized_title,
+        )?
+        .ok_or_else(|| "restorable agent session row was not readable after update".to_string());
+    }
+    conn.execute(
+        "INSERT INTO agent_sessions (
+            session_uuid, provider, workspace_key, git_remote_url, repo_path, title,
+            normalized_title, cli_session_id, restore_state, metadata_json,
+            created_at_ms, updated_at_ms, last_seen_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11)
+        ON CONFLICT(provider, workspace_key, normalized_title) DO UPDATE SET
+            session_uuid = excluded.session_uuid,
+            git_remote_url = excluded.git_remote_url,
+            repo_path = excluded.repo_path,
+            title = excluded.title,
+            cli_session_id = excluded.cli_session_id,
+            restore_state = excluded.restore_state,
+            metadata_json = excluded.metadata_json,
+            updated_at_ms = excluded.updated_at_ms,
+            last_seen_at_ms = excluded.last_seen_at_ms,
+            ended_at_ms = NULL",
+        params![
+            input.session_uuid.unwrap_or_else(new_session_uuid),
+            input.provider_id,
+            input.workspace.key(),
+            input.workspace.git_remote_url(),
+            input.workspace.repo_path().to_string_lossy(),
+            title,
+            normalized_title,
+            external_session_id,
+            RestoreState::Restorable.as_str(),
+            json!({ "native_app_session": true }).to_string(),
+            now,
+        ],
+    )
+    .map_err(db_error)?;
+
+    lookup_by_title(
+        &conn,
+        input.workspace.key(),
+        &input.provider_id,
+        &normalized_title,
+    )?
+    .ok_or_else(|| "restorable agent session was not readable after upsert".to_string())
+}
+
 pub fn upsert_session_for_manual_id(
     input: AgentSessionUpsert,
     session_id: u64,
@@ -759,7 +873,8 @@ pub fn mark_ended(local_id: i64) -> Result<(), String> {
     conn.execute(
         "UPDATE agent_sessions
          SET ended_at_ms = COALESCE(ended_at_ms, ?2),
-             updated_at_ms = ?2
+             updated_at_ms = ?2,
+             last_seen_at_ms = ?2
          WHERE id = ?1",
         params![local_id, now],
     )

@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::ui::canvas_scroll;
+
 type ActionCallback = Rc<dyn Fn(ThreadPickerAction)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,16 +88,22 @@ pub(crate) enum ThreadPickerAction {
     Cancel,
 }
 
+#[derive(Clone, Debug)]
+enum ThreadPickerEntry {
+    Thread(ThreadPickerRow),
+    Footer {
+        loading: bool,
+        has_more: bool,
+        error: Option<String>,
+    },
+}
+
 struct PickerState {
     model: gio::ListStore,
     stack: gtk::Stack,
     empty_spinner: adw::Spinner,
     empty_title: gtk::Label,
     empty_description: gtk::Label,
-    footer: gtk::Box,
-    footer_spinner: adw::Spinner,
-    count_label: gtk::Label,
-    load_more_button: gtk::Button,
     callbacks: Rc<RefCell<Vec<ActionCallback>>>,
     thread_ids: RefCell<HashSet<String>>,
     loading: Cell<bool>,
@@ -119,7 +127,7 @@ impl CodexThreadPicker {
         let callbacks = Rc::new(RefCell::new(Vec::<ActionCallback>::new()));
         let model = gio::ListStore::new::<glib::BoxedAnyObject>();
         let selection = gtk::NoSelection::new(Some(model.clone()));
-        let list = gtk::ListView::new(Some(selection), Some(thread_factory(callbacks.clone())));
+        let list = gtk::ListView::new(Some(selection), None::<gtk::ListItemFactory>);
         list.set_hexpand(true);
         list.set_vexpand(true);
         list.set_single_click_activate(true);
@@ -132,6 +140,22 @@ impl CodexThreadPicker {
             .vexpand(true)
             .child(&list)
             .build();
+        let autoscroll_marker = gtk::DrawingArea::builder()
+            .halign(gtk::Align::Fill)
+            .valign(gtk::Align::Fill)
+            .hexpand(true)
+            .vexpand(true)
+            .can_target(false)
+            .build();
+        let scroller_overlay = gtk::Overlay::builder().hexpand(true).vexpand(true).build();
+        scroller_overlay.set_child(Some(&scroller));
+        scroller_overlay.add_overlay(&autoscroll_marker);
+        canvas_scroll::install_scrolled_window_middle_autoscroll(
+            &scroller,
+            &autoscroll_marker,
+            canvas_scroll::AutoscrollAxes::Vertical,
+            "codex_thread_picker",
+        );
 
         let empty_spinner = adw::Spinner::new();
         empty_spinner.set_size_request(40, 40);
@@ -163,7 +187,7 @@ impl CodexThreadPicker {
         empty_content.append(&empty_description);
 
         let stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
-        stack.add_named(&scroller, Some("threads"));
+        stack.add_named(&scroller_overlay, Some("threads"));
         stack.add_named(&empty_content, Some("empty"));
         stack.set_visible_child_name("empty");
 
@@ -207,31 +231,6 @@ impl CodexThreadPicker {
         );
         filters.append(&sort);
 
-        let footer_spinner = adw::Spinner::new();
-        footer_spinner.set_size_request(16, 16);
-        footer_spinner.set_visible(false);
-        let count_label = gtk::Label::builder()
-            .css_classes(["dim-label"])
-            .xalign(0.0)
-            .hexpand(true)
-            .build();
-        let load_more_button = gtk::Button::builder()
-            .label("Load More")
-            .visible(false)
-            .build();
-        let footer = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
-            .margin_top(8)
-            .margin_bottom(8)
-            .margin_start(12)
-            .margin_end(12)
-            .visible(false)
-            .build();
-        footer.append(&footer_spinner);
-        footer.append(&count_label);
-        footer.append(&load_more_button);
-
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .hexpand(true)
@@ -240,7 +239,6 @@ impl CodexThreadPicker {
         root.append(&header);
         root.append(&filters);
         root.append(&stack);
-        root.append(&footer);
 
         let state = Rc::new(PickerState {
             model,
@@ -248,10 +246,6 @@ impl CodexThreadPicker {
             empty_spinner,
             empty_title,
             empty_description,
-            footer,
-            footer_spinner,
-            count_label,
-            load_more_button,
             callbacks,
             thread_ids: RefCell::new(HashSet::new()),
             loading: Cell::new(false),
@@ -259,6 +253,7 @@ impl CodexThreadPicker {
             load_request_pending: Cell::new(false),
             error: RefCell::new(None),
         });
+        list.set_factory(Some(&thread_factory(Rc::downgrade(&state))));
         let picker = Self {
             root,
             search_entry,
@@ -267,7 +262,7 @@ impl CodexThreadPicker {
             suppress_search: Rc::new(Cell::new(false)),
             state,
         };
-        picker.connect_controls(&list, &scroller, &cancel_button);
+        picker.connect_controls(&list, &cancel_button);
         picker.update_view();
         picker
     }
@@ -340,6 +335,7 @@ impl CodexThreadPicker {
     }
 
     fn append_normalized_rows(&self, rows: Vec<ThreadPickerRow>) {
+        remove_footer(&self.state);
         let mut thread_ids = self.state.thread_ids.borrow_mut();
         let mut invalid_count = 0usize;
         for row in rows {
@@ -350,7 +346,9 @@ impl CodexThreadPicker {
             if !thread_ids.insert(row.thread_id.clone()) {
                 continue;
             }
-            self.state.model.append(&glib::BoxedAnyObject::new(row));
+            self.state
+                .model
+                .append(&glib::BoxedAnyObject::new(ThreadPickerEntry::Thread(row)));
         }
         if invalid_count > 0 {
             log::warn!("Codex thread picker ignored {invalid_count} rows without thread IDs");
@@ -365,173 +363,153 @@ impl CodexThreadPicker {
         self.update_view();
     }
 
-    fn connect_controls(
-        &self,
-        list: &gtk::ListView,
-        scroller: &gtk::ScrolledWindow,
-        cancel_button: &gtk::Button,
-    ) {
+    fn connect_controls(&self, list: &gtk::ListView, cancel_button: &gtk::Button) {
         self.search_entry.connect_search_changed({
-            let picker = self.clone();
+            let suppress_search = self.suppress_search.clone();
+            let state = Rc::downgrade(&self.state);
 
             move |entry| {
-                if picker.suppress_search.get() {
+                if suppress_search.get() {
                     return;
                 }
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
                 let query = entry.text().trim().to_string();
-                picker.state.model.remove_all();
-                picker.state.thread_ids.borrow_mut().clear();
-                picker.state.error.borrow_mut().take();
-                picker.state.has_more.set(false);
-                picker.state.load_request_pending.set(false);
-                picker.update_view();
-                picker.emit(ThreadPickerAction::SearchChanged(query));
+                reset_for_filter_change(&state);
+                update_picker_view(&state, &query);
+                emit_to(&state.callbacks, ThreadPickerAction::SearchChanged(query));
             }
         });
         self.archived_toggle.connect_toggled({
-            let picker = self.clone();
+            let state = Rc::downgrade(&self.state);
+            let search_entry = self.search_entry.downgrade();
 
             move |toggle| {
-                picker.state.model.remove_all();
-                picker.state.thread_ids.borrow_mut().clear();
-                picker.state.error.borrow_mut().take();
-                picker.state.has_more.set(false);
-                picker.state.load_request_pending.set(false);
-                picker.update_view();
-                picker.emit(ThreadPickerAction::ArchivedChanged(toggle.is_active()));
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                reset_for_filter_change(&state);
+                let query = search_entry
+                    .upgrade()
+                    .map(|entry| entry.text().trim().to_string())
+                    .unwrap_or_default();
+                update_picker_view(&state, &query);
+                emit_to(
+                    &state.callbacks,
+                    ThreadPickerAction::ArchivedChanged(toggle.is_active()),
+                );
             }
         });
         self.sort.connect_selected_notify({
-            let picker = self.clone();
+            let state = Rc::downgrade(&self.state);
+            let search_entry = self.search_entry.downgrade();
 
-            move |_| {
-                picker.reset_for_filter_change();
-                picker.emit(ThreadPickerAction::SortChanged(picker.sort()));
+            move |sort| {
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                reset_for_filter_change(&state);
+                let query = search_entry
+                    .upgrade()
+                    .map(|entry| entry.text().trim().to_string())
+                    .unwrap_or_default();
+                update_picker_view(&state, &query);
+                emit_to(
+                    &state.callbacks,
+                    ThreadPickerAction::SortChanged(match sort.selected() {
+                        1 => ThreadPickerSort::Created,
+                        _ => ThreadPickerSort::Updated,
+                    }),
+                );
             }
         });
         cancel_button.connect_clicked({
-            let picker = self.clone();
-
-            move |_| picker.emit(ThreadPickerAction::Cancel)
-        });
-        self.state.load_more_button.connect_clicked({
-            let picker = self.clone();
-
-            move |_| picker.request_more()
-        });
-        list.connect_activate({
-            let picker = self.clone();
-
-            move |_, position| {
-                let Some(row) = picker.thread_at(position) else {
-                    return;
-                };
-                picker.emit(if row.archived {
-                    ThreadPickerAction::Unarchive(row.thread_id)
-                } else {
-                    ThreadPickerAction::Resume(row.thread_id)
-                });
-            }
-        });
-        scroller.connect_edge_reached({
-            let picker = self.clone();
-
-            move |_, position| {
-                if position == gtk::PositionType::Bottom {
-                    picker.request_more();
+            let state = Rc::downgrade(&self.state);
+            move |_| {
+                if let Some(state) = state.upgrade() {
+                    emit_to(&state.callbacks, ThreadPickerAction::Cancel);
                 }
             }
         });
-    }
+        list.connect_activate({
+            let state = Rc::downgrade(&self.state);
 
-    fn thread_at(&self, position: u32) -> Option<ThreadPickerRow> {
-        let item = self
-            .state
-            .model
-            .item(position)?
-            .downcast::<glib::BoxedAnyObject>()
-            .ok()?;
-        let row = item.borrow::<ThreadPickerRow>().clone();
-        Some(row)
-    }
-
-    fn request_more(&self) {
-        if self.state.loading.get()
-            || !self.state.has_more.get()
-            || self.state.load_request_pending.replace(true)
-        {
-            return;
-        }
-        self.update_view();
-        self.emit(ThreadPickerAction::LoadMore);
-    }
-
-    fn reset_for_filter_change(&self) {
-        self.state.model.remove_all();
-        self.state.thread_ids.borrow_mut().clear();
-        self.state.error.borrow_mut().take();
-        self.state.has_more.set(false);
-        self.state.load_request_pending.set(false);
-        self.update_view();
-    }
-
-    fn emit(&self, action: ThreadPickerAction) {
-        for callback in self.state.callbacks.borrow().iter() {
-            callback(action.clone());
-        }
+            move |_, position| {
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                let Some(row) = thread_at(&state, position) else {
+                    return;
+                };
+                emit_to(
+                    &state.callbacks,
+                    if row.archived {
+                        ThreadPickerAction::Unarchive(row.thread_id)
+                    } else {
+                        ThreadPickerAction::Resume(row.thread_id)
+                    },
+                );
+            }
+        });
     }
 
     fn update_view(&self) {
-        let count = self.state.model.n_items();
-        let loading = self.state.loading.get() || self.state.load_request_pending.get();
-        let has_rows = count > 0;
-        self.state
-            .stack
-            .set_visible_child_name(if has_rows { "threads" } else { "empty" });
-        self.state.empty_spinner.set_visible(!has_rows && loading);
-        self.state.footer.set_visible(has_rows);
-        self.state.footer_spinner.set_visible(has_rows && loading);
-        self.state.load_more_button.set_visible(
-            has_rows && self.state.has_more.get() && !self.state.error.borrow().is_some(),
-        );
-        self.state.load_more_button.set_sensitive(!loading);
-        if has_rows && let Some(error) = self.state.error.borrow().as_deref() {
-            self.state
-                .count_label
-                .set_label(&format!("Could not load more threads: {error}"));
-            self.state.count_label.set_tooltip_text(Some(error));
-        } else {
-            self.state.count_label.set_label(&format!(
-                "{count} {}",
-                if count == 1 { "thread" } else { "threads" }
-            ));
-            self.state.count_label.set_tooltip_text(None);
-        }
-
-        if let Some(error) = self.state.error.borrow().as_deref() {
-            self.state.empty_title.set_label("Could not load threads");
-            self.state.empty_description.set_label(error);
-            self.state.empty_description.set_visible(true);
-        } else if loading {
-            self.state.empty_title.set_label("Loading threads…");
-            self.state.empty_description.set_visible(false);
-        } else if self.query().is_empty() {
-            self.state.empty_title.set_label("No Codex threads");
-            self.state
-                .empty_description
-                .set_label("Start a new conversation to create one.");
-            self.state.empty_description.set_visible(true);
-        } else {
-            self.state.empty_title.set_label("No matching threads");
-            self.state
-                .empty_description
-                .set_label("Try a different search.");
-            self.state.empty_description.set_visible(true);
-        }
+        update_picker_view(&self.state, &self.query());
     }
 }
 
-fn thread_factory(callbacks: Rc<RefCell<Vec<ActionCallback>>>) -> gtk::SignalListItemFactory {
+fn thread_at(state: &PickerState, position: u32) -> Option<ThreadPickerRow> {
+    let item = state
+        .model
+        .item(position)?
+        .downcast::<glib::BoxedAnyObject>()
+        .ok()?;
+    match item.borrow::<ThreadPickerEntry>().clone() {
+        ThreadPickerEntry::Thread(row) => Some(row),
+        ThreadPickerEntry::Footer { .. } => None,
+    }
+}
+
+fn reset_for_filter_change(state: &PickerState) {
+    state.model.remove_all();
+    state.thread_ids.borrow_mut().clear();
+    state.error.borrow_mut().take();
+    state.has_more.set(false);
+    state.load_request_pending.set(false);
+}
+
+fn update_picker_view(state: &Rc<PickerState>, query: &str) {
+    sync_footer(state);
+    let count = state.thread_ids.borrow().len();
+    let loading = state.loading.get() || state.load_request_pending.get();
+    let has_rows = count > 0;
+    state
+        .stack
+        .set_visible_child_name(if has_rows { "threads" } else { "empty" });
+    state.empty_spinner.set_visible(!has_rows && loading);
+
+    if let Some(error) = state.error.borrow().as_deref() {
+        state.empty_title.set_label("Could not load threads");
+        state.empty_description.set_label(error);
+        state.empty_description.set_visible(true);
+    } else if loading {
+        state.empty_title.set_label("Loading threads…");
+        state.empty_description.set_visible(false);
+    } else if query.is_empty() {
+        state.empty_title.set_label("No Codex threads");
+        state
+            .empty_description
+            .set_label("Start a new conversation to create one.");
+        state.empty_description.set_visible(true);
+    } else {
+        state.empty_title.set_label("No matching threads");
+        state.empty_description.set_label("Try a different search.");
+        state.empty_description.set_visible(true);
+    }
+}
+
+fn thread_factory(state: std::rc::Weak<PickerState>) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
@@ -541,8 +519,20 @@ fn thread_factory(callbacks: Rc<RefCell<Vec<ActionCallback>>>) -> gtk::SignalLis
             item.set_child(None::<&gtk::Widget>);
             return;
         };
-        let row = row.borrow::<ThreadPickerRow>().clone();
-        item.set_child(Some(&thread_row(&row, &callbacks)));
+        let entry = row.borrow::<ThreadPickerEntry>().clone();
+        let Some(state) = state.upgrade() else {
+            item.set_child(None::<&gtk::Widget>);
+            return;
+        };
+        let child = match entry {
+            ThreadPickerEntry::Thread(row) => thread_row(&row, &state.callbacks),
+            ThreadPickerEntry::Footer {
+                loading,
+                has_more,
+                error,
+            } => thread_footer(&state, loading, has_more, error.as_deref()),
+        };
+        item.set_child(Some(&child));
     });
     factory.connect_unbind(|_, item| {
         if let Some(item) = item.downcast_ref::<gtk::ListItem>() {
@@ -550,6 +540,103 @@ fn thread_factory(callbacks: Rc<RefCell<Vec<ActionCallback>>>) -> gtk::SignalLis
         }
     });
     factory
+}
+
+fn thread_footer(
+    state: &Rc<PickerState>,
+    loading: bool,
+    has_more: bool,
+    error: Option<&str>,
+) -> gtk::Widget {
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .halign(gtk::Align::Center)
+        .margin_top(12)
+        .margin_bottom(16)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    if loading {
+        let spinner = adw::Spinner::new();
+        spinner.set_size_request(20, 20);
+        content.append(&spinner);
+    }
+    if let Some(error) = error {
+        content.append(
+            &gtk::Label::builder()
+                .label(format!("Could not load more threads: {error}"))
+                .css_classes(["dim-label"])
+                .wrap(true)
+                .justify(gtk::Justification::Center)
+                .tooltip_text(error)
+                .build(),
+        );
+    }
+    if has_more && !loading {
+        let button = gtk::Button::with_label(if error.is_some() {
+            "Retry"
+        } else {
+            "Load More"
+        });
+        button.connect_clicked({
+            let state = Rc::downgrade(state);
+            move |_| {
+                if let Some(state) = state.upgrade() {
+                    request_more(&state);
+                }
+            }
+        });
+        content.append(&button);
+    }
+    content.upcast()
+}
+
+fn request_more(state: &Rc<PickerState>) {
+    if state.loading.get() || !state.has_more.get() || state.load_request_pending.replace(true) {
+        return;
+    }
+    sync_footer(state);
+    emit_to(&state.callbacks, ThreadPickerAction::LoadMore);
+}
+
+fn remove_footer(state: &PickerState) {
+    let count = state.model.n_items();
+    if count == 0 {
+        return;
+    }
+    let is_footer = state
+        .model
+        .item(count - 1)
+        .and_downcast::<glib::BoxedAnyObject>()
+        .is_some_and(|item| {
+            matches!(
+                &*item.borrow::<ThreadPickerEntry>(),
+                ThreadPickerEntry::Footer { .. }
+            )
+        });
+    if is_footer {
+        state.model.remove(count - 1);
+    }
+}
+
+fn sync_footer(state: &Rc<PickerState>) {
+    remove_footer(state);
+    if state.thread_ids.borrow().is_empty() {
+        return;
+    }
+    let loading = state.loading.get() || state.load_request_pending.get();
+    let has_more = state.has_more.get();
+    let error = state.error.borrow().clone();
+    if loading || has_more || error.is_some() {
+        state
+            .model
+            .append(&glib::BoxedAnyObject::new(ThreadPickerEntry::Footer {
+                loading,
+                has_more,
+                error,
+            }));
+    }
 }
 
 fn thread_row(row: &ThreadPickerRow, callbacks: &Rc<RefCell<Vec<ActionCallback>>>) -> gtk::Widget {

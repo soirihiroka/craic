@@ -26,7 +26,7 @@ impl AgentProvider for Provider {
     }
 
     fn session_icon_name(&self) -> &'static str {
-        "craic-codex-symbolic"
+        "utilities-terminal-symbolic"
     }
 
     fn command(

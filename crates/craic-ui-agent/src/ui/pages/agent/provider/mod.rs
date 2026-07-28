@@ -110,8 +110,12 @@ impl CommandSpec {
 }
 
 pub fn all_providers() -> &'static [&'static dyn AgentProvider] {
-    static PROVIDERS: [&'static dyn AgentProvider; 3] =
-        [&codex::PROVIDER, &agy::PROVIDER, &opencode::PROVIDER];
+    static PROVIDERS: [&'static dyn AgentProvider; 4] = [
+        &app::PROVIDER,
+        &codex::PROVIDER,
+        &agy::PROVIDER,
+        &opencode::PROVIDER,
+    ];
     &PROVIDERS
 }
 

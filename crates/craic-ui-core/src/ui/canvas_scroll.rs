@@ -258,7 +258,7 @@ pub fn install_middle_autoscroll<
     let click = gtk::GestureClick::builder().button(0).build();
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
     click.connect_pressed({
-        let widget = widget.clone();
+        let widget = widget.downgrade();
         let autoscroll = Rc::clone(autoscroll);
         let middle_press = Rc::clone(&middle_press);
         let can_scroll = Rc::clone(&can_scroll);
@@ -269,6 +269,9 @@ pub fn install_middle_autoscroll<
         let redraw = Rc::clone(&redraw);
 
         move |gesture, _, x, y| {
+            let Some(widget) = widget.upgrade() else {
+                return;
+            };
             let button = gesture.current_button();
             if button == 2 {
                 widget.grab_focus();
@@ -414,7 +417,7 @@ pub fn install_middle_autoscroll<
         }
     });
     motion.connect_leave({
-        let widget = widget.clone();
+        let widget = widget.downgrade();
         let autoscroll = Rc::clone(autoscroll);
         let set_cursor = Rc::clone(&set_cursor);
         let redraw = Rc::clone(&redraw);
@@ -423,6 +426,9 @@ pub fn install_middle_autoscroll<
             if !autoscroll.is_active() {
                 return;
             }
+            let Some(widget) = widget.upgrade() else {
+                return;
+            };
             if let Some((x, y)) = controller
                 .current_event()
                 .and_then(|event| event.position())
@@ -492,8 +498,12 @@ pub fn install_scrolled_window_middle_autoscroll(
         axes,
         log_target,
         {
-            let scroller = scroller.clone();
-            move |cursor| scroller.set_cursor_from_name(cursor)
+            let scroller = scroller.downgrade();
+            move |cursor| {
+                if let Some(scroller) = scroller.upgrade() {
+                    scroller.set_cursor_from_name(cursor);
+                }
+            }
         },
     );
     autoscroll
@@ -518,19 +528,31 @@ pub fn install_scrolled_window_middle_autoscroll_with_state<SetCursor>(
         axes,
         log_target,
         {
-            let scroller = scroller.clone();
-            move || scrolled_window_autoscroll_has_axis(&scroller, axes)
+            let scroller = scroller.downgrade();
+            move || {
+                scroller
+                    .upgrade()
+                    .is_some_and(|scroller| scrolled_window_autoscroll_has_axis(&scroller, axes))
+            }
         },
         {
-            let scroller = scroller.clone();
-            move |state| apply_scrolled_window_middle_autoscroll(&scroller, axes, state)
+            let scroller = scroller.downgrade();
+            move |state| {
+                if let Some(scroller) = scroller.upgrade() {
+                    apply_scrolled_window_middle_autoscroll(&scroller, axes, state);
+                }
+            }
         },
         || {},
         || {},
         set_cursor,
         {
-            let marker = marker.clone();
-            move || marker.queue_draw()
+            let marker = marker.downgrade();
+            move || {
+                if let Some(marker) = marker.upgrade() {
+                    marker.queue_draw();
+                }
+            }
         },
     );
 }
