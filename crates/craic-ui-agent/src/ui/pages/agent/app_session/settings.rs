@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use craic_config::{AppAgentSetting, AppAgentSettings};
 use serde_json::{Map, Value, json};
 
 use super::super::codex_chat::{ChatSelector, CodexChatView, SelectorOption};
@@ -14,6 +15,11 @@ pub(super) struct ModelServiceTiers {
 }
 
 impl AppChatSessionInner {
+    pub(super) fn selector_has_local_override(&self, selector: ChatSelector) -> bool {
+        self.dirty_selectors.borrow().contains(&selector)
+            || self.remembered_selectors.borrow().contains(&selector)
+    }
+
     pub(super) fn apply_model_catalog(&self, result: &Value) {
         let Some(models) = result.get("data").and_then(Value::as_array) else {
             return;
@@ -94,7 +100,9 @@ impl AppChatSessionInner {
             .borrow()
             .get(&ChatSelector::Model)
             .cloned()
-            .or(catalog_default);
+            .filter(|selected| options.iter().any(|option| option.id == *selected))
+            .or(catalog_default)
+            .or_else(|| options.first().map(|option| option.id.clone()));
         if let Some(selected) = selected.as_ref() {
             self.selected_values
                 .borrow_mut()
@@ -145,6 +153,7 @@ impl AppChatSessionInner {
             if let Some(value) = keys
                 .iter()
                 .find_map(|key| config.get(key).and_then(Value::as_str))
+                && !self.selector_has_local_override(selector)
             {
                 self.selected_values
                     .borrow_mut()
@@ -199,6 +208,7 @@ impl AppChatSessionInner {
             .borrow()
             .get(&ChatSelector::Permissions)
             .cloned()
+            .filter(|selected| options.iter().any(|option| option.id == *selected))
             .or_else(|| options.first().map(|option| option.id.clone()));
         if let Some(selected) = selected.as_ref() {
             self.selected_values
@@ -226,22 +236,24 @@ impl AppChatSessionInner {
             })
             .collect::<Vec<_>>();
         self.collaboration_modes.replace(modes);
-        let selected = options
-            .iter()
-            .find(|option| option.id.eq_ignore_ascii_case("default"))
-            .or_else(|| options.first())
-            .map(|option| option.id.clone());
-        if let Some(selected) = selected.as_ref() {
-            self.selected_values
-                .borrow_mut()
-                .entry(ChatSelector::Collaboration)
-                .or_insert_with(|| selected.clone());
-        }
         let selected = self
             .selected_values
             .borrow()
             .get(&ChatSelector::Collaboration)
-            .cloned();
+            .cloned()
+            .filter(|selected| options.iter().any(|option| option.id == *selected))
+            .or_else(|| {
+                options
+                    .iter()
+                    .find(|option| option.id.eq_ignore_ascii_case("default"))
+                    .or_else(|| options.first())
+                    .map(|option| option.id.clone())
+            });
+        if let Some(selected) = selected.as_ref() {
+            self.selected_values
+                .borrow_mut()
+                .insert(ChatSelector::Collaboration, selected.clone());
+        }
         self.view
             .set_selector_options(ChatSelector::Collaboration, &options, selected.as_deref());
     }
@@ -400,6 +412,7 @@ impl AppChatSessionInner {
 
     pub(super) fn update_selector(&self, selector: ChatSelector, value: Option<String>) {
         self.dirty_selectors.borrow_mut().insert(selector);
+        persist_selector_value(selector, value.as_deref());
         let Some(value) = value else {
             self.selected_values.borrow_mut().remove(&selector);
             return;
@@ -480,6 +493,7 @@ impl AppChatSessionInner {
     pub(super) fn turn_settings(&self) -> Map<String, Value> {
         let selected = self.selected_values.borrow().clone();
         let dirty = self.dirty_selectors.borrow();
+        let remembered = self.remembered_selectors.borrow();
         let mut settings = Map::new();
         for (selector, field) in [
             (ChatSelector::Model, "model"),
@@ -489,13 +503,14 @@ impl AppChatSessionInner {
             (ChatSelector::Permissions, "permissions"),
             (ChatSelector::ApprovalReviewer, "approvalsReviewer"),
         ] {
-            if dirty.contains(&selector)
+            if (dirty.contains(&selector) || remembered.contains(&selector))
                 && let Some(value) = selected.get(&selector)
             {
                 settings.insert(field.to_owned(), Value::String(value.clone()));
             }
         }
-        if dirty.contains(&ChatSelector::ServiceTier)
+        if (dirty.contains(&ChatSelector::ServiceTier)
+            || remembered.contains(&ChatSelector::ServiceTier))
             && let Some(value) = selected.get(&ChatSelector::ServiceTier)
         {
             settings.insert(
@@ -507,7 +522,8 @@ impl AppChatSessionInner {
                 },
             );
         }
-        if dirty.contains(&ChatSelector::Collaboration)
+        if (dirty.contains(&ChatSelector::Collaboration)
+            || remembered.contains(&ChatSelector::Collaboration))
             && let Some(name) = selected.get(&ChatSelector::Collaboration)
             && let Some(mode) = self.collaboration_mode(name)
         {
@@ -517,7 +533,50 @@ impl AppChatSessionInner {
     }
 }
 
-pub(super) fn set_initial_selector_options(view: &CodexChatView) {
+pub(super) fn remembered_selector_values() -> HashMap<ChatSelector, String> {
+    let AppAgentSettings {
+        model,
+        reasoning,
+        reasoning_summary,
+        personality,
+        permissions,
+        collaboration,
+        service_tier,
+        approval_reviewer,
+    } = craic_config::app_agent_settings();
+    [
+        (ChatSelector::Model, model),
+        (ChatSelector::Reasoning, reasoning),
+        (ChatSelector::ReasoningSummary, reasoning_summary),
+        (ChatSelector::Personality, personality),
+        (ChatSelector::Permissions, permissions),
+        (ChatSelector::Collaboration, collaboration),
+        (ChatSelector::ServiceTier, service_tier),
+        (ChatSelector::ApprovalReviewer, approval_reviewer),
+    ]
+    .into_iter()
+    .filter_map(|(selector, value)| value.map(|value| (selector, value)))
+    .collect()
+}
+
+fn persist_selector_value(selector: ChatSelector, value: Option<&str>) {
+    let setting = match selector {
+        ChatSelector::Model => AppAgentSetting::Model,
+        ChatSelector::Reasoning => AppAgentSetting::Reasoning,
+        ChatSelector::ReasoningSummary => AppAgentSetting::ReasoningSummary,
+        ChatSelector::Personality => AppAgentSetting::Personality,
+        ChatSelector::Permissions => AppAgentSetting::Permissions,
+        ChatSelector::Collaboration => AppAgentSetting::Collaboration,
+        ChatSelector::ServiceTier => AppAgentSetting::ServiceTier,
+        ChatSelector::ApprovalReviewer => AppAgentSetting::ApprovalReviewer,
+    };
+    craic_config::save_app_agent_setting(setting, value);
+}
+
+pub(super) fn set_initial_selector_options(
+    view: &CodexChatView,
+    selected: &HashMap<ChatSelector, String>,
+) {
     view.set_selector_options(ChatSelector::Model, &[], None);
     view.set_selector_options(
         ChatSelector::Reasoning,
@@ -528,7 +587,7 @@ pub(super) fn set_initial_selector_options(view: &CodexChatView) {
                 label: title_case(id),
             })
             .collect::<Vec<_>>(),
-        None,
+        selected.get(&ChatSelector::Reasoning).map(String::as_str),
     );
     view.set_selector_options(
         ChatSelector::ReasoningSummary,
@@ -539,7 +598,9 @@ pub(super) fn set_initial_selector_options(view: &CodexChatView) {
                 label: title_case(id),
             })
             .collect::<Vec<_>>(),
-        None,
+        selected
+            .get(&ChatSelector::ReasoningSummary)
+            .map(String::as_str),
     );
     view.set_selector_options(
         ChatSelector::Personality,
@@ -550,7 +611,7 @@ pub(super) fn set_initial_selector_options(view: &CodexChatView) {
                 label: title_case(id),
             })
             .collect::<Vec<_>>(),
-        None,
+        selected.get(&ChatSelector::Personality).map(String::as_str),
     );
     view.set_selector_options(ChatSelector::Permissions, &[], None);
     view.set_selector_options(ChatSelector::Collaboration, &[], None);
@@ -560,7 +621,10 @@ pub(super) fn set_initial_selector_options(view: &CodexChatView) {
             id: DEFAULT_SERVICE_TIER_ID.to_owned(),
             label: "Standard".to_owned(),
         }],
-        Some(DEFAULT_SERVICE_TIER_ID),
+        selected
+            .get(&ChatSelector::ServiceTier)
+            .map(String::as_str)
+            .or(Some(DEFAULT_SERVICE_TIER_ID)),
     );
     view.set_selector_options(
         ChatSelector::ApprovalReviewer,
@@ -571,7 +635,10 @@ pub(super) fn set_initial_selector_options(view: &CodexChatView) {
                 label: title_case(id),
             })
             .collect::<Vec<_>>(),
-        Some("user"),
+        selected
+            .get(&ChatSelector::ApprovalReviewer)
+            .map(String::as_str)
+            .or(Some("user")),
     );
 }
 

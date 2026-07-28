@@ -1305,7 +1305,7 @@ impl AppChatSessionInner {
         let detail = params
             .get("patch")
             .or_else(|| params.get("changes"))
-            .map(compact_json)
+            .map(file_change_detail)
             .unwrap_or_default();
         let mut timeline = self.timeline.borrow_mut();
         let item = timeline
@@ -1587,7 +1587,7 @@ pub(super) fn timeline_from_item(item: &Value, completed: bool) -> TimelineItem 
             TimelineItemKind::FileChange,
             Some("File changes".to_owned()),
             file_change_summary(item),
-            item.get("changes").map(compact_json),
+            item.get("changes").map(file_change_detail),
         ),
         "mcpToolCall" => (
             TimelineItemKind::McpTool,
@@ -1820,16 +1820,58 @@ fn file_change_summary(item: &Value) -> String {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|change| {
-            let path = change.get("path")?.as_str()?;
-            let kind = change
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("update");
-            Some(format!("{kind}: {path}"))
-        })
+        .filter_map(file_change_description)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn file_change_detail(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Array(changes) => {
+            let detail = changes
+                .iter()
+                .filter_map(|change| {
+                    let description = file_change_description(change)?;
+                    Some(
+                        change
+                            .get("diff")
+                            .and_then(Value::as_str)
+                            .filter(|diff| !diff.is_empty())
+                            .map_or(description.clone(), |diff| format!("{description}\n{diff}")),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if detail.is_empty() {
+                compact_json(value)
+            } else {
+                detail
+            }
+        }
+        Value::Object(object) => object
+            .get("changes")
+            .map(file_change_detail)
+            .unwrap_or_else(|| compact_json(value)),
+        _ => compact_json(value),
+    }
+}
+
+fn file_change_description(change: &Value) -> Option<String> {
+    let path = change.get("path")?.as_str()?;
+    let kind = change.get("kind");
+    let kind_name = kind
+        .and_then(Value::as_str)
+        .or_else(|| kind?.get("type")?.as_str())
+        .unwrap_or("update");
+    let move_path = kind
+        .and_then(Value::as_object)
+        .and_then(|kind| kind.get("move_path").or_else(|| kind.get("movePath")))
+        .and_then(Value::as_str);
+    Some(move_path.map_or_else(
+        || format!("{}: {path}", title_case(kind_name)),
+        |move_path| format!("Move: {path} → {move_path}"),
+    ))
 }
 
 fn nonempty(value: String) -> Option<String> {
