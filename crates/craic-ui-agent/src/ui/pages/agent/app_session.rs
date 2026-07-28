@@ -29,9 +29,9 @@ use self::settings::{DEFAULT_SERVICE_TIER_ID, ModelServiceTiers, set_initial_sel
 use super::super::{PageCommand, PageContext};
 use super::codex_chat::{
     ChatConnectionStatus, ChatSelector, CodexChatAction, CodexChatView, CollaborationParticipant,
-    ComposerAttachment, ComposerAttachmentKind, ComposerSubmission, PendingRequestResponse,
-    QueueDirection, QueuedSubmission, SelectorOption, TimelineItem, TimelineItemKind,
-    TimelineItemStatus,
+    ComposerAttachment, ComposerAttachmentKind, ComposerSubmission, PendingRequest,
+    PendingRequestKind, PendingRequestResponse, QueueDirection, QueuedSubmission, RequestOption,
+    RequestOptionStyle, SelectorOption, TimelineItem, TimelineItemKind, TimelineItemStatus,
 };
 use super::thread_picker::CodexThreadPicker;
 use crate::system::capabilities::shell::ShellAccess;
@@ -40,6 +40,16 @@ use crate::system::{ProviderKind, WorkspaceRef};
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_EVENTS_PER_POLL: usize = 256;
 const MAX_RENDERED_JSON_BYTES: usize = 24 * 1024;
+const PLAN_IMPLEMENTATION_REQUEST_ID: &str = "craic:plan-implementation";
+const PLAN_IMPLEMENTATION_CURRENT: &str = "current";
+const PLAN_IMPLEMENTATION_NEW: &str = "new";
+const PLAN_IMPLEMENTATION_REJECT: &str = "reject";
+const PLAN_IMPLEMENTATION_MESSAGE: &str = "Implement the plan.";
+const PLAN_IMPLEMENTATION_NEW_THREAD_PREFIX: &str = concat!(
+    "A previous agent produced the plan below to accomplish the user's task. ",
+    "Implement the plan in a fresh context. Treat the plan as the source of user intent, ",
+    "re-read files as needed, and carry the work through implementation and verification."
+);
 
 type TitleCallback = Rc<dyn Fn(u64, String)>;
 type StateCallback = Rc<dyn Fn(u64, AppChatState)>;
@@ -102,6 +112,9 @@ struct AppChatSessionInner {
     title: RefCell<String>,
     timeline: RefCell<HashMap<String, TimelineItem>>,
     pending_requests: RefCell<HashMap<String, PendingServerRequest>>,
+    proposed_plan: RefCell<Option<String>>,
+    pending_plan_implementation: RefCell<Option<String>>,
+    pending_thread_submission: RefCell<Option<ComposerSubmission>>,
     selected_values: RefCell<HashMap<ChatSelector, String>>,
     dirty_selectors: RefCell<HashSet<ChatSelector>>,
     model_reasoning: RefCell<HashMap<String, Vec<SelectorOption>>>,
@@ -213,6 +226,9 @@ impl AppChatSession {
             title: RefCell::new(title.to_owned()),
             timeline: RefCell::new(HashMap::new()),
             pending_requests: RefCell::new(HashMap::new()),
+            proposed_plan: RefCell::new(None),
+            pending_plan_implementation: RefCell::new(None),
+            pending_thread_submission: RefCell::new(None),
             selected_values: RefCell::new(HashMap::new()),
             dirty_selectors: RefCell::new(HashSet::new()),
             model_reasoning: RefCell::new(HashMap::new()),
@@ -546,6 +562,11 @@ impl AppChatSessionInner {
                     || self.content.visible_child_name().as_deref() != Some("threads")
                 {
                     self.hide_thread_picker();
+                }
+                if method == Some("thread/start")
+                    && let Some(submission) = self.pending_thread_submission.borrow_mut().take()
+                {
+                    self.submit(submission, false);
                 }
             }
             Some("thread/read") | Some("thread/rollback") => {
@@ -953,6 +974,10 @@ impl AppChatSessionInner {
         if input.is_empty() {
             return false;
         }
+        if steer {
+            self.proposed_plan.borrow_mut().take();
+        }
+        self.dismiss_plan_implementation();
         let client_id = self.next_id("user");
         let result = {
             let server = self.server.borrow();
@@ -1052,6 +1077,8 @@ impl AppChatSessionInner {
             source.remove();
         }
         self.clear_pending_requests();
+        self.dismiss_plan_implementation();
+        self.pending_thread_submission.borrow_mut().take();
         if let Some(mut server) = self.server.borrow_mut().take() {
             let session_id = self.id;
             if let Err(error) = std::thread::Builder::new()
@@ -1085,6 +1112,9 @@ impl AppChatSessionInner {
 
     fn fail(&self, message: String) {
         self.active_turn_id.borrow_mut().take();
+        self.proposed_plan.borrow_mut().take();
+        self.pending_thread_submission.borrow_mut().take();
+        self.dismiss_plan_implementation();
         self.view.set_turn_active(false);
         self.view
             .set_connection_status(ChatConnectionStatus::Failed(message.clone()));
@@ -1144,6 +1174,10 @@ impl AppChatSessionInner {
     }
 
     fn resolve_request(&self, request_key: &str, response: PendingRequestResponse) {
+        if request_key == PLAN_IMPLEMENTATION_REQUEST_ID {
+            self.resolve_plan_implementation(response);
+            return;
+        }
         let Some(pending) = self.pending_requests.borrow_mut().remove(request_key) else {
             self.push_error("That Codex request is no longer pending".to_owned());
             self.view.resolve_pending_request(request_key);
@@ -1200,6 +1234,168 @@ impl AppChatSessionInner {
                 self.view.upsert_pending_request(replacement);
             }
         }
+    }
+
+    pub(super) fn maybe_prompt_plan_implementation(&self, turn_status: &str) {
+        let proposed_plan = self.proposed_plan.borrow_mut().take();
+        let Some(proposed_plan) = proposed_plan.filter(|plan| !plan.trim().is_empty()) else {
+            return;
+        };
+        let selected_mode = self
+            .selected_values
+            .borrow()
+            .get(&ChatSelector::Collaboration)
+            .cloned();
+        let in_plan_mode = selected_mode.is_some_and(|name| {
+            self.collaboration_modes
+                .borrow()
+                .get(&name)
+                .and_then(|mode| mode.get("mode"))
+                .and_then(Value::as_str)
+                .is_some_and(|mode| mode.eq_ignore_ascii_case("plan"))
+        });
+        if turn_status != "completed"
+            || !in_plan_mode
+            || self.default_collaboration_mode_name().is_none()
+            || !self.queued_turns.borrow().is_empty()
+            || !self.pending_requests.borrow().is_empty()
+            || self.pending_plan_implementation.borrow().is_some()
+        {
+            return;
+        }
+
+        log::info!(
+            "showing plan implementation choices session_id={} thread_id={:?}",
+            self.id,
+            self.thread_id.borrow().as_deref()
+        );
+        self.pending_plan_implementation
+            .replace(Some(proposed_plan));
+        self.view.upsert_pending_request(PendingRequest {
+            request_id: PLAN_IMPLEMENTATION_REQUEST_ID.to_owned(),
+            kind: PendingRequestKind::UserInput,
+            title: "Implement this plan?".to_owned(),
+            description: "Choose where Codex should implement the plan, or stay in Plan mode."
+                .to_owned(),
+            options: vec![
+                RequestOption {
+                    id: PLAN_IMPLEMENTATION_CURRENT.to_owned(),
+                    label: "Implement in current thread".to_owned(),
+                    style: RequestOptionStyle::Suggested,
+                },
+                RequestOption {
+                    id: PLAN_IMPLEMENTATION_NEW.to_owned(),
+                    label: "Implement in new thread".to_owned(),
+                    style: RequestOptionStyle::Default,
+                },
+                RequestOption {
+                    id: PLAN_IMPLEMENTATION_REJECT.to_owned(),
+                    label: "Reject plan".to_owned(),
+                    style: RequestOptionStyle::Default,
+                },
+            ],
+            allows_text: false,
+            text_placeholder: None,
+        });
+        self.view.scroll_transcript_to_end();
+    }
+
+    fn resolve_plan_implementation(&self, response: PendingRequestResponse) {
+        let PendingRequestResponse::Option(choice) = response else {
+            self.push_error("Choose one of the plan implementation options".to_owned());
+            return;
+        };
+        let Some(proposed_plan) = self.dismiss_plan_implementation() else {
+            return;
+        };
+        if choice == PLAN_IMPLEMENTATION_REJECT {
+            log::info!(
+                "plan implementation rejected session_id={} thread_id={:?}",
+                self.id,
+                self.thread_id.borrow().as_deref()
+            );
+            return;
+        }
+        let Some(default_mode) = self.default_collaboration_mode_name() else {
+            self.push_error("Default collaboration mode is unavailable".to_owned());
+            return;
+        };
+        self.view
+            .set_selector_value(ChatSelector::Collaboration, &default_mode);
+
+        if choice == PLAN_IMPLEMENTATION_CURRENT {
+            self.update_selector(ChatSelector::Collaboration, Some(default_mode));
+            self.submit(
+                ComposerSubmission {
+                    text: PLAN_IMPLEMENTATION_MESSAGE.to_owned(),
+                    attachments: Vec::new(),
+                },
+                false,
+            );
+            return;
+        }
+        if choice != PLAN_IMPLEMENTATION_NEW {
+            self.push_error("Unknown plan implementation option".to_owned());
+            return;
+        }
+
+        self.selected_values
+            .borrow_mut()
+            .insert(ChatSelector::Collaboration, default_mode);
+        self.dirty_selectors
+            .borrow_mut()
+            .insert(ChatSelector::Collaboration);
+        self.prepare_thread_switch();
+        self.pending_thread_submission
+            .replace(Some(ComposerSubmission {
+                text: format!("{PLAN_IMPLEMENTATION_NEW_THREAD_PREFIX}\n\n{proposed_plan}"),
+                attachments: Vec::new(),
+            }));
+        let start_error = {
+            let server = self.server.borrow();
+            match server.as_ref() {
+                Some(server) => server
+                    .thread_start(ThreadStartParams {
+                        cwd: Some(self.workspace_root.clone()),
+                        ..Default::default()
+                    })
+                    .err()
+                    .map(|error| error.to_string()),
+                None => Some("Codex App Server is unavailable".to_owned()),
+            }
+        };
+        if let Some(error) = start_error {
+            self.pending_thread_submission.borrow_mut().take();
+            self.fail(format!("Failed to start implementation thread: {error}"));
+        }
+    }
+
+    fn default_collaboration_mode_name(&self) -> Option<String> {
+        self.collaboration_modes
+            .borrow()
+            .iter()
+            .find(|(name, mode)| {
+                name.eq_ignore_ascii_case("default")
+                    || mode
+                        .get("mode")
+                        .and_then(Value::as_str)
+                        .is_some_and(|mode| mode.eq_ignore_ascii_case("default"))
+            })
+            .map(|(name, _)| name.clone())
+    }
+
+    fn dismiss_plan_implementation(&self) -> Option<String> {
+        let plan = self.pending_plan_implementation.borrow_mut().take();
+        if plan.is_some() {
+            log::debug!(
+                "dismissing plan implementation choices session_id={} thread_id={:?}",
+                self.id,
+                self.thread_id.borrow().as_deref()
+            );
+            self.view
+                .resolve_pending_request(PLAN_IMPLEMENTATION_REQUEST_ID);
+        }
+        plan
     }
 
     fn choose_context(self: &Rc<Self>, selection: ComposerContextSelection) {

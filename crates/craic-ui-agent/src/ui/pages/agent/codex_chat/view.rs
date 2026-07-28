@@ -1018,6 +1018,21 @@ impl CodexChatView {
         control.dropdown.set_sensitive(!options.is_empty());
         control.updating.set(false);
     }
+
+    pub fn set_selector_value(&self, selector: ChatSelector, selected_id: &str) {
+        let Some(control) = self.state.selectors.get(&selector) else {
+            return;
+        };
+        let selected = control
+            .ids
+            .borrow()
+            .iter()
+            .position(|id| id == selected_id)
+            .map_or(gtk::INVALID_LIST_POSITION, |position| position as u32);
+        control.updating.set(true);
+        control.dropdown.set_selected(selected);
+        control.updating.set(false);
+    }
 }
 
 // Thread and context popovers live in `menus.rs`.
