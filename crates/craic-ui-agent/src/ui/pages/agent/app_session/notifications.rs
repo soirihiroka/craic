@@ -61,6 +61,8 @@ impl AppChatSessionInner {
                 _ => {}
             },
             "turn/started" => {
+                self.proposed_plan.borrow_mut().take();
+                self.dismiss_plan_implementation();
                 if let Some(turn_id) = params.pointer("/turn/id").and_then(Value::as_str) {
                     self.active_turn_id.replace(Some(turn_id.to_owned()));
                 }
@@ -87,6 +89,7 @@ impl AppChatSessionInner {
                 self.view.set_collaboration_progress(None);
                 self.set_state(AppChatState::Ready);
                 self.persist_overlay(None);
+                self.maybe_prompt_plan_implementation(status);
                 self.submit_next_queued();
             }
             "hook/started" | "hook/completed" => self.apply_hook(method, &params),
@@ -102,7 +105,22 @@ impl AppChatSessionInner {
             }
             "item/completed" => {
                 if let Some(item) = params.get("item") {
-                    self.upsert_timeline(timeline_from_item(item, true));
+                    let mut timeline_item = timeline_from_item(item, true);
+                    if timeline_item.kind == TimelineItemKind::Plan {
+                        if timeline_item.body.trim().is_empty()
+                            && let Some(streamed_plan) = self
+                                .timeline
+                                .borrow()
+                                .get(&timeline_item.id)
+                                .map(|item| item.body.clone())
+                        {
+                            timeline_item.body = streamed_plan;
+                        }
+                        if !timeline_item.body.trim().is_empty() {
+                            self.proposed_plan.replace(Some(timeline_item.body.clone()));
+                        }
+                    }
+                    self.upsert_timeline(timeline_item);
                     self.update_collaboration_progress(item, true);
                 }
             }

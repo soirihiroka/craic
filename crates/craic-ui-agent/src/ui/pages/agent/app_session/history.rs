@@ -404,6 +404,9 @@ impl AppChatSessionInner {
         if self.active_turn_id.borrow().is_some() {
             self.interrupt();
         }
+        self.proposed_plan.borrow_mut().take();
+        self.dismiss_plan_implementation();
+        self.pending_thread_submission.borrow_mut().take();
         if let Some(thread_id) = self.thread_id.borrow_mut().take()
             && let Some(server) = self.server.borrow().as_ref()
         {
