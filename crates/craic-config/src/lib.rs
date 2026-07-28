@@ -22,6 +22,7 @@ const SHELL_FONT_SIZE_KEY: &str = "font_size.shell";
 const EDITOR_FONT_SIZE_KEY: &str = "font_size.editor";
 const DIFF_FONT_SIZE_KEY: &str = "font_size.diff";
 const AGENT_FONT_SIZE_KEY: &str = "font_size.agent";
+const APP_AGENT_SETTINGS_PREFIX: &str = "app_agent";
 const COLOR_KEY: &str = "color";
 
 type ConfigMap = HashMap<String, toml::Value>;
@@ -61,6 +62,30 @@ pub struct WorkspaceColor {
 pub struct SmartFeatureConfig {
     pub provider: String,
     pub model: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AppAgentSettings {
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+    pub reasoning_summary: Option<String>,
+    pub personality: Option<String>,
+    pub permissions: Option<String>,
+    pub collaboration: Option<String>,
+    pub service_tier: Option<String>,
+    pub approval_reviewer: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum AppAgentSetting {
+    Model,
+    Reasoning,
+    ReasoningSummary,
+    Personality,
+    Permissions,
+    Collaboration,
+    ServiceTier,
+    ApprovalReviewer,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -214,6 +239,52 @@ pub fn smart_feature_config(shell_provider_id: &str) -> SmartFeatureConfig {
             provider: shell_provider_id.to_string(),
             model: None,
         })
+}
+
+pub fn app_agent_settings() -> AppAgentSettings {
+    let config = load_user_config();
+    AppAgentSettings {
+        model: app_agent_setting(&config, AppAgentSetting::Model),
+        reasoning: app_agent_setting(&config, AppAgentSetting::Reasoning),
+        reasoning_summary: app_agent_setting(&config, AppAgentSetting::ReasoningSummary),
+        personality: app_agent_setting(&config, AppAgentSetting::Personality),
+        permissions: app_agent_setting(&config, AppAgentSetting::Permissions),
+        collaboration: app_agent_setting(&config, AppAgentSetting::Collaboration),
+        service_tier: app_agent_setting(&config, AppAgentSetting::ServiceTier),
+        approval_reviewer: app_agent_setting(&config, AppAgentSetting::ApprovalReviewer),
+    }
+}
+
+pub fn save_app_agent_setting(setting: AppAgentSetting, value: Option<&str>) {
+    let mut config = load_user_config();
+    let key = app_agent_setting_key(setting);
+    match value.map(str::to_owned).and_then(normalized_config_string) {
+        Some(value) => {
+            config.insert(key, toml::Value::String(value));
+        }
+        None => {
+            config.remove(&key);
+        }
+    }
+    save_config_file(&config);
+}
+
+fn app_agent_setting(config: &ConfigMap, setting: AppAgentSetting) -> Option<String> {
+    config_string(config, &app_agent_setting_key(setting)).and_then(normalized_config_string)
+}
+
+fn app_agent_setting_key(setting: AppAgentSetting) -> String {
+    let name = match setting {
+        AppAgentSetting::Model => "model",
+        AppAgentSetting::Reasoning => "reasoning",
+        AppAgentSetting::ReasoningSummary => "reasoning_summary",
+        AppAgentSetting::Personality => "personality",
+        AppAgentSetting::Permissions => "permissions",
+        AppAgentSetting::Collaboration => "collaboration",
+        AppAgentSetting::ServiceTier => "service_tier",
+        AppAgentSetting::ApprovalReviewer => "approval_reviewer",
+    };
+    format!("{APP_AGENT_SETTINGS_PREFIX}.{name}")
 }
 
 pub fn workspace_color_for(provider_id: &str, workspace_root: &str) -> Option<WorkspaceColor> {

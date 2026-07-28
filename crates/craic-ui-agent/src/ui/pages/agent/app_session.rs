@@ -117,6 +117,7 @@ struct AppChatSessionInner {
     pending_thread_submission: RefCell<Option<ComposerSubmission>>,
     selected_values: RefCell<HashMap<ChatSelector, String>>,
     dirty_selectors: RefCell<HashSet<ChatSelector>>,
+    remembered_selectors: RefCell<HashSet<ChatSelector>>,
     model_reasoning: RefCell<HashMap<String, Vec<SelectorOption>>>,
     model_service_tiers: RefCell<HashMap<String, ModelServiceTiers>>,
     context_window_fallback: Cell<Option<u64>>,
@@ -167,11 +168,21 @@ impl AppChatSession {
             .ok_or_else(|| "Shell access is unavailable for this workspace".to_owned())?;
         let provider_kind = ctx.system_ref().provider_kind;
         let workspace = ctx.workspace_ref();
+        let selected_values = if resume_thread_id.is_none() {
+            settings::remembered_selector_values()
+        } else {
+            HashMap::new()
+        };
+        let remembered_selectors = selected_values.keys().copied().collect();
+        log::debug!(
+            "loaded remembered App agent settings session_id={id} count={}",
+            selected_values.len()
+        );
         let view = CodexChatView::new();
         let picker = CodexThreadPicker::new();
         view.set_connection_status(ChatConnectionStatus::Connecting);
         view.set_composer_enabled(false);
-        set_initial_selector_options(&view);
+        set_initial_selector_options(&view, &selected_values);
 
         let content = gtk::Stack::builder().hexpand(true).vexpand(true).build();
         let loading_spinner = adw::Spinner::builder()
@@ -229,8 +240,9 @@ impl AppChatSession {
             proposed_plan: RefCell::new(None),
             pending_plan_implementation: RefCell::new(None),
             pending_thread_submission: RefCell::new(None),
-            selected_values: RefCell::new(HashMap::new()),
+            selected_values: RefCell::new(selected_values),
             dirty_selectors: RefCell::new(HashSet::new()),
+            remembered_selectors: RefCell::new(remembered_selectors),
             model_reasoning: RefCell::new(HashMap::new()),
             model_service_tiers: RefCell::new(HashMap::new()),
             context_window_fallback: Cell::new(None),
@@ -656,13 +668,17 @@ impl AppChatSessionInner {
             (ChatSelector::ApprovalReviewer, "/approvalsReviewer"),
             (ChatSelector::Permissions, "/activePermissionProfile/id"),
         ] {
-            if let Some(value) = result.pointer(pointer).and_then(Value::as_str) {
+            if let Some(value) = result.pointer(pointer).and_then(Value::as_str)
+                && !self.selector_has_local_override(selector)
+            {
                 self.selected_values
                     .borrow_mut()
                     .insert(selector, value.to_owned());
             }
         }
-        if result.get("serviceTier").is_some_and(Value::is_null) {
+        if result.get("serviceTier").is_some_and(Value::is_null)
+            && !self.selector_has_local_override(ChatSelector::ServiceTier)
+        {
             self.selected_values.borrow_mut().insert(
                 ChatSelector::ServiceTier,
                 DEFAULT_SERVICE_TIER_ID.to_owned(),

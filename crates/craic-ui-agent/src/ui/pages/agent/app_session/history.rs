@@ -404,6 +404,13 @@ impl AppChatSessionInner {
         if self.active_turn_id.borrow().is_some() {
             self.interrupt();
         }
+        if !self.remembered_selectors.borrow().is_empty() {
+            log::debug!(
+                "clearing remembered App agent settings for thread switch session_id={}",
+                self.id
+            );
+        }
+        self.remembered_selectors.borrow_mut().clear();
         self.proposed_plan.borrow_mut().take();
         self.dismiss_plan_implementation();
         self.pending_thread_submission.borrow_mut().take();
