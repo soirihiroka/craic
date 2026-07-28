@@ -495,16 +495,24 @@ impl AgentList {
         local_history_id: Option<i64>,
         state: AgentSessionState,
     ) {
-        if self
-            .active_sessions
-            .borrow()
-            .iter()
-            .any(|session| session.session_id == session_id)
+        let last_seen_at_ms = self.active_session_last_seen_at_ms(local_history_id);
+        let mut active_sessions = self.active_sessions.borrow_mut();
+        if let Some(session) = active_sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
         {
+            session.provider = provider;
+            session.title = title.to_string();
+            session.local_history_id = local_history_id;
+            if local_history_id.is_some() {
+                session.last_seen_at_ms = last_seen_at_ms;
+            }
+            session.state = state;
+            drop(active_sessions);
+            self.apply_rows();
             return;
         }
 
-        let last_seen_at_ms = self.active_session_last_seen_at_ms(local_history_id);
         if let Some(local_id) = local_history_id {
             log::debug!(
                 "agent list restored row placed by history timestamp session_id={} local_id={} last_seen_at_ms={}",
@@ -514,7 +522,7 @@ impl AgentList {
             );
         }
 
-        self.active_sessions.borrow_mut().insert(
+        active_sessions.insert(
             0,
             ActiveSessionInfo {
                 session_id,
@@ -526,6 +534,7 @@ impl AgentList {
                 last_seen_at_ms,
             },
         );
+        drop(active_sessions);
         self.apply_rows();
         self.select_session(session_id);
     }
@@ -1132,13 +1141,18 @@ impl AgentList {
 
     fn context_target_for_row(&self, row: &gtk::ListBoxRow) -> Option<AgentListContextTarget> {
         match row_identity(row)? {
-            RowIdentity::History(local_id) => Some(AgentListContextTarget {
-                session_id: None,
-                local_id: Some(local_id),
-                loaded: false,
-                has_summary: self.history_row_has_summary(local_id),
-                terminal_session: true,
-            }),
+            RowIdentity::History(local_id) => self
+                .history_rows
+                .borrow()
+                .iter()
+                .find(|history| history.id == local_id)
+                .map(|history| AgentListContextTarget {
+                    session_id: None,
+                    local_id: Some(local_id),
+                    loaded: false,
+                    has_summary: history.task_description.is_some(),
+                    terminal_session: history.provider_id != "codex-app",
+                }),
             RowIdentity::Active(session_id) => self
                 .active_sessions
                 .borrow()

@@ -13,7 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::config;
+use crate::{config, ui::canvas_scroll};
 
 const TRANSCRIPT_FOLLOW_DISTANCE: f64 = 72.0;
 thread_local! {
@@ -60,6 +60,7 @@ struct CodexChatViewState {
     pending_indices: RefCell<HashMap<String, u32>>,
     queued_timeline_updates: RefCell<Vec<TimelineItem>>,
     timeline_flush_scheduled: Cell<bool>,
+    transcript_scroll_scheduled: Cell<bool>,
     transcript_stack: gtk::Stack,
     transcript_scroller: gtk::ScrolledWindow,
     status_icon: gtk::Image,
@@ -116,6 +117,22 @@ impl CodexChatView {
             .vexpand(true)
             .child(&transcript)
             .build();
+        let transcript_autoscroll_marker = gtk::DrawingArea::builder()
+            .halign(gtk::Align::Fill)
+            .valign(gtk::Align::Fill)
+            .hexpand(true)
+            .vexpand(true)
+            .can_target(false)
+            .build();
+        let transcript_overlay = gtk::Overlay::builder().hexpand(true).vexpand(true).build();
+        transcript_overlay.set_child(Some(&transcript_scroller));
+        transcript_overlay.add_overlay(&transcript_autoscroll_marker);
+        canvas_scroll::install_scrolled_window_middle_autoscroll(
+            &transcript_scroller,
+            &transcript_autoscroll_marker,
+            canvas_scroll::AutoscrollAxes::Vertical,
+            "codex_chat_transcript",
+        );
         let empty_label = gtk::Label::builder()
             .label("Start a Codex conversation")
             .css_classes(["title-2", "dim-label"])
@@ -126,7 +143,7 @@ impl CodexChatView {
             .build();
         let transcript_stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
         transcript_stack.add_named(&empty_label, Some("empty"));
-        transcript_stack.add_named(&transcript_scroller, Some("transcript"));
+        transcript_stack.add_named(&transcript_overlay, Some("transcript"));
         transcript_stack.set_visible_child_name("empty");
 
         let older_turns_button = gtk::Button::with_label("Load older messages");
@@ -436,6 +453,7 @@ impl CodexChatView {
             pending_indices: RefCell::new(HashMap::new()),
             queued_timeline_updates: RefCell::new(Vec::new()),
             timeline_flush_scheduled: Cell::new(false),
+            transcript_scroll_scheduled: Cell::new(false),
             transcript_stack,
             transcript_scroller,
             status_icon,
@@ -665,6 +683,7 @@ impl CodexChatView {
             .borrow_mut()
             .retain(|queued| queued.id != item.id);
         let follow = adjustment_is_near_bottom(&self.state.transcript_scroller);
+        let was_empty = self.state.model.n_items() == 0;
         let existing = self.state.timeline_indices.borrow().get(&item.id).copied();
         let object = glib::BoxedAnyObject::new(TranscriptEntry::Timeline(item.clone()));
         if let Some(position) = existing {
@@ -680,8 +699,8 @@ impl CodexChatView {
         self.state
             .transcript_stack
             .set_visible_child_name("transcript");
-        if follow || existing.is_none() {
-            scroll_transcript_to_end(&self.state.transcript_scroller);
+        if follow || was_empty {
+            schedule_scroll_transcript_to_end(&self.state);
         }
     }
 
@@ -708,6 +727,7 @@ impl CodexChatView {
 
     pub fn upsert_pending_request(&self, request: PendingRequest) {
         let follow = adjustment_is_near_bottom(&self.state.transcript_scroller);
+        let was_empty = self.state.model.n_items() == 0;
         let existing = self
             .state
             .pending_indices
@@ -728,9 +748,13 @@ impl CodexChatView {
         self.state
             .transcript_stack
             .set_visible_child_name("transcript");
-        if follow || existing.is_none() {
-            scroll_transcript_to_end(&self.state.transcript_scroller);
+        if follow || was_empty {
+            schedule_scroll_transcript_to_end(&self.state);
         }
+    }
+
+    pub fn scroll_transcript_to_end(&self) {
+        schedule_scroll_transcript_to_end(&self.state);
     }
 
     pub fn resolve_pending_request(&self, request_id: &str) {
@@ -1549,10 +1573,17 @@ fn adjustment_is_near_bottom(scroller: &gtk::ScrolledWindow) -> bool {
     adjustment.upper() - (adjustment.value() + adjustment.page_size()) <= TRANSCRIPT_FOLLOW_DISTANCE
 }
 
-fn scroll_transcript_to_end(scroller: &gtk::ScrolledWindow) {
-    let scroller = scroller.clone();
+fn schedule_scroll_transcript_to_end(state: &Rc<CodexChatViewState>) {
+    if state.transcript_scroll_scheduled.replace(true) {
+        return;
+    }
+    let state = Rc::downgrade(state);
     glib::idle_add_local_once(move || {
-        let adjustment = scroller.vadjustment();
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        state.transcript_scroll_scheduled.set(false);
+        let adjustment = state.transcript_scroller.vadjustment();
         adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(adjustment.lower()));
     });
 }

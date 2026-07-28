@@ -86,6 +86,7 @@ impl AppChatSessionInner {
                 self.collaboration.borrow_mut().clear();
                 self.view.set_collaboration_progress(None);
                 self.set_state(AppChatState::Ready);
+                self.persist_overlay(None);
                 self.submit_next_queued();
             }
             "hook/started" | "hook/completed" => self.apply_hook(method, &params),

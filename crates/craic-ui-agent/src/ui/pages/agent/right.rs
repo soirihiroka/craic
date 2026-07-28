@@ -280,6 +280,7 @@ impl AgentChat {
                 &self.app_sessions,
                 &self.notebook,
                 &self.close_callback,
+                &self.history_callback,
             );
         }
         session_ids.len() + app_session_ids.len()
@@ -294,13 +295,27 @@ impl AgentChat {
     }
 
     pub fn start_app(&self) {
-        let session_id = self.reserve_session_id();
-        let session = match AppChatSession::new(session_id, self.ctx.clone()) {
-            Ok(session) => session,
-            Err(error) => {
-                self.ctx.show_error("Start Codex App Failed", &error);
-                return;
-            }
+        if let Err(error) = self.start_app_session(None) {
+            self.ctx.show_error("Start Codex App Failed", &error);
+        }
+    }
+
+    fn start_app_session(&self, restored: Option<&AgentSessionRow>) -> Result<u64, String> {
+        let session_id = restored
+            .map(|row| history_session_id(row.id))
+            .transpose()?
+            .unwrap_or_else(|| self.reserve_session_id());
+        self.reserve_session_id_at_least(session_id);
+        let session = if let Some(row) = restored {
+            let thread_id = row.cli_session_id.clone().ok_or_else(|| {
+                format!(
+                    "Stored Codex App session local_id={} has no thread id.",
+                    row.id
+                )
+            })?;
+            AppChatSession::resume(session_id, self.ctx.clone(), thread_id, row.id, &row.title)?
+        } else {
+            AppChatSession::new(session_id, self.ctx.clone())?
         };
         let page = session.root();
         page.set_widget_name(&session_id.to_string());
@@ -349,8 +364,16 @@ impl AgentChat {
             let notebook = self.notebook.clone();
             let root = self.root.clone();
             let close_callback = self.close_callback.clone();
+            let history_callback = self.history_callback.clone();
             move |_| {
-                request_close_app_session(session_id, &root, &sessions, &notebook, &close_callback)
+                request_close_app_session(
+                    session_id,
+                    &root,
+                    &sessions,
+                    &notebook,
+                    &close_callback,
+                    &history_callback,
+                )
             }
         });
         session.connect_title_changed({
@@ -383,13 +406,123 @@ impl AgentChat {
             let history_callback = self.history_callback.clone();
             move |_| notify_history_changed(&history_callback)
         });
+        session.connect_thread_changed({
+            let sessions = Rc::downgrade(&self.app_sessions);
+            let workspace_history = self.workspace_history.clone();
+            let notebook = self.notebook.clone();
+            let close_callback = self.close_callback.clone();
+            let new_session_callback = self.new_session_callback.clone();
+            let history_callback = self.history_callback.clone();
+            move |session_id, thread_id, title| {
+                let Some(sessions) = sessions.upgrade() else {
+                    return;
+                };
+                let Some(session) = app_session_by_id(&sessions, session_id) else {
+                    log::warn!(
+                        "Codex App thread update ignored for missing session session_id={session_id} thread_id={thread_id}"
+                    );
+                    return;
+                };
+                if thread_id.is_empty() {
+                    if let Some(callback) = new_session_callback.borrow().clone() {
+                        callback(
+                            session_id,
+                            &provider::app::PROVIDER,
+                            title,
+                            None,
+                            app_agent_session_state(&session.state()),
+                        );
+                    }
+                    return;
+                }
+                let existing = sessions
+                    .borrow()
+                    .iter()
+                    .find(|candidate| {
+                        candidate.id() != session_id
+                            && candidate.thread_id().as_deref() == Some(thread_id.as_str())
+                    })
+                    .cloned();
+                if let Some(existing) = existing {
+                    if let Some(page_num) = notebook.page_num(&existing.root()) {
+                        notebook.set_current_page(Some(page_num));
+                    }
+                    existing.focus();
+                    log::info!(
+                        "Codex App duplicate thread focused existing_session_id={} duplicate_session_id={session_id} thread_id={thread_id}",
+                        existing.id()
+                    );
+                    let sessions = sessions.clone();
+                    let notebook = notebook.clone();
+                    let close_callback = close_callback.clone();
+                    let history_callback = history_callback.clone();
+                    glib::idle_add_local_once(move || {
+                        close_app_session(
+                            session_id,
+                            &sessions,
+                            &notebook,
+                            &close_callback,
+                            &history_callback,
+                        );
+                    });
+                    return;
+                }
+                let result = agent_history::upsert_restorable_session(
+                    agent_history::AgentSessionUpsert {
+                        provider_id: provider::app::PROVIDER.provider_id().to_owned(),
+                        workspace: workspace_history.borrow().clone(),
+                        title: title.clone(),
+                        initial_restore_state: RestoreState::Restorable,
+                        session_uuid: Some(thread_id.clone()),
+                    },
+                    &thread_id,
+                );
+                match result {
+                    Ok(row) => {
+                        if let Some(previous_local_id) = session.local_history_id()
+                            && previous_local_id != row.id
+                            && let Err(error) = agent_history::mark_ended(previous_local_id)
+                        {
+                            log::warn!(
+                                "failed marking previous Codex App session ended session_id={session_id} local_id={previous_local_id}: {error}"
+                            );
+                        }
+                        session.set_local_history_id(row.id);
+                        if let Some(callback) = new_session_callback.borrow().clone() {
+                            callback(
+                                session_id,
+                                &provider::app::PROVIDER,
+                                title,
+                                Some(row.id),
+                                app_agent_session_state(&session.state()),
+                            );
+                        }
+                        notify_history_changed(&history_callback);
+                        log::info!(
+                            "Codex App session stored session_id={session_id} local_id={} thread_id={thread_id}",
+                            row.id
+                        );
+                    }
+                    Err(error) => log::warn!(
+                        "failed storing Codex App session session_id={session_id} thread_id={thread_id}: {error}"
+                    ),
+                }
+            }
+        });
         session.connect_close_requested({
             let sessions = Rc::downgrade(&self.app_sessions);
             let notebook = self.notebook.clone();
             let close_callback = self.close_callback.clone();
+            let history_callback = self.history_callback.clone();
             move |session_id| {
                 if let Some(sessions) = sessions.upgrade() {
-                    close_app_session(session_id, &sessions, &notebook, &close_callback);
+                    close_app_session(
+                        session_id,
+                        &sessions,
+                        &notebook,
+                        &close_callback,
+                        &history_callback,
+                    );
                 }
             }
         });
@@ -401,8 +534,12 @@ impl AgentChat {
                 session_id,
                 &provider::app::PROVIDER,
                 session.title(),
-                None,
-                AgentSessionState::Active(AgentActiveState::NewChat),
+                session.local_history_id(),
+                if restored.is_some() {
+                    AgentSessionState::Active(AgentActiveState::Loading)
+                } else {
+                    AgentSessionState::Active(AgentActiveState::NewChat)
+                },
             );
         }
         notify_session_state_changed(
@@ -411,6 +548,7 @@ impl AgentChat {
             &provider::app::PROVIDER,
             AgentSessionState::Active(AgentActiveState::Loading),
         );
+        Ok(session_id)
     }
 
     pub fn start_chat(&self, provider: &'static dyn AgentProvider) {
@@ -467,6 +605,27 @@ impl AgentChat {
                 row.restore_state.as_str()
             );
             return Err("Agent session is not restorable.".to_string());
+        }
+        if row.provider_id == provider::app::PROVIDER.provider_id() {
+            if let Some(session) = app_session_by_local_history_id(&self.app_sessions, row.id) {
+                self.show_session(session.id());
+                return Ok(session.id());
+            }
+            if let Some(thread_id) = row.cli_session_id.as_deref()
+                && let Some(session) = app_session_by_thread_id(&self.app_sessions, thread_id)
+            {
+                self.show_session(session.id());
+                return Ok(session.id());
+            }
+            let session_id = history_session_id(row.id)?;
+            if session_by_id(&self.sessions, session_id).is_some()
+                || app_session_by_id(&self.app_sessions, session_id).is_some()
+            {
+                return Err(format!(
+                    "Craic session id {session_id} is already active for another agent session."
+                ));
+            }
+            return self.start_app_session(Some(row));
         }
         let cli_session_id = row.cli_session_id.as_deref().ok_or_else(|| {
             format!(
@@ -686,6 +845,7 @@ impl AgentChat {
                 &self.app_sessions,
                 &self.notebook,
                 &self.close_callback,
+                &self.history_callback,
             );
             return;
         }
@@ -700,6 +860,17 @@ impl AgentChat {
     }
 
     pub fn request_unload_history_session(&self, local_id: i64) {
+        if let Some(session) = app_session_by_local_history_id(&self.app_sessions, local_id) {
+            request_close_app_session(
+                session.id(),
+                &self.root,
+                &self.app_sessions,
+                &self.notebook,
+                &self.close_callback,
+                &self.history_callback,
+            );
+            return;
+        }
         request_unload_history_session(
             local_id,
             &self.root,
@@ -711,6 +882,16 @@ impl AgentChat {
     }
 
     pub fn close_history_session(&self, local_id: i64) {
+        if let Some(session) = app_session_by_local_history_id(&self.app_sessions, local_id) {
+            close_app_session(
+                session.id(),
+                &self.app_sessions,
+                &self.notebook,
+                &self.close_callback,
+                &self.history_callback,
+            );
+            return;
+        }
         let Some(session) = session_by_local_history_id(&self.sessions, local_id) else {
             return;
         };
@@ -725,12 +906,24 @@ impl AgentChat {
 
     pub fn history_session_is_loaded(&self, local_id: i64) -> bool {
         session_by_local_history_id(&self.sessions, local_id).is_some()
+            || app_session_by_local_history_id(&self.app_sessions, local_id).is_some()
     }
 
     pub fn loaded_history_session_status(
         &self,
         local_id: i64,
     ) -> Option<LoadedHistorySessionStatus> {
+        if let Some(session) = app_session_by_local_history_id(&self.app_sessions, local_id) {
+            let state = session.state();
+            return Some(LoadedHistorySessionStatus {
+                session_id: session.id(),
+                terminal_state: app_chat_state_label(&state),
+                active_state: match app_agent_session_state(&state) {
+                    AgentSessionState::Active(state) => Some(state),
+                    AgentSessionState::Inactive(_) => None,
+                },
+            });
+        }
         let session = session_by_local_history_id(&self.sessions, local_id)?;
         Some(loaded_history_session_status(&session))
     }
@@ -740,7 +933,7 @@ impl AgentChat {
             return Some(ActiveSessionStatus {
                 session_id,
                 session_uuid: session.thread_id().unwrap_or_default(),
-                local_history_id: None,
+                local_history_id: session.local_history_id(),
                 provider_id: provider::app::PROVIDER.provider_id(),
                 title: session.title(),
                 terminal_state: app_chat_state_label(&session.state()),
@@ -1870,6 +2063,7 @@ fn close_app_session(
     sessions: &Rc<RefCell<Vec<AppChatSession>>>,
     notebook: &gtk::Notebook,
     close_callback: &Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
+    history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 ) {
     let session = {
         let mut sessions = sessions.borrow_mut();
@@ -1886,6 +2080,15 @@ fn close_app_session(
         notebook.remove_page(Some(page_num));
     }
     session.shutdown();
+    if let Some(local_id) = session.local_history_id() {
+        if let Err(error) = agent_history::mark_ended(local_id) {
+            log::warn!(
+                "failed marking Codex App session ended session_id={session_id} local_id={local_id}: {error}"
+            );
+        } else {
+            notify_history_changed(history_callback);
+        }
+    }
     if let Some(callback) = close_callback.borrow().clone() {
         callback(session_id);
     }
@@ -1897,6 +2100,7 @@ fn request_close_app_session(
     sessions: &Rc<RefCell<Vec<AppChatSession>>>,
     notebook: &gtk::Notebook,
     close_callback: &Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
+    history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 ) {
     let Some(session) = app_session_by_id(sessions, session_id) else {
         return;
@@ -1909,7 +2113,13 @@ fn request_close_app_session(
             | AppChatState::Running
             | AppChatState::AwaitingInput
     ) {
-        close_app_session(session_id, sessions, notebook, close_callback);
+        close_app_session(
+            session_id,
+            sessions,
+            notebook,
+            close_callback,
+            history_callback,
+        );
         return;
     }
 
@@ -1934,9 +2144,16 @@ fn request_close_app_session(
         let sessions = sessions.clone();
         let notebook = notebook.clone();
         let close_callback = close_callback.clone();
+        let history_callback = history_callback.clone();
         move |response| {
             if response.as_str() == "close" {
-                close_app_session(session_id, &sessions, &notebook, &close_callback);
+                close_app_session(
+                    session_id,
+                    &sessions,
+                    &notebook,
+                    &close_callback,
+                    &history_callback,
+                );
             }
         }
     });
@@ -1950,6 +2167,28 @@ fn app_session_by_id(
         .borrow()
         .iter()
         .find(|session| session.id() == session_id)
+        .cloned()
+}
+
+fn app_session_by_local_history_id(
+    sessions: &Rc<RefCell<Vec<AppChatSession>>>,
+    local_id: i64,
+) -> Option<AppChatSession> {
+    sessions
+        .borrow()
+        .iter()
+        .find(|session| session.local_history_id() == Some(local_id))
+        .cloned()
+}
+
+fn app_session_by_thread_id(
+    sessions: &Rc<RefCell<Vec<AppChatSession>>>,
+    thread_id: &str,
+) -> Option<AppChatSession> {
+    sessions
+        .borrow()
+        .iter()
+        .find(|session| session.thread_id().as_deref() == Some(thread_id))
         .cloned()
 }
 
