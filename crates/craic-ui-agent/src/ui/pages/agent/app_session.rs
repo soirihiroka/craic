@@ -7,6 +7,7 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod history;
+mod link_activation;
 mod notifications;
 mod settings;
 mod tools;
@@ -675,6 +676,9 @@ impl AppChatSessionInner {
             }
             CodexChatAction::OpenChanges => {
                 self.ctx.dispatch_command(PageCommand::ShowChanges);
+            }
+            CodexChatAction::OpenLink(target) => {
+                link_activation::activate(&self.ctx, &self.workspace_root, target)
             }
             CodexChatAction::AttachmentRemoved(attachment_id) => {
                 self.remove_temporary_attachment(&attachment_id)

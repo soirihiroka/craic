@@ -1,0 +1,10 @@
+[package]
+name = "craic-ui-markdown"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+craic-language.workspace = true
+gtk.workspace = true
+pulldown-cmark.workspace = true

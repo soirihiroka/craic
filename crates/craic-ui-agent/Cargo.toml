@@ -13,6 +13,7 @@ craic-codex-app-server.workspace = true
 craic-system.workspace = true
 craic-vcs.workspace = true
 craic-ui-core.workspace = true
+craic-ui-markdown.workspace = true
 craic-ui-terminal.workspace = true
 gtk.workspace = true
 libc.workspace = true

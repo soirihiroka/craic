@@ -1009,7 +1009,7 @@ fn transcript_factory(callbacks: Rc<RefCell<Vec<ActionCallback>>>) -> gtk::Signa
         };
         let entry = entry.borrow::<TranscriptEntry>().clone();
         let row = match entry {
-            TranscriptEntry::Timeline(entry) => timeline_row(&entry),
+            TranscriptEntry::Timeline(entry) => timeline_row(&entry, &callbacks),
             TranscriptEntry::Pending(request) => pending_request_row(&request, &callbacks),
         };
         item.set_child(Some(&row));
