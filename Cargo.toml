@@ -28,6 +28,7 @@ craic-ui-agent = { path = "crates/craic-ui-agent" }
 craic-ui-containers = { path = "crates/craic-ui-containers" }
 craic-ui-editor = { path = "crates/craic-ui-editor" }
 craic-ui-file = { path = "crates/craic-ui-file" }
+craic-ui-markdown = { path = "crates/craic-ui-markdown" }
 craic-ui-object-viewer = { path = "crates/craic-ui-object-viewer" }
 craic-ui-preview = { path = "crates/craic-ui-preview" }
 craic-ui-terminal = { path = "crates/craic-ui-terminal" }

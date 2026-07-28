@@ -770,6 +770,7 @@ dependencies = [
  "craic-config",
  "craic-system",
  "craic-ui-core",
+ "craic-ui-markdown",
  "craic-ui-terminal",
  "craic-vcs",
  "gtk4",
@@ -857,6 +858,15 @@ dependencies = [
  "serde_json",
  "uuid",
  "webkit6",
+]
+
+[[package]]
+name = "craic-ui-markdown"
+version = "0.1.0"
+dependencies = [
+ "craic-language",
+ "gtk4",
+ "pulldown-cmark",
 ]
 
 [[package]]

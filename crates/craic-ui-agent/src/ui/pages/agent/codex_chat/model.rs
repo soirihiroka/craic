@@ -366,6 +366,7 @@ pub enum CodexChatAction {
     StartReview,
     UndoLastTurn,
     OpenChanges,
+    OpenLink(craic_ui_markdown::LinkTarget),
     Submit(ComposerSubmission),
     Steer(ComposerSubmission),
     Queue(ComposerSubmission),

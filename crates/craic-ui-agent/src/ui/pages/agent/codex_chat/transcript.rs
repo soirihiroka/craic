@@ -7,12 +7,16 @@ use super::{
     StructuredRequestResponse, TimelineItem, TimelineItemKind, TimelineItemStatus,
 };
 use adw::prelude::*;
+use craic_ui_markdown::{LinkHandler, RenderOptions, render, render_with_options};
 use gtk::glib;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-pub(super) fn timeline_row(item: &TimelineItem) -> gtk::Widget {
+pub(super) fn timeline_row(
+    item: &TimelineItem,
+    callbacks: &Rc<RefCell<Vec<ActionCallback>>>,
+) -> gtk::Widget {
     let (default_title, icon_name) = match &item.kind {
         TimelineItemKind::UserMessage => ("You", "avatar-default-symbolic"),
         TimelineItemKind::AssistantMessage => ("Codex", "system-run-symbolic"),
@@ -43,26 +47,40 @@ pub(super) fn timeline_row(item: &TimelineItem) -> gtk::Widget {
         .hexpand(true)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
-    let status_label = gtk::Label::builder()
-        .label(match item.status {
-            TimelineItemStatus::Running => "Running",
-            TimelineItemStatus::Completed => "Completed",
-            TimelineItemStatus::Failed => "Failed",
-            TimelineItemStatus::Interrupted => "Interrupted",
-        })
-        .css_classes(["caption", "dim-label"])
-        .build();
-    if matches!(item.status, TimelineItemStatus::Failed) {
-        status_label.remove_css_class("dim-label");
-        status_label.add_css_class("error");
-    }
+    let (status, status_label): (gtk::Widget, &str) = match item.status {
+        TimelineItemStatus::Running => {
+            let spinner = adw::Spinner::new();
+            spinner.set_size_request(16, 16);
+            (spinner.upcast(), "Running")
+        }
+        TimelineItemStatus::Completed => {
+            let icon = gtk::Image::from_icon_name("emblem-ok-symbolic");
+            icon.set_pixel_size(16);
+            (icon.upcast(), "Completed")
+        }
+        TimelineItemStatus::Failed => {
+            let icon = gtk::Image::from_icon_name("dialog-error-symbolic");
+            icon.set_pixel_size(16);
+            icon.add_css_class("error");
+            (icon.upcast(), "Failed")
+        }
+        TimelineItemStatus::Interrupted => {
+            let icon = gtk::Image::from_icon_name("media-playback-stop-symbolic");
+            icon.set_pixel_size(16);
+            icon.add_css_class("dim-label");
+            (icon.upcast(), "Interrupted")
+        }
+    };
+    status.set_valign(gtk::Align::Center);
+    status.set_tooltip_text(Some(status_label));
+    status.update_property(&[gtk::accessible::Property::Label(status_label)]);
     let header = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
         .build();
     header.append(&icon);
     header.append(&title_label);
-    header.append(&status_label);
+    header.append(&status);
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -74,19 +92,19 @@ pub(super) fn timeline_row(item: &TimelineItem) -> gtk::Widget {
         .build();
     content.append(&header);
     if !item.body.is_empty() {
-        let body = gtk::Label::builder()
-            .label(&item.body)
-            .xalign(0.0)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .selectable(true)
-            .build();
-        if matches!(
-            item.kind,
-            TimelineItemKind::Command | TimelineItemKind::FileChange
-        ) {
-            body.add_css_class("monospace");
-        }
+        let body = render_with_options(
+            &item.body,
+            RenderOptions {
+                monospace: matches!(
+                    item.kind,
+                    TimelineItemKind::Command | TimelineItemKind::FileChange
+                ),
+            },
+            Rc::new({
+                let callbacks = callbacks.clone();
+                move |target| emit_action(&callbacks, CodexChatAction::OpenLink(target))
+            }) as LinkHandler,
+        );
         content.append(&body);
     }
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
@@ -96,20 +114,20 @@ pub(super) fn timeline_row(item: &TimelineItem) -> gtk::Widget {
             .child(&detail_content)
             .build();
         let detail = detail.to_owned();
+        let callbacks = Rc::clone(callbacks);
         let detail_materialized = Cell::new(false);
         expander.connect_notify_local(Some("expanded"), move |expander, _| {
             if !expander.is_expanded() || detail_materialized.replace(true) {
                 return;
             }
-            let detail_label = gtk::Label::builder()
-                .label(&detail)
-                .xalign(0.0)
-                .yalign(0.0)
-                .wrap(true)
-                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                .selectable(true)
-                .css_classes(["monospace"])
-                .build();
+            let detail_label = render_with_options(
+                &detail,
+                RenderOptions { monospace: true },
+                Rc::new({
+                    let callbacks = callbacks.clone();
+                    move |target| emit_action(&callbacks, CodexChatAction::OpenLink(target))
+                }),
+            );
             let detail_scroller = gtk::ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Never)
                 .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -184,15 +202,13 @@ pub(super) fn pending_request_row(
         .build();
     content.append(&header);
     if !request.description.is_empty() {
-        content.append(
-            &gtk::Label::builder()
-                .label(&request.description)
-                .xalign(0.0)
-                .wrap(true)
-                .wrap_mode(gtk::pango::WrapMode::WordChar)
-                .selectable(true)
-                .build(),
-        );
+        content.append(&render(
+            &request.description,
+            Rc::new({
+                let callbacks = callbacks.clone();
+                move |target| emit_action(&callbacks, CodexChatAction::OpenLink(target))
+            }),
+        ));
     }
 
     match &request.kind {
