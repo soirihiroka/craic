@@ -16,7 +16,6 @@ use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub(super) enum GitAction {
-    Fetch(Option<String>),
     Push,
     Pull,
     PullPush,
@@ -100,29 +99,192 @@ pub(super) fn run_git_action(state: &Rc<AppState>) {
                 }
             };
 
-            let remote = snapshot.remote_name.clone();
-            let action = if !snapshot.has_upstream {
-                if let Some(remote_name) = remote.clone() {
-                    GitAction::Publish(remote_name, snapshot.branch.clone())
+            if !snapshot.has_upstream {
+                if let Some(remote_name) = snapshot.remote_name.clone() {
+                    execute_git_action_with_snapshot(
+                        &state,
+                        snapshot.clone(),
+                        GitAction::Publish(remote_name, snapshot.branch.clone()),
+                        action_git_handle.clone(),
+                    );
                 } else {
                     show_publish_repository_dialog(&state, snapshot);
-                    return;
                 }
-            } else if snapshot.behind > 0 {
-                if snapshot.ahead > 0 {
-                    GitAction::PullPush
-                } else {
-                    GitAction::Pull
-                }
-            } else if snapshot.ahead > 0 {
-                GitAction::Push
             } else {
-                GitAction::Fetch(remote.clone())
-            };
-
-            execute_git_action_with_snapshot(&state, snapshot, action, action_git_handle.clone());
+                fetch_before_sync(
+                    &state,
+                    workspace_key.clone(),
+                    snapshot,
+                    action_git_handle.clone(),
+                );
+            }
         },
     );
+}
+
+fn fetch_before_sync(
+    state: &Rc<AppState>,
+    workspace_key: String,
+    snapshot: RepositorySnapshot,
+    git_handle: Arc<GitRepoHandle>,
+) {
+    let (sender, receiver) = mpsc::channel();
+    let remote_name = snapshot
+        .remote_name
+        .clone()
+        .unwrap_or_else(|| "remote".to_string());
+
+    state.git_action_running.set(true);
+    state.content.clear_git_action_progress();
+    state.content.update(&snapshot, true);
+    state
+        .content
+        .set_git_action_progress(&format!("Fetching {remote_name}..."));
+    log::info!(
+        "fetching before git synchronization workspace={} remote={}",
+        workspace_key,
+        remote_name
+    );
+
+    let progress_sender = sender.clone();
+    git_handle.fetch_with_progress(
+        None,
+        Box::new(move |progress| {
+            let _ = progress_sender.send(GitActionEvent::Progress(progress));
+        }),
+        Box::new(move |result| {
+            let _ = sender.send(GitActionEvent::Finished(result));
+        }),
+    );
+
+    gtk::glib::timeout_add_local(Duration::from_millis(100), {
+        let state = state.clone();
+        move || {
+            let mut latest_progress = None;
+
+            loop {
+                match receiver.try_recv() {
+                    Ok(GitActionEvent::Progress(progress)) => {
+                        latest_progress = Some(progress);
+                    }
+                    Ok(GitActionEvent::Finished(Ok(fetch_output))) => {
+                        state
+                            .content
+                            .set_git_action_progress("Checking remote status...");
+                        log::info!(
+                            "pre-synchronization fetch completed workspace={}",
+                            workspace_key
+                        );
+
+                        let result_workspace_key = workspace_key.clone();
+                        let result_git_handle = git_handle.clone();
+                        request_provider_git_snapshot(
+                            result_workspace_key.clone(),
+                            result_git_handle.clone(),
+                            {
+                                let state = state.clone();
+                                let remote_name = remote_name.clone();
+                                move |response_key, result| {
+                                    state.git_action_running.set(false);
+                                    state.content.clear_git_action_progress();
+
+                                    if response_key != result_workspace_key
+                                        || !active_workspace_matches(&state, &result_workspace_key)
+                                    {
+                                        log::debug!(
+                                            "discarding post-fetch snapshot for inactive workspace {}",
+                                            response_key
+                                        );
+                                        return;
+                                    }
+
+                                    let snapshot = match result {
+                                        Ok(snapshot) => snapshot,
+                                        Err(err) => {
+                                            show_error_dialog(
+                                                &state.window,
+                                                "Repository Error",
+                                                &err,
+                                            );
+                                            refresh(&state, None);
+                                            return;
+                                        }
+                                    };
+
+                                    let action = if snapshot.behind > 0 {
+                                        if snapshot.ahead > 0 {
+                                            Some(GitAction::PullPush)
+                                        } else {
+                                            Some(GitAction::Pull)
+                                        }
+                                    } else if snapshot.ahead > 0 {
+                                        Some(GitAction::Push)
+                                    } else {
+                                        None
+                                    };
+
+                                    if let Some(action) = action {
+                                        log::info!(
+                                            "post-fetch git action selected workspace={} action={:?} ahead={} behind={}",
+                                            result_workspace_key,
+                                            action,
+                                            snapshot.ahead,
+                                            snapshot.behind
+                                        );
+                                        execute_git_action_with_snapshot(
+                                            &state,
+                                            snapshot,
+                                            action,
+                                            result_git_handle.clone(),
+                                        );
+                                    } else {
+                                        state.content.update(&snapshot, false);
+                                        let message = if fetch_output.is_empty() {
+                                            format!("Fetched {remote_name}.")
+                                        } else {
+                                            fetch_output.clone()
+                                        };
+                                        refresh(&state, Some(message));
+                                    }
+                                }
+                            },
+                        );
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                    Ok(GitActionEvent::Finished(Err(err))) => {
+                        state.git_action_running.set(false);
+                        state.content.clear_git_action_progress();
+                        log::warn!(
+                            "pre-synchronization fetch failed workspace={}: {}",
+                            workspace_key,
+                            err
+                        );
+                        show_error_dialog(&state.window, "Git Action Failed", &err);
+                        refresh(&state, None);
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        state.git_action_running.set(false);
+                        state.content.clear_git_action_progress();
+                        show_error_dialog(
+                            &state.window,
+                            "Git Action Failed",
+                            "Fetch did not return a result.",
+                        );
+                        refresh(&state, None);
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                }
+            }
+
+            if let Some(progress) = latest_progress {
+                state.content.set_git_action_progress(&progress);
+            }
+
+            gtk::glib::ControlFlow::Continue
+        }
+    });
 }
 
 fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnapshot) {
@@ -760,31 +922,6 @@ fn execute_git_action_with_snapshot(
                         }
                     });
                     let _ = sender.send(GitActionEvent::Finished(message));
-                }),
-            );
-        }
-        GitAction::Fetch(remote) => {
-            let remote_name = remote.as_deref().unwrap_or("remote").to_string();
-            let progress_sender = sender.clone();
-            let _ = progress_sender.send(GitActionEvent::Progress(format!(
-                "Fetching {remote_name}..."
-            )));
-            let finish_sender = sender.clone();
-            let finished_remote_name = remote_name.clone();
-            git_handle.fetch_with_progress(
-                remote.as_deref(),
-                Box::new(move |progress| {
-                    let _ = progress_sender.send(GitActionEvent::Progress(progress));
-                }),
-                Box::new(move |result| {
-                    let message = result.map(|output| {
-                        if output.is_empty() {
-                            format!("Fetched {finished_remote_name}.")
-                        } else {
-                            output
-                        }
-                    });
-                    let _ = finish_sender.send(GitActionEvent::Finished(message));
                 }),
             );
         }

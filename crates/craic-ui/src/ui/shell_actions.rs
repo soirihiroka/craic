@@ -1,6 +1,6 @@
 use super::app_menu::launch_workspace_in_new_instance;
 use super::dialogs::show_error_dialog;
-use super::git_actions::{GitAction, execute_git_action};
+use super::git_actions::{GitAction, execute_git_action, run_git_action};
 use super::preferences::show_preferences_window;
 use super::{
     AppState, activate_page, active_workspace_from_config, apply_workspace_color,
@@ -57,7 +57,7 @@ fn connect_app_actions(state: &Rc<AppState>) {
         push_action.connect_activate({
             let state = state.clone();
             move |_, _| {
-                execute_git_action(&state, GitAction::Push);
+                run_git_action(&state);
             }
         });
         app.add_action(&push_action);
