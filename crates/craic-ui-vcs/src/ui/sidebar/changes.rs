@@ -32,6 +32,7 @@ pub fn apply_changed_files(
     selection_syncing: &Rc<Cell<bool>>,
     file_signature: Rc<RefCell<Vec<(String, String)>>>,
     checked_paths: Rc<RefCell<HashSet<String>>>,
+    commit_running: Rc<Cell<bool>>,
 ) {
     let desired_paths = snapshot
         .changed_files
@@ -72,6 +73,7 @@ pub fn apply_changed_files(
                 selection_syncing,
                 file_signature.clone(),
                 checked_paths.clone(),
+                commit_running.clone(),
             ),
         };
         rendered
@@ -109,6 +111,7 @@ fn mount_changed_file_row(
     selection_syncing: &Rc<Cell<bool>>,
     file_signature: Rc<RefCell<Vec<(String, String)>>>,
     checked_paths: Rc<RefCell<HashSet<String>>>,
+    commit_running: Rc<Cell<bool>>,
 ) -> gtk::ListBoxRow {
     let row = file_row::changed_file_row(path, status, true);
     if let Some(check_button) = row_check_button(&row) {
@@ -132,6 +135,7 @@ fn mount_changed_file_row(
                 &summary_entry,
                 &commit_button,
                 &file_signature.borrow(),
+                commit_running.get(),
             );
             generate_button.set_sensitive(!checked_paths.borrow().is_empty());
             update_selection_header(
@@ -178,6 +182,7 @@ pub fn update_commit_button_sensitivity_for_paths(
     summary_entry: &gtk::Entry,
     commit_button: &gtk::Button,
     file_signature: &[(String, String)],
+    commit_running: bool,
 ) {
     let mut files = files.iter().cloned().collect::<Vec<_>>();
     files.sort();
@@ -187,7 +192,7 @@ pub fn update_commit_button_sensitivity_for_paths(
     summary_entry.set_placeholder_text(Some(
         default_summary.as_deref().unwrap_or("Summary (required)"),
     ));
-    commit_button.set_sensitive(has_summary && has_checked_file);
+    commit_button.set_sensitive(!commit_running && has_summary && has_checked_file);
 }
 
 pub fn default_commit_summary(
