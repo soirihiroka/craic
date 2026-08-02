@@ -238,23 +238,43 @@ impl ChangesPage {
                     ctx.show_error("Commit Failed", &ctx.git_unavailable_message());
                     return;
                 };
+                if !panel.begin_commit() {
+                    return;
+                }
+                log::info!(
+                    "starting commit workspace={} files={}",
+                    ctx.workspace_key(),
+                    files.len()
+                );
                 let completion = command_mailbox::once({
                     let ctx = ctx.clone();
+                    let panel = panel.clone();
                     let summary_entry = summary_entry.clone();
                     let description_view = description_view.clone();
 
-                    move |result: Result<String, String>| match result {
-                        Ok(output) => {
-                            summary_entry.set_text("");
-                            description_view.buffer().set_text("");
-                            let message = if output.is_empty() {
-                                "Commit created.".to_string()
-                            } else {
-                                output
-                            };
-                            ctx.refresh_without_toast(Some(message));
+                    move |result: Result<String, String>| {
+                        let succeeded = result.is_ok();
+                        log::info!(
+                            "commit finished workspace={} success={succeeded}",
+                            ctx.workspace_key()
+                        );
+                        match result {
+                            Ok(output) => {
+                                summary_entry.set_text("");
+                                description_view.buffer().set_text("");
+                                panel.finish_commit();
+                                let message = if output.is_empty() {
+                                    "Commit created.".to_string()
+                                } else {
+                                    output
+                                };
+                                ctx.refresh_without_toast(Some(message));
+                            }
+                            Err(err) => {
+                                panel.finish_commit();
+                                ctx.show_error("Commit Failed", &err);
+                            }
                         }
-                        Err(err) => ctx.show_error("Commit Failed", &err),
                     }
                 });
                 git_handle.commit_paths(

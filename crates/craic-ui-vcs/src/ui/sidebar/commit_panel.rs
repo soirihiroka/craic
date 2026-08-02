@@ -14,6 +14,8 @@ pub struct CommitPanel {
     pub generate_button: gtk::Button,
     pub generate_icon_stack: gtk::Stack,
     pub commit_button: gtk::Button,
+    pub commit_spinner: adw::Spinner,
+    commit_label: gtk::Label,
     avatar_source: RefCell<Option<String>>,
 }
 
@@ -107,7 +109,18 @@ impl CommitPanel {
             .child(&description_view)
             .build();
 
-        let commit_button = gtk::Button::with_label("Commit to branch");
+        let commit_spinner = adw::Spinner::new();
+        commit_spinner.set_size_request(16, 16);
+        commit_spinner.set_visible(false);
+        let commit_label = gtk::Label::new(Some("Commit to branch"));
+        let commit_content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .halign(gtk::Align::Center)
+            .build();
+        commit_content.append(&commit_spinner);
+        commit_content.append(&commit_label);
+        let commit_button = gtk::Button::builder().child(&commit_content).build();
         commit_button.add_css_class("suggested-action");
         commit_button.set_sensitive(false);
 
@@ -133,12 +146,14 @@ impl CommitPanel {
             generate_button,
             generate_icon_stack,
             commit_button,
+            commit_spinner,
+            commit_label,
             avatar_source: RefCell::new(None),
         }
     }
 
     pub fn set_branch(&self, branch: &str) {
-        self.commit_button.set_label(&format!("Commit to {branch}"));
+        self.commit_label.set_label(&format!("Commit to {branch}"));
     }
 
     pub fn clear(&self) {

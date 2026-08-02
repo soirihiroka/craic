@@ -22,6 +22,8 @@ pub struct ChangesPanel {
     summary_entry: gtk::Entry,
     generate_button: gtk::Button,
     commit_button: gtk::Button,
+    commit_spinner: adw::Spinner,
+    commit_running: Rc<Cell<bool>>,
     files_stack: gtk::Stack,
     search_panel: SearchPanel,
     select_all_check: gtk::CheckButton,
@@ -152,6 +154,8 @@ impl ChangesPanel {
             summary_entry: commit_panel.summary_entry.clone(),
             generate_button: commit_panel.generate_button.clone(),
             commit_button: commit_panel.commit_button.clone(),
+            commit_spinner: commit_panel.commit_spinner.clone(),
+            commit_running: Rc::new(Cell::new(false)),
             files_stack,
             search_panel,
             select_all_check,
@@ -272,6 +276,21 @@ impl ChangesPanel {
             .unwrap_or_default()
     }
 
+    pub fn begin_commit(&self) -> bool {
+        if self.commit_running.replace(true) {
+            return false;
+        }
+        self.commit_spinner.set_visible(true);
+        self.refresh_controls();
+        true
+    }
+
+    pub fn finish_commit(&self) {
+        self.commit_running.set(false);
+        self.commit_spinner.set_visible(false);
+        self.refresh_controls();
+    }
+
     pub fn clear(&self) {
         self.root.set_visible_child_name("content");
         self.files_stack.set_visible_child_name("files");
@@ -339,6 +358,7 @@ impl ChangesPanel {
             &self.selection_syncing,
             self.file_signature.clone(),
             self.checked_paths.clone(),
+            self.commit_running.clone(),
         );
     }
 
@@ -381,6 +401,7 @@ impl ChangesPanel {
             let commit_button = self.commit_button.clone();
             let file_signature = self.file_signature.clone();
             let checked_paths = self.checked_paths.clone();
+            let commit_running = self.commit_running.clone();
 
             move |entry| {
                 update_commit_button_sensitivity_for_paths(
@@ -388,6 +409,7 @@ impl ChangesPanel {
                     entry,
                     &commit_button,
                     &file_signature.borrow(),
+                    commit_running.get(),
                 );
             }
         });
@@ -404,6 +426,7 @@ impl ChangesPanel {
             let selection_syncing = self.selection_syncing.clone();
             let file_signature = self.file_signature.clone();
             let checked_paths = self.checked_paths.clone();
+            let commit_running = self.commit_running.clone();
 
             move |button| {
                 if selection_syncing.get() {
@@ -427,6 +450,7 @@ impl ChangesPanel {
                     &summary_entry,
                     &commit_button,
                     &file_signature.borrow(),
+                    commit_running.get(),
                 );
                 generate_button.set_sensitive(!checked_paths.borrow().is_empty());
                 update_selection_header(
@@ -452,6 +476,7 @@ impl ChangesPanel {
             &self.summary_entry,
             &self.commit_button,
             &self.file_signature.borrow(),
+            self.commit_running.get(),
         );
         self.generate_button
             .set_sensitive(!self.checked_paths.borrow().is_empty());
