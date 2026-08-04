@@ -1,5 +1,6 @@
 use super::{
-    DisclosureAnimator, ICON_SIZE, TreeRenderState, TreeRow, icon_row_entry, sticky_items,
+    DisclosureAnimator, ICON_SIZE, TreeRenderState, TreeRow, icon_row_entry,
+    sticky_items_with_offsets,
 };
 use crate::ui::{canvas_scroll, canvas_scrollbar};
 use gtk::prelude::*;
@@ -9,6 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::OnceLock;
+
+const VIRTUAL_FALLBACK_VIEWPORT_HEIGHT: f64 = 640.0;
+const VIRTUAL_OVERSCAN_VIEWPORTS: f64 = 1.0;
 
 type MountFn<K, S> = dyn Fn(usize, &K, &TreeRenderState<K, S>) -> gtk::Widget;
 // Updates normally mutate the mounted widget and return `None`. Returning a new widget asks the
@@ -138,7 +142,10 @@ pub struct TreeView<K, S> {
     pub scroller: gtk::ScrolledWindow,
     sticky_layer: gtk::Fixed,
     scrollbar: Option<TreeCanvasScrollbar>,
+    top_spacer: gtk::Widget,
+    bottom_spacer: gtk::Widget,
     rows: RefCell<Vec<TreeRow<K, S>>>,
+    row_offsets: RefCell<Vec<f64>>,
     renderer: RefCell<Option<TreeRenderer<K, S>>>,
     row_widgets: RefCell<HashMap<K, gtk::Widget>>,
     row_states: RefCell<HashMap<K, TreeRenderState<K, S>>>,
@@ -146,6 +153,7 @@ pub struct TreeView<K, S> {
     sticky_states: RefCell<HashMap<K, TreeRenderState<K, S>>>,
     disclosure: DisclosureAnimator<K>,
     sticky_signature: RefCell<Vec<K>>,
+    mounted_range: Cell<Option<(usize, usize)>>,
 }
 
 impl<K, S> TreeView<K, S>
@@ -201,6 +209,12 @@ impl TreeViewBuilder {
             .halign(gtk::Align::Fill)
             .build();
         list.add_css_class("repo-browser-list");
+        let top_spacer = gtk::Box::builder().hexpand(true).height_request(0).build();
+        top_spacer.set_can_target(false);
+        let bottom_spacer = gtk::Box::builder().hexpand(true).height_request(0).build();
+        bottom_spacer.set_can_target(false);
+        list.append(&top_spacer);
+        list.append(&bottom_spacer);
 
         let viewport = gtk::Viewport::builder()
             .scroll_to_focus(false)
@@ -267,7 +281,10 @@ impl TreeViewBuilder {
             scroller,
             sticky_layer,
             scrollbar,
+            top_spacer: top_spacer.upcast(),
+            bottom_spacer: bottom_spacer.upcast(),
             rows: RefCell::new(Vec::new()),
+            row_offsets: RefCell::new(vec![0.0]),
             renderer: RefCell::new(None),
             row_widgets: RefCell::new(HashMap::new()),
             row_states: RefCell::new(HashMap::new()),
@@ -275,6 +292,7 @@ impl TreeViewBuilder {
             sticky_states: RefCell::new(HashMap::new()),
             disclosure: DisclosureAnimator::new(),
             sticky_signature: RefCell::new(Vec::new()),
+            mounted_range: Cell::new(None),
         });
         tree.connect_sticky_scroll();
         tree.connect_canvas_scrollbar();
@@ -302,32 +320,97 @@ where
         renderer: TreeRenderer<K, S>,
     ) -> TreeUpdateStats {
         self.renderer.replace(Some(renderer.clone()));
+        self.row_offsets.replace(row_offsets(&rows));
+        self.rows.replace(rows);
+        self.mounted_range.set(None);
+        let stats = self.update_virtual_rows_with_renderer(&renderer);
+        self.update_sticky_rows();
+        self.update_canvas_scrollbar();
+        stats
+    }
+
+    fn update_virtual_rows(&self) -> TreeUpdateStats {
+        let Some(renderer) = self.renderer.borrow().clone() else {
+            return TreeUpdateStats::default();
+        };
+        self.update_virtual_rows_with_renderer(&renderer)
+    }
+
+    fn update_virtual_rows_with_renderer(&self, renderer: &TreeRenderer<K, S>) -> TreeUpdateStats {
+        // Spacers retain the full scroll geometry while GTK only owns widgets near the viewport.
+        let (start, end) = self.virtual_row_range();
+        if self.mounted_range.get() == Some((start, end)) {
+            return TreeUpdateStats::default();
+        }
+
         let width = self.list.allocated_width().max(1);
-        let states = rows
+        let offsets = self.row_offsets.borrow();
+        let states = self.rows.borrow()[start..end]
             .iter()
             .cloned()
-            .map(|row| {
+            .enumerate()
+            .map(|(offset, row)| {
+                let index = start + offset;
                 (
                     row.key.clone(),
                     TreeRenderState {
                         row,
                         sticky: false,
                         bottom: false,
-                        y: 0.0,
+                        y: offsets[index],
                         width,
                     },
                 )
             })
             .collect::<Vec<_>>();
-        let stats = self.apply_row_commands(states, &renderer);
-        self.rows.replace(rows);
-        self.update_sticky_rows();
-        self.update_canvas_scrollbar();
+        let top_height = offsets.get(start).copied().unwrap_or_default();
+        let bottom_height = offsets.last().copied().unwrap_or_default()
+            - offsets.get(end).copied().unwrap_or_default();
+        drop(offsets);
+
+        self.top_spacer
+            .set_height_request(top_height.round() as i32);
+        self.bottom_spacer
+            .set_height_request(bottom_height.round() as i32);
+        let stats = self.apply_row_commands(start, states, renderer);
+        self.mounted_range.set(Some((start, end)));
         stats
+    }
+
+    fn virtual_row_range(&self) -> (usize, usize) {
+        let rows_len = self.rows.borrow().len();
+        if rows_len == 0 {
+            return (0, 0);
+        }
+
+        let adjustment = self.scroller.vadjustment();
+        let page_size = self.external_scroll_page_size(&adjustment);
+        let viewport_height = if page_size <= 1.0 {
+            VIRTUAL_FALLBACK_VIEWPORT_HEIGHT
+        } else {
+            page_size
+        };
+        let offsets = self.row_offsets.borrow();
+        let total_height = offsets.last().copied().unwrap_or_default();
+        let scroll_y = adjustment
+            .value()
+            .clamp(0.0, (total_height - viewport_height).max(0.0));
+        let overscan = viewport_height * VIRTUAL_OVERSCAN_VIEWPORTS;
+        let mount_top = (scroll_y - overscan).max(0.0);
+        let mount_bottom = (scroll_y + viewport_height + overscan).min(total_height);
+        let start = offsets
+            .partition_point(|offset| *offset <= mount_top)
+            .saturating_sub(1)
+            .min(rows_len);
+        let end = offsets[..rows_len]
+            .partition_point(|offset| *offset < mount_bottom)
+            .max((start + 1).min(rows_len));
+        (start, end)
     }
 
     fn apply_row_commands(
         &self,
+        start_index: usize,
         states: Vec<(K, TreeRenderState<K, S>)>,
         renderer: &TreeRenderer<K, S>,
     ) -> TreeUpdateStats {
@@ -351,8 +434,13 @@ where
             self.row_states.borrow_mut().remove(&key);
         }
 
-        let mut previous_widget = None;
+        if !widget_follows(&self.top_spacer, None) {
+            self.list
+                .reorder_child_after(&self.top_spacer, None::<&gtk::Widget>);
+        }
+        let mut previous_widget = Some(self.top_spacer.clone());
         for (index, (key, state)) in states.into_iter().enumerate() {
+            let index = start_index + index;
             let existing = { self.row_widgets.borrow().get(&key).cloned() };
             let widget = match existing {
                 Some(mut widget) => {
@@ -394,6 +482,10 @@ where
             };
             self.row_states.borrow_mut().insert(key, state);
             previous_widget = Some(widget);
+        }
+        if !widget_follows(&self.bottom_spacer, previous_widget.as_ref()) {
+            self.list
+                .reorder_child_after(&self.bottom_spacer, previous_widget.as_ref());
         }
         stats
     }
@@ -467,11 +559,19 @@ where
 
     pub fn clear(&self) {
         self.rows.borrow_mut().clear();
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
+        self.row_offsets.replace(vec![0.0]);
+        for widget in self
+            .row_widgets
+            .borrow_mut()
+            .drain()
+            .map(|(_, widget)| widget)
+        {
+            self.list.remove(&widget);
         }
-        self.row_widgets.borrow_mut().clear();
         self.row_states.borrow_mut().clear();
+        self.top_spacer.set_height_request(0);
+        self.bottom_spacer.set_height_request(0);
+        self.mounted_range.set(None);
         self.clear_sticky_rows();
         self.update_canvas_scrollbar();
     }
@@ -483,8 +583,11 @@ where
         };
 
         let scroll_y = self.scroller.vadjustment().value().max(0.0);
-        let rows = self.rows.borrow().clone();
-        let items = sticky_items(&rows, scroll_y);
+        let rows = self.rows.borrow();
+        let offsets = self.row_offsets.borrow();
+        let items = sticky_items_with_offsets(&rows, &offsets, scroll_y);
+        drop(offsets);
+        drop(rows);
         if items.is_empty() {
             self.clear_sticky_rows();
             return;
@@ -538,7 +641,7 @@ where
     pub fn sticky_row_at_viewport_y(&self, y: f64) -> Option<TreeRow<K, S>> {
         let scroll_y = self.scroller.vadjustment().value().max(0.0);
         let content_y = y + scroll_y;
-        sticky_items(&self.rows.borrow(), scroll_y)
+        sticky_items_with_offsets(&self.rows.borrow(), &self.row_offsets.borrow(), scroll_y)
             .into_iter()
             .find(|item| content_y >= item.draw_y && content_y < item.visible_bottom)
             .map(|item| item.row)
@@ -546,7 +649,7 @@ where
 
     pub fn last_sticky_row(&self) -> Option<TreeRow<K, S>> {
         let scroll_y = self.scroller.vadjustment().value().max(0.0);
-        sticky_items(&self.rows.borrow(), scroll_y)
+        sticky_items_with_offsets(&self.rows.borrow(), &self.row_offsets.borrow(), scroll_y)
             .last()
             .map(|item| item.row.clone())
     }
@@ -556,15 +659,11 @@ where
             return None;
         }
 
-        let mut top = 0.0;
-        for row in self.rows.borrow().iter() {
-            let bottom = top + row.height;
-            if y >= top && y < bottom {
-                return Some(row.clone());
-            }
-            top = bottom;
-        }
-        None
+        let offsets = self.row_offsets.borrow();
+        let index = offsets
+            .partition_point(|offset| *offset <= y)
+            .saturating_sub(1);
+        self.rows.borrow().get(index).cloned()
     }
 
     pub fn last_row_before_content_y_matching<F>(
@@ -579,18 +678,10 @@ where
             return None;
         }
 
-        let mut top = 0.0;
-        let mut previous = None;
-        for row in self.rows.borrow().iter() {
-            if top > y {
-                break;
-            }
-            if matches(row) {
-                previous = Some(row.clone());
-            }
-            top += row.height;
-        }
-        previous
+        let rows = self.rows.borrow();
+        let offsets = self.row_offsets.borrow();
+        let end = offsets[..rows.len()].partition_point(|offset| *offset <= y);
+        rows[..end].iter().rev().find(|row| matches(row)).cloned()
     }
 
     pub fn scroll_row_into_view(&self, key: &K) {
@@ -622,6 +713,7 @@ where
     }
 
     pub fn focus_row(&self, key: &K) -> bool {
+        self.update_virtual_rows();
         let Some(button) = self
             .row_widget(key)
             .and_then(|widget| widget.first_child())
@@ -633,6 +725,7 @@ where
     }
 
     pub fn focus_edit_row(&self, key: &K, placement: EditFocusPlacement) -> bool {
+        self.update_virtual_rows();
         let Some(entry) = self.row_widget(key).and_then(icon_row_entry) else {
             return false;
         };
@@ -714,8 +807,7 @@ where
     }
 
     fn row_widget(&self, key: &K) -> Option<gtk::Widget> {
-        let index = self.rows.borrow().iter().position(|row| row.key == *key)?;
-        child_at_index(&self.list, index)
+        self.row_widgets.borrow().get(key).cloned()
     }
 
     pub fn draw_disclosure(
@@ -800,9 +892,17 @@ where
         self.scroller.vadjustment().connect_value_changed({
             let tree = self.clone();
             move |_| {
+                tree.update_virtual_rows();
                 tree.update_sticky_rows();
                 tree.list.queue_draw();
                 tree.update_canvas_scrollbar();
+            }
+        });
+        self.scroller.vadjustment().connect_page_size_notify({
+            let tree = self.clone();
+            move |_| {
+                tree.update_virtual_rows();
+                tree.update_sticky_rows();
             }
         });
     }
@@ -1206,12 +1306,13 @@ fn map_scroll_value(value: f64, lower: f64, from_max: f64, to_max: f64) -> f64 {
     lower + progress * (to_max - lower)
 }
 
-fn child_at_index(parent: &gtk::Box, index: usize) -> Option<gtk::Widget> {
-    let mut child = parent.first_child();
-    for _ in 0..index {
-        child = child?.next_sibling();
+fn row_offsets<K, S>(rows: &[TreeRow<K, S>]) -> Vec<f64> {
+    let mut offsets = Vec::with_capacity(rows.len() + 1);
+    offsets.push(0.0);
+    for row in rows {
+        offsets.push(offsets.last().copied().unwrap_or_default() + row.height);
     }
-    child
+    offsets
 }
 
 fn widget_tree_has_focus(widget: &gtk::Widget) -> bool {
