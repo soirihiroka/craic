@@ -1408,10 +1408,6 @@ fn refresh_workspace(
         force_update,
     };
     if state.snapshot_refresh_running.get() {
-        if request.message.is_none() && !request.show_toast && !request.force_update {
-            log::trace!("skipped workspace polling refresh because a snapshot is already running");
-            return;
-        }
         queue_workspace_refresh(state, request);
         return;
     }

@@ -11,6 +11,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
 
+const DIRECTORY_INFO_BATCH_SIZE: usize = 512;
+
 impl FileBrowser {
     pub fn visible_rows(self: &Rc<Self>) -> Vec<BrowserRow> {
         let workspace = self.workspace.borrow().clone();
@@ -261,25 +263,45 @@ fn directory_listing_rows(
     listing: DirectoryListing,
 ) -> Result<Vec<BrowserRow>, String> {
     let depth = directory_child_depth(&listing.path);
-    let entry_paths = listing
-        .entries
-        .into_iter()
-        .filter(|path| path.file_name().is_some_and(|name| !should_skip(name)))
-        .collect::<Vec<_>>();
-    let infos = file_access.info_many(&entry_paths).map_err(|err| {
-        log::debug!(
-            "file browser node info failed path={} entries={} err={err}",
-            listing.path.display(),
-            entry_paths.len()
+    let entry_count = listing.entries.len();
+    let mut visible_entry_count = 0usize;
+    let mut children = Vec::with_capacity(entry_count.min(MAX_TREE_ROWS));
+    for entries in listing.entries.chunks(DIRECTORY_INFO_BATCH_SIZE) {
+        let entry_paths = entries
+            .iter()
+            .filter(|path| path.file_name().is_some_and(|name| !should_skip(name)))
+            .cloned()
+            .collect::<Vec<_>>();
+        visible_entry_count += entry_paths.len();
+        let infos = file_access.info_many(&entry_paths).map_err(|err| {
+            log::debug!(
+                "file browser node info failed path={} entries={} err={err}",
+                listing.path.display(),
+                entry_paths.len()
+            );
+            err
+        })?;
+        children.extend(
+            infos
+                .into_iter()
+                .filter(|info| !should_skip(&info.display_name))
+                .map(|info| BrowserRow::from_info(info, depth)),
         );
-        err
-    })?;
-    let mut children = infos
-        .into_iter()
-        .filter(|info| !should_skip(&info.display_name))
-        .map(|info| BrowserRow::from_info(info, depth))
-        .collect::<Vec<_>>();
+        if children.len() >= MAX_TREE_ROWS * 2 {
+            sort_browser_rows(&mut children);
+            children.truncate(MAX_TREE_ROWS);
+        }
+    }
     sort_browser_rows(&mut children);
+    children.truncate(MAX_TREE_ROWS);
+    if visible_entry_count > children.len() {
+        log::info!(
+            "file browser directory listing limited path={} entries={} retained={}",
+            listing.path.display(),
+            entry_count,
+            children.len()
+        );
+    }
     Ok(children)
 }
 

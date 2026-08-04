@@ -34,10 +34,23 @@ where
     K: Clone,
     S: Clone,
 {
-    sticky_layout(rows, scroll_y).items
+    let offsets = row_offsets(rows);
+    sticky_items_with_offsets(rows, &offsets, scroll_y)
 }
 
-fn sticky_layout<K, S>(rows: &[TreeRow<K, S>], scroll_y: f64) -> StickyLayout<K, S>
+pub fn sticky_items_with_offsets<K, S>(
+    rows: &[TreeRow<K, S>],
+    offsets: &[f64],
+    scroll_y: f64,
+) -> Vec<StickyLayoutItem<K, S>>
+where
+    K: Clone,
+    S: Clone,
+{
+    sticky_layout(rows, offsets, scroll_y).items
+}
+
+fn sticky_layout<K, S>(rows: &[TreeRow<K, S>], offsets: &[f64], scroll_y: f64) -> StickyLayout<K, S>
 where
     K: Clone,
     S: Clone,
@@ -46,14 +59,13 @@ where
         return StickyLayout { items: Vec::new() };
     }
 
-    let offsets = row_offsets(rows);
     let mut items = Vec::new();
     let mut sticky_height = 0.0;
     let mut first_visible_y = scroll_y;
     let mut previous_index: Option<usize> = None;
 
     loop {
-        let Some(first_index) = row_index_at_y(rows, &offsets, first_visible_y) else {
+        let Some(first_index) = row_index_at_y(rows, offsets, first_visible_y) else {
             break;
         };
         let Some(candidate_index) = ancestor_under_previous(rows, first_index, previous_index)
@@ -70,19 +82,14 @@ where
         }
 
         if candidate_index == first_index
-            && node_top_aligns_with_sticky_bottom(
-                &offsets,
-                candidate_index,
-                scroll_y,
-                sticky_height,
-            )
+            && node_top_aligns_with_sticky_bottom(offsets, candidate_index, scroll_y, sticky_height)
         {
             break;
         }
 
         let end_index = subtree_end_index(rows, candidate_index);
         let position = sticky_node_position(
-            &offsets,
+            offsets,
             rows,
             end_index,
             scroll_y,
@@ -105,11 +112,9 @@ where
 
 fn row_offsets<K, S>(rows: &[TreeRow<K, S>]) -> Vec<f64> {
     let mut offsets = Vec::with_capacity(rows.len() + 1);
-    let mut current = 0.0;
-    offsets.push(current);
+    offsets.push(0.0);
     for row in rows {
-        current += row.height;
-        offsets.push(current);
+        offsets.push(offsets.last().copied().unwrap_or_default() + row.height);
     }
     offsets
 }

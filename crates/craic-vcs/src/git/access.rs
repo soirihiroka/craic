@@ -15,15 +15,15 @@ use crate::{bitbucket, gitlab};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GIT_CHANGE_LISTENER_INTERVAL: Duration = Duration::from_secs(2);
-const GIT_BACKGROUND_PULL_INTERVAL: Duration = Duration::from_secs(300);
+const GIT_BACKGROUND_PULL_INTERVAL: Duration = Duration::from_secs(60);
 const RECENT_BRANCHES_LIMIT: usize = 5;
 const CHECK_IGNORE_SCRIPT: &str = include_str!("scripts/check_ignore.sh");
 const COMMIT_SELECTED_SCRIPT: &str = include_str!("scripts/commit_selected.sh");
@@ -34,6 +34,11 @@ const PYTHON_DIFF_SCRIPT: &str = include_str!("scripts/diff.py");
 const PYTHON_BYTES_SCRIPT: &str = include_str!("scripts/bytes.py");
 const PYTHON_HISTORY_PAGE_SCRIPT: &str = include_str!("scripts/history_page.py");
 const PYTHON_WATCH_SCRIPT: &str = include_str!("scripts/watch.py");
+
+fn successful_fetch_times() -> &'static Mutex<HashMap<String, SystemTime>> {
+    static FETCH_TIMES: OnceLock<Mutex<HashMap<String, SystemTime>>> = OnceLock::new();
+    FETCH_TIMES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 pub type OperationCallback<T> = Box<dyn FnOnce(Result<T, String>) + Send + 'static>;
 pub type WatchCallback<T> = Box<dyn FnMut(Result<T, String>) + Send + 'static>;
@@ -284,10 +289,6 @@ impl BackgroundPullSubscription {
             let mut previous_error: Option<String> = None;
 
             loop {
-                if stop_receiver.recv_timeout(interval).is_ok() {
-                    break;
-                }
-
                 let start = Instant::now();
                 match pull() {
                     Ok(output) => {
@@ -314,6 +315,11 @@ impl BackgroundPullSubscription {
                             previous_error = Some(err);
                         }
                     }
+                }
+
+                match stop_receiver.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
             }
 
@@ -416,6 +422,28 @@ impl GitRepoHandle {
 
     fn git_ok(&self, args: &[String]) -> Result<String, String> {
         self.git(args).map(|out| out.trim().to_string())
+    }
+
+    fn record_fetch(&self) {
+        let workspace_key = self.workspace.id.to_string();
+        match successful_fetch_times().lock() {
+            Ok(mut fetch_times) => {
+                fetch_times.insert(workspace_key, SystemTime::now());
+            }
+            Err(err) => {
+                log::warn!(
+                    "failed to record git fetch time workspace={}: {err}",
+                    self.workspace.display_name
+                );
+            }
+        }
+    }
+
+    fn last_fetch_at(&self) -> Option<SystemTime> {
+        successful_fetch_times()
+            .lock()
+            .ok()
+            .and_then(|fetch_times| fetch_times.get(&self.workspace.id.to_string()).copied())
     }
 
     fn run_script_output(
@@ -1142,7 +1170,7 @@ impl GitRepoHandle {
             ahead,
             behind,
             has_upstream,
-            last_fetch_at: None,
+            last_fetch_at: self.last_fetch_at(),
             user_name: self
                 .git_ok(&["config".into(), "--get".into(), "user.name".into()])
                 .ok(),
@@ -1605,7 +1633,7 @@ impl GitRepoHandle {
     }
 
     fn pull_blocking(&self) -> Result<String, String> {
-        self.run_with_hooks("git pull", || {
+        let result = self.run_with_hooks("git pull", || {
             self.git(&[
                 "-c".into(),
                 "rebase.backend=merge".into(),
@@ -1613,7 +1641,11 @@ impl GitRepoHandle {
                 "--ff".into(),
                 "--recurse-submodules".into(),
             ])
-        })
+        });
+        if result.is_ok() {
+            self.record_fetch();
+        }
+        result
     }
 
     fn publish_blocking(&self, remote: &str, branch: &str) -> Result<String, String> {
@@ -1632,7 +1664,11 @@ impl GitRepoHandle {
         if let Some(remote) = remote {
             args.push(remote.to_string());
         }
-        self.run_with_hooks("git fetch", || self.git(&args))
+        let result = self.run_with_hooks("git fetch", || self.git(&args));
+        if result.is_ok() {
+            self.record_fetch();
+        }
+        result
     }
 
     fn checkout_branch_blocking(&self, branch: &str) -> Result<String, String> {

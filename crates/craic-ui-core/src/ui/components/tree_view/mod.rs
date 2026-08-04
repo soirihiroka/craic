@@ -13,5 +13,5 @@ pub use icon_row::{
     sync_icon_row_depth, sync_icon_row_drop_target, sync_icon_row_progress, sync_icon_row_selected,
     sync_icon_row_text,
 };
-pub use tree_row::{TreeRenderState, TreeRow, sticky_items};
+pub use tree_row::{TreeRenderState, TreeRow, sticky_items, sticky_items_with_offsets};
 pub use view::{EditFocusPlacement, TreeRenderer, TreeUpdateStats, TreeView};
