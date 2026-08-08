@@ -1,7 +1,7 @@
 use craic_file_support::LanguageId;
 use tree_sitter::Language;
 
-use super::highlight::{CsvSyntax, PlainSyntax, SyntaxSupport, TreeSitterSyntax};
+use super::highlight::{CsvSyntax, DiffSyntax, PlainSyntax, SyntaxSupport, TreeSitterSyntax};
 use super::newline::{NewlineService, PLAIN_TEXT_NEWLINE, RUST_NEWLINE};
 use super::suggest::{CompletionService, RUST_COMPLETION};
 
@@ -32,6 +32,7 @@ pub struct LanguageSupport {
 
 static PLAIN: PlainSyntax = PlainSyntax;
 static CSV: CsvSyntax = CsvSyntax;
+static DIFF: DiffSyntax = DiffSyntax;
 
 macro_rules! language_fn {
     ($name:ident, $language:expr) => {
@@ -392,6 +393,7 @@ pub static LANGUAGES: &[LanguageSupport] = &[
         None
     ),
     plain!(Dart, ["dart"]),
+    entry!(Diff, ["diff", "patch"], &DIFF, None, Disabled, None),
     plain!(Elixir, ["elixir", "ex", "exs"]),
     plain!(Elm, ["elm"]),
     plain!(Erlang, ["erlang", "erl"]),
