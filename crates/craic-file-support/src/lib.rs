@@ -22,6 +22,7 @@ pub enum LanguageId {
     Csv,
     Cuda,
     Dart,
+    Diff,
     Elixir,
     Elm,
     Erlang,

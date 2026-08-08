@@ -120,6 +120,25 @@ impl SyntaxSupport for CsvSyntax {
     }
 }
 
+pub struct DiffSyntax;
+impl SyntaxSupport for DiffSyntax {
+    fn parser_language(&self) -> Option<Language> {
+        None
+    }
+    fn highlight_query(&self) -> Option<Cow<'static, str>> {
+        None
+    }
+    fn injection_query(&self) -> Option<&'static str> {
+        None
+    }
+    fn is_foldable(&self, _node_kind: &str) -> bool {
+        false
+    }
+    fn custom_highlights(&self, source: &str) -> Option<Vec<HighlightRange>> {
+        Some(diff_ranges(source))
+    }
+}
+
 pub struct PlainSyntax;
 impl SyntaxSupport for PlainSyntax {
     fn parser_language(&self) -> Option<Language> {
@@ -353,6 +372,60 @@ fn rainbow_csv_ranges(source: &str) -> Vec<HighlightRange> {
     }
 
     push_csv_field(&mut ranges, field_start, source.len(), column);
+    ranges
+}
+
+fn diff_ranges(source: &str) -> Vec<HighlightRange> {
+    if source.len() > MAX_HIGHLIGHT_BYTES || source.lines().count() > MAX_HIGHLIGHT_LINES {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    for raw_line in source.split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let foreground = if line.starts_with("@@") {
+            Some("#c678dd")
+        } else if line.starts_with("diff ")
+            || line.starts_with("index ")
+            || line.starts_with("Index: ")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+            || line.starts_with("=== ")
+            || line.starts_with("new file mode ")
+            || line.starts_with("deleted file mode ")
+            || line.starts_with("old mode ")
+            || line.starts_with("new mode ")
+            || line.starts_with("similarity index ")
+            || line.starts_with("rename from ")
+            || line.starts_with("rename to ")
+            || line.starts_with("Binary files ")
+            || line == "GIT binary patch"
+        {
+            Some("#56b6c2")
+        } else if line.starts_with('+') || line.starts_with("> ") {
+            Some("#98c379")
+        } else if line.starts_with('-') || line.starts_with("< ") {
+            Some("#e06c75")
+        } else if line.starts_with("\\ No newline at end of file") {
+            Some("#5c6370")
+        } else {
+            None
+        };
+
+        if let Some(foreground) = foreground
+            && !line.is_empty()
+        {
+            ranges.push(HighlightRange {
+                start: offset,
+                end: offset + line.len(),
+                style: Style { foreground },
+                priority: 50,
+            });
+        }
+        offset += raw_line.len();
+    }
     ranges
 }
 

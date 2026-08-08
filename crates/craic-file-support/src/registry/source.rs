@@ -86,6 +86,12 @@ pub(crate) static RESOLVERS: &[&dyn FileSupportResolver] = &[
     rule!(&["xml"], L::Xml, "application/xml", "text-xml-symbolic"),
     rule!(&["csv"], L::Csv, "text/csv", "text-x-generic-symbolic"),
     rule!(
+        &["diff", "patch"],
+        L::Diff,
+        "text/x-patch",
+        "patch-symbolic"
+    ),
+    rule!(
         &["py", "pyw"],
         L::Python,
         "text/x-python",
