@@ -1,9 +1,6 @@
 use super::dialogs::show_error_dialog;
-use super::{
-    AppState, refresh, refresh_active_repo_metadata, refresh_without_toast,
-    request_provider_git_snapshot,
-};
-use crate::git::{GitRepoHandle, RepositorySnapshot};
+use super::{AppState, refresh, refresh_active_repo_metadata, request_provider_git_snapshot};
+use crate::git::{GitCommandEvent, GitRepoHandle, RepositorySnapshot};
 use crate::github::GitHubAccess;
 use crate::github::{GitHubAuthAccount, GitHubPublishRepositoryRequest, GitHubRepositoryOwner};
 use adw::prelude::*;
@@ -23,7 +20,6 @@ pub(super) enum GitAction {
 }
 
 enum GitActionEvent {
-    Progress(String),
     Finished(Result<String, String>),
 }
 
@@ -41,6 +37,15 @@ pub(super) fn execute_git_action(state: &Rc<AppState>, action: GitAction) {
             return;
         }
     };
+    state.git_action_running.set(true);
+    state
+        .content
+        .begin_git_action("Checking repository status...");
+    log::info!(
+        "git action entered refresh state workspace={} action={:?}",
+        workspace_key,
+        action
+    );
     let action = action.clone();
     let action_git_handle = git_handle.clone();
     request_provider_git_snapshot(
@@ -51,6 +56,9 @@ pub(super) fn execute_git_action(state: &Rc<AppState>, action: GitAction) {
                 if response_key != workspace_key
                     || !active_workspace_matches(&state, &workspace_key)
                 {
+                    state.git_action_running.set(false);
+                    state.content.clear_git_action_progress();
+                    refresh(&state, None);
                     return;
                 }
                 execute_git_action_with_snapshot(
@@ -63,8 +71,13 @@ pub(super) fn execute_git_action(state: &Rc<AppState>, action: GitAction) {
             Err(err) => {
                 if response_key == workspace_key && active_workspace_matches(&state, &workspace_key)
                 {
+                    state.git_action_running.set(false);
+                    state.content.clear_git_action_progress();
                     show_error_dialog(&state.window, "Repository Error", &err);
                     refresh(&state, None);
+                } else {
+                    state.git_action_running.set(false);
+                    state.content.clear_git_action_progress();
                 }
             }
         },
@@ -72,6 +85,10 @@ pub(super) fn execute_git_action(state: &Rc<AppState>, action: GitAction) {
 }
 
 pub(super) fn run_git_action(state: &Rc<AppState>) {
+    if state.git_action_running.get() {
+        return;
+    }
+
     let state = state.clone();
     let (workspace_key, git_handle) = match active_git_handle(&state) {
         Ok(access) => access,
@@ -81,18 +98,31 @@ pub(super) fn run_git_action(state: &Rc<AppState>) {
             return;
         }
     };
+    state.git_action_running.set(true);
+    state
+        .content
+        .begin_git_action("Checking repository status...");
+    log::info!(
+        "git synchronization entered refresh state workspace={}",
+        workspace_key
+    );
     let action_git_handle = git_handle.clone();
     request_provider_git_snapshot(
         workspace_key.clone(),
         git_handle,
         move |response_key, result| {
             if response_key != workspace_key || !active_workspace_matches(&state, &workspace_key) {
+                state.git_action_running.set(false);
+                state.content.clear_git_action_progress();
+                refresh(&state, None);
                 return;
             }
 
             let snapshot = match result {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
+                    state.git_action_running.set(false);
+                    state.content.clear_git_action_progress();
                     show_error_dialog(&state.window, "Repository Error", &err);
                     refresh(&state, None);
                     return;
@@ -128,7 +158,6 @@ fn fetch_before_sync(
     snapshot: RepositorySnapshot,
     git_handle: Arc<GitRepoHandle>,
 ) {
-    let (sender, receiver) = mpsc::channel();
     let remote_name = snapshot
         .remote_name
         .clone()
@@ -146,16 +175,7 @@ fn fetch_before_sync(
         remote_name
     );
 
-    let progress_sender = sender.clone();
-    git_handle.fetch_with_progress(
-        None,
-        Box::new(move |progress| {
-            let _ = progress_sender.send(GitActionEvent::Progress(progress));
-        }),
-        Box::new(move |result| {
-            let _ = sender.send(GitActionEvent::Finished(result));
-        }),
-    );
+    let receiver = git_handle.fetch_with_progress(None);
 
     gtk::glib::timeout_add_local(Duration::from_millis(100), {
         let state = state.clone();
@@ -164,10 +184,10 @@ fn fetch_before_sync(
 
             loop {
                 match receiver.try_recv() {
-                    Ok(GitActionEvent::Progress(progress)) => {
-                        latest_progress = Some(progress);
+                    Ok(GitCommandEvent::Progress { message }) => {
+                        latest_progress = Some(message);
                     }
-                    Ok(GitActionEvent::Finished(Ok(fetch_output))) => {
+                    Ok(GitCommandEvent::Completed { message }) => {
                         state
                             .content
                             .set_git_action_progress("Checking remote status...");
@@ -239,11 +259,9 @@ fn fetch_before_sync(
                                         );
                                     } else {
                                         state.content.update(&snapshot, false);
-                                        let message = if fetch_output.is_empty() {
-                                            format!("Fetched {remote_name}.")
-                                        } else {
-                                            fetch_output.clone()
-                                        };
+                                        let message = message
+                                            .clone()
+                                            .unwrap_or_else(|| format!("Fetched {remote_name}."));
                                         refresh(&state, Some(message));
                                     }
                                 }
@@ -251,7 +269,7 @@ fn fetch_before_sync(
                         );
                         return gtk::glib::ControlFlow::Break;
                     }
-                    Ok(GitActionEvent::Finished(Err(err))) => {
+                    Ok(GitCommandEvent::Failed { message: err }) => {
                         state.git_action_running.set(false);
                         state.content.clear_git_action_progress();
                         log::warn!(
@@ -292,6 +310,9 @@ fn show_publish_repository_dialog(state: &Rc<AppState>, snapshot: RepositorySnap
     let system = state.system_ref.borrow().clone();
     let Some(github_access) = craic_vcs::github_access(&state.providers, &system, &workspace)
     else {
+        state.git_action_running.set(false);
+        state.content.clear_git_action_progress();
+        state.content.update(&snapshot, false);
         show_error_dialog(
             &state.window,
             "Publish Repository Failed",
@@ -770,7 +791,7 @@ fn execute_publish_repository_action(
                 state.content.clear_git_action_progress();
                 log::info!("github repository publish completed: {message}");
                 refresh_active_repo_metadata(&state, None);
-                refresh_without_toast(&state, Some(message));
+                refresh(&state, Some(message));
                 gtk::glib::ControlFlow::Break
             }
             Ok(GitActionEvent::Finished(Err(err))) => {
@@ -780,10 +801,6 @@ fn execute_publish_repository_action(
                 show_error_dialog(&state.window, "Publish Repository Failed", &err);
                 refresh(&state, None);
                 gtk::glib::ControlFlow::Break
-            }
-            Ok(GitActionEvent::Progress(progress)) => {
-                state.content.set_git_action_progress(&progress);
-                gtk::glib::ControlFlow::Continue
             }
             Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
             Err(TryRecvError::Disconnected) => {
@@ -844,11 +861,6 @@ fn execute_git_action_with_snapshot(
     git_handle: Arc<GitRepoHandle>,
 ) {
     let refresh_repo_metadata_on_success = matches!(action, GitAction::Pull | GitAction::PullPush);
-    let show_success_toast = !matches!(
-        &action,
-        GitAction::Push | GitAction::PullPush | GitAction::Publish(_, _)
-    );
-    let (sender, receiver) = mpsc::channel();
 
     state.git_action_running.set(true);
     state.content.clear_git_action_progress();
@@ -859,73 +871,12 @@ fn execute_git_action_with_snapshot(
         state.workspace_ref.borrow().display_name
     );
 
-    match action.clone() {
-        GitAction::Push => {
-            let sender = sender.clone();
-            git_handle.push(Box::new(move |result| {
-                let message = result.map(|output| {
-                    if output.is_empty() {
-                        "Push complete.".to_string()
-                    } else {
-                        output
-                    }
-                });
-                let _ = sender.send(GitActionEvent::Finished(message));
-            }));
-        }
-        GitAction::Pull => {
-            let sender = sender.clone();
-            git_handle.pull(Box::new(move |result| {
-                let message = result.map(|output| {
-                    if output.is_empty() {
-                        "Pull complete.".to_string()
-                    } else {
-                        output
-                    }
-                });
-                let _ = sender.send(GitActionEvent::Finished(message));
-            }));
-        }
-        GitAction::PullPush => {
-            let sender = sender.clone();
-            let push_handle = git_handle.clone();
-            git_handle.pull(Box::new(move |pull_result| match pull_result {
-                Ok(_) => {
-                    let sender = sender.clone();
-                    push_handle.push(Box::new(move |push_result| {
-                        let message = match push_result {
-                            Ok(output) if output.is_empty() => {
-                                Ok("Pull and push complete.".to_string())
-                            }
-                            Ok(output) => Ok(output),
-                            Err(err) => Err(format!("Pull succeeded, but Push failed: {err}")),
-                        };
-                        let _ = sender.send(GitActionEvent::Finished(message));
-                    }));
-                }
-                Err(err) => {
-                    let _ = sender.send(GitActionEvent::Finished(Err(err)));
-                }
-            }));
-        }
-        GitAction::Publish(remote, branch) => {
-            let sender = sender.clone();
-            git_handle.publish(
-                &remote,
-                &branch,
-                Box::new(move |result| {
-                    let message = result.map(|output| {
-                        if output.is_empty() {
-                            "Publish complete.".to_string()
-                        } else {
-                            output
-                        }
-                    });
-                    let _ = sender.send(GitActionEvent::Finished(message));
-                }),
-            );
-        }
-    }
+    let receiver = match action.clone() {
+        GitAction::Push => git_handle.push_with_progress(),
+        GitAction::Pull => git_handle.pull_with_progress(),
+        GitAction::PullPush => git_handle.pull_push_with_progress(),
+        GitAction::Publish(remote, branch) => git_handle.publish_with_progress(&remote, &branch),
+    };
 
     gtk::glib::timeout_add_local(Duration::from_millis(100), {
         let state = state.clone();
@@ -934,25 +885,27 @@ fn execute_git_action_with_snapshot(
 
             loop {
                 match receiver.try_recv() {
-                    Ok(GitActionEvent::Progress(progress)) => {
-                        log::trace!("git action progress: {progress}");
-                        latest_progress = Some(progress);
+                    Ok(GitCommandEvent::Progress { message }) => {
+                        log::trace!("git action progress: {message}");
+                        latest_progress = Some(message);
                     }
-                    Ok(GitActionEvent::Finished(Ok(message))) => {
+                    Ok(GitCommandEvent::Completed { message }) => {
+                        let message = message.unwrap_or_else(|| match &action {
+                            GitAction::Push => "Push complete.".to_string(),
+                            GitAction::Pull => "Pull complete.".to_string(),
+                            GitAction::PullPush => "Pull and push complete.".to_string(),
+                            GitAction::Publish(_, _) => "Publish complete.".to_string(),
+                        });
                         state.git_action_running.set(false);
                         state.content.clear_git_action_progress();
                         log::debug!("git action completed successfully: {message}");
                         if refresh_repo_metadata_on_success {
                             refresh_active_repo_metadata(&state, None);
                         }
-                        if show_success_toast {
-                            refresh(&state, Some(message));
-                        } else {
-                            refresh_without_toast(&state, Some(message));
-                        }
+                        refresh(&state, Some(message));
                         return gtk::glib::ControlFlow::Break;
                     }
-                    Ok(GitActionEvent::Finished(Err(err))) => {
+                    Ok(GitCommandEvent::Failed { message: err }) => {
                         state.git_action_running.set(false);
                         state.content.clear_git_action_progress();
                         log::debug!("git action failed: {err}");
@@ -1111,10 +1064,6 @@ fn stash_changes_and_retry_git_action(
                 show_error_dialog(&state.window, "Stash Failed", &err);
                 refresh(&state, None);
                 gtk::glib::ControlFlow::Break
-            }
-            Ok(GitActionEvent::Progress(progress)) => {
-                state.content.set_git_action_progress(&progress);
-                gtk::glib::ControlFlow::Continue
             }
             Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
             Err(TryRecvError::Disconnected) => {

@@ -1,13 +1,14 @@
 use crate::system::capabilities::shell::{
-    ShellAccess, ShellCommandActivity, ShellCommandOutput, ShellCommandRunRequest,
-    ShellCommandSpec, ShellRunCallback, ShellRunRequest, default_shell,
+    ShellAccess, ShellCommandActivity, ShellCommandEvent, ShellCommandGenerator,
+    ShellCommandOutput, ShellCommandRunRequest, ShellCommandSpec, ShellRunCallback,
+    ShellRunRequest, default_shell, run_streaming_command,
 };
 use crate::system::path::{WorkspacePath, WorkspaceRef};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
 
@@ -138,6 +139,16 @@ impl ShellAccess for LocalShellAccess {
         thread::spawn(move || {
             callback(run_local_command(workspace, request));
         });
+    }
+
+    fn stream_fast_command(&self, request: ShellCommandRunRequest) -> ShellCommandGenerator {
+        let (sender, receiver) = mpsc::channel();
+        let workspace = self.workspace.display_name.clone();
+        thread::spawn(move || {
+            let result = stream_local_command(&workspace, &request, &sender);
+            let _ = sender.send(ShellCommandEvent::Finished(result.map(Into::into)));
+        });
+        receiver
     }
 
     fn command_display(&self, command: &ShellCommandSpec) -> String {
@@ -360,6 +371,54 @@ fn run_local_command(
         stderr: output.stderr,
         status_code: output.status.code(),
     })
+}
+
+fn stream_local_command(
+    workspace_name: &str,
+    request: &ShellCommandRunRequest,
+    event_sender: &mpsc::Sender<ShellCommandEvent>,
+) -> Result<ShellCommandOutput, String> {
+    log::info!(
+        "local streaming command start workspace={} operation={} working_dir={} program={} args={}",
+        workspace_name,
+        request.operation,
+        request.working_dir.display(),
+        request.program,
+        request.args.len()
+    );
+    let mut command = Command::new(&request.program);
+    command
+        .args(&request.args)
+        .current_dir(&request.working_dir.absolute);
+    let result = run_streaming_command(
+        &mut command,
+        request.stdin.as_deref(),
+        &request.operation,
+        event_sender,
+    );
+    match &result {
+        Ok(output) if output.status_success(&[0]) => log::info!(
+            "local streaming command complete workspace={} operation={} stdout_bytes={} stderr_bytes={}",
+            workspace_name,
+            request.operation,
+            output.stdout.len(),
+            output.stderr.len()
+        ),
+        Ok(output) => log::warn!(
+            "local streaming command failed workspace={} operation={} status={:?} stderr={}",
+            workspace_name,
+            request.operation,
+            output.status_code,
+            output.stderr_text_trimmed()
+        ),
+        Err(err) => log::warn!(
+            "local streaming command error workspace={} operation={}: {}",
+            workspace_name,
+            request.operation,
+            err
+        ),
+    }
+    result
 }
 
 fn command_name_can_use_path(program: &str) -> bool {

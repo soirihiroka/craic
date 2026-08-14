@@ -7,7 +7,8 @@ use crate::gitignore;
 use crate::system::capabilities::{
     files::FileAccess,
     shell::{
-        ShellAccess, ShellCommandOutput, ShellCommandRunRequest, ShellCommandSpec, ShellRunRequest,
+        ShellAccess, ShellCommandEvent, ShellCommandOutput, ShellCommandRunRequest,
+        ShellCommandSpec, ShellRunRequest,
     },
 };
 use crate::system::path::WorkspaceRef;
@@ -42,8 +43,16 @@ fn successful_fetch_times() -> &'static Mutex<HashMap<String, SystemTime>> {
 
 pub type OperationCallback<T> = Box<dyn FnOnce(Result<T, String>) + Send + 'static>;
 pub type WatchCallback<T> = Box<dyn FnMut(Result<T, String>) + Send + 'static>;
-pub type ProgressCallback = Box<dyn FnMut(String) + Send + 'static>;
 pub type ChangeListener = Arc<dyn Fn() + Send + Sync + 'static>;
+
+#[derive(Debug)]
+pub enum GitCommandEvent {
+    Progress { message: String },
+    Completed { message: Option<String> },
+    Failed { message: String },
+}
+
+pub type GitCommandGenerator = mpsc::Receiver<GitCommandEvent>;
 
 pub trait GitOperationHook: Send + Sync {
     fn pre(&self) -> Result<Box<dyn GitOperationPostHook>, String>;
@@ -420,6 +429,38 @@ impl GitRepoHandle {
         self.run_command_text("git", "git", args, None, &[0])
     }
 
+    fn git_with_progress(
+        &self,
+        args: &[String],
+        progress: &mut dyn FnMut(String),
+    ) -> Result<String, String> {
+        let request = ShellCommandRunRequest::new("git", self.workspace.root.clone(), "git")
+            .args(args.iter().cloned());
+        let events = self.shell.stream_fast_command(request);
+        for event in events {
+            match event {
+                ShellCommandEvent::Record { text, .. } => {
+                    progress(text);
+                }
+                ShellCommandEvent::Finished(result) => {
+                    let output = result?;
+                    if output.status_success(&[0]) {
+                        return Ok(output.stdout);
+                    }
+
+                    let message = output.failure_message();
+                    return Err(if message.is_empty() {
+                        format!("git failed with status {:?}", output.status_code)
+                    } else {
+                        message
+                    });
+                }
+            }
+        }
+
+        Err("git command stream stopped before returning a result.".to_string())
+    }
+
     fn git_ok(&self, args: &[String]) -> Result<String, String> {
         self.git(args).map(|out| out.trim().to_string())
     }
@@ -641,6 +682,34 @@ where
     });
 }
 
+fn git_command_generator<F>(operation: &'static str, run: F) -> GitCommandGenerator
+where
+    F: FnOnce(&mut dyn FnMut(String)) -> Result<String, String> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let start = Instant::now();
+        let progress_sender = sender.clone();
+        let result = run(&mut move |message| {
+            let _ = progress_sender.send(GitCommandEvent::Progress { message });
+        });
+        log::debug!(
+            "git command generator complete operation={} status={} elapsed_ms={}",
+            operation,
+            if result.is_ok() { "ok" } else { "error" },
+            start.elapsed().as_millis()
+        );
+        let event = match result {
+            Ok(message) => GitCommandEvent::Completed {
+                message: (!message.is_empty()).then_some(message),
+            },
+            Err(message) => GitCommandEvent::Failed { message },
+        };
+        let _ = sender.send(event);
+    });
+    receiver
+}
+
 impl GitRepoHandle {
     pub fn load_repository_snapshot(&self) -> Result<RepositorySnapshot, String> {
         self.repository_snapshot_blocking()
@@ -785,9 +854,33 @@ impl GitRepoHandle {
         run_operation("git push", callback, move || handle.push_blocking());
     }
 
+    pub fn push_with_progress(&self) -> GitCommandGenerator {
+        let handle = self.clone();
+        git_command_generator("git push", move |progress| {
+            handle.push_with_progress_blocking(progress)
+        })
+    }
+
     pub fn pull(&self, callback: OperationCallback<String>) {
         let handle = self.clone();
         run_operation("git pull", callback, move || handle.pull_blocking());
+    }
+
+    pub fn pull_with_progress(&self) -> GitCommandGenerator {
+        let handle = self.clone();
+        git_command_generator("git pull", move |progress| {
+            handle.pull_with_progress_blocking(progress)
+        })
+    }
+
+    pub fn pull_push_with_progress(&self) -> GitCommandGenerator {
+        let handle = self.clone();
+        git_command_generator("git pull and push", move |progress| {
+            handle.pull_with_progress_blocking(progress)?;
+            handle
+                .push_with_progress_blocking(progress)
+                .map_err(|err| format!("Pull succeeded, but Push failed: {err}"))
+        })
     }
 
     pub fn publish(&self, remote: &str, branch: &str, callback: OperationCallback<String>) {
@@ -799,17 +892,21 @@ impl GitRepoHandle {
         });
     }
 
-    pub fn fetch_with_progress(
-        &self,
-        remote: Option<&str>,
-        mut progress: ProgressCallback,
-        callback: OperationCallback<String>,
-    ) {
+    pub fn publish_with_progress(&self, remote: &str, branch: &str) -> GitCommandGenerator {
+        let handle = self.clone();
+        let remote = remote.to_string();
+        let branch = branch.to_string();
+        git_command_generator("git publish", move |progress| {
+            handle.publish_with_progress_blocking(&remote, &branch, progress)
+        })
+    }
+
+    pub fn fetch_with_progress(&self, remote: Option<&str>) -> GitCommandGenerator {
         let handle = self.clone();
         let remote = remote.map(ToString::to_string);
-        run_operation("git fetch", callback, move || {
-            handle.fetch_with_progress_blocking(remote.as_deref(), &mut progress)
-        });
+        git_command_generator("git fetch", move |progress| {
+            handle.fetch_with_progress_blocking(remote.as_deref(), progress)
+        })
     }
 
     pub fn checkout_branch(&self, branch: &str, callback: OperationCallback<String>) {
@@ -1632,6 +1729,15 @@ impl GitRepoHandle {
         self.run_with_hooks("git push", || self.git(&["push".into()]))
     }
 
+    fn push_with_progress_blocking(
+        &self,
+        progress: &mut dyn FnMut(String),
+    ) -> Result<String, String> {
+        self.run_with_hooks("git push", || {
+            self.git_with_progress(&["push".into()], progress)
+        })
+    }
+
     fn pull_blocking(&self) -> Result<String, String> {
         let result = self.run_with_hooks("git pull", || {
             self.git(&[
@@ -1648,9 +1754,45 @@ impl GitRepoHandle {
         result
     }
 
+    fn pull_with_progress_blocking(
+        &self,
+        progress: &mut dyn FnMut(String),
+    ) -> Result<String, String> {
+        let result = self.run_with_hooks("git pull", || {
+            self.git_with_progress(
+                &[
+                    "-c".into(),
+                    "rebase.backend=merge".into(),
+                    "pull".into(),
+                    "--ff".into(),
+                    "--recurse-submodules".into(),
+                ],
+                progress,
+            )
+        });
+        if result.is_ok() {
+            self.record_fetch();
+        }
+        result
+    }
+
     fn publish_blocking(&self, remote: &str, branch: &str) -> Result<String, String> {
         self.run_with_hooks("git publish", || {
             self.git(&["push".into(), "-u".into(), remote.into(), branch.into()])
+        })
+    }
+
+    fn publish_with_progress_blocking(
+        &self,
+        remote: &str,
+        branch: &str,
+        progress: &mut dyn FnMut(String),
+    ) -> Result<String, String> {
+        self.run_with_hooks("git publish", || {
+            self.git_with_progress(
+                &["push".into(), "-u".into(), remote.into(), branch.into()],
+                progress,
+            )
         })
     }
 
@@ -1664,7 +1806,7 @@ impl GitRepoHandle {
         if let Some(remote) = remote {
             args.push(remote.to_string());
         }
-        let result = self.run_with_hooks("git fetch", || self.git(&args));
+        let result = self.run_with_hooks("git fetch", || self.git_with_progress(&args, progress));
         if result.is_ok() {
             self.record_fetch();
         }

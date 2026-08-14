@@ -1,12 +1,12 @@
 use super::{SshCommandRunner, shell_quote};
 use crate::system::capabilities::shell::{
-    ShellAccess, ShellCommandActivity, ShellCommandRunRequest, ShellCommandSpec, ShellRunCallback,
-    ShellRunRequest,
+    ShellAccess, ShellCommandActivity, ShellCommandEvent, ShellCommandGenerator,
+    ShellCommandRunRequest, ShellCommandSpec, ShellRunCallback, ShellRunRequest,
 };
 use crate::system::path::{WorkspacePath, WorkspaceRef};
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
 
@@ -64,11 +64,13 @@ impl ShellAccess for SshShellAccess {
             shell_quote(REMOTE_SHELL_ACTIVITY_MONITOR),
             shell_quote(REMOTE_SHELL_ACTIVITY_NOTIFICATION),
         );
-        Ok(ShellCommandSpec::new("ssh", self.workspace.root.clone())
-            .arg(self.host.clone())
-            .arg("-t")
-            .arg(remote)
-            .activity(ShellCommandActivity::ReportedInteractiveShell))
+        Ok(
+            ShellCommandSpec::new("ssh", WorkspacePath::from_absolute("/"))
+                .arg(self.host.clone())
+                .arg("-t")
+                .arg(remote)
+                .activity(ShellCommandActivity::ReportedInteractiveShell),
+        )
     }
 
     fn command(
@@ -103,10 +105,12 @@ impl ShellAccess for SshShellAccess {
                 working_dir.display(),
                 program
             );
-            return Ok(ShellCommandSpec::new("ssh", self.workspace.root.clone())
-                .arg(self.host.clone())
-                .arg("-t")
-                .arg(remote));
+            return Ok(
+                ShellCommandSpec::new("ssh", WorkspacePath::from_absolute("/"))
+                    .arg(self.host.clone())
+                    .arg("-t")
+                    .arg(remote),
+            );
         }
 
         let mut remote = format!(
@@ -124,10 +128,12 @@ impl ShellAccess for SshShellAccess {
             working_dir.display(),
             program
         );
-        Ok(ShellCommandSpec::new("ssh", self.workspace.root.clone())
-            .arg(self.host.clone())
-            .arg("-t")
-            .arg(remote))
+        Ok(
+            ShellCommandSpec::new("ssh", WorkspacePath::from_absolute("/"))
+                .arg(self.host.clone())
+                .arg("-t")
+                .arg(remote),
+        )
     }
 
     fn fast_command(
@@ -143,9 +149,11 @@ impl ShellAccess for SshShellAccess {
             working_dir.display(),
             program
         );
-        Ok(ShellCommandSpec::new("ssh", self.workspace.root.clone())
-            .arg(self.host.clone())
-            .arg(remote))
+        Ok(
+            ShellCommandSpec::new("ssh", WorkspacePath::from_absolute("/"))
+                .arg(self.host.clone())
+                .arg(remote),
+        )
     }
 
     fn run_script(&self, request: ShellRunRequest, callback: ShellRunCallback) {
@@ -190,6 +198,22 @@ impl ShellAccess for SshShellAccess {
                 request.stdin.as_deref(),
             ));
         });
+    }
+
+    fn stream_fast_command(&self, request: ShellCommandRunRequest) -> ShellCommandGenerator {
+        let (sender, receiver) = mpsc::channel();
+        let host = self.host.clone();
+        thread::spawn(move || {
+            let remote = fast_remote_command(&request.working_dir, &request.program, &request.args);
+            let result = SshCommandRunner::new(host).run_script_output_with_stdin_stream(
+                &request.operation,
+                &remote,
+                request.stdin.as_deref(),
+                &sender,
+            );
+            let _ = sender.send(ShellCommandEvent::Finished(result.map(Into::into)));
+        });
+        receiver
     }
 
     fn command_display(&self, command: &ShellCommandSpec) -> String {

@@ -12,7 +12,7 @@ use crate::system::capabilities::{
     docker::DockerAccess,
     files::FileAccess,
     open::DesktopOpenAccess,
-    shell::{ShellAccess, ShellCommandOutput},
+    shell::{ShellAccess, ShellCommandEvent, ShellCommandOutput, run_streaming_command},
     terminal_link::TerminalLinkAccess,
     url::UrlOpenAccess,
 };
@@ -28,6 +28,7 @@ use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::thread;
 use std::time::Duration;
@@ -288,6 +289,61 @@ impl SshCommandRunner {
         stdin: Option<&[u8]>,
     ) -> Result<ShellCommandOutput, String> {
         self.run_script_output_with_stdin_progress(operation, script, stdin, |_, _| Ok(()))
+    }
+
+    pub fn run_script_output_with_stdin_stream(
+        &self,
+        operation: &str,
+        script: &str,
+        stdin: Option<&[u8]>,
+        event_sender: &mpsc::Sender<ShellCommandEvent>,
+    ) -> Result<ShellCommandOutput, String> {
+        let remote_command = format!("sh -lc {}", shell_quote(script));
+        log::info!(
+            "ssh streaming command start provider={} operation={} script_bytes={}",
+            self.label,
+            operation,
+            script.len()
+        );
+
+        let mut command = Command::new("ssh");
+        command
+            .arg("-o")
+            .arg("ControlMaster=auto")
+            .arg("-o")
+            .arg("ControlPersist=5m")
+            .arg("-o")
+            .arg(format!(
+                "ControlPath=/tmp/craic-ssh-{}-%r@%h:%p",
+                sanitize_id(&self.host)
+            ))
+            .arg("--")
+            .arg(&self.host)
+            .arg(remote_command);
+        let result = run_streaming_command(&mut command, stdin, operation, event_sender);
+        match &result {
+            Ok(output) if output.status_success(&[0]) => log::info!(
+                "ssh streaming command complete provider={} operation={} stdout_bytes={} stderr_bytes={}",
+                self.label,
+                operation,
+                output.stdout.len(),
+                output.stderr.len()
+            ),
+            Ok(output) => log::warn!(
+                "ssh streaming command failed provider={} operation={} status={:?} stderr={}",
+                self.label,
+                operation,
+                output.status_code,
+                output.stderr_text_trimmed()
+            ),
+            Err(err) => log::warn!(
+                "ssh streaming command error provider={} operation={}: {}",
+                self.label,
+                operation,
+                err
+            ),
+        }
+        result
     }
 
     pub fn run_script_output_with_stdin_progress<F>(

@@ -299,6 +299,16 @@ impl ContentPane {
         self.push_button.set_tooltip_text(Some(progress));
     }
 
+    pub fn begin_git_action(&self, progress: &str) {
+        self.clear_git_action_progress();
+        self.push_icon.set_visible(false);
+        self.push_spinner.set_visible(true);
+        self.push_ahead_box.set_visible(false);
+        self.push_behind_box.set_visible(false);
+        self.push_button.set_sensitive(false);
+        self.set_git_action_progress(progress);
+    }
+
     pub fn clear_git_action_progress(&self) {
         self.git_action_progress.borrow_mut().take();
     }
