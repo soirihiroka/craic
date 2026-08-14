@@ -4,6 +4,7 @@ use crate::git::FileComparison;
 use crate::markdown_lint::MarkdownLintIssue;
 use crate::spellcheck::SpellcheckIssue;
 use crate::system::FileNodePath;
+use crate::system::capabilities::files::FileAccess;
 use crate::ui::content::{binary_preview, code_editor, folder_view};
 use adw::prelude::*;
 use craic_dynamic_data::{TextFormat, parse_text};
@@ -12,6 +13,7 @@ use craic_ui_preview::markdown_preview::MarkdownPreview as AdwMarkdownPreview;
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 const PREVIEW_LOADING_DELAY: Duration = Duration::from_millis(100);
@@ -48,6 +50,7 @@ pub struct RightPane {
     file_code_button: gtk::ToggleButton,
     file_view_button: gtk::ToggleButton,
     file_view_kind: Rc<Cell<Option<FileViewKind>>>,
+    edit_sudo_button: gtk::Button,
     stack: gtk::Stack,
     preview_generation: Cell<u64>,
     pending_preview_loading: RefCell<Option<PendingPreviewLoading>>,
@@ -58,6 +61,8 @@ pub struct RightPane {
     pub file_editor_path: Rc<RefCell<Option<FileNodePath>>>,
     pub file_editor_disk_signature: Rc<RefCell<Option<provider::DiskSignature>>>,
     pub file_editor_writable: Rc<Cell<bool>>,
+    pub file_editor_sudo: Rc<Cell<bool>>,
+    pub file_editor_access: Rc<RefCell<Option<Arc<dyn FileAccess>>>>,
     pub file_view_split: gtk::Paned,
     pub file_svg_preview: Rc<super::provider::svg::SvgPreview>,
     pub file_html_preview: Rc<super::provider::html::HtmlPreview>,
@@ -111,6 +116,11 @@ impl RightPane {
         file_view_mode_switcher.add_css_class("linked");
         file_view_mode_switcher.append(&file_code_button);
         file_view_mode_switcher.append(&file_view_button);
+        let edit_sudo_button = gtk::Button::builder()
+            .label("Edit with sudo")
+            .visible(false)
+            .valign(gtk::Align::Center)
+            .build();
 
         let header = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -121,6 +131,7 @@ impl RightPane {
             .margin_end(14)
             .build();
         header.append(&title_box);
+        header.append(&edit_sudo_button);
         header.append(&file_view_mode_switcher);
 
         let file_editor = code_editor::CodeEditor::new("", "");
@@ -306,6 +317,7 @@ impl RightPane {
             file_code_button,
             file_view_button,
             file_view_kind,
+            edit_sudo_button,
             stack,
             preview_generation: Cell::new(0),
             pending_preview_loading: RefCell::new(None),
@@ -316,6 +328,8 @@ impl RightPane {
             file_editor_path: Rc::new(RefCell::new(None)),
             file_editor_disk_signature: Rc::new(RefCell::new(None)),
             file_editor_writable: Rc::new(Cell::new(false)),
+            file_editor_sudo: Rc::new(Cell::new(false)),
+            file_editor_access: Rc::new(RefCell::new(None)),
             file_view_split,
             file_svg_preview,
             file_html_preview,
@@ -477,6 +491,8 @@ impl RightPane {
         self.file_editor_disk_signature
             .replace(Some(disk_signature));
         self.file_editor_writable.set(writable);
+        self.file_editor_sudo.set(false);
+        self.edit_sudo_button.set_visible(!writable);
 
         let language = crate::ui::file_type::detect(file_path, false).language;
         self.file_editor.set_document_id(language, text);
@@ -630,6 +646,9 @@ impl RightPane {
         self.file_editor_path.borrow_mut().take();
         self.file_editor_disk_signature.borrow_mut().take();
         self.file_editor_writable.set(false);
+        self.file_editor_sudo.set(false);
+        self.file_editor_access.borrow_mut().take();
+        self.edit_sudo_button.set_visible(false);
         self.file_editor.set_editable(false);
         self.file_editor.set_language("");
         self.file_editor.set_text("");
@@ -653,6 +672,29 @@ impl RightPane {
         self.file_view_kind.set(None);
         self.file_csv_preview.clear();
         self.file_object_preview.clear();
+    }
+
+    pub fn connect_edit_with_sudo<F>(&self, callback: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.edit_sudo_button.connect_clicked(move |_| callback());
+    }
+
+    pub fn enable_sudo_editing(&self, files: Arc<dyn FileAccess>) {
+        self.file_editor_writable.set(true);
+        self.file_editor_sudo.set(true);
+        self.file_editor_access.replace(Some(files));
+        self.file_editor.set_editable(true);
+        self.edit_sudo_button.set_visible(false);
+    }
+
+    pub fn expire_sudo_editing(&self) {
+        self.file_editor_writable.set(true);
+        self.file_editor_sudo.set(true);
+        self.file_editor_access.borrow_mut().take();
+        self.file_editor.set_editable(false);
+        self.edit_sudo_button.set_visible(true);
     }
 
     fn set_title(&self, file_path: &str, subtitle: &str) {

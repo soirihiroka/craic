@@ -101,3 +101,4 @@ uuid = { version = "1", features = ["v4"] }
 vte4 = { version = "0.10", features = ["v0_84"] }
 walkdir = "2"
 webkit6 = "0.6"
+zeroize = "1"

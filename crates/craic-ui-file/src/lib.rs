@@ -7,6 +7,8 @@ pub use craic_vcs::{git, gitignore};
 pub mod ui {
     pub use craic_ui_core::ui::{canvas_scrollbar, components, file_status, file_type, widgets};
 
+    pub(crate) mod sudo;
+
     pub mod content {
         pub use craic_ui_editor::code_editor;
         pub use craic_ui_preview::{binary_preview, folder_view};

@@ -724,6 +724,7 @@ dependencies = [
  "serde_json",
  "uuid",
  "walkdir",
+ "zeroize",
 ]
 
 [[package]]

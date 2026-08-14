@@ -2,9 +2,10 @@ use crate::system::capabilities::files::{
     DirectoryListing, FileAccess, FileCopyRequest, FileDeleteRequest, FileKind, FileMoveRequest,
     FileNodeCapabilities, FileNodeInfo, FileOperation, FileOperationCallback, FileOperationError,
     FileOperationErrorKind, FileOperationEvent, FileOperationProgress, FileRead, FileReadRequest,
-    FileSearchMatch, FileSearchOutput, FileSearchQuery, FileSignature, FileWatchCallback,
-    FileWatchChanges, FileWatchRequest, FileWatchSubscription, FileWriteMode, FileWritePayload,
-    FileWriteRequest, file_operation_canceled,
+    FileSearchMatch, FileSearchOutput, FileSearchQuery, FileSignature, FileSudoError,
+    FileSudoErrorKind, FileSudoPassword, FileWatchCallback, FileWatchChanges, FileWatchRequest,
+    FileWatchSubscription, FileWriteMode, FileWritePayload, FileWriteRequest,
+    file_operation_canceled,
 };
 use crate::system::path::{
     ArchiveFormat, FileNodePath, FileNodeRef, SystemRef, WorkspacePath, WorkspaceRef,
@@ -17,9 +18,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -28,6 +31,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
+use zeroize::Zeroizing;
 
 const LOCAL_FILE_MONITOR_RATE_LIMIT_MS: i32 = 250;
 const LOCAL_FILE_MONITOR_SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -41,6 +45,7 @@ pub struct LocalFileAccess {
     workspace: WorkspaceRef,
     root_path: PathBuf,
     file_watch_service: Arc<LocalFileWatchService>,
+    sudo: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +137,106 @@ impl LocalFileAccess {
             workspace,
             root_path,
             file_watch_service,
+            sudo: false,
+        }
+    }
+
+    fn authenticate_sudo(password: Option<&FileSudoPassword>) -> Result<(), FileSudoError> {
+        let mut command = Command::new("sudo");
+        command.env("LC_ALL", "C");
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        if password.is_some() {
+            command.args(["-S", "-p", "", "-v"]).stdin(Stdio::piped());
+        } else {
+            command.args(["-n", "-v"]);
+        }
+        let mut child = command.spawn().map_err(|err| {
+            FileSudoError::new(
+                FileSudoErrorKind::Unavailable,
+                format!("Unable to start sudo: {err}"),
+            )
+        })?;
+        if let Some(password) = password
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            let mut bytes = Zeroizing::new(password.bytes().to_vec());
+            bytes.push(b'\n');
+            let result = stdin.write_all(&bytes);
+            result.map_err(|err| {
+                FileSudoError::new(
+                    FileSudoErrorKind::AuthenticationFailed,
+                    format!("Unable to send the sudo password: {err}"),
+                )
+            })?;
+        }
+        let output = child.wait_with_output().map_err(|err| {
+            FileSudoError::new(
+                FileSudoErrorKind::Unavailable,
+                format!("Unable to wait for sudo authentication: {err}"),
+            )
+        })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(FileSudoError::new(
+            if password.is_some() {
+                FileSudoErrorKind::AuthenticationFailed
+            } else {
+                FileSudoErrorKind::PasswordRequired
+            },
+            if message.is_empty() {
+                "Sudo authentication failed.".to_string()
+            } else {
+                message
+            },
+        ))
+    }
+
+    fn run_sudo_command(
+        &self,
+        operation: &str,
+        program: &str,
+        args: &[&std::ffi::OsStr],
+        stdin: Option<&[u8]>,
+    ) -> Result<Output, String> {
+        let mut command = Command::new("sudo");
+        command
+            .args(["-n", "--", "env", "LC_ALL=C"])
+            .arg(program)
+            .args(args);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if stdin.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        log::info!("local sudo file operation start operation={operation}");
+        let mut child = command
+            .spawn()
+            .map_err(|err| format!("Unable to start sudo for {operation}: {err}"))?;
+        if let Some(bytes) = stdin
+            && let Some(mut child_stdin) = child.stdin.take()
+        {
+            child_stdin
+                .write_all(bytes)
+                .map_err(|err| format!("Unable to write sudo stdin for {operation}: {err}"))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|err| format!("Unable to wait for sudo {operation}: {err}"))?;
+        if output.status.success() {
+            log::info!("local sudo file operation complete operation={operation}");
+            Ok(output)
+        } else {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            log::warn!(
+                "local sudo file operation failed operation={operation} status={} stderr={message}",
+                output.status
+            );
+            Err(if message.is_empty() {
+                format!("Sudo {operation} failed with status {}.", output.status)
+            } else {
+                message
+            })
         }
     }
 
@@ -197,11 +302,34 @@ impl LocalFileAccess {
             _ => PathBuf::from(&path.absolute),
         };
 
-        if local_path.starts_with(&self.root_path) {
-            Ok(local_path)
-        } else {
-            Err("Path is outside the workspace.".to_string())
+        if !local_path.starts_with(&self.root_path) {
+            return Err("Path is outside the workspace.".to_string());
         }
+        if self.sudo {
+            self.run_sudo_command(
+                "validate workspace path",
+                "sh",
+                &[
+                    std::ffi::OsStr::new("-c"),
+                    std::ffi::OsStr::new(
+                        "root=$(realpath -e -- \"$1\") || exit 1; candidate=$2; while [ ! -e \"$candidate\" ] && [ ! -L \"$candidate\" ]; do parent=$(dirname -- \"$candidate\") || exit 1; [ \"$parent\" != \"$candidate\" ] || exit 1; candidate=$parent; done; resolved=$(realpath -e -- \"$candidate\") || exit 1; if [ \"$root\" != / ]; then case \"$resolved\" in \"$root\"|\"$root\"/*) ;; *) printf 'CRAIC-ERROR\\toutside-workspace\\n' >&2; exit 18 ;; esac; fi",
+                    ),
+                    std::ffi::OsStr::new("sh"),
+                    self.root_path.as_os_str(),
+                    local_path.as_os_str(),
+                ],
+                None,
+            )
+            .map_err(|err| {
+                if err.contains("CRAIC-ERROR\toutside-workspace") {
+                    "Elevated file operation would leave the workspace through a symlink."
+                        .to_string()
+                } else {
+                    format!("Unable to validate elevated workspace path: {err}")
+                }
+            })?;
+        }
+        Ok(local_path)
     }
 
     fn local_path_for_node(&self, path: &FileNodePath) -> Result<PathBuf, String> {
@@ -224,19 +352,19 @@ impl LocalFileAccess {
     }
 
     fn info_for_native_node(&self, path: &FileNodePath) -> Result<FileNodeInfo, String> {
+        if self.sudo {
+            return self.info_for_sudo_native_node(path);
+        }
         let workspace_path = self.native_workspace_path(path)?;
         let local_path = self.local_path_for_workspace(&workspace_path)?;
         let metadata = fs::symlink_metadata(&local_path)
             .map_err(|err| format!("Unable to inspect {}: {err}", path.display()))?;
+        let writable = local_path_writable(&local_path);
         let mut kind = file_kind(&metadata);
         let mut capabilities = match kind {
-            FileKind::Directory => {
-                FileNodeCapabilities::native_directory(!metadata.permissions().readonly())
-            }
-            FileKind::File => FileNodeCapabilities::native_file(!metadata.permissions().readonly()),
-            FileKind::Symlink | FileKind::Other => {
-                FileNodeCapabilities::native_other(!metadata.permissions().readonly())
-            }
+            FileKind::Directory => FileNodeCapabilities::native_directory(writable),
+            FileKind::File => FileNodeCapabilities::native_file(writable),
+            FileKind::Symlink | FileKind::Other => FileNodeCapabilities::native_other(writable),
             FileKind::Archive { .. } => unreachable!(),
         };
         if kind == FileKind::File
@@ -246,7 +374,7 @@ impl LocalFileAccess {
             kind = FileKind::Archive { format };
             capabilities = FileNodeCapabilities {
                 listable: supported,
-                ..FileNodeCapabilities::native_file(!metadata.permissions().readonly())
+                ..FileNodeCapabilities::native_file(writable)
             };
             log::info!(
                 "local archive detected workspace={} path={} format={} supported={}",
@@ -268,6 +396,72 @@ impl LocalFileAccess {
             owner: None,
             group: None,
             mode: Some(mode_bits(&metadata)),
+            git_ignored: None,
+            capabilities,
+        })
+    }
+
+    fn info_for_sudo_native_node(&self, path: &FileNodePath) -> Result<FileNodeInfo, String> {
+        let local_path = self.local_path_for_node(path)?;
+        let output = self.run_sudo_command(
+            "inspect file",
+            "stat",
+            &[
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new("%F\x1f%s\x1f%Y\x1f%a"),
+                std::ffi::OsStr::new("--"),
+                local_path.as_os_str(),
+            ],
+            None,
+        )?;
+        let raw = String::from_utf8(output.stdout)
+            .map_err(|_| "Sudo file metadata was not valid UTF-8.".to_string())?;
+        let mut fields = raw.trim_end().split('\x1f');
+        let raw_kind = fields.next().unwrap_or_default();
+        let len = fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| "Sudo file metadata did not include a valid size.".to_string())?;
+        let modified = fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds));
+        let mode = fields
+            .next()
+            .and_then(|value| u32::from_str_radix(value, 8).ok());
+        let mut kind = match raw_kind {
+            "directory" => FileKind::Directory,
+            "regular file" | "regular empty file" => FileKind::File,
+            "symbolic link" => FileKind::Symlink,
+            _ => FileKind::Other,
+        };
+        let mut capabilities = match kind {
+            FileKind::Directory => FileNodeCapabilities::native_directory(true),
+            FileKind::File => FileNodeCapabilities::native_file(true),
+            FileKind::Symlink | FileKind::Other => FileNodeCapabilities::native_other(true),
+            FileKind::Archive { .. } => unreachable!(),
+        };
+        if kind == FileKind::File
+            && let Some(format) = path.file_name().and_then(ArchiveFormat::from_name)
+        {
+            kind = FileKind::Archive { format };
+            capabilities = FileNodeCapabilities {
+                listable: archive_format_supported(format),
+                ..FileNodeCapabilities::native_file(true)
+            };
+        }
+        Ok(FileNodeInfo {
+            path: path.clone(),
+            display_name: path
+                .file_name()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| self.workspace.display_name.clone()),
+            kind,
+            len: Some(len),
+            modified,
+            owner: None,
+            group: None,
+            mode,
             git_ignored: None,
             capabilities,
         })
@@ -722,6 +916,59 @@ impl LocalFileAccess {
                 err,
             )
         })?;
+        if self.sudo {
+            let info = self
+                .info_for_sudo_native_node(&request.path)
+                .map_err(|err| {
+                    Self::operation_error(
+                        operation,
+                        FileOperationErrorKind::Io,
+                        Some(request.path.clone()),
+                        None,
+                        err,
+                    )
+                })?;
+            if !matches!(info.kind, FileKind::File | FileKind::Archive { .. })
+                || request
+                    .max_bytes
+                    .is_some_and(|max_bytes| info.len_or_zero() > max_bytes)
+            {
+                return Ok(FileRead { info, bytes: None });
+            }
+            let output = self
+                .run_sudo_command(
+                    "read file",
+                    "cat",
+                    &[std::ffi::OsStr::new("--"), local_path.as_os_str()],
+                    None,
+                )
+                .map_err(|err| {
+                    Self::operation_error(
+                        operation,
+                        FileOperationErrorKind::Io,
+                        Some(request.path.clone()),
+                        None,
+                        err,
+                    )
+                })?;
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.path.clone()),
+                    current_path: Some(request.path.clone()),
+                    completed_bytes: output.stdout.len() as u64,
+                    total_bytes: info.len_or_zero(),
+                    completed_files: 1,
+                    total_files: 1,
+                    destination: None,
+                },
+            );
+            return Ok(FileRead {
+                info,
+                bytes: Some(output.stdout),
+            });
+        }
         let metadata = fs::symlink_metadata(&local_path).map_err(|err| {
             Self::io_error(
                 operation,
@@ -825,6 +1072,76 @@ impl LocalFileAccess {
                 err,
             )
         })?;
+        if self.sudo {
+            let result = match &request.payload {
+                FileWritePayload::Directory => {
+                    if request.mode != FileWriteMode::CreateNew {
+                        return Err(Self::operation_error(
+                            operation,
+                            FileOperationErrorKind::Unsupported,
+                            Some(request.path.clone()),
+                            None,
+                            "Directories can only be created with create-new mode.",
+                        ));
+                    }
+                    self.run_sudo_command(
+                        "create directory",
+                        "mkdir",
+                        &[std::ffi::OsStr::new("--"), local_path.as_os_str()],
+                        None,
+                    )
+                }
+                FileWritePayload::File(contents) => {
+                    let script = match request.mode {
+                        FileWriteMode::CreateNew => "set -C; cat > \"$1\"",
+                        FileWriteMode::Replace => "cat > \"$1\"",
+                        FileWriteMode::Append => "cat >> \"$1\"",
+                    };
+                    self.run_sudo_command(
+                        "write file",
+                        "sh",
+                        &[
+                            std::ffi::OsStr::new("-c"),
+                            std::ffi::OsStr::new(script),
+                            std::ffi::OsStr::new("craic-sudo-write"),
+                            local_path.as_os_str(),
+                        ],
+                        Some(contents),
+                    )
+                }
+            };
+            result.map_err(|err| {
+                Self::operation_error(
+                    operation,
+                    if err.contains("File exists") {
+                        FileOperationErrorKind::AlreadyExists
+                    } else {
+                        FileOperationErrorKind::Io
+                    },
+                    Some(request.path.clone()),
+                    None,
+                    err,
+                )
+            })?;
+            let completed_bytes = match &request.payload {
+                FileWritePayload::File(contents) => contents.len() as u64,
+                FileWritePayload::Directory => 0,
+            };
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.path.clone()),
+                    destination: Some(request.path.clone()),
+                    current_path: Some(request.path.clone()),
+                    completed_bytes,
+                    total_bytes: completed_bytes,
+                    completed_files: 1,
+                    total_files: 1,
+                },
+            );
+            return Ok(());
+        }
         if matches!(request.payload, FileWritePayload::Directory) {
             if request.mode != FileWriteMode::CreateNew {
                 return Err(Self::operation_error(
@@ -994,6 +1311,48 @@ impl LocalFileAccess {
                 Some(request.destination.clone()),
                 format!("{} already exists.", request.destination.display()),
             ));
+        }
+        if self.sudo {
+            let result = self.run_sudo_command(
+                "copy path",
+                "sh",
+                &[
+                    std::ffi::OsStr::new("-c"),
+                    std::ffi::OsStr::new(
+                        "if [ -e \"$2\" ] || [ -L \"$2\" ]; then printf 'CRAIC-ERROR\\talready-exists\\n' >&2; exit 17; fi; exec cp -a -- \"$1\" \"$2\"",
+                    ),
+                    std::ffi::OsStr::new("sh"),
+                    source_path.as_os_str(),
+                    destination_path.as_os_str(),
+                ],
+                None,
+            );
+            result.map_err(|err| {
+                Self::operation_error(
+                    operation,
+                    if err.contains("CRAIC-ERROR\talready-exists") {
+                        FileOperationErrorKind::AlreadyExists
+                    } else {
+                        FileOperationErrorKind::Io
+                    },
+                    Some(request.source.clone()),
+                    Some(request.destination.clone()),
+                    err,
+                )
+            })?;
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.source.clone()),
+                    destination: Some(request.destination.clone()),
+                    current_path: Some(request.destination.clone()),
+                    completed_files: 1,
+                    total_files: 1,
+                    ..FileOperationProgress::new(operation)
+                },
+            );
+            return Ok(request.destination.clone());
         }
         let totals = local_copy_totals(
             &source_path,
@@ -1252,6 +1611,48 @@ impl LocalFileAccess {
                 format!("{} already exists.", destination.display()),
             ));
         }
+        if self.sudo {
+            let result = self.run_sudo_command(
+                "move path",
+                "sh",
+                &[
+                    std::ffi::OsStr::new("-c"),
+                    std::ffi::OsStr::new(
+                        "if [ -e \"$2\" ] || [ -L \"$2\" ]; then printf 'CRAIC-ERROR\\talready-exists\\n' >&2; exit 17; fi; exec mv -- \"$1\" \"$2\"",
+                    ),
+                    std::ffi::OsStr::new("sh"),
+                    source_path.as_os_str(),
+                    destination_path.as_os_str(),
+                ],
+                None,
+            );
+            result.map_err(|err| {
+                Self::operation_error(
+                    operation,
+                    if err.contains("CRAIC-ERROR\talready-exists") {
+                        FileOperationErrorKind::AlreadyExists
+                    } else {
+                        FileOperationErrorKind::Io
+                    },
+                    Some(request.source.clone()),
+                    Some(destination.clone()),
+                    err,
+                )
+            })?;
+            Self::emit_progress(
+                callback,
+                FileOperationProgress {
+                    operation,
+                    source: Some(request.source.clone()),
+                    destination: Some(destination.clone()),
+                    current_path: Some(destination.clone()),
+                    completed_files: 1,
+                    total_files: 1,
+                    ..FileOperationProgress::new(operation)
+                },
+            );
+            return Ok(destination);
+        }
         match fs::rename(&source_path, &destination_path) {
             Ok(()) => {
                 Self::emit_progress(
@@ -1310,6 +1711,15 @@ impl LocalFileAccess {
                 "Archive contents are read-only.",
             ));
         }
+        if request.path.is_root() {
+            return Err(Self::operation_error(
+                operation,
+                FileOperationErrorKind::Unsupported,
+                Some(request.path.clone()),
+                None,
+                "The workspace root cannot be deleted.",
+            ));
+        }
         let local_path = self.local_path_for_node(&request.path).map_err(|err| {
             Self::operation_error(
                 operation,
@@ -1319,6 +1729,41 @@ impl LocalFileAccess {
                 err,
             )
         })?;
+        if self.sudo {
+            self.run_sudo_command(
+                "delete path",
+                "rm",
+                &[
+                    std::ffi::OsStr::new("-rf"),
+                    std::ffi::OsStr::new("--"),
+                    local_path.as_os_str(),
+                ],
+                None,
+            )
+            .map_err(|err| {
+                Self::operation_error(
+                    operation,
+                    FileOperationErrorKind::Io,
+                    Some(request.path.clone()),
+                    None,
+                    err,
+                )
+            })?;
+            if let Some(callback) = callback {
+                Self::emit_progress(
+                    callback,
+                    FileOperationProgress {
+                        operation,
+                        source: Some(request.path.clone()),
+                        current_path: Some(request.path.clone()),
+                        completed_files: 1,
+                        total_files: 1,
+                        ..FileOperationProgress::new(operation)
+                    },
+                );
+            }
+            return Ok(());
+        }
         let metadata = fs::symlink_metadata(&local_path).map_err(|err| {
             Self::io_error(
                 operation,
@@ -1375,8 +1820,29 @@ impl FileAccess for LocalFileAccess {
         self.root_node()
     }
 
+    fn sudo_access(
+        &self,
+        password: Option<FileSudoPassword>,
+    ) -> Result<Arc<dyn FileAccess>, FileSudoError> {
+        log::info!(
+            "local sudo file authorization start workspace={} password_supplied={}",
+            self.workspace.display_name,
+            password.is_some()
+        );
+        Self::authenticate_sudo(password.as_ref())?;
+        let mut access = self.clone();
+        access.sudo = true;
+        log::info!(
+            "local sudo file authorization complete workspace={}",
+            self.workspace.display_name
+        );
+        Ok(Arc::new(access))
+    }
+
     fn local_path(&self, path: &FileNodePath) -> Option<PathBuf> {
-        self.local_path_for_node(path).ok()
+        (!self.sudo)
+            .then(|| self.local_path_for_node(path).ok())
+            .flatten()
     }
 
     fn watch(
@@ -1477,6 +1943,33 @@ impl FileAccess for LocalFileAccess {
             }
             let local_path = self.local_path_for_node(path)?;
             let mut entries = Vec::new();
+            if self.sudo {
+                let output = self.run_sudo_command(
+                    "list directory",
+                    "find",
+                    &[
+                        local_path.as_os_str(),
+                        std::ffi::OsStr::new("-mindepth"),
+                        std::ffi::OsStr::new("1"),
+                        std::ffi::OsStr::new("-maxdepth"),
+                        std::ffi::OsStr::new("1"),
+                        std::ffi::OsStr::new("-print0"),
+                    ],
+                    None,
+                )?;
+                for raw_path in output.stdout.split(|byte| *byte == 0) {
+                    if !raw_path.is_empty() {
+                        entries.push(self.node_path_for_local(&PathBuf::from(
+                            std::ffi::OsString::from_vec(raw_path.to_vec()),
+                        )));
+                    }
+                }
+                listings.push(DirectoryListing {
+                    path: path.clone(),
+                    entries,
+                });
+                continue;
+            }
             for entry in fs::read_dir(&local_path)
                 .map_err(|err| format!("Unable to list {}: {err}", path.display()))?
             {
@@ -2321,6 +2814,20 @@ fn local_io_error_kind(err: &std::io::Error) -> FileOperationErrorKind {
 
 fn local_io_error_is_cross_device(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(18)
+}
+
+#[cfg(unix)]
+fn local_path_writable(path: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a valid NUL-terminated byte string for the duration of the call.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+fn local_path_writable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| !metadata.permissions().readonly())
 }
 
 fn file_kind(metadata: &fs::Metadata) -> FileKind {

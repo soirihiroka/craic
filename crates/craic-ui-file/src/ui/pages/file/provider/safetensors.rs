@@ -24,12 +24,19 @@ fn show_safetensors(request: PreviewRequest<'_>) {
     let file_path = request.file_path.to_string();
     let apply_file_path = file_path.clone();
     let local_path = request.local_path.map(PathBuf::from);
+    let prefetched_bytes = request.prefetched_bytes.map(ToOwned::to_owned);
 
     super::spawn_preview_load(
         Rc::clone(&request.right),
         request.load_token,
         file_path.clone(),
-        move || read_metadata_text(local_path.as_deref(), &file_path),
+        move || {
+            read_metadata_text(
+                local_path.as_deref(),
+                prefetched_bytes.as_deref(),
+                &file_path,
+            )
+        },
         move |right, result| match result {
             Ok(text) => right.show_safetensors_metadata(&apply_file_path, &text),
             Err(message) => right.show_unavailable(&apply_file_path, &message),
@@ -39,8 +46,12 @@ fn show_safetensors(request: PreviewRequest<'_>) {
 
 fn read_metadata_text(
     local_path: Option<&std::path::Path>,
+    prefetched_bytes: Option<&[u8]>,
     file_path: &str,
 ) -> Result<String, String> {
+    if let Some(bytes) = prefetched_bytes {
+        return metadata_text_from_bytes(bytes, file_path);
+    }
     let local_path = local_path.ok_or_else(|| {
         format!("Safetensors metadata preview is only available for local files: {file_path}")
     })?;
@@ -70,7 +81,33 @@ fn read_metadata_text(
     file.read_exact(&mut bytes[8..])
         .map_err(|error| format!("Unable to read {file_path} header: {error}"))?;
 
-    let header = std::str::from_utf8(&bytes[8..]).map_err(|error| {
+    metadata_text_from_bytes(&bytes, file_path)
+}
+
+fn metadata_text_from_bytes(bytes: &[u8], file_path: &str) -> Result<String, String> {
+    let header_size: [u8; 8] = bytes
+        .get(..8)
+        .ok_or_else(|| format!("Unable to read {file_path} header."))?
+        .try_into()
+        .expect("slice length checked above");
+    let header_len = u64::from_le_bytes(header_size);
+    let total_len = header_len
+        .checked_add(8)
+        .ok_or_else(|| format!("{file_path} has an invalid header size to preview."))?;
+    if total_len > MAX_METADATA_BYTES {
+        return Err(format!(
+            "{file_path} metadata is too large to preview ({} bytes).",
+            total_len
+        ));
+    }
+    let total_len = usize::try_from(total_len).map_err(|_| {
+        format!("{file_path} has a header size that is too large to preview ({header_len} bytes).")
+    })?;
+    let bytes = bytes.get(8..total_len).ok_or_else(|| {
+        format!("Unable to read the complete Safetensors metadata header from {file_path}.")
+    })?;
+
+    let header = std::str::from_utf8(bytes).map_err(|error| {
         format!("Unable to parse Safetensors header as UTF-8 from {file_path}: {error}")
     })?;
     let header: serde_json::Value = serde_json::from_str(header).map_err(|error| {

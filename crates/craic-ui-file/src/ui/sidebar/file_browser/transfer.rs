@@ -28,6 +28,11 @@ const TRANSFER_CANCELED_MESSAGE: &str = "Transfer canceled.";
 const LOCAL_FILE_TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
 const TRANSFER_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_secs(1);
 
+fn permission_denied_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("permission denied") || message.contains("operation not permitted")
+}
+
 static FILE_CLIPBOARD: OnceLock<Mutex<Option<FileClipboard>>> = OnceLock::new();
 static DRAG_CLIPBOARD: OnceLock<Mutex<Option<FileClipboard>>> = OnceLock::new();
 static NEXT_TRANSFER_UI_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
@@ -229,13 +234,30 @@ impl FileBrowser {
         target_folder: FileNodePath,
         auto_focus: bool,
     ) {
+        let file_access = self.file_access.borrow().clone();
+        self.transfer_local_paths_with_access(
+            sources,
+            target_folder,
+            auto_focus,
+            file_access,
+            true,
+        );
+    }
+
+    fn transfer_local_paths_with_access(
+        self: &Rc<Self>,
+        sources: Vec<PathBuf>,
+        target_folder: FileNodePath,
+        auto_focus: bool,
+        file_access: Arc<dyn FileAccess>,
+        allow_sudo: bool,
+    ) {
         if sources.is_empty() {
             return;
         }
         let operation = TransferOperation::Copy;
 
         let workspace = self.workspace.borrow().clone();
-        let file_access = self.file_access.borrow().clone();
         let transfer_id = self.next_transfer_id.get();
         self.next_transfer_id
             .set(transfer_id.wrapping_add(1).max(1));
@@ -247,6 +269,11 @@ impl FileBrowser {
                 sources.len() as u64,
                 auto_focus,
                 cancel_requested.clone(),
+                Some(TransferRetry::Local {
+                    sources: sources.clone(),
+                    target_folder: target_folder.clone(),
+                    allow_sudo,
+                }),
             ),
         );
         self.refresh_transfer_progress_rows();
@@ -306,12 +333,33 @@ impl FileBrowser {
         operation: TransferOperation,
         auto_focus: bool,
     ) {
+        let file_access = self.file_access.borrow().clone();
+        self.transfer_workspace_paths_with_access(
+            clipboard,
+            target_folder,
+            operation,
+            auto_focus,
+            file_access,
+            true,
+            false,
+        );
+    }
+
+    fn transfer_workspace_paths_with_access(
+        self: &Rc<Self>,
+        clipboard: FileClipboard,
+        target_folder: FileNodePath,
+        operation: TransferOperation,
+        auto_focus: bool,
+        destination_access: Arc<dyn FileAccess>,
+        allow_sudo: bool,
+        sudo_destination: bool,
+    ) {
         if clipboard.paths.is_empty() {
             return;
         }
 
         let workspace = self.workspace.borrow().clone();
-        let file_access = self.file_access.borrow().clone();
         let transfer_id = self.next_transfer_id.get();
         self.next_transfer_id
             .set(transfer_id.wrapping_add(1).max(1));
@@ -323,6 +371,13 @@ impl FileBrowser {
                 clipboard.paths.len() as u64,
                 auto_focus,
                 cancel_requested.clone(),
+                Some(TransferRetry::Workspace(WorkspaceTransferRetry {
+                    clipboard: clipboard.clone(),
+                    target_folder: target_folder.clone(),
+                    allow_sudo,
+                    destination_access: destination_access.clone(),
+                    sudo_destination,
+                })),
             ),
         );
         self.refresh_transfer_progress_rows();
@@ -337,7 +392,7 @@ impl FileBrowser {
             let mut progress_sender = TransferProgressSender::new(dispatcher.clone());
             let result = transfer_workspace_paths(
                 clipboard.source_access,
-                file_access,
+                destination_access,
                 clipboard.paths,
                 target_folder,
                 operation,
@@ -380,6 +435,7 @@ impl FileBrowser {
         let selected_path = self.selected_node_path.borrow().clone();
         let active = self.active_transfers.borrow_mut().remove(&transfer_id);
         let auto_focus = active.as_ref().is_some_and(|active| active.auto_focus);
+        let retry = active.as_ref().and_then(|active| active.retry.clone());
         let selected_active_path = selected_path.clone().filter(|path| {
             active
                 .as_ref()
@@ -416,7 +472,79 @@ impl FileBrowser {
                     if let Some(selected) = selected_active_path {
                         self.emit_selected_node_path(selected);
                     }
-                    self.show_error(operation.failure_heading(), &message);
+                    if permission_denied_message(&message)
+                        && retry.as_ref().is_some_and(TransferRetry::allow_sudo)
+                    {
+                        let retry = retry.expect("checked above");
+                        if let TransferRetry::Workspace(source_retry) = &retry
+                            && source_retry.sudo_destination
+                        {
+                            let source_retry = source_retry.clone();
+                            let retry_browser = self.clone();
+                            let error_browser = self.clone();
+                            crate::ui::sudo::offer_retry(
+                                self.root.clone().upcast(),
+                                source_retry.clipboard.source_access.clone(),
+                                operation.failure_heading(),
+                                &message,
+                                Rc::new(move |sudo_source| {
+                                    let mut clipboard = source_retry.clipboard.clone();
+                                    clipboard.source_access = sudo_source;
+                                    retry_browser.transfer_workspace_paths_with_access(
+                                        clipboard,
+                                        source_retry.target_folder.clone(),
+                                        operation,
+                                        auto_focus,
+                                        source_retry.destination_access.clone(),
+                                        false,
+                                        true,
+                                    );
+                                }),
+                                Rc::new(move |message| {
+                                    error_browser.show_error(operation.failure_heading(), &message)
+                                }),
+                            );
+                            return;
+                        }
+                        let retry_browser = self.clone();
+                        let prompt_browser = self.clone();
+                        let base_access = self.file_access.borrow().clone();
+                        super::file_ops::offer_sudo_retry(
+                            prompt_browser,
+                            operation.failure_heading(),
+                            &message,
+                            Rc::new(move |sudo_access| match &retry {
+                                TransferRetry::Local {
+                                    sources,
+                                    target_folder,
+                                    ..
+                                } => retry_browser.transfer_local_paths_with_access(
+                                    sources.clone(),
+                                    target_folder.clone(),
+                                    auto_focus,
+                                    sudo_access,
+                                    false,
+                                ),
+                                TransferRetry::Workspace(retry) => {
+                                    let mut clipboard = retry.clipboard.clone();
+                                    if Arc::ptr_eq(&clipboard.source_access, &base_access) {
+                                        clipboard.source_access = sudo_access.clone();
+                                    }
+                                    retry_browser.transfer_workspace_paths_with_access(
+                                        clipboard,
+                                        retry.target_folder.clone(),
+                                        operation,
+                                        auto_focus,
+                                        sudo_access,
+                                        !Arc::ptr_eq(&retry.clipboard.source_access, &base_access),
+                                        true,
+                                    );
+                                }
+                            }),
+                        );
+                    } else {
+                        self.show_error(operation.failure_heading(), &message);
+                    }
                 }
             }
         }
@@ -695,9 +823,21 @@ impl FileBrowser {
         destination: FileDownloadDestination,
     ) {
         let file_access = self.file_access.borrow().clone();
+        self.start_download_with_access(file_access, sources, destination, true);
+    }
+
+    fn start_download_with_access(
+        self: &Rc<Self>,
+        file_access: Arc<dyn FileAccess>,
+        sources: Vec<FileNodePath>,
+        destination: FileDownloadDestination,
+        allow_sudo: bool,
+    ) {
         let count = sources.len();
         let result_command = command_mailbox::once({
             let browser = self.clone();
+            let retry_sources = sources.clone();
+            let retry_destination = destination.clone();
 
             move |result: Result<Vec<PathBuf>, String>| match result {
                 Ok(paths) => {
@@ -710,6 +850,25 @@ impl FileBrowser {
                 }
                 Err(err) if err == TRANSFER_CANCELED_MESSAGE => {
                     log::info!("remote download canceled count={count}");
+                }
+                Err(err) if allow_sudo && permission_denied_message(&err) => {
+                    let retry_browser = browser.clone();
+                    let prompt_browser = browser.clone();
+                    let retry_sources = retry_sources.clone();
+                    let retry_destination = retry_destination.clone();
+                    super::file_ops::offer_sudo_retry(
+                        prompt_browser,
+                        "Download Failed",
+                        &err,
+                        Rc::new(move |sudo_access| {
+                            retry_browser.start_download_with_access(
+                                sudo_access,
+                                retry_sources.clone(),
+                                retry_destination.clone(),
+                                false,
+                            );
+                        }),
+                    );
                 }
                 Err(err) => browser.show_error("Download Failed", &err),
             }
@@ -900,6 +1059,35 @@ pub struct ActiveTransfer {
     total_bytes: u64,
     copied_files: u64,
     total_files: u64,
+    retry: Option<TransferRetry>,
+}
+
+#[derive(Clone)]
+struct WorkspaceTransferRetry {
+    clipboard: FileClipboard,
+    target_folder: FileNodePath,
+    allow_sudo: bool,
+    destination_access: Arc<dyn FileAccess>,
+    sudo_destination: bool,
+}
+
+#[derive(Clone)]
+enum TransferRetry {
+    Local {
+        sources: Vec<PathBuf>,
+        target_folder: FileNodePath,
+        allow_sudo: bool,
+    },
+    Workspace(WorkspaceTransferRetry),
+}
+
+impl TransferRetry {
+    fn allow_sudo(&self) -> bool {
+        match self {
+            Self::Local { allow_sudo, .. } => *allow_sudo,
+            Self::Workspace(retry) => retry.allow_sudo,
+        }
+    }
 }
 
 impl ActiveTransfer {
@@ -908,6 +1096,7 @@ impl ActiveTransfer {
         total_files: u64,
         auto_focus: bool,
         cancel_requested: Arc<AtomicBool>,
+        retry: Option<TransferRetry>,
     ) -> Self {
         Self {
             operation,
@@ -918,6 +1107,7 @@ impl ActiveTransfer {
             total_bytes: 0,
             copied_files: 0,
             total_files,
+            retry,
         }
     }
 }
@@ -1568,7 +1758,7 @@ fn run_transfer_file_operation(
             TransferOperation::Move => {
                 copy_between_file_accesses(
                     source_access.clone(),
-                    destination_access,
+                    destination_access.clone(),
                     source.clone(),
                     destination.clone(),
                     cancel_requested.clone(),
@@ -1576,7 +1766,19 @@ fn run_transfer_file_operation(
                     total_files,
                     progress,
                 )?;
-                delete_file_access_node(source_access, source, Some(cancel_requested))?;
+                if let Err(err) =
+                    delete_file_access_node(source_access, source, Some(cancel_requested))
+                {
+                    if let Err(cleanup_err) =
+                        delete_file_access_node(destination_access, destination.clone(), None)
+                    {
+                        log::warn!(
+                            "cross-provider move rollback failed path={} err={cleanup_err}",
+                            destination.display()
+                        );
+                    }
+                    return Err(err);
+                }
                 Ok(destination)
             }
         };
@@ -1692,23 +1894,37 @@ fn copy_between_file_accesses_inner(
                 None,
                 progress,
             )?;
-            let listings = source_access.list_dirs(std::slice::from_ref(&source))?;
-            let Some(listing) = listings.into_iter().next() else {
-                return Err(format!("Unable to list {}.", source.display()));
-            };
-            for child in listing.entries {
-                check_transfer_canceled(cancel_requested.as_ref())?;
-                let name = file_name_for_transfer(&child)?;
-                copy_between_file_accesses(
-                    source_access.clone(),
-                    destination_access.clone(),
-                    child,
-                    destination.join_child(name),
-                    cancel_requested.clone(),
-                    completed_before,
-                    total_files,
-                    progress,
-                )?;
+            let copy_children = (|| {
+                let listings = source_access.list_dirs(std::slice::from_ref(&source))?;
+                let Some(listing) = listings.into_iter().next() else {
+                    return Err(format!("Unable to list {}.", source.display()));
+                };
+                for child in listing.entries {
+                    check_transfer_canceled(cancel_requested.as_ref())?;
+                    let name = file_name_for_transfer(&child)?;
+                    copy_between_file_accesses(
+                        source_access.clone(),
+                        destination_access.clone(),
+                        child,
+                        destination.join_child(name),
+                        cancel_requested.clone(),
+                        completed_before,
+                        total_files,
+                        progress,
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(err) = copy_children {
+                if let Err(cleanup_err) =
+                    delete_file_access_node(destination_access, destination.clone(), None)
+                {
+                    log::warn!(
+                        "cross-provider directory rollback failed path={} err={cleanup_err}",
+                        destination.display()
+                    );
+                }
+                return Err(err);
             }
             Ok(destination)
         }
