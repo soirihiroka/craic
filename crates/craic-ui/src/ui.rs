@@ -1354,10 +1354,6 @@ fn refresh(state: &Rc<AppState>, message: Option<String>) {
     refresh_workspace(state, message, true, true);
 }
 
-fn refresh_without_toast(state: &Rc<AppState>, message: Option<String>) {
-    refresh_workspace(state, message, false, true);
-}
-
 fn refresh_with_toast(state: &Rc<AppState>, message: Option<String>, show_toast: bool) {
     refresh_workspace(state, message, show_toast, true);
 }

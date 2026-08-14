@@ -1,7 +1,11 @@
 use crate::system::path::WorkspacePath;
 use std::ffi::{CStr, OsStr, OsString};
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::process::{Command, Stdio};
 use std::ptr;
+use std::sync::mpsc;
+use std::thread;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellCommandSpec {
@@ -25,6 +29,28 @@ pub struct ShellCommandOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub status_code: Option<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellCommandTextOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub status_code: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellCommandStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug)]
+pub enum ShellCommandEvent {
+    Record {
+        stream: ShellCommandStream,
+        text: String,
+    },
+    Finished(Result<ShellCommandTextOutput, String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,6 +117,7 @@ impl ShellCommandRunRequest {
 }
 
 pub type ShellRunCallback = Box<dyn FnOnce(Result<ShellCommandOutput, String>) + Send + 'static>;
+pub type ShellCommandGenerator = mpsc::Receiver<ShellCommandEvent>;
 
 impl ShellCommandOutput {
     pub fn status_success(&self, success_codes: &[i32]) -> bool {
@@ -116,6 +143,31 @@ impl ShellCommandOutput {
             self.stdout_text_trimmed()
         } else {
             stderr
+        }
+    }
+}
+
+impl From<ShellCommandOutput> for ShellCommandTextOutput {
+    fn from(output: ShellCommandOutput) -> Self {
+        Self {
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            status_code: output.status_code,
+        }
+    }
+}
+
+impl ShellCommandTextOutput {
+    pub fn status_success(&self, success_codes: &[i32]) -> bool {
+        self.status_code
+            .is_some_and(|code| success_codes.contains(&code))
+    }
+
+    pub fn failure_message(&self) -> String {
+        if self.stderr.is_empty() {
+            self.stdout.clone()
+        } else {
+            self.stderr.clone()
         }
     }
 }
@@ -162,7 +214,119 @@ pub trait ShellAccess: Send + Sync {
     fn run_script(&self, request: ShellRunRequest, callback: ShellRunCallback);
     fn run_fast_script(&self, request: ShellRunRequest, callback: ShellRunCallback);
     fn run_fast_command(&self, request: ShellCommandRunRequest, callback: ShellRunCallback);
+    fn stream_fast_command(&self, request: ShellCommandRunRequest) -> ShellCommandGenerator;
     fn command_display(&self, command: &ShellCommandSpec) -> String;
+}
+
+pub(crate) fn run_streaming_command(
+    command: &mut Command,
+    stdin: Option<&[u8]>,
+    operation: &str,
+    event_sender: &mpsc::Sender<ShellCommandEvent>,
+) -> Result<ShellCommandOutput, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("Failed to start command for {operation}: {err}"))?;
+    if let Some(stdin_bytes) = stdin
+        && let Some(mut child_stdin) = child.stdin.take()
+        && let Err(err) = child_stdin.write_all(stdin_bytes)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "Failed to write command stdin for {operation}: {err}"
+        ));
+    }
+
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("Command for {operation} did not provide stdout."));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("Command for {operation} did not provide stderr."));
+    };
+
+    let stdout_thread = read_command_stream(
+        stdout,
+        ShellCommandStream::Stdout,
+        operation.to_string(),
+        event_sender.clone(),
+    );
+    let stderr_thread = read_command_stream(
+        stderr,
+        ShellCommandStream::Stderr,
+        operation.to_string(),
+        event_sender.clone(),
+    );
+    let status = child
+        .wait()
+        .map_err(|err| format!("Failed to wait for command {operation}: {err}"))?;
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| format!("Stdout reader stopped unexpectedly for {operation}."))??;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| format!("Stderr reader stopped unexpectedly for {operation}."))??;
+
+    Ok(ShellCommandOutput {
+        stdout,
+        stderr,
+        status_code: status.code(),
+    })
+}
+
+fn read_command_stream<R>(
+    mut reader: R,
+    stream: ShellCommandStream,
+    operation: String,
+    event_sender: mpsc::Sender<ShellCommandEvent>,
+) -> thread::JoinHandle<Result<Vec<u8>, String>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut record = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|err| format!("Failed to read {stream:?} for {operation}: {err}"))?;
+            if count == 0 {
+                send_command_record(&event_sender, stream, &record);
+                return Ok(output);
+            }
+
+            output.extend_from_slice(&buffer[..count]);
+            for byte in &buffer[..count] {
+                if matches!(byte, b'\r' | b'\n') {
+                    send_command_record(&event_sender, stream, &record);
+                    record.clear();
+                } else {
+                    record.push(*byte);
+                }
+            }
+        }
+    })
+}
+
+fn send_command_record(
+    event_sender: &mpsc::Sender<ShellCommandEvent>,
+    stream: ShellCommandStream,
+    bytes: &[u8],
+) {
+    let text = String::from_utf8_lossy(bytes).trim().to_string();
+    if !text.is_empty() {
+        let _ = event_sender.send(ShellCommandEvent::Record { stream, text });
+    }
 }
 
 pub fn default_shell() -> OsString {
