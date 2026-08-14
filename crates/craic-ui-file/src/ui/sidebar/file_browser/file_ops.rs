@@ -4,17 +4,39 @@ use super::{
 };
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{
-    FileDeleteRequest, FileMoveRequest, FileOperationError, FileOperationEvent, FileWriteMode,
-    FileWritePayload, FileWriteRequest,
+    FileAccess, FileDeleteRequest, FileMoveRequest, FileOperationError, FileOperationErrorKind,
+    FileOperationEvent, FileWriteMode, FileWritePayload, FileWriteRequest,
 };
 use adw::prelude::*;
 use craic_ui_core::ui::command_mailbox;
 use gtk::gio;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 const DELETE_WATCH_SUPPRESSION_MS: u64 = 1_200;
+
+pub(super) type SudoFileRetry = crate::ui::sudo::SudoFileRetry;
+
+pub(super) fn offer_sudo_retry(
+    browser: Rc<FileBrowser>,
+    heading: &str,
+    message: &str,
+    retry: SudoFileRetry,
+) {
+    let file_access = browser.file_access.borrow().clone();
+    let error_browser = browser.clone();
+    let error_heading = heading.to_string();
+    crate::ui::sudo::offer_retry(
+        browser.root.clone().upcast(),
+        file_access,
+        heading,
+        message,
+        retry,
+        Rc::new(move |message| error_browser.show_error(&error_heading, &message)),
+    );
+}
 
 impl FileBrowser {
     pub fn browser_list_rows_with_pending_new_entry(
@@ -220,17 +242,66 @@ impl FileBrowser {
             NewEntryKind::File => FileWritePayload::File(Vec::new()),
             NewEntryKind::Folder => FileWritePayload::Directory,
         };
+        self.write_created_node(
+            file_access,
+            folder.clone(),
+            name.to_string(),
+            kind,
+            created,
+            payload,
+            true,
+        );
+        self.refresh_browser_row_state();
+        Ok(())
+    }
+
+    fn write_created_node(
+        self: &Rc<Self>,
+        file_access: Arc<dyn FileAccess>,
+        folder: FileNodePath,
+        name: String,
+        kind: NewEntryKind,
+        created: FileNodePath,
+        payload: FileWritePayload,
+        allow_sudo: bool,
+    ) {
         let result_command = command_mailbox::once({
             let browser = self.clone();
             let folder = folder.clone();
-            let name = name.to_string();
+            let name = name.clone();
             let created = created.clone();
+            let payload = payload.clone();
 
             move |result: Result<(), FileOperationError>| match result {
                 Ok(()) => browser.finish_successful_create(&folder, &name, kind, created.clone()),
                 Err(err) => {
                     browser.rebuild();
-                    browser.show_error(kind.error_heading(), &err.to_string());
+                    if allow_sudo && err.kind == FileOperationErrorKind::PermissionDenied {
+                        let retry_browser = browser.clone();
+                        let prompt_browser = browser.clone();
+                        let retry_folder = folder.clone();
+                        let retry_name = name.clone();
+                        let retry_created = created.clone();
+                        let retry_payload = payload.clone();
+                        offer_sudo_retry(
+                            prompt_browser,
+                            kind.error_heading(),
+                            &err.to_string(),
+                            Rc::new(move |sudo_access| {
+                                retry_browser.write_created_node(
+                                    sudo_access,
+                                    retry_folder.clone(),
+                                    retry_name.clone(),
+                                    kind,
+                                    retry_created.clone(),
+                                    retry_payload.clone(),
+                                    false,
+                                );
+                            }),
+                        );
+                    } else {
+                        browser.show_error(kind.error_heading(), &err.to_string());
+                    }
                 }
             }
         });
@@ -247,8 +318,6 @@ impl FileBrowser {
                 }
             }),
         );
-        self.refresh_browser_row_state();
-        Ok(())
     }
 
     fn finish_successful_create(
@@ -400,10 +469,31 @@ impl FileBrowser {
             new_name
         );
         let file_access = self.file_access.borrow().clone();
+        self.move_renamed_node(
+            file_access,
+            target.clone(),
+            parent,
+            new_name.to_string(),
+            true,
+        );
+        self.rebuild();
+        Ok(())
+    }
+
+    fn move_renamed_node(
+        self: &Rc<Self>,
+        file_access: Arc<dyn FileAccess>,
+        target: BrowserTarget,
+        parent: FileNodePath,
+        new_name: String,
+        allow_sudo: bool,
+    ) {
         let completion_parent = parent.clone();
         let result_command = command_mailbox::once({
             let browser = self.clone();
             let target = target.clone();
+            let retry_parent = parent.clone();
+            let retry_name = new_name.clone();
 
             move |result: Result<FileNodePath, FileOperationError>| match result {
                 Ok(renamed) => {
@@ -411,7 +501,29 @@ impl FileBrowser {
                 }
                 Err(err) => {
                     browser.rebuild();
-                    browser.show_error("Rename Failed", &format!("Unable to rename: {err}"));
+                    if allow_sudo && err.kind == FileOperationErrorKind::PermissionDenied {
+                        let retry_browser = browser.clone();
+                        let prompt_browser = browser.clone();
+                        let retry_target = target.clone();
+                        let nested_parent = retry_parent.clone();
+                        let nested_name = retry_name.clone();
+                        offer_sudo_retry(
+                            prompt_browser,
+                            "Rename Failed",
+                            &format!("Unable to rename: {err}"),
+                            Rc::new(move |sudo_access| {
+                                retry_browser.move_renamed_node(
+                                    sudo_access,
+                                    retry_target.clone(),
+                                    nested_parent.clone(),
+                                    nested_name.clone(),
+                                    false,
+                                );
+                            }),
+                        );
+                    } else {
+                        browser.show_error("Rename Failed", &format!("Unable to rename: {err}"));
+                    }
                 }
             }
         });
@@ -428,8 +540,6 @@ impl FileBrowser {
                 }
             }),
         );
-        self.rebuild();
-        Ok(())
     }
 
     fn finish_successful_rename(
@@ -459,20 +569,26 @@ impl FileBrowser {
         let Some(path) = self.selected_node_path.borrow().clone() else {
             return;
         };
+        if path.is_root() {
+            return;
+        }
         let target = match self.file_access.borrow().info(&path) {
             Ok(info) => BrowserTarget::from_info(info),
             Err(err) => {
-                self.show_error(
-                    "Delete Failed",
-                    &format!("Unable to inspect {}: {err}", path.display()),
+                log::info!(
+                    "file browser delete continuing without metadata path={} err={err}",
+                    path.display()
                 );
-                return;
+                BrowserTarget::fallback(path)
             }
         };
         self.delete_target(target);
     }
 
     pub fn delete_target(self: &Rc<Self>, target: BrowserTarget) {
+        if target.node_path.is_root() {
+            return;
+        }
         let body = if target.is_dir {
             format!(
                 "Delete the folder \"{}\" and everything inside it?",
@@ -503,21 +619,48 @@ impl FileBrowser {
     }
 
     fn delete_confirmed(self: &Rc<Self>, target: BrowserTarget) {
+        let file_access = self.file_access.borrow().clone();
+        self.delete_with_access(target, file_access, true);
+    }
+
+    fn delete_with_access(
+        self: &Rc<Self>,
+        target: BrowserTarget,
+        file_access: Arc<dyn FileAccess>,
+        allow_sudo: bool,
+    ) {
         let path = target.node_path.clone();
         if !self.start_pending_delete(&path) {
             return;
         }
 
-        let file_access = self.file_access.borrow().clone();
         let result_command = command_mailbox::once({
             let browser = self.clone();
             let target = target.clone();
 
             move |result: Result<(), FileOperationError>| match result {
                 Ok(()) => browser.finish_successful_delete(&target),
-                Err(message) => {
+                Err(err) => {
                     browser.finish_failed_delete(&target.node_path);
-                    browser.show_error("Delete Failed", &message.to_string());
+                    if allow_sudo && err.kind == FileOperationErrorKind::PermissionDenied {
+                        let retry_target = target.clone();
+                        let retry_browser = browser.clone();
+                        let prompt_browser = browser.clone();
+                        offer_sudo_retry(
+                            prompt_browser,
+                            "Delete Failed",
+                            &err.to_string(),
+                            Rc::new(move |sudo_access| {
+                                retry_browser.delete_with_access(
+                                    retry_target.clone(),
+                                    sudo_access,
+                                    false,
+                                );
+                            }),
+                        );
+                    } else {
+                        browser.show_error("Delete Failed", &err.to_string());
+                    }
                 }
             }
         });

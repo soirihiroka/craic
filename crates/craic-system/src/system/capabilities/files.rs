@@ -223,6 +223,52 @@ pub type FileWatchCallback = Arc<dyn Fn(FileWatchChanges) + Send + Sync + 'stati
 pub type FileCancellation = Arc<AtomicBool>;
 pub type FileOperationCallback<T> = Box<dyn Fn(FileOperationEvent<T>) + Send + 'static>;
 
+pub struct FileSudoPassword(zeroize::Zeroizing<Vec<u8>>);
+
+impl FileSudoPassword {
+    pub fn new(password: impl Into<Vec<u8>>) -> Self {
+        Self(zeroize::Zeroizing::new(password.into()))
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for FileSudoPassword {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FileSudoPassword([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileSudoErrorKind {
+    PasswordRequired,
+    AuthenticationFailed,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSudoError {
+    pub kind: FileSudoErrorKind,
+    pub message: String,
+}
+
+impl FileSudoError {
+    pub fn new(kind: FileSudoErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for FileSudoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileOperation {
     Read,
@@ -586,6 +632,15 @@ pub struct FileSearchOutput {
 pub trait FileAccess: Send + Sync {
     fn workspace(&self) -> WorkspaceRef;
     fn root(&self) -> FileNodePath;
+    fn sudo_access(
+        &self,
+        _password: Option<FileSudoPassword>,
+    ) -> Result<Arc<dyn FileAccess>, FileSudoError> {
+        Err(FileSudoError::new(
+            FileSudoErrorKind::Unavailable,
+            "Sudo file access is unavailable for this workspace.",
+        ))
+    }
     fn copy_path(&self, path: &FileNodePath) -> String {
         path.to_workspace_path(&self.workspace())
             .map(|path| path.absolute)

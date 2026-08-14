@@ -33,6 +33,11 @@ const FILE_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(75);
 const FILE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(120);
 const LIVE_PREVIEW_REFRESH_DEBOUNCE: Duration = Duration::from_millis(60);
 
+fn permission_denied_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("permission denied") || message.contains("operation not permitted")
+}
+
 pub struct FilePage {
     ctx: PageContext,
     left: left::LeftPane,
@@ -274,8 +279,12 @@ impl OpenedFileMonitor {
             return;
         }
 
-        let current_signature = disk_signature_for_path(ctx, &target.node_path)
-            .ok()
+        let current_signature = right
+            .file_editor_access
+            .borrow()
+            .clone()
+            .or_else(|| ctx.files())
+            .and_then(|files| disk_signature_with_access(files.as_ref(), &target.node_path).ok())
             .flatten();
         if current_signature == target.signature {
             return;
@@ -400,6 +409,40 @@ impl FilePage {
             });
         }
 
+        right.connect_edit_with_sudo({
+            let ctx = ctx.clone();
+            let right = right.clone();
+            move || {
+                let Some(path) = right.file_editor_path.borrow().clone() else {
+                    return;
+                };
+                let Some(files) = ctx.files() else {
+                    ctx.show_error(
+                        "Edit with sudo Failed",
+                        "File access is unavailable for this workspace.",
+                    );
+                    return;
+                };
+                let Some(window) = ctx.window() else {
+                    ctx.show_error(
+                        "Edit with sudo Failed",
+                        "The application window is unavailable.",
+                    );
+                    return;
+                };
+                let retry_right = right.clone();
+                let error_ctx = ctx.clone();
+                crate::ui::sudo::offer_retry(
+                    window.upcast(),
+                    files,
+                    "Edit Read-only File",
+                    format!("{} is not writable by the connected user.", path.display()),
+                    Rc::new(move |sudo_access| retry_right.enable_sudo_editing(sudo_access)),
+                    Rc::new(move |message| error_ctx.show_error("Edit with sudo Failed", &message)),
+                );
+            }
+        });
+
         right.file_editor.connect_markdown_lint_ignore({
             let ctx = ctx.clone();
             let file_editor = right.file_editor.clone();
@@ -418,7 +461,6 @@ impl FilePage {
             let file_editor = right.file_editor.clone();
             let right = right.clone();
             let pending_save = pending_save.clone();
-            let file_monitor = file_monitor.clone();
             let displayed_preview = displayed_preview.clone();
             let save_generation = Rc::new(Cell::new(0_u64));
             let preview_generation = Rc::new(Cell::new(0_u64));
@@ -478,8 +520,6 @@ impl FilePage {
                 let file_editor_path = file_editor_path.clone();
                 let right = right.clone();
                 let pending_save = pending_save.clone();
-                let file_monitor = file_monitor.clone();
-                let displayed_preview = displayed_preview.clone();
                 let save_generation = save_generation.clone();
                 gtk::glib::timeout_add_local_once(Duration::from_millis(90), move || {
                     if save_generation.get() != generation {
@@ -491,31 +531,46 @@ impl FilePage {
                     if file_editor_path.borrow().as_ref() != Some(&node_path) {
                         return;
                     }
-                    let current_signature =
-                        disk_signature_for_path(&ctx, &node_path).ok().flatten();
                     let Some(pending) = pending_save.borrow().clone() else {
                         return;
                     };
+                    let Some(files) = right
+                        .file_editor_access
+                        .borrow()
+                        .clone()
+                        .or_else(|| ctx.files())
+                    else {
+                        ctx.show_error(
+                            "Save Failed",
+                            "File access is unavailable for this workspace.",
+                        );
+                        return;
+                    };
+                    let current_signature =
+                        match disk_signature_with_access(files.as_ref(), &node_path) {
+                            Ok(signature) => signature,
+                            Err(err) => {
+                                ctx.show_error("Save Failed", &err);
+                                return;
+                            }
+                        };
                     if pending.base_signature != current_signature {
-                        clear_pending_save(&pending_save, &node_path, generation);
-                        show_repository_node_path(
-                            &ctx,
-                            &right,
-                            &pending_save,
-                            &file_monitor,
-                            &displayed_preview,
-                            node_path.clone(),
-                            None,
+                        ctx.show_error(
+                            "Save Failed",
+                            "The file changed on disk. Your pending editor changes were preserved.",
                         );
                         return;
                     }
                     let text = file_editor.document_text();
                     spellcheck_editor_document(&ctx, &file_editor, &file_path, &text);
-                    if let Err(err) = write_repository_file(&ctx, &node_path, &text) {
+                    if let Err(err) = write_repository_file(files.as_ref(), &node_path, &text) {
+                        if right.file_editor_sudo.get() {
+                            right.expire_sudo_editing();
+                        }
                         ctx.show_error("Save Failed", &err);
                         return;
                     }
-                    if let Ok(signature) = disk_signature_for_path(&ctx, &node_path) {
+                    if let Ok(signature) = disk_signature_with_access(files.as_ref(), &node_path) {
                         file_editor_disk_signature.replace(signature);
                     }
                     clear_pending_save(&pending_save, &node_path, generation);
@@ -711,7 +766,13 @@ fn show_repository_file_location(
     let node_path = native_node_path(ctx, file_path);
     if right.file_editor_path.borrow().as_ref() == Some(&node_path) {
         let loaded_signature = *right.file_editor_disk_signature.borrow();
-        let current_signature = disk_signature_for_path(ctx, &node_path).ok().flatten();
+        let current_signature = right
+            .file_editor_access
+            .borrow()
+            .clone()
+            .or_else(|| ctx.files())
+            .and_then(|files| disk_signature_with_access(files.as_ref(), &node_path).ok())
+            .flatten();
         if current_signature == loaded_signature {
             if let Some(line) = line {
                 right
@@ -719,9 +780,6 @@ fn show_repository_file_location(
                     .select_line_column(line, column.unwrap_or(1));
             }
             return;
-        }
-        if pending_save_node_path(pending_save).as_ref() == Some(&node_path) {
-            pending_save.borrow_mut().take();
         }
     }
     if !flush_pending_save(ctx, right, pending_save) {
@@ -855,15 +913,18 @@ fn show_repository_node_path(
     let file_path = node_path.display();
     if right.file_editor_path.borrow().as_ref() == Some(&node_path) {
         let loaded_signature = *right.file_editor_disk_signature.borrow();
-        let current_signature = disk_signature_for_path(ctx, &node_path).ok().flatten();
+        let current_signature = right
+            .file_editor_access
+            .borrow()
+            .clone()
+            .or_else(|| ctx.files())
+            .and_then(|files| disk_signature_with_access(files.as_ref(), &node_path).ok())
+            .flatten();
         if current_signature == loaded_signature {
             if let Some((start, end)) = selection {
                 right.file_editor.select_range(start, end);
             }
             return;
-        }
-        if pending_save_node_path(pending_save).as_ref() == Some(&node_path) {
-            pending_save.borrow_mut().take();
         }
     }
     if !flush_pending_save(ctx, right, pending_save) {
@@ -1089,6 +1150,8 @@ struct RepositoryItem {
     prefetched_bytes: Option<Vec<u8>>,
 }
 
+type RepositoryItemCallback = Box<dyn FnOnce(Result<RepositoryItem, String>)>;
+
 fn load_repository_item<F>(ctx: &PageContext, node_path: FileNodePath, callback: F)
 where
     F: FnOnce(Result<RepositoryItem, String>) + 'static,
@@ -1100,27 +1163,50 @@ where
         return;
     };
 
+    load_repository_item_with_access(
+        ctx.clone(),
+        node_path,
+        files.clone(),
+        files,
+        true,
+        Rc::new(RefCell::new(Some(Box::new(callback)))),
+    );
+}
+
+fn load_repository_item_with_access(
+    ctx: PageContext,
+    node_path: FileNodePath,
+    base_files: Arc<dyn FileAccess>,
+    files: Arc<dyn FileAccess>,
+    allow_sudo: bool,
+    callback: Rc<RefCell<Option<RepositoryItemCallback>>>,
+) {
     let workspace = ctx.workspace_ref();
-    let local_path = local_workspace_path(ctx, &node_path);
+    let local_path = files.local_path(&node_path);
     let request_path = node_path.clone();
     let item_files = Arc::clone(&files);
     let (sender, receiver) = mpsc::channel();
     files.read_with_info(
         FileReadRequest {
-            path: request_path,
+            path: request_path.clone(),
             max_bytes: Some(MAX_EDITOR_FILE_BYTES),
             cancel_requested: None,
         },
         Box::new(move |event| {
             if let FileOperationEvent::Finished(result) = event {
                 let result = result
-                    .map(|read| RepositoryItem {
-                        files: item_files.clone(),
-                        workspace: workspace.clone(),
-                        node_path: node_path.clone(),
-                        local_path: local_path.clone(),
-                        info: read.info,
-                        prefetched_bytes: read.bytes,
+                    .map(|mut read| {
+                        if !allow_sudo {
+                            read.info.capabilities.writable = false;
+                        }
+                        RepositoryItem {
+                            files: item_files.clone(),
+                            workspace: workspace.clone(),
+                            node_path: node_path.clone(),
+                            local_path: local_path.clone(),
+                            info: read.info,
+                            prefetched_bytes: read.bytes,
+                        }
                     })
                     .map_err(|err| err.to_string());
                 let _ = sender.send(result);
@@ -1128,18 +1214,51 @@ where
         }),
     );
 
-    let mut callback = Some(callback);
+    let retry_ctx = ctx.clone();
+    let retry_node_path = request_path;
     gtk::glib::timeout_add_local(FILE_EVENT_POLL_INTERVAL, move || {
         match receiver.try_recv() {
             Ok(result) => {
-                if let Some(callback) = callback.take() {
+                if allow_sudo
+                    && result
+                        .as_ref()
+                        .is_err_and(|message| permission_denied_message(message))
+                    && let Some(window) = ctx.window()
+                {
+                    let retry_callback = callback.clone();
+                    let retry_base_files = base_files.clone();
+                    let retry_path = retry_node_path.clone();
+                    let retry_ctx = retry_ctx.clone();
+                    let error_callback = callback.clone();
+                    crate::ui::sudo::offer_retry(
+                        window.upcast(),
+                        base_files.clone(),
+                        "Open File Failed",
+                        result.as_ref().err().cloned().unwrap_or_default(),
+                        Rc::new(move |sudo_files| {
+                            load_repository_item_with_access(
+                                retry_ctx.clone(),
+                                retry_path.clone(),
+                                retry_base_files.clone(),
+                                sudo_files,
+                                false,
+                                retry_callback.clone(),
+                            );
+                        }),
+                        Rc::new(move |message| {
+                            if let Some(callback) = error_callback.borrow_mut().take() {
+                                callback(Err(message));
+                            }
+                        }),
+                    );
+                } else if let Some(callback) = callback.borrow_mut().take() {
                     callback(result);
                 }
                 gtk::glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
             Err(mpsc::TryRecvError::Disconnected) => {
-                if let Some(callback) = callback.take() {
+                if let Some(callback) = callback.borrow_mut().take() {
                     callback(Err("Read operation did not return a result.".to_string()));
                 }
                 gtk::glib::ControlFlow::Break
@@ -1180,6 +1299,9 @@ fn show_repository_item(
     }
 
     displayed_preview.replace(Some(displayed));
+    right
+        .file_editor_access
+        .replace(Some(Arc::clone(&item.files)));
     let selected_provider =
         provider::for_file(&file_path, &item.info, item.prefetched_bytes.as_deref());
     match selection {
@@ -1222,16 +1344,24 @@ fn add_gitignore_pattern(ctx: &PageContext, pattern: &str) {
         );
         return;
     };
+    add_gitignore_pattern_with_access(ctx.clone(), pattern.to_string(), files, true);
+}
+
+fn add_gitignore_pattern_with_access(
+    ctx: PageContext,
+    pattern: String,
+    files: Arc<dyn FileAccess>,
+    allow_sudo: bool,
+) {
     let (sender, receiver) = mpsc::channel();
     gitignore::add_pattern_to_workspace(
-        files,
-        pattern.to_string(),
+        files.clone(),
+        pattern.clone(),
         Box::new(move |result| {
             let _ = sender.send(result);
         }),
     );
 
-    let ctx = ctx.clone();
     gtk::glib::timeout_add_local(FILE_EVENT_POLL_INTERVAL, move || {
         match receiver.try_recv() {
             Ok(Ok(message)) => {
@@ -1239,7 +1369,32 @@ fn add_gitignore_pattern(ctx: &PageContext, pattern: &str) {
                 gtk::glib::ControlFlow::Break
             }
             Ok(Err(err)) => {
-                ctx.show_error("Ignore Failed", &err);
+                if allow_sudo && permission_denied_message(&err) {
+                    let Some(window) = ctx.window() else {
+                        ctx.show_error("Ignore Failed", &err);
+                        return gtk::glib::ControlFlow::Break;
+                    };
+                    let retry_ctx = ctx.clone();
+                    let retry_pattern = pattern.clone();
+                    let error_ctx = ctx.clone();
+                    crate::ui::sudo::offer_retry(
+                        window.upcast(),
+                        files.clone(),
+                        "Ignore Failed",
+                        &err,
+                        Rc::new(move |sudo_access| {
+                            add_gitignore_pattern_with_access(
+                                retry_ctx.clone(),
+                                retry_pattern.clone(),
+                                sudo_access,
+                                false,
+                            )
+                        }),
+                        Rc::new(move |message| error_ctx.show_error("Ignore Failed", &message)),
+                    );
+                } else {
+                    ctx.show_error("Ignore Failed", &err);
+                }
                 gtk::glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
@@ -1264,9 +1419,27 @@ fn add_markdown_lint_ignore(
         );
         return;
     };
+    add_markdown_lint_ignore_with_access(
+        ctx.clone(),
+        file_editor.clone(),
+        file_editor_path.clone(),
+        rule_name.to_string(),
+        files,
+        true,
+    );
+}
+
+fn add_markdown_lint_ignore_with_access(
+    ctx: PageContext,
+    file_editor: code_editor::CodeEditor,
+    file_editor_path: Rc<RefCell<Option<FileNodePath>>>,
+    rule_name: String,
+    files: Arc<dyn FileAccess>,
+    allow_sudo: bool,
+) {
     match crate::workspace_config::add_markdown_lint_ignore_with_file_access(
         files.as_ref(),
-        rule_name,
+        &rule_name,
     ) {
         Ok(message) => {
             ctx.show_toast(&message);
@@ -1283,6 +1456,36 @@ fn add_markdown_lint_ignore(
                     &ignored_rules,
                 ));
             }
+        }
+        Err(err) if allow_sudo && permission_denied_message(&err) => {
+            let Some(window) = ctx.window() else {
+                ctx.show_error("Markdown Lint Ignore Failed", &err);
+                return;
+            };
+            let retry_ctx = ctx.clone();
+            let retry_editor = file_editor.clone();
+            let retry_path = file_editor_path.clone();
+            let retry_rule = rule_name.clone();
+            let error_ctx = ctx.clone();
+            crate::ui::sudo::offer_retry(
+                window.upcast(),
+                files,
+                "Markdown Lint Ignore Failed",
+                &err,
+                Rc::new(move |sudo_access| {
+                    add_markdown_lint_ignore_with_access(
+                        retry_ctx.clone(),
+                        retry_editor.clone(),
+                        retry_path.clone(),
+                        retry_rule.clone(),
+                        sudo_access,
+                        false,
+                    )
+                }),
+                Rc::new(move |message| {
+                    error_ctx.show_error("Markdown Lint Ignore Failed", &message)
+                }),
+            );
         }
         Err(err) => ctx.show_error("Markdown Lint Ignore Failed", &err),
     }
@@ -1416,31 +1619,46 @@ fn flush_pending_save(
         return true;
     }
 
-    let current_signature = disk_signature_for_path(ctx, &pending.node_path)
-        .ok()
-        .flatten();
+    let Some(files) = right
+        .file_editor_access
+        .borrow()
+        .clone()
+        .or_else(|| ctx.files())
+    else {
+        ctx.show_error(
+            "Save Failed",
+            "File access is unavailable for this workspace.",
+        );
+        return false;
+    };
+    let current_signature = match disk_signature_with_access(files.as_ref(), &pending.node_path) {
+        Ok(signature) => signature,
+        Err(err) => {
+            ctx.show_error("Save Failed", &err);
+            return false;
+        }
+    };
     if current_signature != pending.base_signature {
-        pending_save.borrow_mut().take();
-        return true;
+        ctx.show_error(
+            "Save Failed",
+            "The file changed on disk. Your pending editor changes were preserved.",
+        );
+        return false;
     }
 
     let text = right.file_editor.document_text();
-    if let Err(err) = write_repository_file(ctx, &pending.node_path, &text) {
+    if let Err(err) = write_repository_file(files.as_ref(), &pending.node_path, &text) {
+        if right.file_editor_sudo.get() {
+            right.expire_sudo_editing();
+        }
         ctx.show_error("Save Failed", &err);
         return false;
     }
-    if let Ok(signature) = disk_signature_for_path(ctx, &pending.node_path) {
+    if let Ok(signature) = disk_signature_with_access(files.as_ref(), &pending.node_path) {
         right.file_editor_disk_signature.replace(signature);
     }
     clear_pending_save(pending_save, &pending.node_path, pending.generation);
     true
-}
-
-fn pending_save_node_path(pending_save: &PendingSaveState) -> Option<FileNodePath> {
-    pending_save
-        .borrow()
-        .as_ref()
-        .map(|pending| pending.node_path.clone())
 }
 
 fn pending_save_matches(
@@ -1464,13 +1682,10 @@ fn clear_pending_save(pending_save: &PendingSaveState, path: &FileNodePath, gene
     }
 }
 
-fn disk_signature_for_path(
-    ctx: &PageContext,
+fn disk_signature_with_access(
+    files: &dyn FileAccess,
     path: &FileNodePath,
 ) -> Result<Option<provider::DiskSignature>, String> {
-    let files = ctx
-        .files()
-        .ok_or_else(|| "File access is unavailable for this workspace.".to_string())?;
     let info = files.info(path)?;
     if !info.kind.is_file() {
         return Ok(None);
@@ -1562,23 +1777,16 @@ fn text_from_repository_bytes(bytes: Vec<u8>) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8 text.".to_string())
 }
 
-fn write_repository_file(ctx: &PageContext, path: &FileNodePath, text: &str) -> Result<(), String> {
-    let files = ctx
-        .files()
-        .ok_or_else(|| "File access is unavailable for this workspace.".to_string())?;
+fn write_repository_file(
+    files: &dyn FileAccess,
+    path: &FileNodePath,
+    text: &str,
+) -> Result<(), String> {
     let info = files.info(path)?;
     if !info.kind.is_file() {
         return Err("Select a file to edit.".to_string());
     }
-    if !info.capabilities.writable {
-        log::info!(
-            "repository file save skipped read-only file_path={}",
-            path.display()
-        );
-        return Ok(());
-    }
-
-    write_text_via_callback(files.as_ref(), path, text)
+    write_text_via_callback(files, path, text)
 }
 
 fn write_text_via_callback(

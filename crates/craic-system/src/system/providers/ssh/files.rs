@@ -1,21 +1,26 @@
-use super::{SshCommandRunner, remote_workspace_path, shell_quote, workspace_path_for_remote};
+use super::{
+    SshCommandRunner, SshOutput, remote_workspace_path, shell_quote, workspace_path_for_remote,
+};
 use crate::system::capabilities::files::{
     DirectoryListing, FileAccess, FileCopyRequest, FileDeleteRequest, FileDownloadDestination,
     FileDownloadRequest, FileKind, FileMoveRequest, FileNodeCapabilities, FileNodeInfo,
     FileOperation, FileOperationCallback, FileOperationError, FileOperationErrorKind,
     FileOperationEvent, FileOperationProgress, FileRead, FileReadRequest, FileSearchMatch,
-    FileSearchOutput, FileSearchQuery, FileSignature, FileWatchCallback, FileWatchRequest,
-    FileWatchSubscription, FileWriteMode, FileWritePayload, FileWriteRequest,
-    file_operation_canceled,
+    FileSearchOutput, FileSearchQuery, FileSignature, FileSudoError, FileSudoErrorKind,
+    FileSudoPassword, FileWatchCallback, FileWatchRequest, FileWatchSubscription, FileWriteMode,
+    FileWritePayload, FileWriteRequest, file_operation_canceled,
 };
 use crate::system::path::{ArchiveFormat, FileNodePath, SystemRef, WorkspacePath, WorkspaceRef};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 const SSH_FILE_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const SSH_LIST_DIR_CACHE_TTL: Duration = Duration::from_millis(500);
@@ -35,6 +40,8 @@ pub struct SshFileAccess {
     workspace: WorkspaceRef,
     runner: SshCommandRunner,
     list_dir_cache: Arc<Mutex<SshListDirCache>>,
+    sudo: bool,
+    sudo_password: Option<Arc<Mutex<FileSudoPassword>>>,
 }
 
 #[derive(Debug, Default)]
@@ -77,6 +84,176 @@ impl SshFileAccess {
             workspace,
             runner,
             list_dir_cache: Arc::new(Mutex::new(SshListDirCache::default())),
+            sudo: false,
+            sudo_password: None,
+        }
+    }
+
+    fn sudo_script(&self, script: &str) -> String {
+        if self.sudo {
+            let password_flag = if self.sudo_password.is_some() {
+                "-S -p ''"
+            } else {
+                "-n"
+            };
+            format!(
+                "LC_ALL=C sudo {password_flag} -- sh -c {}",
+                shell_quote(script)
+            )
+        } else {
+            script.to_string()
+        }
+    }
+
+    fn sudo_write_script(&self, script: &str) -> String {
+        if !self.sudo || self.sudo_password.is_none() {
+            return self.sudo_script(script);
+        }
+        let privileged_script = format!("craic_payload=$1\n{script} < \"$craic_payload\"");
+        format!(
+            "umask 077; craic_payload=$(mktemp) || exit 1; trap 'rm -f -- \"$craic_payload\"' EXIT; IFS= read -r craic_password || exit 1; cat > \"$craic_payload\" || exit 1; printf '%s\\n' \"$craic_password\" | LC_ALL=C sudo -S -p '' -- sh -c {} sh \"$craic_payload\"",
+            shell_quote(&privileged_script)
+        )
+    }
+
+    fn sudo_stdin(&self, payload: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+        let Some(password) = &self.sudo_password else {
+            return Ok(None);
+        };
+        let password = password
+            .lock()
+            .map_err(|_| "Remote sudo credential state is unavailable.".to_string())?;
+        let mut input = Zeroizing::new(Vec::with_capacity(
+            password.bytes().len() + 1 + payload.len(),
+        ));
+        input.extend_from_slice(password.bytes());
+        input.push(b'\n');
+        input.extend_from_slice(payload);
+        Ok(Some(input))
+    }
+
+    fn run_file_script(&self, operation: &str, script: &str) -> Result<SshOutput, String> {
+        let script = self.sudo_script(script);
+        let input = self.sudo_stdin(&[])?;
+        self.runner.run_script_with_stdin(
+            operation,
+            &script,
+            input.as_ref().map(|input| input.as_slice()),
+        )
+    }
+
+    fn run_file_text(&self, operation: &str, script: &str) -> Result<String, String> {
+        let output = self.run_file_script(operation, script)?;
+        String::from_utf8(output.stdout).map_err(|_| format!("ssh {operation} returned non-UTF-8"))
+    }
+
+    fn authenticate_sudo(&self, password: Option<&FileSudoPassword>) -> Result<(), FileSudoError> {
+        let (script, stdin) = if let Some(password) = password {
+            let mut input = Zeroizing::new(password.bytes().to_vec());
+            input.push(b'\n');
+            ("LC_ALL=C sudo -S -p '' -v", Some(input))
+        } else {
+            ("LC_ALL=C sudo -n -v", None)
+        };
+        let output = self
+            .runner
+            .run_script_output_with_stdin(
+                "authorize sudo file access",
+                script,
+                stdin.as_deref().map(|input| input.as_slice()),
+            )
+            .map_err(|err| FileSudoError::new(FileSudoErrorKind::Unavailable, err))?;
+        if output.status_success(&[0]) {
+            return Ok(());
+        }
+        let message = output.failure_message();
+        Err(FileSudoError::new(
+            if password.is_some() {
+                FileSudoErrorKind::AuthenticationFailed
+            } else {
+                FileSudoErrorKind::PasswordRequired
+            },
+            if message.is_empty() {
+                "Remote sudo authentication failed.".to_string()
+            } else {
+                message
+            },
+        ))
+    }
+
+    fn download_paths_with_sudo(
+        &self,
+        resolved: &[SshResolvedFileNode],
+        destination: &FileDownloadDestination,
+        cancel_requested: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(), String> {
+        if cancel_requested.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err("Transfer canceled.".to_string());
+        }
+        if let FileDownloadDestination::File(destination) = destination {
+            let source = resolved
+                .first()
+                .ok_or_else(|| "Select a remote file to download.".to_string())?;
+            let script = format!("cat -- {}", shell_quote(&source.remote_path));
+            let output = self.run_file_script("download protected file", &script)?;
+            std::fs::write(destination, output.stdout).map_err(|err| {
+                format!(
+                    "Unable to write downloaded file {}: {err}",
+                    destination.display()
+                )
+            })?;
+            return Ok(());
+        }
+
+        let FileDownloadDestination::Folder(destination) = destination else {
+            unreachable!();
+        };
+        let mut script = String::from("tar -cf -");
+        for source in resolved {
+            let path = Path::new(&source.remote_path);
+            let parent = path.parent().ok_or_else(|| {
+                "Downloading the remote filesystem root is unsupported.".to_string()
+            })?;
+            let name = path.file_name().ok_or_else(|| {
+                "Downloading the remote filesystem root is unsupported.".to_string()
+            })?;
+            script.push_str(" -C ");
+            script.push_str(&shell_quote(&parent.to_string_lossy()));
+            script.push(' ');
+            script.push_str(&shell_quote(&format!("./{}", name.to_string_lossy())));
+        }
+        let output = self.run_file_script("download protected paths", &script)?;
+        let mut command = Command::new("tar");
+        command
+            .args(["-xf", "-", "-C"])
+            .arg(destination)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|err| format!("Unable to start local tar extraction: {err}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(&output.stdout)
+                .map_err(|err| format!("Unable to stream the protected download: {err}"))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|err| format!("Unable to wait for local tar extraction: {err}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if message.is_empty() {
+                format!(
+                    "Protected download extraction failed with status {}.",
+                    output.status
+                )
+            } else {
+                message
+            })
         }
     }
 
@@ -124,6 +301,21 @@ impl SshFileAccess {
         let workspace_path =
             WorkspacePath::from_workspace_relative(&self.workspace.root, &relative);
         let remote_path = remote_workspace_path(&self.workspace, &workspace_path);
+        if self.sudo {
+            let validation = shell_script_with_args(
+                "root=$(realpath -e -- \"$1\") || exit 1\ncandidate=$2\nwhile [ ! -e \"$candidate\" ] && [ ! -L \"$candidate\" ]; do\n  parent=$(dirname -- \"$candidate\") || exit 1\n  [ \"$parent\" != \"$candidate\" ] || exit 1\n  candidate=$parent\ndone\nresolved=$(realpath -e -- \"$candidate\") || exit 1\nif [ \"$root\" != / ]; then\n  case \"$resolved\" in\n    \"$root\"|\"$root\"/*) ;;\n    *) printf 'CRAIC-ERROR\\toutside-workspace\\n' >&2; exit 18 ;;\n  esac\nfi",
+                &[self.workspace.root.absolute.clone(), remote_path.clone()],
+            );
+            self.run_file_script("validate workspace path", &validation)
+                .map_err(|err| {
+                    if err.contains("CRAIC-ERROR\toutside-workspace") {
+                        "Elevated file operation would leave the workspace through a symlink."
+                            .to_string()
+                    } else {
+                        format!("Unable to validate elevated workspace path: {err}")
+                    }
+                })?;
+        }
         log::info!(
             "ssh file node resolved workspace={} operation={} node={} remote_path={}",
             self.workspace.display_name,
@@ -268,30 +460,35 @@ impl SshFileAccess {
                 )
             })?;
         let script = shell_read_with_info_script(&resolved.remote_path, request.max_bytes);
-        let output_result = self.runner.run_script_with_stdout_progress(
-            "read file node with info",
-            &script,
-            |stdout| {
-                Self::check_canceled(operation, &request.path, &request.cancel_requested)
-                    .map_err(|err| err.to_string())?;
-                if let Some((completed_bytes, total_bytes)) = remote_read_progress(stdout) {
-                    Self::emit_progress(
-                        callback,
-                        FileOperationProgress {
-                            operation,
-                            source: Some(request.path.clone()),
-                            current_path: Some(request.path.clone()),
-                            completed_bytes,
-                            total_bytes,
-                            completed_files: (completed_bytes == total_bytes) as u64,
-                            total_files: 1,
-                            destination: None,
-                        },
-                    );
-                }
-                Ok(())
-            },
-        );
+        let output_result = if self.sudo_password.is_some() {
+            self.run_file_script("read file node with info", &script)
+        } else {
+            let script = self.sudo_script(&script);
+            self.runner.run_script_with_stdout_progress(
+                "read file node with info",
+                &script,
+                |stdout| {
+                    Self::check_canceled(operation, &request.path, &request.cancel_requested)
+                        .map_err(|err| err.to_string())?;
+                    if let Some((completed_bytes, total_bytes)) = remote_read_progress(stdout) {
+                        Self::emit_progress(
+                            callback,
+                            FileOperationProgress {
+                                operation,
+                                source: Some(request.path.clone()),
+                                current_path: Some(request.path.clone()),
+                                completed_bytes,
+                                total_bytes,
+                                completed_files: (completed_bytes == total_bytes) as u64,
+                                total_files: 1,
+                                destination: None,
+                            },
+                        );
+                    }
+                    Ok(())
+                },
+            )
+        };
         let output = match output_result {
             Ok(output) => output,
             Err(err) => {
@@ -360,8 +557,7 @@ impl SshFileAccess {
                 ));
             }
             let script = format!("mkdir -- {}", shell_quote(&resolved.remote_path));
-            self.runner
-                .run_script("create directory", &script)
+            self.run_file_script("create directory", &script)
                 .map_err(|err| {
                     Self::remote_error(operation, Some(request.path.clone()), None, err)
                 })?;
@@ -397,13 +593,26 @@ impl SshFileAccess {
                 std::slice::from_ref(&resolved.remote_path),
             ),
         };
+        let script = self.sudo_write_script(&script);
+        let sudo_input = self
+            .sudo_stdin(contents)
+            .map_err(|err| Self::remote_error(operation, Some(request.path.clone()), None, err))?;
+        let password_prefix = sudo_input
+            .as_ref()
+            .map(|input| input.len().saturating_sub(contents.len()))
+            .unwrap_or(0) as u64;
+        let input = sudo_input.as_deref().unwrap_or(contents);
         let write_result = self.runner.run_script_with_stdin_progress(
             "write file",
             &script,
-            contents,
-            |completed_bytes, total_bytes| {
+            input,
+            |wire_completed, _| {
                 Self::check_canceled(operation, &request.path, &request.cancel_requested)
                     .map_err(|err| err.to_string())?;
+                let completed_bytes = wire_completed
+                    .saturating_sub(password_prefix)
+                    .min(contents.len() as u64);
+                let total_bytes = contents.len() as u64;
                 Self::emit_progress(
                     callback,
                     FileOperationProgress {
@@ -474,16 +683,14 @@ impl SshFileAccess {
             COPY_PATH_SCRIPT,
             &[source.remote_path.clone(), destination.remote_path.clone()],
         );
-        self.runner
-            .run_script("copy path", &script)
-            .map_err(|err| {
-                Self::remote_error(
-                    operation,
-                    Some(request.source.clone()),
-                    Some(request.destination.clone()),
-                    err,
-                )
-            })?;
+        self.run_file_script("copy path", &script).map_err(|err| {
+            Self::remote_error(
+                operation,
+                Some(request.source.clone()),
+                Some(request.destination.clone()),
+                err,
+            )
+        })?;
         Self::emit_progress(
             callback,
             FileOperationProgress {
@@ -557,16 +764,14 @@ impl SshFileAccess {
             MOVE_PATH_SCRIPT,
             &[source.remote_path.clone(), destination.remote_path.clone()],
         );
-        self.runner
-            .run_script("move path", &script)
-            .map_err(|err| {
-                Self::remote_error(
-                    operation,
-                    Some(request.source.clone()),
-                    Some(destination_path.clone()),
-                    err,
-                )
-            })?;
+        self.run_file_script("move path", &script).map_err(|err| {
+            Self::remote_error(
+                operation,
+                Some(request.source.clone()),
+                Some(destination_path.clone()),
+                err,
+            )
+        })?;
         Self::emit_progress(
             callback,
             FileOperationProgress {
@@ -589,6 +794,15 @@ impl SshFileAccess {
     ) -> Result<(), FileOperationError> {
         let operation = FileOperation::Delete;
         Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
+        if request.path.is_root() {
+            return Err(Self::operation_error(
+                operation,
+                FileOperationErrorKind::Unsupported,
+                Some(request.path.clone()),
+                None,
+                "The workspace root cannot be deleted.",
+            ));
+        }
         let resolved = self
             .resolve_native_node(&request.path, "delete")
             .map_err(|err| {
@@ -601,8 +815,7 @@ impl SshFileAccess {
                 )
             })?;
         let script = format!("rm -rf -- {}", shell_quote(&resolved.remote_path));
-        self.runner
-            .run_script("delete path", &script)
+        self.run_file_script("delete path", &script)
             .map_err(|err| Self::remote_error(operation, Some(request.path.clone()), None, err))?;
         Self::emit_progress(
             callback,
@@ -664,6 +877,27 @@ impl FileAccess for SshFileAccess {
 
     fn root(&self) -> FileNodePath {
         self.workspace.root_node_path(&self.system)
+    }
+
+    fn sudo_access(
+        &self,
+        password: Option<FileSudoPassword>,
+    ) -> Result<Arc<dyn FileAccess>, FileSudoError> {
+        log::info!(
+            "ssh sudo file authorization start workspace={} password_supplied={}",
+            self.workspace.display_name,
+            password.is_some()
+        );
+        self.authenticate_sudo(password.as_ref())?;
+        let mut access = self.clone();
+        access.sudo = true;
+        access.sudo_password = password.map(|password| Arc::new(Mutex::new(password)));
+        access.list_dir_cache = Arc::new(Mutex::new(SshListDirCache::default()));
+        log::info!(
+            "ssh sudo file authorization complete workspace={}",
+            self.workspace.display_name
+        );
+        Ok(Arc::new(access))
     }
 
     fn supports_download(&self) -> bool {
@@ -732,6 +966,14 @@ impl FileAccess for SshFileAccess {
         let destination = match &request.destination {
             FileDownloadDestination::File(path) | FileDownloadDestination::Folder(path) => path,
         };
+        if self.sudo {
+            self.download_paths_with_sudo(
+                &resolved,
+                &request.destination,
+                request.cancel_requested.as_deref(),
+            )?;
+            return Ok(output_paths);
+        }
         self.runner.download_paths(
             &remote_paths,
             destination,
@@ -743,7 +985,7 @@ impl FileAccess for SshFileAccess {
     fn info(&self, path: &FileNodePath) -> Result<FileNodeInfo, String> {
         let resolved = self.resolve_native_node(path, "info")?;
         let script = shell_metadata_script(&resolved.remote_path);
-        let raw = self.runner.run_text("file node info", &script)?;
+        let raw = self.run_file_text("file node info", &script)?;
         parse_metadata_line(self, resolved.path, raw.trim_end(), None)
     }
 
@@ -790,7 +1032,7 @@ impl FileAccess for SshFileAccess {
                 .map(|resolved| resolved.remote_path.clone())
                 .collect::<Vec<_>>();
             let script = shell_list_dirs_script(&remote_paths);
-            let raw = self.runner.run_text("list directories", &script)?;
+            let raw = self.run_file_text("list directories", &script)?;
             let mut listings = parse_directory_output(&missing_paths, &raw)?;
             for listing in &mut listings {
                 listing

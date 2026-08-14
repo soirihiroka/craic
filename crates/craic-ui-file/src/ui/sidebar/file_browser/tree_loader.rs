@@ -121,7 +121,7 @@ impl FileBrowser {
         let workspace_name = workspace.display_name.clone();
         let browser = self.clone();
         let updates = command_mailbox::once(move |result| {
-            browser.finish_directory_load(generation, result);
+            browser.finish_directory_load(generation, result, true);
         });
         thread::spawn(move || {
             log::debug!(
@@ -138,12 +138,14 @@ impl FileBrowser {
         self: &Rc<Self>,
         generation: u64,
         results: Vec<TreeDirectoryLoadResult>,
+        allow_sudo: bool,
     ) {
         if self.tree_directory_load_generation.get() != generation {
             return;
         }
 
         let mut changed = false;
+        let mut sudo_retry = None;
         {
             let mut loading = self.tree_directory_loading.borrow_mut();
             let mut cache = self.tree_directory_cache.borrow_mut();
@@ -164,7 +166,10 @@ impl FileBrowser {
                             "file browser directory load failed path={} cached_empty=true err={err}",
                             path.display()
                         );
-                        cache.insert(path, Vec::new());
+                        cache.insert(path.clone(), Vec::new());
+                        if allow_sudo && sudo_retry.is_none() && permission_denied_message(&err) {
+                            sudo_retry = Some((path, err));
+                        }
                     }
                 }
                 changed = true;
@@ -178,6 +183,32 @@ impl FileBrowser {
                 self.rebuild_if_changed();
             }
         }
+        if let Some((path, message)) = sudo_retry {
+            let browser = self.clone();
+            let retry_path = path.clone();
+            super::file_ops::offer_sudo_retry(
+                self.clone(),
+                "Open Folder Failed",
+                &message,
+                Rc::new(move |sudo_access| {
+                    browser.retry_directory_load(sudo_access, retry_path.clone());
+                }),
+            );
+        }
+    }
+
+    fn retry_directory_load(self: &Rc<Self>, file_access: Arc<dyn FileAccess>, path: FileNodePath) {
+        let generation = self.tree_directory_load_generation.get();
+        self.tree_directory_loading
+            .borrow_mut()
+            .insert(path.clone());
+        let browser = self.clone();
+        let updates = command_mailbox::once(move |result| {
+            browser.finish_directory_load(generation, result, false);
+        });
+        thread::spawn(move || {
+            updates.send(load_directory_rows(file_access, vec![path]));
+        });
     }
 
     fn collect_rows(
@@ -215,6 +246,11 @@ struct TreeDirectoryLoadResult {
     path: Option<FileNodePath>,
     rows: Result<Vec<BrowserRow>, String>,
     message: String,
+}
+
+fn permission_denied_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("permission denied") || message.contains("operation not permitted")
 }
 
 impl TreeDirectoryLoadResult {
