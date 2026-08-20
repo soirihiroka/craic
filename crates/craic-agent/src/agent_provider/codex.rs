@@ -37,6 +37,7 @@ impl AgentProvider for Provider {
             "exec".to_string(),
             "--sandbox".to_string(),
             "read-only".to_string(),
+            "--skip-git-repo-check".to_string(),
         ];
         append_model_args(&mut args, model);
         run_generation_command(
