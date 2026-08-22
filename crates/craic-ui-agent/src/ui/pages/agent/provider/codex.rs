@@ -39,11 +39,7 @@ impl AgentProvider for Provider {
             system,
             workspace,
             command_binary("codex", shell)?,
-            vec![
-                "--no-alt-screen".into(),
-                "--cd".into(),
-                workspace.root.absolute.clone().into(),
-            ],
+            launch_args(workspace, None),
         ))
     }
 
@@ -58,19 +54,32 @@ impl AgentProvider for Provider {
             system,
             workspace,
             command_binary("codex", shell)?,
-            vec![
-                "--no-alt-screen".into(),
-                "--cd".into(),
-                workspace.root.absolute.clone().into(),
-                "resume".into(),
-                cli_session_id.into(),
-            ],
+            launch_args(workspace, Some(cli_session_id)),
         ))
     }
 
     fn shell_integration(&self) -> &'static dyn AgentShellIntegration {
         &SHELL_INTEGRATION
     }
+}
+
+fn launch_args(workspace: &WorkspaceRef, cli_session_id: Option<&str>) -> Vec<std::ffi::OsString> {
+    let mut args = vec![
+        "--no-alt-screen".into(),
+        "--cd".into(),
+        workspace.root.absolute.clone().into(),
+    ];
+    if matches!(
+        craic_config::app_agent_settings().permissions.as_deref(),
+        Some(":full-access" | ":danger-full-access")
+    ) {
+        log::debug!("Codex CLI launch applying saved full-access permission profile");
+        args.push("--dangerously-bypass-approvals-and-sandbox".into());
+    }
+    if let Some(cli_session_id) = cli_session_id {
+        args.extend(["resume".into(), cli_session_id.into()]);
+    }
+    args
 }
 
 impl AgentShellIntegration for ShellIntegration {

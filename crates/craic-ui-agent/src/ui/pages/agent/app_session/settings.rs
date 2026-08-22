@@ -646,7 +646,7 @@ fn permission_label(id: &str) -> String {
     match id {
         ":read-only" => "Read only".to_owned(),
         ":workspace" => "Workspace".to_owned(),
-        ":full-access" => "Full access".to_owned(),
+        ":full-access" | ":danger-full-access" => "Full access".to_owned(),
         _ => title_case(id.trim_start_matches(':')),
     }
 }

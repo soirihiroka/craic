@@ -584,9 +584,17 @@ fn parse_line_model_options(output: &str) -> Result<Vec<ModelOption>, String> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(|line| ModelOption {
-            id: line.to_string(),
-            label: line.to_string(),
+        .filter_map(|line| {
+            let (id, label) = line.split_once('\t').unwrap_or((line, line));
+            let id = id.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let label = label.trim();
+            Some(ModelOption {
+                id: id.to_string(),
+                label: if label.is_empty() { id } else { label }.to_string(),
+            })
         })
         .collect::<Vec<_>>();
 
