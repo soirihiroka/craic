@@ -32,7 +32,12 @@ impl AgentProvider for Provider {
         prompt: &str,
         cancellation: &CancellationToken,
     ) -> Result<String, String> {
-        let mut args = vec!["run".to_string(), "--read-only".to_string()];
+        let mut args = vec!["--sandbox".to_string()];
+        let model = model.map(|model| {
+            model
+                .split_once('\t')
+                .map_or(model, |(model_id, _)| model_id.trim())
+        });
         append_model_args(&mut args, model);
         run_generation_command(
             self,
