@@ -20,6 +20,7 @@ use craic_codex_app_server::protocol::{
 use craic_codex_app_server::{
     AppServer, AppServerConfig, AppServerEvent, ConnectionState, ExitStatus,
 };
+use craic_ui_core::ui::command_mailbox;
 use gtk::{gio, glib};
 use serde_json::{Value, json};
 
@@ -33,6 +34,7 @@ use super::codex_chat::{
     PendingRequestKind, PendingRequestResponse, QueueDirection, QueuedSubmission, RequestOption,
     RequestOptionStyle, SelectorOption, TimelineItem, TimelineItemKind, TimelineItemStatus,
 };
+use super::remote_image::RemoteImage;
 use super::thread_picker::CodexThreadPicker;
 use crate::system::capabilities::shell::ShellAccess;
 use crate::system::{ProviderKind, WorkspaceRef};
@@ -85,6 +87,11 @@ struct QueuedTurn {
     submission: ComposerSubmission,
 }
 
+enum TemporaryAttachment {
+    Local(PathBuf),
+    Remote(RemoteImage),
+}
+
 #[derive(Clone, Copy)]
 enum ComposerContextSelection {
     Media,
@@ -131,7 +138,7 @@ struct AppChatSessionInner {
     tool_requests: RefCell<HashMap<RequestId, tools::ToolRequest>>,
     thread_operations: RefCell<HashMap<RequestId, (String, String)>>,
     queued_turns: RefCell<Vec<QueuedTurn>>,
-    temporary_attachments: RefCell<HashMap<String, PathBuf>>,
+    temporary_attachments: RefCell<HashMap<String, TemporaryAttachment>>,
     next_local_id: Cell<u64>,
     closing: Cell<bool>,
     title_callback: RefCell<Option<TitleCallback>>,
@@ -1460,7 +1467,7 @@ impl AppChatSessionInner {
         }
     }
 
-    fn add_attachment(&self, reference: String, mention: bool) {
+    fn add_attachment(self: &Rc<Self>, reference: String, mention: bool) {
         let label = Path::new(&reference)
             .file_name()
             .and_then(|name| name.to_str())
@@ -1472,6 +1479,15 @@ impl AppChatSessionInner {
         } else {
             attachment_kind(&reference)
         };
+        if !mention
+            && matches!(kind, ComposerAttachmentKind::Image)
+            && self.ctx.system_ref().provider_kind != ProviderKind::Local
+            && !is_http_url(&reference)
+        {
+            let attachment_id = format!("file:{reference}");
+            self.upload_remote_image(attachment_id, label, PathBuf::from(reference));
+            return;
+        }
         self.view.add_attachment(ComposerAttachment {
             id: format!("{}:{reference}", if mention { "mention" } else { "file" }),
             label,
@@ -1480,7 +1496,7 @@ impl AppChatSessionInner {
         });
     }
 
-    fn add_pasted_clipboard_image(&self, png_bytes: &[u8]) {
+    fn add_pasted_clipboard_image(self: &Rc<Self>, png_bytes: &[u8]) {
         if png_bytes.is_empty() {
             self.push_error("The clipboard image was empty".to_owned());
             return;
@@ -1497,9 +1513,14 @@ impl AppChatSessionInner {
             self.push_error(format!("Failed to save the pasted image: {error}"));
             return;
         }
-        self.temporary_attachments
-            .borrow_mut()
-            .insert(attachment_id.clone(), path.clone());
+        self.temporary_attachments.borrow_mut().insert(
+            attachment_id.clone(),
+            TemporaryAttachment::Local(path.clone()),
+        );
+        if self.ctx.system_ref().provider_kind != ProviderKind::Local {
+            self.upload_remote_image(attachment_id, "Pasted image".to_owned(), path);
+            return;
+        }
         self.view.add_attachment(ComposerAttachment {
             id: attachment_id,
             label: "Pasted image".to_owned(),
@@ -1508,22 +1529,104 @@ impl AppChatSessionInner {
         });
     }
 
+    fn upload_remote_image(self: &Rc<Self>, attachment_id: String, label: String, source: PathBuf) {
+        let Some(shell) = self.ctx.shell() else {
+            self.push_error("Shell access is unavailable for remote image upload".to_owned());
+            return;
+        };
+        let working_dir = self.ctx.workspace_ref().root;
+        let completion = command_mailbox::once({
+            let weak = Rc::downgrade(self);
+            let cleanup_shell = shell.clone();
+            let cleanup_working_dir = working_dir.clone();
+            move |result| {
+                let Some(session) = weak.upgrade() else {
+                    if let Ok(images) = result {
+                        super::remote_image::remove_images(
+                            cleanup_shell.clone(),
+                            cleanup_working_dir.clone(),
+                            images,
+                        );
+                    }
+                    return;
+                };
+                if session.closing.get() {
+                    if let Ok(images) = result {
+                        super::remote_image::remove_images(
+                            cleanup_shell.clone(),
+                            cleanup_working_dir.clone(),
+                            images,
+                        );
+                    }
+                    return;
+                }
+                match result {
+                    Ok(mut images) => {
+                        let Some(image) = images.pop() else {
+                            session.push_error(
+                                "Remote image upload returned no image path".to_owned(),
+                            );
+                            return;
+                        };
+                        let previous = session.temporary_attachments.borrow_mut().insert(
+                            attachment_id.clone(),
+                            TemporaryAttachment::Remote(image.clone()),
+                        );
+                        if let Some(previous) = previous {
+                            session.cleanup_temporary_attachment(previous);
+                        }
+                        session.view.add_attachment(ComposerAttachment {
+                            id: attachment_id.clone(),
+                            label: label.clone(),
+                            kind: ComposerAttachmentKind::Image,
+                            reference: image.path,
+                        });
+                    }
+                    Err(error) => {
+                        session.remove_temporary_attachment(&attachment_id);
+                        session.push_error(error);
+                    }
+                }
+            }
+        });
+        super::remote_image::upload_images(shell, working_dir, vec![source], move |result| {
+            completion.send(result)
+        });
+    }
+
     fn remove_temporary_attachment(&self, attachment_id: &str) {
-        let Some(path) = self
+        let Some(attachment) = self
             .temporary_attachments
             .borrow_mut()
             .remove(attachment_id)
         else {
             return;
         };
-        if let Err(error) = std::fs::remove_file(&path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            log::warn!(
-                "failed removing temporary Codex attachment session_id={} path={}: {error}",
-                self.id,
-                path.display()
-            );
+        self.cleanup_temporary_attachment(attachment);
+    }
+
+    fn cleanup_temporary_attachment(&self, attachment: TemporaryAttachment) {
+        match attachment {
+            TemporaryAttachment::Local(path) => {
+                if let Err(error) = std::fs::remove_file(&path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    log::warn!(
+                        "failed removing temporary Codex attachment session_id={} path={}: {error}",
+                        self.id,
+                        path.display()
+                    );
+                }
+            }
+            TemporaryAttachment::Remote(image) => {
+                if let Some(shell) = self.ctx.shell() {
+                    super::remote_image::remove_images(
+                        shell,
+                        self.ctx.workspace_ref().root,
+                        vec![image],
+                    );
+                }
+            }
         }
     }
 
@@ -1621,21 +1724,14 @@ impl Drop for AppChatSessionInner {
         // `AppServer::drop` initiates shutdown and detaches its worker handles. Holding the
         // value until this scope ends keeps this fallback non-blocking for GTK's main thread.
         let _server = self.server.get_mut().take();
-        for path in self
+        let attachments = self
             .temporary_attachments
             .get_mut()
             .drain()
-            .map(|(_, path)| path)
-        {
-            if let Err(error) = std::fs::remove_file(&path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                log::warn!(
-                    "failed removing temporary Codex attachment session_id={} path={}: {error}",
-                    self.id,
-                    path.display()
-                );
-            }
+            .map(|(_, attachment)| attachment)
+            .collect::<Vec<_>>();
+        for attachment in attachments {
+            self.cleanup_temporary_attachment(attachment);
         }
     }
 }
@@ -1675,6 +1771,12 @@ fn submission_inputs(submission: &ComposerSubmission) -> Vec<UserInput> {
     }
     for attachment in &submission.attachments {
         match attachment.kind {
+            ComposerAttachmentKind::Image if is_http_url(&attachment.reference) => {
+                input.push(UserInput::Image {
+                    url: attachment.reference.clone(),
+                    detail: None,
+                })
+            }
             ComposerAttachmentKind::Image => input.push(UserInput::LocalImage {
                 path: PathBuf::from(&attachment.reference),
                 detail: None,
@@ -1746,7 +1848,8 @@ fn concise_title(prompt: &str) -> Option<String> {
 }
 
 fn attachment_kind(reference: &str) -> ComposerAttachmentKind {
-    let extension = Path::new(reference)
+    let path = reference.split(['?', '#']).next().unwrap_or(reference);
+    let extension = Path::new(path)
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
@@ -1761,6 +1864,11 @@ fn attachment_kind(reference: &str) -> ComposerAttachmentKind {
     } else {
         ComposerAttachmentKind::File
     }
+}
+
+fn is_http_url(reference: &str) -> bool {
+    let lower = reference.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 fn title_case(value: &str) -> String {

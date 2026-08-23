@@ -5,6 +5,7 @@ mod codex_requests;
 mod left;
 mod prompts;
 mod provider;
+mod remote_image;
 mod right;
 mod smart_summary;
 mod thread_picker;

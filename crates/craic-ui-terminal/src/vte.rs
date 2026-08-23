@@ -30,6 +30,7 @@ const TERMINAL_PATH_MATCH_PATTERN: &str = r#"(?x)
 "#;
 
 type ActivationHandlers = Rc<RefCell<Vec<Box<dyn Fn(TerminalActivation)>>>>;
+type FileDropHandler = Rc<dyn Fn(VteTerminal, Vec<PathBuf>)>;
 
 #[derive(Clone)]
 pub struct VteTerminal {
@@ -42,6 +43,7 @@ pub struct VteTerminal {
     launch_dir: Rc<RefCell<String>>,
     visible_title: Rc<RefCell<Option<String>>>,
     activation_handlers: ActivationHandlers,
+    file_drop_handler: Rc<RefCell<Option<FileDropHandler>>>,
 }
 
 pub struct SpawnSpec {
@@ -166,6 +168,7 @@ impl VteTerminal {
             launch_dir: Rc::new(RefCell::new(String::new())),
             visible_title,
             activation_handlers: Rc::new(RefCell::new(Vec::new())),
+            file_drop_handler: Rc::new(RefCell::new(None)),
         };
         this.install_matches();
         this.install_activation();
@@ -331,6 +334,23 @@ impl VteTerminal {
 
     pub fn paste_text(&self, text: &str) {
         self.terminal.paste_text(text);
+    }
+
+    pub fn set_file_drop_handler<F>(&self, handler: F)
+    where
+        F: Fn(VteTerminal, Vec<PathBuf>) + 'static,
+    {
+        self.file_drop_handler.replace(Some(Rc::new(handler)));
+    }
+
+    pub fn paste_file_paths(&self, paths: &[PathBuf]) {
+        let text = paths
+            .iter()
+            .map(|path| shell_quote(&path.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.paste_text(&text);
+        self.grab_focus();
     }
 
     pub fn feed_child(&self, bytes: &[u8]) {
@@ -549,13 +569,12 @@ impl VteTerminal {
                 if paths.is_empty() {
                     return false;
                 }
-                let text = paths
-                    .iter()
-                    .map(|path| shell_quote(&path.to_string_lossy()))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                this.paste_text(&text);
-                this.grab_focus();
+                if let Some(handler) = this.file_drop_handler.borrow().clone() {
+                    handler(this.clone(), paths.clone());
+                    log::info!("VTE terminal file drop delegated count={}", paths.len());
+                    return true;
+                }
+                this.paste_file_paths(&paths);
                 log::info!("VTE terminal file drop pasted paths count={}", paths.len());
                 true
             }

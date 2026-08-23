@@ -6,6 +6,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 
 use super::super::PageContext;
@@ -18,13 +19,16 @@ use super::{
     provider::{self, AgentProvider, CommandSpec},
 };
 use crate::config;
+use crate::system::capabilities::shell::ShellAccess;
 use crate::system::capabilities::terminal_link::TerminalLinkTarget;
+use crate::system::{ProviderKind, WorkspacePath};
 use crate::ui::agent_history::{self, AgentSessionRow, RestoreState};
 use crate::ui::agent_status::{AgentActiveState, AgentInactiveState, AgentSessionState};
 use crate::ui::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsageTracker};
 use crate::ui::components::search::{SearchOption, SearchPanel};
 use crate::ui::pages::PageCommand;
 use crate::ui::{AGENT_SESSION_NOTIFICATION_DETAILED_ACTION, agent_session_notification_id};
+use craic_ui_core::ui::command_mailbox;
 use craic_ui_terminal::ui::components::terminal as terminal_component;
 use craic_ui_terminal::vte::{SpawnSpec, VteTerminal, terminal_environment};
 
@@ -65,6 +69,23 @@ struct AgentSession {
     loading_poll_count: Rc<Cell<u8>>,
     summary_requested: Rc<Cell<bool>>,
     summary_in_flight: Rc<Cell<bool>>,
+    _remote_image_uploads: Option<Rc<RemoteImageUploads>>,
+}
+
+struct RemoteImageUploads {
+    shell: Arc<dyn ShellAccess>,
+    working_dir: WorkspacePath,
+    images: RefCell<Vec<super::remote_image::RemoteImage>>,
+}
+
+impl Drop for RemoteImageUploads {
+    fn drop(&mut self) {
+        super::remote_image::remove_images(
+            self.shell.clone(),
+            self.working_dir.clone(),
+            self.images.get_mut().drain(..).collect(),
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1226,6 +1247,55 @@ impl AgentChat {
             &self.sessions,
             &self.search_panel,
         );
+        let remote_image_uploads = if provider.provider_id() == "codex"
+            && self.ctx.system_ref().provider_kind != ProviderKind::Local
+            && let Some(shell) = self.ctx.shell()
+        {
+            let ctx = self.ctx.clone();
+            let working_dir = self.ctx.workspace_ref().root;
+            let uploads = Rc::new(RemoteImageUploads {
+                shell: shell.clone(),
+                working_dir: working_dir.clone(),
+                images: RefCell::new(Vec::new()),
+            });
+            let handler_uploads = uploads.clone();
+            terminal.set_file_drop_handler(move |terminal, paths| {
+                if paths
+                    .iter()
+                    .any(|path| !super::remote_image::supported_image_path(path))
+                {
+                    ctx.show_error(
+                        "Remote Image Upload Failed",
+                        "Remote Codex CLI drops currently accept PNG, JPEG, GIF, WebP, and BMP images.",
+                    );
+                    return;
+                }
+                let completion = command_mailbox::once({
+                    let ctx = ctx.clone();
+                    let uploads = handler_uploads.clone();
+                    move |result: Result<Vec<super::remote_image::RemoteImage>, String>| match result {
+                        Ok(images) => {
+                            uploads.images.borrow_mut().extend(images.iter().cloned());
+                            let paths = images
+                                .into_iter()
+                                .map(|image| PathBuf::from(image.path))
+                                .collect::<Vec<_>>();
+                            terminal.paste_file_paths(&paths);
+                        }
+                        Err(error) => ctx.show_error("Remote Image Upload Failed", &error),
+                    }
+                });
+                super::remote_image::upload_images(
+                    shell.clone(),
+                    working_dir.clone(),
+                    paths,
+                    move |result| completion.send(result),
+                );
+            });
+            Some(uploads)
+        } else {
+            None
+        };
         install_focus_tracking(&terminal, &self.focus_handlers);
         terminal.connect_activation({
             let ctx = self.ctx.clone();
@@ -1383,6 +1453,7 @@ impl AgentChat {
             loading_poll_count,
             summary_requested,
             summary_in_flight,
+            _remote_image_uploads: remote_image_uploads,
         };
 
         self.sessions.borrow_mut().push(session.clone());
