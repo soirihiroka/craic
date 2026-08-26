@@ -169,7 +169,7 @@ impl ChangesPage {
     }
 
     fn connect_file_selection(&self) {
-        self.panel.files_list.connect_row_selected({
+        self.panel.connect_file_selected({
             let ctx = self.ctx.clone();
             let right = self.right.clone();
             let active_preview_signature = self.active_preview_signature.clone();
@@ -177,11 +177,8 @@ impl ChangesPage {
             let preview_signatures = self.preview_signatures.clone();
             let preview_cache = self.preview_cache.clone();
 
-            move |_, row| {
-                let Some(file_path) = row
-                    .map(|row| row.widget_name().to_string())
-                    .filter(|path| !path.is_empty())
-                else {
+            move |file_path| {
+                let Some(file_path) = file_path else {
                     active_preview_signature.borrow_mut().take();
                     active_preview_subscription.borrow_mut().take();
                     log::info!(
@@ -430,27 +427,12 @@ impl ChangesPage {
     }
 
     fn connect_context_menus(&self) {
-        let files_list = self.panel.files_list.clone();
-        let click = gtk::GestureClick::builder().button(0).build();
-        click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        click.connect_pressed({
+        self.panel.connect_file_context_requested({
             let ctx = self.ctx.clone();
             let active_context_menu = self.active_context_menu.clone();
 
-            move |gesture, _, x, y| {
-                if gesture.current_button() != 3 {
-                    return;
-                }
-
-                let Some(row) = files_list.row_at_y(y as i32) else {
-                    return;
-                };
-                let file_path = row.widget_name().to_string();
-                if file_path.is_empty() {
-                    return;
-                }
-
-                let parent = files_list.clone();
+            move |parent, file_path, x, y, _event_time| {
+                let parent = parent.clone();
                 let ctx = ctx.clone();
                 let active_context_menu = active_context_menu.clone();
                 gtk::glib::idle_add_local_once(move || {
@@ -463,10 +445,8 @@ impl ChangesPage {
                         y,
                     );
                 });
-                gesture.set_state(gtk::EventSequenceState::Claimed);
             }
         });
-        self.panel.files_list.add_controller(click);
 
         let selection_header = self.panel.selection_header.clone();
         let click = gtk::GestureClick::builder().button(0).build();
@@ -611,7 +591,7 @@ impl Page for ChangesPage {
     fn handle_command(&self, command: &PageCommand) -> PageCommandResult {
         match command {
             PageCommand::ClearSelection => {
-                self.panel.files_list.unselect_all();
+                self.panel.clear_selection();
                 self.active_preview_signature.borrow_mut().take();
                 self.active_preview_subscription.borrow_mut().take();
                 log::info!(
@@ -1456,7 +1436,7 @@ fn changed_file_selector_menu() -> context_menu::ContextMenuBuilder {
 
 fn show_changed_file_context_menu(
     ctx: &PageContext,
-    parent: &gtk::ListBox,
+    parent: &gtk::Widget,
     active_context_menu: &Rc<RefCell<Option<gtk::Popover>>>,
     file_path: &str,
     x: f64,

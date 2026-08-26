@@ -1,14 +1,13 @@
 use super::super::{canvas_scroll, widgets};
 use super::changes::{
-    ChangedFileRows, apply_changed_files, checked_file_paths, clear_changed_files,
-    default_commit_summary, file_signature, install_empty_list_unselect,
-    install_empty_scroller_unselect, set_all_file_checks,
-    update_commit_button_sensitivity_for_paths, update_selection_header,
+    ChangedFileContextCallback, ChangedFileItem, changed_file_factory, default_commit_summary,
+    file_signature, set_realized_file_checks, update_commit_button_sensitivity_for_paths,
 };
 use super::commit_panel::CommitPanel;
 use crate::git::RepositorySnapshot;
 use crate::ui::components::search::SearchPanel;
 use adw::prelude::*;
+use gtk::gio;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -16,9 +15,13 @@ use std::rc::Rc;
 #[derive(Clone)]
 pub struct ChangesPanel {
     pub root: gtk::Stack,
-    pub files_list: gtk::ListBox,
     pub selection_header: gtk::Box,
     pub initialize_button: gtk::Button,
+    model: gio::ListStore,
+    filtered_model: gtk::FilterListModel,
+    filter: gtk::CustomFilter,
+    selection: gtk::SingleSelection,
+    files_list: gtk::ListView,
     summary_entry: gtk::Entry,
     generate_button: gtk::Button,
     commit_button: gtk::Button,
@@ -30,18 +33,29 @@ pub struct ChangesPanel {
     select_all_label: gtk::Label,
     selection_syncing: Rc<Cell<bool>>,
     file_signature: Rc<RefCell<Vec<(String, String)>>>,
-    latest_snapshot: Rc<RefCell<Option<RepositorySnapshot>>>,
     search_query: Rc<RefCell<String>>,
     checked_paths: Rc<RefCell<HashSet<String>>>,
-    file_rows: Rc<RefCell<ChangedFileRows>>,
+    context_requested: Rc<RefCell<Option<Rc<ChangedFileContextCallback>>>>,
 }
 
 impl ChangesPanel {
     pub fn new(commit_panel: &CommitPanel) -> Self {
-        let files_list = gtk::ListBox::new();
-        files_list.set_selection_mode(gtk::SelectionMode::Single);
-        files_list.add_css_class("navigation-sidebar");
-        install_empty_list_unselect(&files_list);
+        let model = gio::ListStore::new::<ChangedFileItem>();
+        let search_query = Rc::new(RefCell::new(String::new()));
+        let filter = gtk::CustomFilter::new({
+            let search_query = search_query.clone();
+
+            move |object| {
+                let Some(file) = object.downcast_ref::<ChangedFileItem>() else {
+                    return false;
+                };
+                file.matches_search(&search_query.borrow())
+            }
+        });
+        let filtered_model = gtk::FilterListModel::new(Some(model.clone()), Some(filter.clone()));
+        let selection = gtk::SingleSelection::new(Some(filtered_model.clone()));
+        selection.set_autoselect(false);
+        selection.set_can_unselect(true);
 
         let select_all_check = gtk::CheckButton::builder()
             .valign(gtk::Align::Center)
@@ -62,13 +76,53 @@ impl ChangesPanel {
         selection_header.append(&select_all_label);
 
         let selection_syncing = Rc::new(Cell::new(false));
+        let file_signature = Rc::new(RefCell::new(Vec::new()));
+        let checked_paths = Rc::new(RefCell::new(HashSet::new()));
+        let commit_running = Rc::new(Cell::new(false));
+        let context_requested = Rc::new(RefCell::new(None));
+        let controls_changed: Rc<dyn Fn()> = Rc::new({
+            let filtered_model = filtered_model.clone();
+            let checked_paths = checked_paths.clone();
+            let select_all_check = select_all_check.clone();
+            let select_all_label = select_all_label.clone();
+            let selection_syncing = selection_syncing.clone();
+            let summary_entry = commit_panel.summary_entry.clone();
+            let generate_button = commit_panel.generate_button.clone();
+            let commit_button = commit_panel.commit_button.clone();
+            let file_signature = file_signature.clone();
+            let commit_running = commit_running.clone();
+
+            move || {
+                refresh_control_widgets(
+                    &filtered_model,
+                    &checked_paths.borrow(),
+                    &select_all_check,
+                    &select_all_label,
+                    &selection_syncing,
+                    &summary_entry,
+                    &generate_button,
+                    &commit_button,
+                    &file_signature.borrow(),
+                    commit_running.get(),
+                );
+            }
+        });
+        let factory = changed_file_factory(
+            &selection,
+            checked_paths.clone(),
+            selection_syncing.clone(),
+            controls_changed,
+            context_requested.clone(),
+        );
+        let files_list = gtk::ListView::new(Some(selection.clone()), Some(factory));
+        files_list.add_css_class("navigation-sidebar");
+
         let search_panel = SearchPanel::new("Search changed files");
         search_panel.set_options_visible(false);
         search_panel.set_navigation_visible(false);
 
         let files_scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
-            .propagate_natural_height(true)
             .vexpand(true)
             .child(&files_list)
             .build();
@@ -88,7 +142,6 @@ impl ChangesPanel {
             canvas_scroll::AutoscrollAxes::Vertical,
             "changes_list",
         );
-        install_empty_scroller_unselect(&files_scroller, &files_list);
 
         let initialize_button = gtk::Button::builder()
             .label("Initialize Git Repository")
@@ -148,24 +201,27 @@ impl ChangesPanel {
 
         let panel = Self {
             root,
-            files_list,
             selection_header,
             initialize_button,
+            model,
+            filtered_model,
+            filter,
+            selection,
+            files_list,
             summary_entry: commit_panel.summary_entry.clone(),
             generate_button: commit_panel.generate_button.clone(),
             commit_button: commit_panel.commit_button.clone(),
             commit_spinner: commit_panel.commit_spinner.clone(),
-            commit_running: Rc::new(Cell::new(false)),
+            commit_running,
             files_stack,
             search_panel,
             select_all_check,
             select_all_label,
             selection_syncing,
-            file_signature: Rc::new(RefCell::new(Vec::new())),
-            latest_snapshot: Rc::new(RefCell::new(None)),
-            search_query: Rc::new(RefCell::new(String::new())),
-            checked_paths: Rc::new(RefCell::new(HashSet::new())),
-            file_rows: Rc::new(RefCell::new(ChangedFileRows::default())),
+            file_signature,
+            search_query,
+            checked_paths,
+            context_requested,
         };
         panel.search_panel.set_key_capture_widget(&panel.root);
         panel.search_panel.install_shortcuts(&panel.root);
@@ -193,21 +249,20 @@ impl ChangesPanel {
                 .map(|(path, _)| path.clone())
                 .collect::<HashSet<_>>();
             *self.file_signature.borrow_mut() = signature;
-            self.latest_snapshot.replace(Some(snapshot.clone()));
             self.update_checked_paths(snapshot, &previous_paths);
 
-            self.render_snapshot(snapshot, selected.as_deref());
-        } else {
-            self.latest_snapshot.replace(Some(snapshot.clone()));
+            update_changed_file_model(&self.model, snapshot);
+            if let Some(path) = selected {
+                self.select_file_path(&path);
+            }
         }
         self.refresh_controls();
     }
 
     fn show_clean_repository(&self, snapshot: &RepositorySnapshot) {
-        let mut rows = self.file_rows.borrow_mut();
-        clear_changed_files(&self.files_list, &mut rows);
+        self.model.remove_all();
+        self.selection.unselect_all();
         self.file_signature.borrow_mut().clear();
-        self.latest_snapshot.replace(Some(snapshot.clone()));
         self.search_query.borrow_mut().clear();
         self.checked_paths.borrow_mut().clear();
         self.search_panel.set_query("", false);
@@ -221,15 +276,34 @@ impl ChangesPanel {
         self.refresh_controls();
     }
 
+    pub fn connect_file_selected<F>(&self, callback: F)
+    where
+        F: Fn(Option<String>) + 'static,
+    {
+        self.selection.connect_selected_notify(move |selection| {
+            let path = selection
+                .selected_item()
+                .and_downcast::<ChangedFileItem>()
+                .map(|file| file.path());
+            callback(path);
+        });
+    }
+
+    pub fn connect_file_context_requested<F>(&self, callback: F)
+    where
+        F: Fn(&gtk::Widget, String, f64, f64, u32) + 'static,
+    {
+        *self.context_requested.borrow_mut() = Some(Rc::new(callback));
+    }
+
     pub fn selected_file_path(&self) -> Option<String> {
-        self.files_list
-            .selected_row()
-            .map(|row| row.widget_name().to_string())
-            .filter(|path| !path.is_empty())
+        self.selection
+            .selected_item()
+            .and_downcast::<ChangedFileItem>()
+            .map(|file| file.path())
     }
 
     pub fn checked_file_paths(&self) -> Vec<String> {
-        self.sync_checked_paths_from_visible_rows();
         let mut paths = self
             .checked_paths
             .borrow()
@@ -241,19 +315,7 @@ impl ChangesPanel {
     }
 
     pub fn has_changed_files(&self) -> bool {
-        let mut child = self.files_list.first_child();
-
-        while let Some(widget) = child {
-            let next = widget.next_sibling();
-            if let Ok(row) = widget.downcast::<gtk::ListBoxRow>() {
-                if !row.widget_name().is_empty() {
-                    return true;
-                }
-            }
-            child = next;
-        }
-
-        false
+        self.model.n_items() > 0
     }
 
     pub fn toggle_search(&self) {
@@ -261,9 +323,15 @@ impl ChangesPanel {
     }
 
     pub fn set_all_checked(&self, active: bool) {
-        set_all_file_checks(&self.files_list, active);
-        self.sync_checked_paths_from_visible_rows();
+        set_filtered_checked_paths(&self.filtered_model, &self.checked_paths, active);
+        self.selection_syncing.set(true);
+        set_realized_file_checks(&self.files_list, active);
+        self.selection_syncing.set(false);
         self.refresh_controls();
+    }
+
+    pub fn clear_selection(&self) {
+        self.selection.unselect_all();
     }
 
     pub fn commit_summary(&self) -> String {
@@ -294,10 +362,9 @@ impl ChangesPanel {
     pub fn clear(&self) {
         self.root.set_visible_child_name("content");
         self.files_stack.set_visible_child_name("files");
-        let mut rows = self.file_rows.borrow_mut();
-        clear_changed_files(&self.files_list, &mut rows);
+        self.model.remove_all();
+        self.selection.unselect_all();
         self.file_signature.borrow_mut().clear();
-        self.latest_snapshot.borrow_mut().take();
         self.search_query.borrow_mut().clear();
         self.checked_paths.borrow_mut().clear();
         self.search_panel.set_query("", false);
@@ -305,10 +372,9 @@ impl ChangesPanel {
     }
 
     pub fn show_initialize_repository(&self) {
-        let mut rows = self.file_rows.borrow_mut();
-        clear_changed_files(&self.files_list, &mut rows);
+        self.model.remove_all();
+        self.selection.unselect_all();
         self.file_signature.borrow_mut().clear();
-        self.latest_snapshot.borrow_mut().take();
         self.search_query.borrow_mut().clear();
         self.checked_paths.borrow_mut().clear();
         self.search_panel.set_query("", false);
@@ -320,7 +386,7 @@ impl ChangesPanel {
         self.search_panel.connect_query_changed({
             let panel = self.clone();
 
-            move |query| panel.update_search_query(query.trim().to_string())
+            move |query| panel.update_search_query(query.trim().to_lowercase())
         });
         self.search_panel.connect_closed({
             let panel = self.clone();
@@ -333,33 +399,10 @@ impl ChangesPanel {
         if *self.search_query.borrow() == query {
             return;
         }
-        self.sync_checked_paths_from_visible_rows();
         self.search_query.replace(query.clone());
         log::debug!("changes search updated query_len={}", query.len());
-        if let Some(snapshot) = self.latest_snapshot.borrow().clone() {
-            self.render_snapshot(&snapshot, self.selected_file_path().as_deref());
-        }
+        self.filter.changed(gtk::FilterChange::Different);
         self.refresh_controls();
-    }
-
-    fn render_snapshot(&self, snapshot: &RepositorySnapshot, selected: Option<&str>) {
-        let filtered = filtered_snapshot(snapshot, &self.search_query.borrow());
-        let mut rows = self.file_rows.borrow_mut();
-        apply_changed_files(
-            &self.files_list,
-            &mut rows,
-            &filtered,
-            selected,
-            &self.summary_entry,
-            &self.generate_button,
-            &self.commit_button,
-            &self.select_all_check,
-            &self.select_all_label,
-            &self.selection_syncing,
-            self.file_signature.clone(),
-            self.checked_paths.clone(),
-            self.commit_running.clone(),
-        );
     }
 
     fn update_checked_paths(
@@ -377,21 +420,6 @@ impl ChangesPanel {
         for path in paths {
             if !previous_paths.contains(&path) {
                 checked.insert(path);
-            }
-        }
-    }
-
-    fn sync_checked_paths_from_visible_rows(&self) {
-        let visible_paths = visible_file_paths(&self.files_list);
-        let checked_visible = checked_file_paths(&self.files_list)
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let mut checked = self.checked_paths.borrow_mut();
-        for path in visible_paths {
-            if checked_visible.contains(&path) {
-                checked.insert(path);
-            } else {
-                checked.remove(&path);
             }
         }
     }
@@ -417,15 +445,16 @@ impl ChangesPanel {
 
     fn connect_select_all(&self) {
         self.select_all_check.connect_toggled({
+            let filtered_model = self.filtered_model.clone();
             let files_list = self.files_list.clone();
+            let checked_paths = self.checked_paths.clone();
+            let selection_syncing = self.selection_syncing.clone();
+            let select_all_check = self.select_all_check.clone();
+            let select_all_label = self.select_all_label.clone();
             let summary_entry = self.summary_entry.clone();
             let generate_button = self.generate_button.clone();
             let commit_button = self.commit_button.clone();
-            let select_all_check = self.select_all_check.clone();
-            let select_all_label = self.select_all_label.clone();
-            let selection_syncing = self.selection_syncing.clone();
             let file_signature = self.file_signature.clone();
-            let checked_paths = self.checked_paths.clone();
             let commit_running = self.commit_running.clone();
 
             move |button| {
@@ -433,96 +462,159 @@ impl ChangesPanel {
                     return;
                 }
 
-                set_all_file_checks(&files_list, button.is_active());
-                let visible_paths = visible_file_paths(&files_list);
-                {
-                    let mut checked = checked_paths.borrow_mut();
-                    for path in visible_paths {
-                        if button.is_active() {
-                            checked.insert(path);
-                        } else {
-                            checked.remove(&path);
-                        }
-                    }
-                }
-                update_commit_button_sensitivity_for_paths(
+                set_filtered_checked_paths(&filtered_model, &checked_paths, button.is_active());
+                selection_syncing.set(true);
+                set_realized_file_checks(&files_list, button.is_active());
+                selection_syncing.set(false);
+                refresh_control_widgets(
+                    &filtered_model,
                     &checked_paths.borrow(),
-                    &summary_entry,
-                    &commit_button,
-                    &file_signature.borrow(),
-                    commit_running.get(),
-                );
-                generate_button.set_sensitive(!checked_paths.borrow().is_empty());
-                update_selection_header(
-                    &files_list,
                     &select_all_check,
                     &select_all_label,
                     &selection_syncing,
+                    &summary_entry,
+                    &generate_button,
+                    &commit_button,
+                    &file_signature.borrow(),
+                    commit_running.get(),
                 );
             }
         });
     }
 
+    fn select_file_path(&self, path: &str) {
+        for position in 0..self.filtered_model.n_items() {
+            let Some(file) = self
+                .filtered_model
+                .item(position)
+                .and_downcast::<ChangedFileItem>()
+            else {
+                continue;
+            };
+            if file.path() == path {
+                self.selection.set_selected(position);
+                return;
+            }
+        }
+        self.selection.unselect_all();
+    }
+
     fn refresh_controls(&self) {
-        self.sync_checked_paths_from_visible_rows();
-        update_selection_header(
-            &self.files_list,
+        refresh_control_widgets(
+            &self.filtered_model,
+            &self.checked_paths.borrow(),
             &self.select_all_check,
             &self.select_all_label,
             &self.selection_syncing,
-        );
-        update_commit_button_sensitivity_for_paths(
-            &self.checked_paths.borrow(),
             &self.summary_entry,
+            &self.generate_button,
             &self.commit_button,
             &self.file_signature.borrow(),
             self.commit_running.get(),
         );
-        self.generate_button
-            .set_sensitive(!self.checked_paths.borrow().is_empty());
     }
 }
 
-fn filtered_snapshot(snapshot: &RepositorySnapshot, query: &str) -> RepositorySnapshot {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return snapshot.clone();
-    }
-
-    let mut filtered = snapshot.clone();
-    filtered.changed_files = snapshot
-        .changed_files
-        .iter()
-        .filter(|file| changed_file_matches(file, &query))
-        .cloned()
-        .collect();
-    filtered
-}
-
-fn changed_file_matches(file: &crate::git::ChangedFile, query: &str) -> bool {
-    file.path.to_lowercase().contains(query)
-        || file_name(&file.path).to_lowercase().contains(query)
-        || file.status.to_lowercase().contains(query)
-}
-
-fn visible_file_paths(list: &gtk::ListBox) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut child = list.first_child();
-    while let Some(widget) = child {
-        let next = widget.next_sibling();
-        if let Ok(row) = widget.downcast::<gtk::ListBoxRow>() {
-            let path = row.widget_name();
-            if !path.is_empty() {
-                paths.push(path.to_string());
-            }
+fn update_changed_file_model(model: &gio::ListStore, snapshot: &RepositorySnapshot) {
+    let old_len = model.n_items() as usize;
+    let new_len = snapshot.changed_files.len();
+    let shared_len = old_len.min(new_len);
+    let mut prefix = 0;
+    while prefix < shared_len {
+        let Some(existing) = model.item(prefix as u32).and_downcast::<ChangedFileItem>() else {
+            break;
+        };
+        let desired = &snapshot.changed_files[prefix];
+        if !existing.matches(&desired.path, &desired.status) {
+            break;
         }
-        child = next;
+        prefix += 1;
     }
-    paths
+
+    let mut suffix = 0;
+    while suffix < shared_len - prefix {
+        let Some(existing) = model
+            .item((old_len - suffix - 1) as u32)
+            .and_downcast::<ChangedFileItem>()
+        else {
+            break;
+        };
+        let desired = &snapshot.changed_files[new_len - suffix - 1];
+        if !existing.matches(&desired.path, &desired.status) {
+            break;
+        }
+        suffix += 1;
+    }
+
+    let additions = snapshot.changed_files[prefix..new_len - suffix]
+        .iter()
+        .map(|file| ChangedFileItem::new(&file.path, &file.status))
+        .collect::<Vec<_>>();
+    let removed = old_len - prefix - suffix;
+    log::debug!(
+        "changes virtual model updated files={} changed_start={} removed={} added={}",
+        new_len,
+        prefix,
+        removed,
+        additions.len()
+    );
+    model.splice(prefix as u32, removed as u32, &additions);
 }
 
-fn file_name(path: &str) -> &str {
-    path.rsplit('/')
-        .find(|segment| !segment.is_empty())
-        .unwrap_or(path)
+fn set_filtered_checked_paths(
+    model: &gtk::FilterListModel,
+    checked_paths: &RefCell<HashSet<String>>,
+    active: bool,
+) {
+    let mut checked = checked_paths.borrow_mut();
+    for position in 0..model.n_items() {
+        let Some(file) = model.item(position).and_downcast::<ChangedFileItem>() else {
+            continue;
+        };
+        if active {
+            checked.insert(file.path());
+        } else {
+            checked.remove(&file.path());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_control_widgets(
+    model: &gtk::FilterListModel,
+    checked_paths: &HashSet<String>,
+    select_all_check: &gtk::CheckButton,
+    select_all_label: &gtk::Label,
+    selection_syncing: &Cell<bool>,
+    summary_entry: &gtk::Entry,
+    generate_button: &gtk::Button,
+    commit_button: &gtk::Button,
+    file_signature: &[(String, String)],
+    commit_running: bool,
+) {
+    let total = model.n_items();
+    let checked = (0..total)
+        .filter_map(|position| model.item(position).and_downcast::<ChangedFileItem>())
+        .filter(|file| file.is_checked(checked_paths))
+        .count() as u32;
+
+    selection_syncing.set(true);
+    select_all_check.set_sensitive(total > 0);
+    select_all_check.set_inconsistent(checked > 0 && checked < total);
+    select_all_check.set_active(total > 0 && checked == total);
+    selection_syncing.set(false);
+    select_all_label.set_label(&match total {
+        0 => "0 changed files".to_string(),
+        1 => "1 changed file".to_string(),
+        count => format!("{count} changed files"),
+    });
+
+    update_commit_button_sensitivity_for_paths(
+        checked_paths,
+        summary_entry,
+        commit_button,
+        file_signature,
+        commit_running,
+    );
+    generate_button.set_sensitive(!checked_paths.is_empty());
 }

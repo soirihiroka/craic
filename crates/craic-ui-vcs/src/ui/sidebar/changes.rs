@@ -1,15 +1,16 @@
-use super::super::file_row;
+use super::super::widgets;
 use crate::git::RepositorySnapshot;
 use adw::prelude::*;
+use craic_ui_core::ui::file_status;
+use gtk::glib;
+use gtk::glib::subclass::prelude::ObjectSubclassIsExt;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 
-#[derive(Default)]
-pub struct ChangedFileRows {
-    rows: HashMap<String, gtk::ListBoxRow>,
-    statuses: HashMap<String, String>,
-}
+const CHANGED_FILE_ROW_DATA_KEY: &str = "craic-changed-file-row";
+
+pub type ChangedFileContextCallback = dyn Fn(&gtk::Widget, String, f64, f64, u32) + 'static;
 
 pub fn file_signature(snapshot: &RepositorySnapshot) -> Vec<(String, String)> {
     snapshot
@@ -19,162 +20,233 @@ pub fn file_signature(snapshot: &RepositorySnapshot) -> Vec<(String, String)> {
         .collect()
 }
 
-pub fn apply_changed_files(
-    list: &gtk::ListBox,
-    rendered: &mut ChangedFileRows,
-    snapshot: &RepositorySnapshot,
-    selected: Option<&str>,
-    summary_entry: &gtk::Entry,
-    generate_button: &gtk::Button,
-    commit_button: &gtk::Button,
-    select_all_check: &gtk::CheckButton,
-    select_all_label: &gtk::Label,
-    selection_syncing: &Rc<Cell<bool>>,
-    file_signature: Rc<RefCell<Vec<(String, String)>>>,
+pub fn changed_file_factory(
+    selection: &gtk::SingleSelection,
     checked_paths: Rc<RefCell<HashSet<String>>>,
-    commit_running: Rc<Cell<bool>>,
-) {
-    let desired_paths = snapshot
-        .changed_files
-        .iter()
-        .map(|file| file.path.as_str())
-        .collect::<HashSet<_>>();
-    let removed = rendered
-        .rows
-        .keys()
-        .filter(|path| !desired_paths.contains(path.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    for path in removed {
-        if let Some(row) = rendered.rows.remove(&path) {
-            list.remove(&row);
-        }
-        rendered.statuses.remove(&path);
-    }
+    checks_syncing: Rc<Cell<bool>>,
+    controls_changed: Rc<dyn Fn()>,
+    context_requested: Rc<RefCell<Option<Rc<ChangedFileContextCallback>>>>,
+) -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup({
+        let selection = selection.clone();
+        let checked_paths = checked_paths.clone();
 
-    for (index, file) in snapshot.changed_files.iter().enumerate() {
-        let existing = rendered.rows.get(&file.path).cloned();
-        let row = match existing {
-            Some(row) => {
-                if rendered.statuses.get(&file.path) != Some(&file.status) {
-                    file_row::update_changed_file_row_status(&row, &file.status);
+        move |_, item| {
+            let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                return;
+            };
+            let row = changed_file_row();
+
+            row.check.connect_toggled({
+                let item = item.clone();
+                let row = row.clone();
+                let checked_paths = checked_paths.clone();
+                let checks_syncing = checks_syncing.clone();
+                let controls_changed = controls_changed.clone();
+
+                move |button| {
+                    if row.binding.get() || checks_syncing.get() {
+                        return;
+                    }
+                    let Some(file) = item.item().and_downcast::<ChangedFileItem>() else {
+                        return;
+                    };
+                    let path = file.path();
+                    if button.is_active() {
+                        checked_paths.borrow_mut().insert(path);
+                    } else {
+                        checked_paths.borrow_mut().remove(&path);
+                    }
+                    controls_changed();
                 }
-                row
+            });
+
+            let click = gtk::GestureClick::builder().button(3).build();
+            click.set_propagation_phase(gtk::PropagationPhase::Capture);
+            click.connect_pressed({
+                let item = item.clone();
+                let root = row.root.clone();
+                let selection = selection.clone();
+                let context_requested = context_requested.clone();
+
+                move |gesture, _, x, y| {
+                    let Some(file) = item.item().and_downcast::<ChangedFileItem>() else {
+                        return;
+                    };
+                    if item.position() != gtk::INVALID_LIST_POSITION {
+                        selection.set_selected(item.position());
+                    }
+                    if let Some(callback) = context_requested.borrow().clone() {
+                        callback(
+                            root.upcast_ref(),
+                            file.path(),
+                            x,
+                            y,
+                            gesture.current_event_time(),
+                        );
+                    }
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                }
+            });
+            row.root.add_controller(click);
+
+            item.set_child(Some(&row.root));
+            unsafe {
+                item.set_data(CHANGED_FILE_ROW_DATA_KEY, row);
             }
-            None => mount_changed_file_row(
-                list,
-                &file.path,
-                &file.status,
-                summary_entry,
-                generate_button,
-                commit_button,
-                select_all_check,
-                select_all_label,
-                selection_syncing,
-                file_signature.clone(),
-                checked_paths.clone(),
-                commit_running.clone(),
-            ),
-        };
-        rendered
-            .statuses
-            .insert(file.path.clone(), file.status.clone());
-        rendered.rows.insert(file.path.clone(), row.clone());
-        if row.index() != index as i32 {
-            if row.parent().is_some() {
-                list.remove(&row);
-            }
-            list.insert(&row, index as i32);
         }
-    }
+    });
+    factory.connect_bind({
+        let checked_paths = checked_paths.clone();
 
-    if let Some(selected) = selected {
-        match row_for_path(list, selected) {
-            Some(row) => list.select_row(Some(&row)),
-            None => list.unselect_all(),
-        }
-    }
+        move |_, item| {
+            let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                return;
+            };
+            let Some(file) = item.item().and_downcast::<ChangedFileItem>() else {
+                return;
+            };
+            let Some(row) = changed_file_row_from_item(item) else {
+                return;
+            };
 
-    update_selection_header(list, select_all_check, select_all_label, selection_syncing);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn mount_changed_file_row(
-    list: &gtk::ListBox,
-    path: &str,
-    status: &str,
-    summary_entry: &gtk::Entry,
-    generate_button: &gtk::Button,
-    commit_button: &gtk::Button,
-    select_all_check: &gtk::CheckButton,
-    select_all_label: &gtk::Label,
-    selection_syncing: &Rc<Cell<bool>>,
-    file_signature: Rc<RefCell<Vec<(String, String)>>>,
-    checked_paths: Rc<RefCell<HashSet<String>>>,
-    commit_running: Rc<Cell<bool>>,
-) -> gtk::ListBoxRow {
-    let row = file_row::changed_file_row(path, status, true);
-    if let Some(check_button) = row_check_button(&row) {
-        check_button.set_active(checked_paths.borrow().contains(path));
-        let list = list.clone();
-        let summary_entry = summary_entry.clone();
-        let generate_button = generate_button.clone();
-        let commit_button = commit_button.clone();
-        let select_all_check = select_all_check.clone();
-        let select_all_label = select_all_label.clone();
-        let selection_syncing = selection_syncing.clone();
-        let path = path.to_string();
-        check_button.connect_toggled(move |button| {
-            if button.is_active() {
-                checked_paths.borrow_mut().insert(path.clone());
-            } else {
-                checked_paths.borrow_mut().remove(&path);
+            let path = file.path();
+            row.binding.set(true);
+            row.title.set_label(&path);
+            row.check.set_active(checked_paths.borrow().contains(&path));
+            while let Some(child) = row.status.first_child() {
+                row.status.remove(&child);
             }
-            update_commit_button_sensitivity_for_paths(
-                &checked_paths.borrow(),
-                &summary_entry,
-                &commit_button,
-                &file_signature.borrow(),
-                commit_running.get(),
-            );
-            generate_button.set_sensitive(!checked_paths.borrow().is_empty());
-            update_selection_header(
-                &list,
-                &select_all_check,
-                &select_all_label,
-                &selection_syncing,
-            );
-        });
-    }
-    row
+            row.status.append(&file_status::icon(&file.status()));
+            row.binding.set(false);
+        }
+    });
+    factory
 }
 
-pub fn clear_changed_files(list: &gtk::ListBox, rendered: &mut ChangedFileRows) {
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
-    }
-    rendered.rows.clear();
-    rendered.statuses.clear();
+#[derive(Clone)]
+struct ChangedFileRow {
+    root: gtk::Box,
+    check: gtk::CheckButton,
+    title: gtk::Label,
+    status: gtk::Box,
+    binding: Rc<Cell<bool>>,
 }
 
-pub fn checked_file_paths(list: &gtk::ListBox) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut child = list.first_child();
+fn changed_file_row_from_item(item: &gtk::ListItem) -> Option<ChangedFileRow> {
+    let row = unsafe { item.data::<ChangedFileRow>(CHANGED_FILE_ROW_DATA_KEY) }?;
+    Some(unsafe { row.as_ref().clone() })
+}
 
+fn changed_file_row() -> ChangedFileRow {
+    let check = gtk::CheckButton::builder()
+        .valign(gtk::Align::Center)
+        .build();
+    let title = widgets::heading("");
+    title.set_wrap(false);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.set_width_chars(1);
+    title.set_hexpand(true);
+    title.set_xalign(0.0);
+    let status = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+
+    let root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(2)
+        .margin_bottom(2)
+        .margin_start(2)
+        .margin_end(6)
+        .build();
+    root.append(&check);
+    root.append(&title);
+    root.append(&status);
+
+    ChangedFileRow {
+        root,
+        check,
+        title,
+        status,
+        binding: Rc::new(Cell::new(false)),
+    }
+}
+
+glib::wrapper! {
+    pub struct ChangedFileItem(ObjectSubclass<changed_file_item::ChangedFileItem>);
+}
+
+impl ChangedFileItem {
+    pub fn new(path: &str, status: &str) -> Self {
+        let item: Self = glib::Object::builder().build();
+        *item.imp().path.borrow_mut() = path.to_string();
+        *item.imp().status.borrow_mut() = status.to_string();
+        item
+    }
+
+    pub fn path(&self) -> String {
+        self.imp().path.borrow().clone()
+    }
+
+    pub fn status(&self) -> String {
+        self.imp().status.borrow().clone()
+    }
+
+    pub fn matches(&self, path: &str, status: &str) -> bool {
+        self.imp().path.borrow().as_str() == path && self.imp().status.borrow().as_str() == status
+    }
+
+    pub fn matches_search(&self, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        let path = self.imp().path.borrow();
+        path.to_lowercase().contains(query)
+            || file_name(&path).to_lowercase().contains(query)
+            || self.imp().status.borrow().to_lowercase().contains(query)
+    }
+
+    pub fn is_checked(&self, checked_paths: &HashSet<String>) -> bool {
+        checked_paths.contains(self.imp().path.borrow().as_str())
+    }
+}
+
+mod changed_file_item {
+    use gtk::glib;
+    use gtk::subclass::prelude::*;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    pub struct ChangedFileItem {
+        pub path: RefCell<String>,
+        pub status: RefCell<String>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for ChangedFileItem {
+        const NAME: &'static str = "CraicChangedFileItem";
+        type Type = super::ChangedFileItem;
+    }
+
+    impl ObjectImpl for ChangedFileItem {}
+}
+
+pub fn set_realized_file_checks(view: &gtk::ListView, active: bool) {
+    set_descendant_checks(view.upcast_ref(), active);
+}
+
+fn set_descendant_checks(widget: &gtk::Widget, active: bool) {
+    if let Some(button) = widget.downcast_ref::<gtk::CheckButton>() {
+        button.set_active(active);
+        return;
+    }
+
+    let mut child = widget.first_child();
     while let Some(widget) = child {
         let next = widget.next_sibling();
-
-        if let Ok(row) = widget.downcast::<gtk::ListBoxRow>() {
-            if row_check_button(&row).is_some_and(|button| button.is_active()) {
-                let path = row.widget_name();
-                if !path.is_empty() {
-                    paths.push(path.to_string());
-                }
-            }
-        }
+        set_descendant_checks(&widget, active);
         child = next;
     }
-    paths
 }
 
 pub fn update_commit_button_sensitivity_for_paths(
@@ -216,108 +288,6 @@ pub fn default_commit_summary(
     }
 }
 
-pub fn update_selection_header(
-    list: &gtk::ListBox,
-    select_all_check: &gtk::CheckButton,
-    select_all_label: &gtk::Label,
-    selection_syncing: &Rc<Cell<bool>>,
-) {
-    let mut total = 0;
-    let mut checked = 0;
-    let mut child = list.first_child();
-
-    while let Some(widget) = child {
-        let next = widget.next_sibling();
-
-        if let Ok(row) = widget.downcast::<gtk::ListBoxRow>() {
-            if !row.widget_name().is_empty() {
-                total += 1;
-                if row_check_button(&row).is_some_and(|button| button.is_active()) {
-                    checked += 1;
-                }
-            }
-        }
-
-        child = next;
-    }
-
-    selection_syncing.set(true);
-    select_all_check.set_sensitive(total > 0);
-    select_all_check.set_inconsistent(checked > 0 && checked < total);
-    select_all_check.set_active(total > 0 && checked == total);
-    selection_syncing.set(false);
-
-    select_all_label.set_label(&match total {
-        0 => "0 changed files".to_string(),
-        1 => "1 changed file".to_string(),
-        count => format!("{count} changed files"),
-    });
-}
-
-pub fn set_all_file_checks(list: &gtk::ListBox, active: bool) {
-    let mut child = list.first_child();
-
-    while let Some(widget) = child {
-        let next = widget.next_sibling();
-
-        if let Ok(row) = widget.downcast::<gtk::ListBoxRow>() {
-            if let Some(button) = row_check_button(&row) {
-                button.set_active(active);
-            }
-        }
-
-        child = next;
-    }
-}
-
-pub fn install_empty_list_unselect(list: &gtk::ListBox) {
-    let click = gtk::GestureClick::new();
-    click.connect_pressed({
-        let list = list.clone();
-
-        move |_, _, _, y| {
-            if list.row_at_y(y as i32).is_none() {
-                list.unselect_all();
-            }
-        }
-    });
-    list.add_controller(click);
-}
-
-pub fn install_empty_scroller_unselect(scroller: &gtk::ScrolledWindow, list: &gtk::ListBox) {
-    let click = gtk::GestureClick::new();
-    click.connect_pressed({
-        let scroller = scroller.clone();
-        let list = list.clone();
-
-        move |_, _, _, y| {
-            let list_y = y + scroller.vadjustment().value();
-            if list.row_at_y(list_y as i32).is_none() {
-                list.unselect_all();
-            }
-        }
-    });
-    scroller.add_controller(click);
-}
-
-fn row_for_path(list: &gtk::ListBox, path: &str) -> Option<gtk::ListBoxRow> {
-    let mut child = list.first_child();
-
-    while let Some(widget) = child {
-        let next = widget.next_sibling();
-
-        if let Ok(row) = widget.downcast::<gtk::ListBoxRow>() {
-            if row.widget_name() == path {
-                return Some(row);
-            }
-        }
-
-        child = next;
-    }
-
-    None
-}
-
 fn file_name(path: &str) -> &str {
     path.rsplit('/')
         .find(|segment| !segment.is_empty())
@@ -342,25 +312,4 @@ fn action_for(status: &str) -> &'static str {
     } else {
         "Update"
     }
-}
-
-fn row_check_button(row: &gtk::ListBoxRow) -> Option<gtk::CheckButton> {
-    find_check_button(&row.child()?)
-}
-
-fn find_check_button(widget: &gtk::Widget) -> Option<gtk::CheckButton> {
-    if let Ok(button) = widget.clone().downcast::<gtk::CheckButton>() {
-        return Some(button);
-    }
-
-    let mut child = widget.first_child();
-    while let Some(widget) = child {
-        let next = widget.next_sibling();
-        if let Some(button) = find_check_button(&widget) {
-            return Some(button);
-        }
-        child = next;
-    }
-
-    None
 }
