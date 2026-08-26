@@ -18,6 +18,8 @@ use std::rc::Rc;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+const REPO_ICON_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+
 pub(super) fn load_repos_async(
     repository_picker: picker::Picker,
     repo_loading: Rc<Cell<bool>>,
@@ -100,15 +102,12 @@ pub(super) fn refresh_repo_icon_kind(
     item_id: Option<String>,
     workspace_host: Option<String>,
     repository_picker: &picker::Picker,
-    repo_icon_loading: Rc<Cell<bool>>,
+    repo_icon_generation: Rc<Cell<u64>>,
     git_handle: Arc<GitRepoHandle>,
     github_access: Option<Arc<dyn GitHubAccess>>,
 ) {
-    if repo_icon_loading.get() {
-        return;
-    }
-
-    repo_icon_loading.set(true);
+    let generation = repo_icon_generation.get().wrapping_add(1);
+    repo_icon_generation.set(generation);
     repository_picker.set_button_spinner();
     resolve_repo_kind_in_background(
         workspace_key,
@@ -117,11 +116,9 @@ pub(super) fn refresh_repo_icon_kind(
         git_handle,
         github_access,
         repository_picker.clone(),
-        true,
-        {
-            let repo_icon_loading = repo_icon_loading.clone();
-            move || repo_icon_loading.set(false)
-        },
+        repo_icon_generation,
+        generation,
+        0,
     );
 }
 
@@ -145,9 +142,12 @@ fn repository_picker_items() -> RepositoryPickerItems {
         let needs_remote_label_fill = cached_properties.as_ref().is_some_and(|properties| {
             properties.remote_label.is_none() && properties.kind.is_remote_metadata()
         });
+        let needs_metadata_refresh = cached_properties.is_none()
+            || needs_remote_label_fill
+            || cached_kind == Some(RepoIconKind::Unknown);
 
         if let Some(workspace_key) = workspace_key
-            && (cached_properties.is_none() || needs_remote_label_fill)
+            && needs_metadata_refresh
         {
             metadata_requests.push(WorkspaceMetadataRequest {
                 item_id: id.clone(),
@@ -265,30 +265,35 @@ fn is_local_hostname(host: &str) -> bool {
     matches!(without_port, "localhost" | "127.0.0.1")
 }
 
-fn resolve_repo_kind_in_background<F: Fn() + 'static>(
+fn resolve_repo_kind_in_background(
     workspace_key: String,
     item_id: Option<String>,
     workspace_host: Option<String>,
     git_handle: Arc<GitRepoHandle>,
     github_access: Option<Arc<dyn GitHubAccess>>,
     repository_picker: picker::Picker,
-    update_button: bool,
-    on_done: F,
+    repo_icon_generation: Rc<Cell<u64>>,
+    generation: u64,
+    retry_attempt: usize,
 ) {
     let (sender, receiver) = std::sync::mpsc::channel();
+    let callback_workspace_key = workspace_key.clone();
+    let callback_workspace_host = workspace_host.clone();
 
     git_handle.workspace_metadata(
-        github_access,
+        github_access.clone(),
         Box::new(move |result| {
             let properties = match result {
                 Ok(metadata) => {
                     let properties =
-                        repo_properties_from_metadata(metadata, workspace_host.as_deref());
-                    cache_resolved_repo_properties(workspace_key.clone(), properties)
+                        repo_properties_from_metadata(metadata, callback_workspace_host.as_deref());
+                    cache_resolved_repo_properties(callback_workspace_key.clone(), properties)
                 }
                 Err(err) => {
-                    log::warn!("repo metadata refresh failed workspace={workspace_key}: {err}");
-                    cached_repo_properties(&workspace_key).unwrap_or(RepoProperties {
+                    log::warn!(
+                        "repo metadata refresh failed workspace={callback_workspace_key}: {err}"
+                    );
+                    cached_repo_properties(&callback_workspace_key).unwrap_or(RepoProperties {
                         kind: RepoIconKind::Unknown,
                         remote_label: None,
                     })
@@ -301,6 +306,56 @@ fn resolve_repo_kind_in_background<F: Fn() + 'static>(
     gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
         match receiver.try_recv() {
             Ok(properties) => {
+                if repo_icon_generation.get() != generation {
+                    log::debug!(
+                        "repo metadata result ignored workspace={} generation={} current_generation={}",
+                        workspace_key,
+                        generation,
+                        repo_icon_generation.get()
+                    );
+                    return gtk::glib::ControlFlow::Break;
+                }
+
+                if properties.kind == RepoIconKind::Unknown
+                    && properties.remote_label.is_some()
+                    && retry_attempt < REPO_ICON_RETRY_DELAYS.len()
+                {
+                    let delay = REPO_ICON_RETRY_DELAYS[retry_attempt];
+                    log::debug!(
+                        "repo metadata retry scheduled workspace={} attempt={} delay_ms={}",
+                        workspace_key,
+                        retry_attempt + 1,
+                        delay.as_millis()
+                    );
+                    gtk::glib::timeout_add_local_once(delay, {
+                        let workspace_key = workspace_key.clone();
+                        let item_id = item_id.clone();
+                        let workspace_host = workspace_host.clone();
+                        let git_handle = git_handle.clone();
+                        let github_access = github_access.clone();
+                        let repository_picker = repository_picker.clone();
+                        let repo_icon_generation = repo_icon_generation.clone();
+
+                        move || {
+                            if repo_icon_generation.get() != generation {
+                                return;
+                            }
+                            resolve_repo_kind_in_background(
+                                workspace_key,
+                                item_id,
+                                workspace_host,
+                                git_handle,
+                                github_access,
+                                repository_picker,
+                                repo_icon_generation,
+                                generation,
+                                retry_attempt + 1,
+                            );
+                        }
+                    });
+                    return gtk::glib::ControlFlow::Break;
+                }
+
                 if let Some(item_id) = item_id.as_deref() {
                     repository_picker.update_item_metadata(
                         item_id,
@@ -308,15 +363,19 @@ fn resolve_repo_kind_in_background<F: Fn() + 'static>(
                         properties.kind.icon_name(),
                     );
                 }
-                if update_button {
-                    repository_picker.set_button_icon(properties.kind.icon_name());
-                }
-                on_done();
+                repository_picker.set_button_icon(properties.kind.icon_name());
                 gtk::glib::ControlFlow::Break
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                on_done();
+                log::warn!(
+                    "repo metadata result channel closed workspace={} generation={}",
+                    workspace_key,
+                    generation
+                );
+                if repo_icon_generation.get() == generation {
+                    repository_picker.set_button_icon(RepoIconKind::Unknown.icon_name());
+                }
                 gtk::glib::ControlFlow::Break
             }
         }

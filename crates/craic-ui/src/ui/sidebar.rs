@@ -20,7 +20,7 @@ pub struct SidebarPane {
     header: adw::HeaderBar,
     page_slot: gtk::Box,
     repo_loading: Rc<Cell<bool>>,
-    repo_icon_loading: Rc<Cell<bool>>,
+    repo_icon_generation: Rc<Cell<u64>>,
     repo_metadata_loading: Rc<Cell<bool>>,
 }
 
@@ -76,7 +76,7 @@ pub fn build(
         header,
         page_slot,
         repo_loading: Rc::new(Cell::new(false)),
-        repo_icon_loading: Rc::new(Cell::new(false)),
+        repo_icon_generation: Rc::new(Cell::new(0)),
         repo_metadata_loading: Rc::new(Cell::new(false)),
     };
 
@@ -121,7 +121,7 @@ impl SidebarPane {
             item_id,
             workspace_host,
             &self.repository_picker,
-            self.repo_icon_loading.clone(),
+            self.repo_icon_generation.clone(),
             git_handle,
             github_access,
         );
