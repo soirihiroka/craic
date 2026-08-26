@@ -1589,15 +1589,58 @@ impl GitRepoHandle {
             }
         };
 
-        let mut args = vec![
-            self.workspace.root.absolute.clone(),
-            git_date,
-            plan.force_remove_paths.len().to_string(),
-            plan.update_paths.len().to_string(),
-        ];
-        args.extend(plan.force_remove_paths);
-        args.extend(plan.update_paths);
-        let script = shell_script_with_args(COMMIT_SELECTED_SCRIPT, &args);
+        if self
+            .git_ok(&["rev-parse".into(), "--verify".into(), "HEAD".into()])
+            .is_ok()
+        {
+            self.git(&["reset".into(), "--".into(), ".".into()])?;
+        } else {
+            self.git(&[
+                "rm".into(),
+                "--cached".into(),
+                "-r".into(),
+                "--ignore-unmatch".into(),
+                ".".into(),
+            ])?;
+        }
+
+        if !plan.force_remove_paths.is_empty() {
+            let mut paths = plan.force_remove_paths.join("\0").into_bytes();
+            paths.push(0);
+            self.run_command_output(
+                "git commit remove paths",
+                "git",
+                &[
+                    "update-index".into(),
+                    "--force-remove".into(),
+                    "-z".into(),
+                    "--stdin".into(),
+                ],
+                Some(&paths),
+                &[0],
+            )?;
+        }
+
+        if !plan.update_paths.is_empty() {
+            let mut paths = plan.update_paths.join("\0").into_bytes();
+            paths.push(0);
+            self.run_command_output(
+                "git commit update paths",
+                "git",
+                &[
+                    "update-index".into(),
+                    "--add".into(),
+                    "--remove".into(),
+                    "--replace".into(),
+                    "-z".into(),
+                    "--stdin".into(),
+                ],
+                Some(&paths),
+                &[0],
+            )?;
+        }
+
+        let script = shell_script_with_args(COMMIT_SELECTED_SCRIPT, &[git_date]);
 
         let stdin = commit_message_stdin(summary, description);
         let output = self.run_script_output("git commit", &script, Some(&stdin), &[0])?;
