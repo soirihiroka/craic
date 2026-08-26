@@ -1,6 +1,14 @@
 cd "$1" || exit 2
 shift
 
+git_date=$1
+shift
+
+if [ -n "$git_date" ]; then
+  export GIT_AUTHOR_DATE="$git_date"
+  export GIT_COMMITTER_DATE="$git_date"
+fi
+
 force_count=$1
 shift
 update_count=$1

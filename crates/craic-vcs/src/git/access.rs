@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GIT_CHANGE_LISTENER_INTERVAL: Duration = Duration::from_secs(2);
 const GIT_BACKGROUND_PULL_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_COMMIT_TIMEZONE: &str = "+0000";
 const RECENT_BRANCHES_LIMIT: usize = 5;
 const CHECK_IGNORE_SCRIPT: &str = include_str!("scripts/check_ignore.sh");
 const COMMIT_SELECTED_SCRIPT: &str = include_str!("scripts/commit_selected.sh");
@@ -1567,8 +1568,30 @@ impl GitRepoHandle {
             return Err("Select at least one file to commit.".to_string());
         }
 
+        let config = crate::workspace_config::git_config_from_file_access(self.files.as_ref());
+        let timezone = match config.commit_timezone {
+            Some(timezone) => Some(crate::workspace_config::normalize_timezone(&timezone)?),
+            None if config.use_system_timezone.unwrap_or(false) => None,
+            None => Some(DEFAULT_COMMIT_TIMEZONE.to_string()),
+        };
+        let git_date = match timezone {
+            Some(timezone) => {
+                let seconds = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|err| err.to_string())?
+                    .as_secs();
+                log::debug!("using commit timezone {timezone}");
+                format!("@{seconds} {timezone}")
+            }
+            None => {
+                log::debug!("using system timezone for commit");
+                String::new()
+            }
+        };
+
         let mut args = vec![
             self.workspace.root.absolute.clone(),
+            git_date,
             plan.force_remove_paths.len().to_string(),
             plan.update_paths.len().to_string(),
         ];
