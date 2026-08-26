@@ -524,10 +524,20 @@ impl Page for ChangesPage {
         replace_worktree_preview_signatures(&self.preview_signatures, snapshot);
         self.panel.update(snapshot);
         self.right.update(snapshot, self.ctx.git_action_running());
-        retain_worktree_preview_cache(&self.preview_cache, snapshot, &self.ctx.workspace_key());
+        retain_worktree_preview_cache(
+            &self.preview_cache,
+            &self.preview_signatures,
+            &self.ctx.workspace_key(),
+        );
 
         if let Some(file_path) = self.panel.selected_file_path() {
-            let signature = worktree_preview_signature(snapshot, &file_path);
+            let Some(signature) = self.preview_signatures.borrow().get(&file_path).cloned() else {
+                self.active_preview_signature.borrow_mut().take();
+                self.active_preview_subscription.borrow_mut().take();
+                self.right.show_home();
+                completion();
+                return;
+            };
             if self.active_preview_signature.borrow().as_ref() == Some(&signature) {
                 completion();
                 return;
@@ -646,11 +656,11 @@ fn replace_worktree_preview_signatures(
     preview_signatures: &Rc<RefCell<HashMap<String, WorktreePreviewSignature>>>,
     snapshot: &RepositorySnapshot,
 ) {
-    let mut signatures = HashMap::new();
+    let mut signatures = HashMap::with_capacity(snapshot.changed_files.len());
     for file in &snapshot.changed_files {
         signatures.insert(
             file.path.clone(),
-            worktree_preview_signature(snapshot, &file.path),
+            worktree_preview_signature(snapshot, file),
         );
     }
     preview_signatures.replace(signatures);
@@ -658,15 +668,14 @@ fn replace_worktree_preview_signatures(
 
 fn retain_worktree_preview_cache(
     preview_cache: &Rc<RefCell<BoundedPreviewCache<WorktreePreviewSignature, WorktreePreview>>>,
-    snapshot: &RepositorySnapshot,
+    preview_signatures: &Rc<RefCell<HashMap<String, WorktreePreviewSignature>>>,
     workspace_key: &str,
 ) {
+    let signatures = preview_signatures.borrow();
     let invalidated = preview_cache.borrow_mut().retain(|signature| {
-        snapshot
-            .changed_files
-            .iter()
-            .any(|file| file.path == signature.path)
-            && worktree_preview_signature(snapshot, &signature.path) == *signature
+        signatures
+            .get(&signature.path)
+            .is_some_and(|current| current == signature)
     });
     if invalidated > 0 {
         log::info!(
@@ -903,24 +912,17 @@ fn worktree_preview_summary(preview: &WorktreePreview) -> String {
 
 fn worktree_preview_signature(
     snapshot: &RepositorySnapshot,
-    file_path: &str,
+    changed_file: &git::ChangedFile,
 ) -> WorktreePreviewSignature {
-    let changed_file = snapshot
-        .changed_files
-        .iter()
-        .find(|file| file.path == file_path);
-    let signature = changed_file.and_then(|file| file.worktree_signature.as_ref());
+    let file_path = &changed_file.path;
+    let signature = changed_file.worktree_signature.as_ref();
     WorktreePreviewSignature {
         path: file_path.to_string(),
         kind: crate::ui::file_type::preview_kind_for_path(
             file_path,
             signature.is_some_and(|signature| signature.is_dir),
         ),
-        status: snapshot
-            .changed_files
-            .iter()
-            .find(|file| file.path == file_path)
-            .map(|file| file.status.clone()),
+        status: Some(changed_file.status.clone()),
         head: snapshot.history_head.clone(),
         disk: signature
             .filter(|signature| !signature.is_dir)

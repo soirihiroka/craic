@@ -7,9 +7,10 @@ use crate::ui::content::binary_preview::{
     set_unavailable_preview, set_video_preview,
 };
 use crate::ui::content::diff_view::DiffView;
-use crate::ui::{file_row, file_type::PreviewKind, left_clamp::LeftClamp, widgets};
+use crate::ui::sidebar::changes::ChangedFileItem;
+use crate::ui::{file_type::PreviewKind, left_clamp::LeftClamp, widgets};
 use adw::prelude::*;
-use gtk::{gdk, pango};
+use gtk::{gdk, gio, pango};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -29,7 +30,8 @@ pub struct HistoryRight {
     deleted: gtk::Label,
     hash_to_copy: Rc<RefCell<Option<String>>>,
     file_count: gtk::Label,
-    files: gtk::ListBox,
+    file_model: gio::ListStore,
+    file_selection: gtk::SingleSelection,
     diff: DiffView,
     preview_stack: gtk::Stack,
     file_preview: BinaryPreviewWidgets,
@@ -156,8 +158,42 @@ impl HistoryRight {
         header.append(&message_clamp);
         header.append(&metadata);
 
-        let files = gtk::ListBox::new();
-        files.set_selection_mode(gtk::SelectionMode::Single);
+        let file_model = gio::ListStore::new::<ChangedFileItem>();
+        let file_selection = gtk::SingleSelection::new(Some(file_model.clone()));
+        file_selection.set_autoselect(false);
+        file_selection.set_can_unselect(true);
+        let file_factory = gtk::SignalListItemFactory::new();
+        file_factory.connect_setup(|_, item| {
+            let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                return;
+            };
+            item.set_child(Some(&history_file_row()));
+        });
+        file_factory.connect_bind(|_, item| {
+            let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+                return;
+            };
+            let Some(file) = item.item().and_downcast::<ChangedFileItem>() else {
+                return;
+            };
+            let Some(row) = item.child().and_downcast::<gtk::Box>() else {
+                return;
+            };
+            let Some(title) = row.first_child().and_downcast::<gtk::Label>() else {
+                return;
+            };
+            let Some(status) = row.last_child().and_downcast::<gtk::Box>() else {
+                return;
+            };
+
+            title.set_label(&file.path());
+            while let Some(child) = status.first_child() {
+                status.remove(&child);
+            }
+            status.append(&craic_ui_core::ui::file_status::icon(&file.status()));
+        });
+
+        let files = gtk::ListView::new(Some(file_selection.clone()), Some(file_factory));
         files.add_css_class("navigation-sidebar");
 
         let files_scroller = gtk::ScrolledWindow::builder()
@@ -225,7 +261,8 @@ impl HistoryRight {
             deleted,
             hash_to_copy,
             file_count,
-            files,
+            file_model,
+            file_selection,
             diff,
             preview_stack,
             file_preview,
@@ -270,13 +307,22 @@ impl HistoryRight {
     where
         F: Fn(Option<String>) + 'static,
     {
-        self.files.connect_row_selected(move |_, row| {
-            callback(row.and_then(row_path));
-        });
+        self.file_selection
+            .connect_selected_notify(move |selection| {
+                callback(
+                    selection
+                        .selected_item()
+                        .and_downcast::<ChangedFileItem>()
+                        .map(|file| file.path()),
+                );
+            });
     }
 
     pub fn selected_file_path(&self) -> Option<String> {
-        self.files.selected_row().and_then(|row| row_path(&row))
+        self.file_selection
+            .selected_item()
+            .and_downcast::<ChangedFileItem>()
+            .map(|file| file.path())
     }
 
     pub fn show_commit(&self, commit: &Commit, files: &[ChangedFile]) {
@@ -371,30 +417,25 @@ impl HistoryRight {
     }
 
     fn clear_files(&self) {
-        self.files.unselect_all();
-        while let Some(row) = self.files.row_at_index(0) {
-            self.files.remove(&row);
-        }
+        self.file_selection.unselect_all();
+        self.file_model.remove_all();
     }
 
     fn fill_files(&self, files: &[ChangedFile]) {
-        self.clear_files();
-
-        for file in files {
-            let row = gtk::ListBoxRow::builder()
-                .child(&file_row::history_file_content(&file.path, &file.status))
-                .build();
-            row.set_widget_name(&file.path);
-            self.files.append(&row);
-        }
+        self.file_selection.unselect_all();
+        let items = files
+            .iter()
+            .map(|file| ChangedFileItem::new(&file.path, &file.status))
+            .collect::<Vec<_>>();
+        self.file_model.splice(0, self.file_model.n_items(), &items);
     }
 
     fn select_first_file(&self) -> bool {
-        let Some(row) = self.files.row_at_index(0) else {
+        if self.file_model.n_items() == 0 {
             return false;
-        };
+        }
 
-        self.files.select_row(Some(&row));
+        self.file_selection.set_selected(0);
         true
     }
 
@@ -429,9 +470,26 @@ impl HistoryRight {
     }
 }
 
-fn row_path(row: &gtk::ListBoxRow) -> Option<String> {
-    let path = row.widget_name().to_string();
-    (!path.is_empty()).then_some(path)
+fn history_file_row() -> gtk::Box {
+    let title = widgets::heading("");
+    title.set_wrap(false);
+    title.set_ellipsize(pango::EllipsizeMode::End);
+    title.set_width_chars(1);
+    title.set_hexpand(true);
+    title.set_xalign(0.0);
+    let status = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(2)
+        .margin_bottom(2)
+        .margin_start(2)
+        .margin_end(6)
+        .build();
+    row.append(&title);
+    row.append(&status);
+    row
 }
 
 fn metadata_label(text: &str) -> gtk::Label {

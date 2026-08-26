@@ -256,9 +256,13 @@ pub fn update_commit_button_sensitivity_for_paths(
     file_signature: &[(String, String)],
     commit_running: bool,
 ) {
-    let mut files = files.iter().cloned().collect::<Vec<_>>();
-    files.sort();
-    let default_summary = default_commit_summary(&files, file_signature);
+    let default_summary = if files.len() <= 2 {
+        let mut files = files.iter().cloned().collect::<Vec<_>>();
+        files.sort();
+        default_commit_summary(&files, file_signature)
+    } else {
+        None
+    };
     let has_summary = !summary_entry.text().trim().is_empty() || default_summary.is_some();
     let has_checked_file = !files.is_empty();
     summary_entry.set_placeholder_text(Some(

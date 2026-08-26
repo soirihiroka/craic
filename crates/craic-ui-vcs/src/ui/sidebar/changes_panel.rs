@@ -593,10 +593,14 @@ fn refresh_control_widgets(
     commit_running: bool,
 ) {
     let total = model.n_items();
-    let checked = (0..total)
-        .filter_map(|position| model.item(position).and_downcast::<ChangedFileItem>())
-        .filter(|file| file.is_checked(checked_paths))
-        .count() as u32;
+    let checked = if total as usize == file_signature.len() {
+        checked_paths.len().min(total as usize) as u32
+    } else {
+        (0..total)
+            .filter_map(|position| model.item(position).and_downcast::<ChangedFileItem>())
+            .filter(|file| file.is_checked(checked_paths))
+            .count() as u32
+    };
 
     selection_syncing.set(true);
     select_all_check.set_sensitive(total > 0);
