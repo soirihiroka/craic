@@ -97,6 +97,7 @@ pub(crate) static RESOLVERS: &[&dyn FileSupportResolver] = &[
         "text/x-python",
         "text-x-python-symbolic"
     ),
+    rule!(&["qml"], L::Qml, "text/x-qml", "text-x-javascript-symbolic"),
     rule!(&["rb"], L::Ruby, "text/x-ruby", "text-x-ruby-symbolic"),
     rule!(&["go"], L::Go, "text/x-go", "text-x-go-symbolic"),
     rule!(&["java"], L::Java, "text/x-java", "devicon-java-symbolic"),

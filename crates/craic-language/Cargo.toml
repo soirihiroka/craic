@@ -28,6 +28,7 @@ tree-sitter-make.workspace = true
 tree-sitter-md.workspace = true
 tree-sitter-powershell.workspace = true
 tree-sitter-python.workspace = true
+tree-sitter-qmljs.workspace = true
 tree-sitter-ruby.workspace = true
 tree-sitter-rst.workspace = true
 tree-sitter-rust.workspace = true

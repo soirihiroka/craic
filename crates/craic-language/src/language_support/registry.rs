@@ -61,6 +61,7 @@ language_fn!(kotlin_language, tree_sitter_kotlin_ng::LANGUAGE);
 language_fn!(markdown_language, tree_sitter_md::LANGUAGE);
 language_fn!(markdown_inline_language, tree_sitter_md::INLINE_LANGUAGE);
 language_fn!(python_language, tree_sitter_python::LANGUAGE);
+language_fn!(qml_language, tree_sitter_qmljs::LANGUAGE);
 language_fn!(ruby_language, tree_sitter_ruby::LANGUAGE);
 language_fn!(rst_language, tree_sitter_rst::LANGUAGE);
 language_fn!(rust_language, tree_sitter_rust::LANGUAGE);
@@ -260,6 +261,20 @@ syntax!(
     [tree_sitter_python::HIGHLIGHTS_QUERY],
     None,
     PYTHON_FOLDS
+);
+syntax!(
+    QML,
+    qml_language,
+    [
+        tree_sitter_javascript::HIGHLIGHT_QUERY,
+        tree_sitter_qmljs::HIGHLIGHTS_QUERY
+    ],
+    None,
+    &[
+        "ui_object_definition",
+        "ui_object_definition_binding",
+        "ui_inline_component"
+    ]
 );
 syntax!(
     RUBY,
@@ -481,6 +496,7 @@ pub static LANGUAGES: &[LanguageSupport] = &[
         Disabled,
         None
     ),
+    entry!(Qml, ["qml"], &QML, Some("//"), Disabled, None),
     plain!(R, ["r"]),
     entry!(Rst, ["rst", "rest"], &RST, None, Markup, None),
     entry!(Ruby, ["ruby", "rb"], &RUBY, Some("#"), Disabled, None),

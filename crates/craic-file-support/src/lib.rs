@@ -54,6 +54,7 @@ pub enum LanguageId {
     Php,
     PowerShell,
     Python,
+    Qml,
     R,
     Rst,
     Ruby,
