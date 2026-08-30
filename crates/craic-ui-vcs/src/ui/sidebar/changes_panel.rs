@@ -1,7 +1,8 @@
 use super::super::{canvas_scroll, widgets};
 use super::changes::{
     ChangedFileContextCallback, ChangedFileItem, changed_file_factory, default_commit_summary,
-    file_signature, set_realized_file_checks, update_commit_button_sensitivity_for_paths,
+    file_signature, install_empty_space_unselect, set_realized_file_checks,
+    update_commit_button_sensitivity_for_paths,
 };
 use super::commit_panel::CommitPanel;
 use crate::git::RepositorySnapshot;
@@ -142,6 +143,7 @@ impl ChangesPanel {
             canvas_scroll::AutoscrollAxes::Vertical,
             "changes_list",
         );
+        install_empty_space_unselect(&files_scroller, &files_list, &selection);
 
         let initialize_button = gtk::Button::builder()
             .label("Initialize Git Repository")

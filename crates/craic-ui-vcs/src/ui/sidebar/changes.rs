@@ -235,6 +235,43 @@ pub fn set_realized_file_checks(view: &gtk::ListView, active: bool) {
     set_descendant_checks(view.upcast_ref(), active);
 }
 
+pub fn install_empty_space_unselect(
+    scroller: &gtk::ScrolledWindow,
+    list: &gtk::ListView,
+    selection: &gtk::SingleSelection,
+) {
+    let click = gtk::GestureClick::builder().button(1).build();
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    click.connect_pressed({
+        let scroller = scroller.clone().upcast::<gtk::Widget>();
+        let list = list.clone().upcast::<gtk::Widget>();
+        let selection = selection.clone();
+
+        move |_, _, x, y| {
+            let Some(mut target) = scroller.pick(x, y, gtk::PickFlags::DEFAULT) else {
+                return;
+            };
+            loop {
+                if target.is::<gtk::Scrollbar>() {
+                    return;
+                }
+                let Some(parent) = target.parent() else {
+                    break;
+                };
+                if parent == list {
+                    return;
+                }
+                if target == scroller {
+                    break;
+                }
+                target = parent;
+            }
+            selection.unselect_all();
+        }
+    });
+    scroller.add_controller(click);
+}
+
 fn set_descendant_checks(widget: &gtk::Widget, active: bool) {
     if let Some(button) = widget.downcast_ref::<gtk::CheckButton>() {
         button.set_active(active);
