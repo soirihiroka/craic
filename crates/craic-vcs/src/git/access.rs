@@ -1232,11 +1232,7 @@ impl GitRepoHandle {
             .git_ok(&["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()])
             .unwrap_or_else(|_| "HEAD".to_string());
         let branches = self.remote_branches().unwrap_or_default();
-        let remote_name = self
-            .git_ok(&["remote".into()])
-            .ok()
-            .and_then(|out| out.lines().next().map(ToString::to_string))
-            .filter(|name| !name.is_empty());
+        let remote_name = self.primary_remote_name();
         let remote_url = remote_name.as_ref().and_then(|remote| {
             self.git_ok(&["remote".into(), "get-url".into(), remote.clone()])
                 .ok()
