@@ -105,14 +105,23 @@ pub fn paint_editor(canvas: &Canvas, request: EditorPaintRequest<'_>) {
         }
         let line_selection_start = selection_start.max(line.start).min(line.end);
         let line_selection_end = selection_end.max(line.start).min(line.end);
-        if line_selection_start < line_selection_end {
+        let newline_selected = line.end_with_newline > line.end
+            && selection_start <= line.end
+            && selection_end > line.end;
+        if line_selection_start < line_selection_end || newline_selected {
             let before = &request.document.text()[line.start..line_selection_start];
             let selected = &request.document.text()[line_selection_start..line_selection_end];
             fill_rect(
                 canvas,
                 text_x + text_advance(before, metrics.char_width),
                 y + 1.0,
-                text_advance(selected, metrics.char_width).max(2.0),
+                (text_advance(selected, metrics.char_width)
+                    + if newline_selected {
+                        metrics.char_width * 0.5
+                    } else {
+                        0.0
+                    })
+                .max(metrics.char_width * 0.5),
                 metrics.line_height - 2.0,
                 rgba(0.18, 0.46, 0.80, 0.72),
             );
