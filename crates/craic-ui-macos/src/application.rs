@@ -27,6 +27,7 @@ use crate::agent_session::{
 use crate::code_view::CodeMetalView;
 use crate::commit_composer::{COMMIT_COMPOSER_HEIGHT, CommitComposer, CommitComposerActions};
 use crate::diff_view::DiffMetalView;
+use crate::image_view::NativeImagePreview;
 use crate::sqlite_preview::{
     self, Sort as NativeSqliteSort, SortDirection as NativeSqliteSortDirection,
 };
@@ -495,7 +496,7 @@ struct FilesUi {
     preview_web: Retained<WKWebView>,
     preview_web_content: Retained<WKUserContentController>,
     preview_divider: Retained<NSBox>,
-    preview_image: Retained<NSImageView>,
+    preview_image: Retained<NativeImagePreview>,
     preview_pdf: Retained<PDFView>,
     preview_table_scroll: Retained<NSScrollView>,
     preview_table: Retained<NSTableView>,
@@ -11579,6 +11580,7 @@ impl AppDelegate {
             ),
         );
         files.preview_image.setFrame(frame);
+        files.preview_image.recalculate_fit();
         files.preview_pdf.setFrame(frame);
         if files.sqlite_controls.isHidden() {
             files.preview_table_scroll.setFrame(frame);
@@ -16627,6 +16629,7 @@ impl AppDelegate {
         files.preview_scroll.setHidden(true);
         files.preview_code.setHidden(true);
         files.preview_image.setHidden(true);
+        files.preview_image.clear_image();
         unsafe { files.preview_spinner.stopAnimation(None) };
         files.preview_spinner.setHidden(true);
         if row_data.info.capabilities.listable {
@@ -17067,6 +17070,7 @@ impl AppDelegate {
         files.preview_scroll.setHidden(true);
         files.preview_code.setHidden(true);
         files.preview_image.setHidden(true);
+        files.preview_image.clear_image();
         files.preview_pdf.setHidden(true);
         unsafe { files.preview_pdf.setDocument(None) };
         files.preview_web_mode.set(NativeWebPreviewMode::Hidden);
@@ -17330,6 +17334,7 @@ impl AppDelegate {
         files.preview_scroll.setHidden(true);
         files.preview_code.setHidden(true);
         files.preview_image.setHidden(true);
+        files.preview_image.clear_image();
         files.preview_pdf.setHidden(true);
         // SAFETY: Preview completions are applied on AppKit's main thread.
         unsafe { files.preview_pdf.setDocument(None) };
@@ -17419,7 +17424,7 @@ impl AppDelegate {
                 if is_image_preview_path(&path_display) {
                     let data = NSData::with_bytes(&bytes);
                     if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
-                        files.preview_image.setImage(Some(&image));
+                        files.preview_image.set_image(&image);
                         files.preview_image.setHidden(false);
                         files.empty.setHidden(true);
                     } else {
@@ -17832,6 +17837,7 @@ impl AppDelegate {
         files.preview_spinner.setHidden(true);
         files.preview_scroll.setHidden(true);
         files.preview_image.setHidden(true);
+        files.preview_image.clear_image();
         files.preview_pdf.setHidden(true);
         unsafe { files.preview_pdf.setDocument(None) };
         files.preview_web_mode.set(NativeWebPreviewMode::Hidden);
@@ -20935,6 +20941,7 @@ impl AppDelegate {
             files.empty.setHidden(false);
             files.preview_scroll.setHidden(true);
             files.preview_image.setHidden(true);
+            files.preview_image.clear_image();
             files.preview_pdf.setHidden(true);
             // SAFETY: Workspace transitions run on AppKit's main thread.
             unsafe { files.preview_pdf.setDocument(None) };
@@ -23250,12 +23257,11 @@ impl AppDelegate {
         preview_divider.setHidden(true);
         content_root.addSubview(&preview_divider);
 
-        let preview_image = NSImageView::initWithFrame(NSImageView::alloc(mtm), preview_frame);
+        let preview_image = NativeImagePreview::new(preview_frame, mtm);
         preview_image.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
-        preview_image.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
         preview_image.setHidden(true);
         content_root.addSubview(&preview_image);
 

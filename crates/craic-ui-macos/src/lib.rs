@@ -8,6 +8,7 @@ mod code_view;
 mod commit_composer;
 mod diff_view;
 mod dispatcher;
+mod image_view;
 mod sqlite_preview;
 mod terminal_view;
 
