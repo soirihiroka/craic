@@ -3,10 +3,11 @@ use super::{BrowserTarget, FileBrowser, should_skip};
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{
     FileAccess, FileCopyRequest, FileDeleteRequest, FileDownloadDestination, FileDownloadRequest,
-    FileKind, FileMoveRequest, FileOperation, FileOperationEvent, FileOperationProgress, FileRead,
-    FileReadRequest, FileWriteMode, FileWritePayload, FileWriteRequest,
+    FileKind, FileMoveRequest, FileOperation, FileOperationEvent, FileOperationProgress,
+    FileOperationReceiver, FileRead, FileReadRequest, FileWriteMode, FileWritePayload,
+    FileWriteRequest,
 };
-use crate::system::capabilities::open::{DesktopOpenActivation, DesktopOpenTargetKind};
+use crate::system::capabilities::open::DesktopOpenTargetKind;
 use adw::prelude::*;
 use craic_ui_core::ui::command_mailbox;
 use gtk::{gdk, gio};
@@ -19,7 +20,6 @@ use std::rc::{Rc, Weak};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -747,10 +747,7 @@ impl FileBrowser {
                 self.toggle_dir(&target.node_path);
             } else {
                 let parent_window = self.root.root().and_downcast::<gtk::Window>();
-                self.open_external(
-                    target,
-                    DesktopOpenActivation::from_parent(parent_window.as_ref()),
-                );
+                self.open_external(target, parent_window);
             }
         } else {
             self.set_selected_node_path(Some(target.node_path.clone()));
@@ -916,11 +913,7 @@ impl FileBrowser {
         set_clipboard_text(&target.path);
     }
 
-    pub fn open_external(
-        self: &Rc<Self>,
-        target: &BrowserTarget,
-        activation: DesktopOpenActivation,
-    ) {
+    pub fn open_external(self: &Rc<Self>, target: &BrowserTarget, parent: Option<gtk::Window>) {
         let Some(desktop_opener) = self.desktop_opener.borrow().clone() else {
             self.notify_open_message("Opening files externally is unavailable for this workspace.");
             return;
@@ -930,7 +923,10 @@ impl FileBrowser {
         } else {
             DesktopOpenTargetKind::File
         };
-        match desktop_opener.open_path(&target.node_path, kind, activation) {
+        match desktop_opener
+            .resolve_open_path(&target.node_path, kind)
+            .and_then(|effect| craic_ui_core::ui::platform::execute_effect(effect, parent.as_ref()))
+        {
             Ok(message) => self.notify_open_message(&message),
             Err(err) => self.notify_open_message(&err),
         }
@@ -939,7 +935,7 @@ impl FileBrowser {
     pub fn open_containing_folder(
         self: &Rc<Self>,
         target: &BrowserTarget,
-        activation: DesktopOpenActivation,
+        parent: Option<gtk::Window>,
     ) {
         let Some(desktop_opener) = self.desktop_opener.borrow().clone() else {
             self.show_error(
@@ -948,7 +944,10 @@ impl FileBrowser {
             );
             return;
         };
-        match desktop_opener.reveal_path(&target.node_path, activation) {
+        match desktop_opener
+            .resolve_reveal_path(&target.node_path)
+            .and_then(|effect| craic_ui_core::ui::platform::execute_effect(effect, parent.as_ref()))
+        {
             Ok(message) => self.notify_open_message(&message),
             Err(err) => self.show_error("Open Failed", &err),
         }
@@ -1617,26 +1616,20 @@ fn write_with_progress(
     local_progress: &mut LocalTransferProgress,
     progress: &mut impl FnMut(TransferProgressUpdate),
 ) -> Result<(), String> {
-    let (sender, receiver) = mpsc::channel();
-    file_access.write_node(
-        request,
-        Box::new(move |event| {
-            let _ = sender.send(event);
-        }),
-    );
+    let mut receiver = file_access.write_node_events(request);
     let mut last_completed_bytes = 0u64;
     loop {
-        match receiver.recv() {
-            Ok(FileOperationEvent::Progress(update)) => {
+        match receiver.blocking_recv() {
+            Some(FileOperationEvent::Progress(update)) => {
                 let delta = update.completed_bytes.saturating_sub(last_completed_bytes);
                 last_completed_bytes = update.completed_bytes;
                 local_progress.add_bytes(delta);
                 progress(local_progress.to_update(display_path));
             }
-            Ok(FileOperationEvent::Finished(result)) => {
+            Some(FileOperationEvent::Finished(result)) => {
                 return result.map_err(|err| err.to_string());
             }
-            Err(_) => return Err("write operation did not return a result.".to_string()),
+            None => return Err("write operation did not return a result.".to_string()),
         }
     }
 }
@@ -1784,34 +1777,24 @@ fn run_transfer_file_operation(
         };
     }
 
-    let (sender, receiver) = mpsc::channel();
-    match operation {
-        TransferOperation::Copy => destination_access.copy_node(
-            FileCopyRequest {
-                source: source.clone(),
-                destination: destination.clone(),
-                cancel_requested: Some(cancel_requested.clone()),
-            },
-            Box::new(move |event| {
-                let _ = sender.send(event);
-            }),
-        ),
-        TransferOperation::Move => destination_access.move_node(
-            FileMoveRequest {
-                source: source.clone(),
-                destination_parent: target_folder,
-                new_name: name,
-                cancel_requested: Some(cancel_requested.clone()),
-            },
-            Box::new(move |event| {
-                let _ = sender.send(event);
-            }),
-        ),
-    }
+    let receiver = match operation {
+        TransferOperation::Copy => destination_access.copy_node_events(FileCopyRequest {
+            source: source.clone(),
+            destination: destination.clone(),
+            cancel_requested: Some(cancel_requested.clone()),
+        }),
+        TransferOperation::Move => destination_access.move_node_events(FileMoveRequest {
+            source: source.clone(),
+            destination_parent: target_folder,
+            new_name: name,
+            cancel_requested: Some(cancel_requested.clone()),
+        }),
+    };
+    let mut receiver = receiver;
 
     loop {
-        match receiver.recv() {
-            Ok(FileOperationEvent::Progress(update)) => {
+        match receiver.blocking_recv() {
+            Some(FileOperationEvent::Progress(update)) => {
                 progress(transfer_progress_update(
                     update,
                     completed_before,
@@ -1821,10 +1804,10 @@ fn run_transfer_file_operation(
                     None,
                 ));
             }
-            Ok(FileOperationEvent::Finished(result)) => {
+            Some(FileOperationEvent::Finished(result)) => {
                 return result.map_err(|err| err.to_string());
             }
-            Err(_) => {
+            None => {
                 return Err(format!(
                     "{} operation did not return a result.",
                     operation.failure_heading()
@@ -1980,13 +1963,7 @@ fn read_file_access_node(
     total_bytes: Option<u64>,
     progress: &mut impl FnMut(TransferProgressUpdate),
 ) -> Result<FileRead, String> {
-    let (sender, receiver) = mpsc::channel();
-    file_access.read_with_info(
-        request,
-        Box::new(move |event| {
-            let _ = sender.send(event);
-        }),
-    );
+    let receiver = file_access.read_with_info_events(request);
     wait_for_file_operation(
         receiver,
         FileOperation::Read,
@@ -2009,13 +1986,7 @@ fn write_file_access_node(
     total_bytes: Option<u64>,
     progress: &mut impl FnMut(TransferProgressUpdate),
 ) -> Result<(), String> {
-    let (sender, receiver) = mpsc::channel();
-    file_access.write_node(
-        request,
-        Box::new(move |event| {
-            let _ = sender.send(event);
-        }),
-    );
+    let receiver = file_access.write_node_events(request);
     wait_for_file_operation(
         receiver,
         FileOperation::Write,
@@ -2033,29 +2004,23 @@ fn delete_file_access_node(
     path: FileNodePath,
     cancel_requested: Option<Arc<AtomicBool>>,
 ) -> Result<(), String> {
-    let (sender, receiver) = mpsc::channel();
-    file_access.delete(
-        FileDeleteRequest {
-            path,
-            cancel_requested,
-        },
-        Box::new(move |event| {
-            let _ = sender.send(event);
-        }),
-    );
+    let mut receiver = file_access.delete_events(FileDeleteRequest {
+        path,
+        cancel_requested,
+    });
     loop {
-        match receiver.recv() {
-            Ok(FileOperationEvent::Progress(_)) => {}
-            Ok(FileOperationEvent::Finished(result)) => {
+        match receiver.blocking_recv() {
+            Some(FileOperationEvent::Progress(_)) => {}
+            Some(FileOperationEvent::Finished(result)) => {
                 return result.map_err(|err| err.to_string());
             }
-            Err(_) => return Err("Delete operation did not return a result.".to_string()),
+            None => return Err("Delete operation did not return a result.".to_string()),
         }
     }
 }
 
 fn wait_for_file_operation<T>(
-    receiver: mpsc::Receiver<FileOperationEvent<T>>,
+    mut receiver: FileOperationReceiver<T>,
     operation: FileOperation,
     completed_before: u64,
     total_files: u64,
@@ -2065,8 +2030,8 @@ fn wait_for_file_operation<T>(
     progress: &mut impl FnMut(TransferProgressUpdate),
 ) -> Result<T, String> {
     loop {
-        match receiver.recv() {
-            Ok(FileOperationEvent::Progress(update)) => {
+        match receiver.blocking_recv() {
+            Some(FileOperationEvent::Progress(update)) => {
                 progress(transfer_progress_update(
                     update,
                     completed_before,
@@ -2076,10 +2041,10 @@ fn wait_for_file_operation<T>(
                     total_bytes,
                 ));
             }
-            Ok(FileOperationEvent::Finished(result)) => {
+            Some(FileOperationEvent::Finished(result)) => {
                 return result.map_err(|err| err.to_string());
             }
-            Err(_) => {
+            None => {
                 return Err(format!(
                     "{} operation did not return a result.",
                     operation.label()

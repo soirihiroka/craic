@@ -14,7 +14,13 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+pub use craic_app_core::PageId;
+
 pub trait Page {
+    fn id(&self) -> PageId {
+        PageId::new(self.label().to_ascii_lowercase())
+    }
+
     fn label(&self) -> &'static str;
     fn icon_name(&self) -> &'static str;
     fn initialize(&self, completion: PageInitializeComplete);
@@ -234,6 +240,11 @@ impl PageContext {
     pub fn url_opener(&self) -> Option<Arc<dyn UrlOpenAccess>> {
         self.providers
             .url_opener(&self.system_ref.borrow().id, &self.workspace_ref())
+    }
+
+    pub fn execute_effect(&self, effect: craic_platform::UiEffect) -> Result<String, String> {
+        let window = self.window();
+        crate::ui::platform::execute_effect(effect, window.as_ref())
     }
 
     pub fn terminal_links(&self) -> Option<Arc<dyn TerminalLinkAccess>> {

@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 adw.workspace = true
 craic-agent.workspace = true
+craic-app-core.workspace = true
 craic-config.workspace = true
 craic-project.workspace = true
 craic-system.workspace = true
@@ -24,3 +25,4 @@ moka.workspace = true
 pango.workspace = true
 pangocairo.workspace = true
 rusqlite.workspace = true
+tokio.workspace = true

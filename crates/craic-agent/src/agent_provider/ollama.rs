@@ -2,8 +2,8 @@ use super::{
     AgentProvider, CANCELED_ERROR, CancellationToken, GENERATION_TIMEOUT, MODEL_LIST_TIMEOUT,
     ModelOption, preview_text,
 };
-use reqwest::blocking::{Client, Response};
 use reqwest::header::CONTENT_TYPE;
+use reqwest::{Client, Response};
 use serde::Deserialize;
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
@@ -31,12 +31,12 @@ impl AgentProvider for Provider {
 
     fn check_available(&self) -> Result<(), String> {
         let base_url = base_url();
-        request_version(&base_url)
+        run_http(request_version(&base_url))
     }
 
     fn fetch_models(&self) -> Result<Vec<ModelOption>, String> {
         let base_url = base_url();
-        let tags = request_tags(&base_url)?;
+        let tags = run_http(request_tags(&base_url))?;
         let models = tags
             .models
             .into_iter()
@@ -84,47 +84,50 @@ impl AgentProvider for Provider {
             return Err(CANCELED_ERROR.to_string());
         }
         let base_url = base_url();
-        let url = format!("{base_url}/api/generate");
-        let client = http_client(GENERATION_TIMEOUT)?;
-        let body = serde_json::json!({
-            "model": model,
-            "prompt": prompt,
-            "stream": false,
-        });
-        let body = serde_json::to_vec(&body)
-            .map_err(|err| format!("Failed to build Ollama request: {err}"))?;
-        let response = client
-            .post(&url)
-            .header(CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .map_err(|err| {
+        run_http(async {
+            let url = format!("{base_url}/api/generate");
+            let client = http_client(GENERATION_TIMEOUT)?;
+            let body = serde_json::json!({
+                "model": model,
+                "prompt": prompt,
+                "stream": false,
+            });
+            let body = serde_json::to_vec(&body)
+                .map_err(|err| format!("Failed to build Ollama request: {err}"))?;
+            let response = client
+                .post(&url)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+                .map_err(|err| {
+                    format!(
+                        "Could not connect to Ollama at {base_url}. Start Ollama or update ollama.base_url. ({err})"
+                    )
+                })?;
+            if cancellation.is_canceled() {
+                log::info!("ollama generation canceled after response base_url={base_url}");
+                return Err(CANCELED_ERROR.to_string());
+            }
+            let text = response_text(response, &base_url, "generate text").await?;
+            if cancellation.is_canceled() {
+                log::info!("ollama generation canceled after body read base_url={base_url}");
+                return Err(CANCELED_ERROR.to_string());
+            }
+            let generated = serde_json::from_str::<GenerateResponse>(&text).map_err(|err| {
                 format!(
-                    "Could not connect to Ollama at {base_url}. Start Ollama or update ollama.base_url. ({err})"
+                    "Ollama returned an invalid generation response from {base_url}: {err}. Body: {}",
+                    preview_text(&text)
                 )
             })?;
-        if cancellation.is_canceled() {
-            log::info!("ollama generation canceled after response base_url={base_url}");
-            return Err(CANCELED_ERROR.to_string());
-        }
-        let text = response_text(response, &base_url, "generate text")?;
-        if cancellation.is_canceled() {
-            log::info!("ollama generation canceled after body read base_url={base_url}");
-            return Err(CANCELED_ERROR.to_string());
-        }
-        let generated = serde_json::from_str::<GenerateResponse>(&text).map_err(|err| {
-            format!(
-                "Ollama returned an invalid generation response from {base_url}: {err}. Body: {}",
-                preview_text(&text)
-            )
-        })?;
-        if generated.response.trim().is_empty() {
-            Err(format!(
-                "Ollama model '{model}' returned an empty response from {base_url}."
-            ))
-        } else {
-            Ok(generated.response)
-        }
+            if generated.response.trim().is_empty() {
+                Err(format!(
+                    "Ollama model '{model}' returned an empty response from {base_url}."
+                ))
+            } else {
+                Ok(generated.response)
+            }
+        })
     }
 }
 
@@ -149,16 +152,16 @@ struct ErrorResponse {
     error: String,
 }
 
-fn request_tags(base_url: &str) -> Result<TagsResponse, String> {
+async fn request_tags(base_url: &str) -> Result<TagsResponse, String> {
     let url = format!("{base_url}/api/tags");
     log::debug!("loading ollama models base_url={base_url}");
     let client = http_client(MODEL_LIST_TIMEOUT)?;
-    let response = client.get(&url).send().map_err(|err| {
+    let response = client.get(&url).send().await.map_err(|err| {
         format!(
             "Could not connect to Ollama at {base_url}. Start Ollama or update ollama.base_url. ({err})"
         )
     })?;
-    let text = response_text(response, base_url, "load models")?;
+    let text = response_text(response, base_url, "load models").await?;
     serde_json::from_str::<TagsResponse>(&text).map_err(|err| {
         format!(
             "Ollama returned an invalid model list from {base_url}: {err}. Body: {}",
@@ -167,22 +170,25 @@ fn request_tags(base_url: &str) -> Result<TagsResponse, String> {
     })
 }
 
-fn request_version(base_url: &str) -> Result<(), String> {
+async fn request_version(base_url: &str) -> Result<(), String> {
     let url = format!("{base_url}/api/version");
     log::debug!("checking ollama availability base_url={base_url}");
     let client = http_client(MODEL_LIST_TIMEOUT)?;
-    let response = client.get(&url).send().map_err(|err| {
+    let response = client.get(&url).send().await.map_err(|err| {
         format!(
             "Could not connect to Ollama at {base_url}. Start Ollama or update ollama.base_url. ({err})"
         )
     })?;
-    response_text(response, base_url, "check availability").map(|_| ())
+    response_text(response, base_url, "check availability")
+        .await
+        .map(|_| ())
 }
 
-fn response_text(response: Response, base_url: &str, action: &str) -> Result<String, String> {
+async fn response_text(response: Response, base_url: &str, action: &str) -> Result<String, String> {
     let status = response.status();
     let text = response
         .text()
+        .await
         .map_err(|err| format!("Failed to read Ollama response from {base_url}: {err}"))?;
     if status.is_success() {
         return Ok(text);
@@ -203,6 +209,23 @@ fn http_client(timeout: std::time::Duration) -> Result<Client, String> {
         .timeout(timeout)
         .build()
         .map_err(|err| format!("Failed to create Ollama HTTP client: {err}"))
+}
+
+fn run_http<T>(future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            return tokio::task::block_in_place(|| handle.block_on(future));
+        }
+        return Err(
+            "Ollama cannot run through the synchronous provider API on a current-thread Tokio runtime."
+                .to_string(),
+        );
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("Failed to start Ollama HTTP runtime: {err}"))?
+        .block_on(future)
 }
 
 fn base_url() -> String {

@@ -1,9 +1,8 @@
-mod docker;
-
 use super::{
     Page, PageCommand, PageCommandResult, PageContext, PageInitializeComplete, PageRefreshComplete,
     PageRefreshRequest,
 };
+use crate::docker;
 use crate::git::WorkspaceSnapshot;
 use crate::system::WorkspacePath;
 use crate::system::capabilities::shell::{ShellCommandActivity, ShellCommandSpec};

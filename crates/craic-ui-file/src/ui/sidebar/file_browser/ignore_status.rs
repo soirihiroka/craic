@@ -108,16 +108,14 @@ impl FileBrowser {
             }
         });
 
-        git_handle.check_ignored_paths(
-            &queries,
-            Box::new(move |ignored_paths| {
-                updates.send(GitIgnoreQueryResult {
-                    generation,
-                    paths: pending_paths,
-                    ignored_paths,
-                });
-            }),
-        );
+        let receiver = git_handle.check_ignored_paths(&queries);
+        command_mailbox::poll_oneshot_result(receiver, move |ignored_paths| {
+            updates.send(GitIgnoreQueryResult {
+                generation,
+                paths: pending_paths,
+                ignored_paths,
+            });
+        });
     }
 
     fn apply_git_ignore_result(

@@ -1,8 +1,10 @@
-use reqwest::blocking::Client;
+use reqwest::Client;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GitLabRepoMetadata {
@@ -38,6 +40,14 @@ pub fn parse_gitlab_url(url: &str) -> Option<String> {
 }
 
 pub fn fetch_repo_metadata(remote_url: &str) -> Result<GitLabRepoMetadata, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("Failed to start GitLab metadata runtime: {err}"))?;
+    runtime.block_on(fetch_repo_metadata_async(remote_url))
+}
+
+pub async fn fetch_repo_metadata_async(remote_url: &str) -> Result<GitLabRepoMetadata, String> {
     let remote = parse_gitlab_remote(remote_url).ok_or_else(|| {
         format!("Invalid GitLab remote URL. Unable to determine host and project for {remote_url}")
     })?;
@@ -52,15 +62,21 @@ pub fn fetch_repo_metadata(remote_url: &str) -> Result<GitLabRepoMetadata, Strin
         remote_url
     );
 
-    let response = Client::new()
+    let client = Client::builder()
+        .timeout(METADATA_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|err| format!("Failed to create GitLab metadata client: {err}"))?;
+    let response = client
         .get(api_url)
         .header("User-Agent", "craic")
         .send()
+        .await
         .map_err(|err| format!("Failed to query GitLab API for {remote_url}: {err}"))?;
 
     let status = response.status();
     let body = response
         .text()
+        .await
         .map_err(|err| format!("Failed to read GitLab API response for {remote_url}: {err}"))?;
 
     if !status.is_success() {

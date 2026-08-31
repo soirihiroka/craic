@@ -326,6 +326,27 @@ pub fn inspect_container(access: &dyn DockerAccess, container: &str) -> Result<S
     Ok(formatted)
 }
 
+pub fn container_logs(access: &dyn DockerAccess, container: &str) -> Result<String, String> {
+    let container = container.trim();
+    if container.is_empty() {
+        return Err("Choose a Docker container to view logs.".to_string());
+    }
+    let output = access.run_docker(&strings(["logs", "--tail", "1000", container]), None)?;
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+pub fn compose_logs(access: &dyn DockerAccess, compose: &ComposeProject) -> Result<String, String> {
+    let working_dir = compose
+        .working_dir
+        .as_ref()
+        .map(|path| WorkspacePath::from_absolute(path.clone()));
+    let output = access.run_docker(
+        &compose_args(compose, &["logs", "--tail", "1000"]),
+        working_dir.as_ref(),
+    )?;
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
 pub fn run_container_action(
     access: &dyn DockerAccess,
     container: &str,

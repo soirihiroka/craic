@@ -1,13 +1,14 @@
 use super::dialogs::show_error_dialog;
 use super::{AppState, refresh, request_provider_git_snapshot};
-use crate::git::{BranchInfo, GitRepoHandle, MergeResult, RepositorySnapshot};
+use crate::git::{
+    BranchInfo, GitOperationReceiver, GitRepoHandle, MergeResult, RepositorySnapshot,
+};
 use adw::prelude::*;
+use craic_ui_core::ui::command_mailbox;
 use gtk::gio;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::mpsc::{self, TryRecvError};
-use std::time::Duration;
 
 #[derive(Clone, Debug)]
 enum BranchCheckoutTarget {
@@ -126,14 +127,13 @@ fn checkout_with_change_prompt(state: &Rc<AppState>, target: BranchCheckoutTarge
 fn checkout_target(
     git_handle: &GitRepoHandle,
     target: &BranchCheckoutTarget,
-    callback: crate::git::OperationCallback<String>,
-) {
+) -> GitOperationReceiver<String> {
     match target {
-        BranchCheckoutTarget::Local(branch) => git_handle.checkout_branch(branch, callback),
+        BranchCheckoutTarget::Local(branch) => git_handle.checkout_branch(branch),
         BranchCheckoutTarget::Remote {
             remote_branch,
             local_branch,
-        } => git_handle.checkout_remote_branch(remote_branch, local_branch, callback),
+        } => git_handle.checkout_remote_branch(remote_branch, local_branch),
     }
 }
 
@@ -143,18 +143,12 @@ fn run_checkout_target(
     target: BranchCheckoutTarget,
     pop_after: bool,
 ) {
-    let (sender, receiver) = mpsc::channel();
-    let pop_handle = git_handle.clone();
-    checkout_target(
-        git_handle.as_ref(),
-        &target,
-        Box::new(move |result| {
-            send_result_after_optional_pop(sender, pop_handle, result, pop_after);
-        }),
-    );
+    let receiver = checkout_target(git_handle.as_ref(), &target);
     poll_branch_action_result(
         state,
         receiver,
+        git_handle,
+        pop_after,
         "Checkout Failed",
         format!("Checked out {}.", target.label()),
     );
@@ -166,73 +160,64 @@ fn run_create_branch(
     branch: String,
     pop_after: bool,
 ) {
-    let (sender, receiver) = mpsc::channel();
-    let pop_handle = git_handle.clone();
-    git_handle.create_branch(
-        &branch,
-        Box::new(move |result| {
-            send_result_after_optional_pop(sender, pop_handle, result, pop_after);
-        }),
-    );
+    let receiver = git_handle.create_branch(&branch);
     poll_branch_action_result(
         state,
         receiver,
+        git_handle,
+        pop_after,
         "Failed to Create Branch",
         format!("Created and checked out {branch}."),
     );
 }
 
-fn send_result_after_optional_pop(
-    sender: mpsc::Sender<Result<String, String>>,
-    git_handle: Arc<GitRepoHandle>,
+fn finish_branch_action_result(
+    state: &Rc<AppState>,
+    error_heading: &str,
+    empty_success_message: &str,
     result: Result<String, String>,
-    pop_after: bool,
 ) {
-    if !pop_after || result.is_err() {
-        let _ = sender.send(result);
-        return;
+    match result {
+        Ok(output) => {
+            super::broadcast_page_command(state, super::pages::PageCommand::ClearSelection);
+            refresh(
+                state,
+                Some(if output.is_empty() {
+                    empty_success_message.to_string()
+                } else {
+                    output
+                }),
+            );
+        }
+        Err(err) => show_error_dialog(&state.window, error_heading, &err),
     }
-
-    git_handle.pop_stash(Box::new(move |pop_result| {
-        let result = match pop_result {
-            Ok(_) => result,
-            Err(err) => Err(format!("Failed to apply stashed changes: {err}")),
-        };
-        let _ = sender.send(result);
-    }));
 }
 
 fn poll_branch_action_result(
     state: &Rc<AppState>,
-    receiver: mpsc::Receiver<Result<String, String>>,
+    receiver: GitOperationReceiver<String>,
+    git_handle: Arc<GitRepoHandle>,
+    pop_after: bool,
     error_heading: &'static str,
     empty_success_message: String,
 ) {
-    gtk::glib::timeout_add_local(Duration::from_millis(75), {
+    command_mailbox::poll_oneshot_result(receiver, {
         let state = state.clone();
-        move || match receiver.try_recv() {
-            Ok(Ok(output)) => {
-                super::broadcast_page_command(&state, super::pages::PageCommand::ClearSelection);
-                if output.is_empty() {
-                    refresh(&state, Some(empty_success_message.clone()));
-                } else {
-                    refresh(&state, Some(output));
-                }
-                gtk::glib::ControlFlow::Break
+        move |result| {
+            if !pop_after || result.is_err() {
+                finish_branch_action_result(&state, error_heading, &empty_success_message, result);
+                return;
             }
-            Ok(Err(err)) => {
-                show_error_dialog(&state.window, error_heading, &err);
-                gtk::glib::ControlFlow::Break
-            }
-            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-            Err(TryRecvError::Disconnected) => {
-                show_error_dialog(
-                    &state.window,
+
+            command_mailbox::poll_oneshot_result(git_handle.pop_stash(), move |pop_result| {
+                let result = pop_result.map(|_| result.expect("successful checkout result"));
+                finish_branch_action_result(
+                    &state,
                     error_heading,
-                    "Git operation did not return a result.",
+                    &empty_success_message,
+                    result.map_err(|err| format!("Failed to apply stashed changes: {err}")),
                 );
-                gtk::glib::ControlFlow::Break
-            }
+            });
         }
     });
 }
@@ -640,101 +625,81 @@ fn run_merge_branch(
         branch,
         current_branch
     );
-    let (sender, receiver) = mpsc::channel();
-    git_handle.merge_branch(
-        &branch,
-        Box::new(move |result| {
-            let _ = sender.send(result);
-        }),
-    );
-    gtk::glib::timeout_add_local(Duration::from_millis(75), {
+    let receiver = git_handle.merge_branch(&branch);
+    command_mailbox::poll_oneshot_result(receiver, {
         let state = state.clone();
         let dialog = dialog.clone();
         let merge_button = merge_button.clone();
         let merge_spinner = merge_spinner.clone();
-        move || match receiver.try_recv() {
-            Ok(result) => {
-                if !active_workspace_matches(&state, &workspace_key) {
-                    log::debug!(
-                        "merge branch result ignored workspace={} source={} reason=workspace-changed",
+        move |result| {
+            if !active_workspace_matches(&state, &workspace_key) {
+                log::debug!(
+                    "merge branch result ignored workspace={} source={} reason=workspace-changed",
+                    workspace_key,
+                    branch
+                );
+                let _ = dialog.close();
+                return;
+            }
+
+            match result {
+                Ok(MergeResult::Success) => {
+                    log::info!(
+                        "merge branch operation complete workspace={} source={} destination={} result=success",
                         workspace_key,
-                        branch
+                        branch,
+                        current_branch
                     );
                     let _ = dialog.close();
-                    return gtk::glib::ControlFlow::Break;
+                    refresh(
+                        &state,
+                        Some(format!("Merged {branch} into {current_branch}.")),
+                    );
                 }
-
-                match result {
-                    Ok(MergeResult::Success) => {
-                        log::info!(
-                            "merge branch operation complete workspace={} source={} destination={} result=success",
-                            workspace_key,
-                            branch,
-                            current_branch
-                        );
-                        let _ = dialog.close();
-                        refresh(
-                            &state,
-                            Some(format!("Merged {branch} into {current_branch}.")),
-                        );
-                    }
-                    Ok(MergeResult::AlreadyUpToDate) => {
-                        log::info!(
-                            "merge branch operation complete workspace={} source={} destination={} result=up-to-date",
-                            workspace_key,
-                            branch,
-                            current_branch
-                        );
-                        let _ = dialog.close();
-                        refresh(
-                            &state,
-                            Some(format!(
-                                "{current_branch} is already up to date with {branch}."
-                            )),
-                        );
-                    }
-                    Ok(MergeResult::Conflicts(message)) => {
-                        log::warn!(
-                            "merge branch operation complete workspace={} source={} destination={} result=conflicts detail={}",
-                            workspace_key,
-                            branch,
-                            current_branch,
-                            message
-                        );
-                        let _ = dialog.close();
-                        refresh(
-                            &state,
-                            Some(format!(
-                                "Merge conflicts found. Resolve them to finish merging {branch}."
-                            )),
-                        );
-                    }
-                    Err(err) => {
-                        log::warn!(
-                            "merge branch operation failed workspace={} source={} destination={}: {}",
-                            workspace_key,
-                            branch,
-                            current_branch,
-                            err
-                        );
-                        merge_spinner.set_visible(false);
-                        merge_button.set_sensitive(true);
-                        refresh(&state, None);
-                        show_error_dialog(&state.window, "Merge Failed", &err);
-                    }
+                Ok(MergeResult::AlreadyUpToDate) => {
+                    log::info!(
+                        "merge branch operation complete workspace={} source={} destination={} result=up-to-date",
+                        workspace_key,
+                        branch,
+                        current_branch
+                    );
+                    let _ = dialog.close();
+                    refresh(
+                        &state,
+                        Some(format!(
+                            "{current_branch} is already up to date with {branch}."
+                        )),
+                    );
                 }
-                gtk::glib::ControlFlow::Break
-            }
-            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-            Err(TryRecvError::Disconnected) => {
-                merge_spinner.set_visible(false);
-                merge_button.set_sensitive(true);
-                show_error_dialog(
-                    &state.window,
-                    "Merge Failed",
-                    "Git merge did not return a result.",
-                );
-                gtk::glib::ControlFlow::Break
+                Ok(MergeResult::Conflicts(message)) => {
+                    log::warn!(
+                        "merge branch operation complete workspace={} source={} destination={} result=conflicts detail={}",
+                        workspace_key,
+                        branch,
+                        current_branch,
+                        message
+                    );
+                    let _ = dialog.close();
+                    refresh(
+                        &state,
+                        Some(format!(
+                            "Merge conflicts found. Resolve them to finish merging {branch}."
+                        )),
+                    );
+                }
+                Err(err) => {
+                    log::warn!(
+                        "merge branch operation failed workspace={} source={} destination={}: {}",
+                        workspace_key,
+                        branch,
+                        current_branch,
+                        err
+                    );
+                    merge_spinner.set_visible(false);
+                    merge_button.set_sensitive(true);
+                    refresh(&state, None);
+                    show_error_dialog(&state.window, "Merge Failed", &err);
+                }
             }
         }
     });
@@ -851,31 +816,13 @@ fn show_uncommitted_changes_dialog<F>(
                 "stash" => false,
                 _ => return,
             };
-            let (sender, receiver) = mpsc::channel();
-            git_handle.stash_changes(Box::new(move |result| {
-                let _ = sender.send(result.map(|_| pop_after));
-            }));
-            gtk::glib::timeout_add_local(Duration::from_millis(75), {
+            let receiver = git_handle.stash_changes();
+            command_mailbox::poll_oneshot_result(receiver, {
                 let state = state.clone();
                 let action = action.clone();
-                move || match receiver.try_recv() {
-                    Ok(Ok(pop_after)) => {
-                        action(pop_after);
-                        gtk::glib::ControlFlow::Break
-                    }
-                    Ok(Err(err)) => {
-                        show_error_dialog(&state.window, "Stash Failed", &err);
-                        gtk::glib::ControlFlow::Break
-                    }
-                    Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-                    Err(TryRecvError::Disconnected) => {
-                        show_error_dialog(
-                            &state.window,
-                            "Stash Failed",
-                            "Git stash did not return a result.",
-                        );
-                        gtk::glib::ControlFlow::Break
-                    }
+                move |result| match result {
+                    Ok(_) => action(pop_after),
+                    Err(err) => show_error_dialog(&state.window, "Stash Failed", &err),
                 }
             });
         }

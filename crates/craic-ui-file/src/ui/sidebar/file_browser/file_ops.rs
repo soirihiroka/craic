@@ -5,7 +5,7 @@ use super::{
 use crate::system::FileNodePath;
 use crate::system::capabilities::files::{
     FileAccess, FileDeleteRequest, FileMoveRequest, FileOperationError, FileOperationErrorKind,
-    FileOperationEvent, FileWriteMode, FileWritePayload, FileWriteRequest,
+    FileOperationEvent, FileOperationReceiver, FileWriteMode, FileWritePayload, FileWriteRequest,
 };
 use adw::prelude::*;
 use craic_ui_core::ui::command_mailbox;
@@ -13,9 +13,24 @@ use gtk::gio;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 const DELETE_WATCH_SUPPRESSION_MS: u64 = 1_200;
+
+fn deliver_file_operation<T: Send + 'static>(
+    mut events: FileOperationReceiver<T>,
+    result_command: command_mailbox::UiCommandSender<Result<T, FileOperationError>>,
+) {
+    thread::spawn(move || {
+        while let Some(event) = events.blocking_recv() {
+            if let FileOperationEvent::Finished(result) = event {
+                result_command.send(result);
+                break;
+            }
+        }
+    });
+}
 
 pub(super) type SudoFileRetry = crate::ui::sudo::SudoFileRetry;
 
@@ -305,18 +320,14 @@ impl FileBrowser {
                 }
             }
         });
-        file_access.write_node(
-            FileWriteRequest {
+        deliver_file_operation(
+            file_access.write_node_events(FileWriteRequest {
                 path: created.clone(),
                 mode: FileWriteMode::CreateNew,
                 payload,
                 cancel_requested: None,
-            },
-            Box::new(move |event| {
-                if let FileOperationEvent::Finished(result) = event {
-                    result_command.send(result);
-                }
             }),
+            result_command,
         );
     }
 
@@ -527,18 +538,14 @@ impl FileBrowser {
                 }
             }
         });
-        file_access.move_node(
-            FileMoveRequest {
+        deliver_file_operation(
+            file_access.move_node_events(FileMoveRequest {
                 source: target.node_path.clone(),
                 destination_parent: parent.clone(),
                 new_name: new_name.to_string(),
                 cancel_requested: None,
-            },
-            Box::new(move |event| {
-                if let FileOperationEvent::Finished(result) = event {
-                    result_command.send(result);
-                }
             }),
+            result_command,
         );
     }
 
@@ -664,16 +671,12 @@ impl FileBrowser {
                 }
             }
         });
-        file_access.delete(
-            FileDeleteRequest {
+        deliver_file_operation(
+            file_access.delete_events(FileDeleteRequest {
                 path: path.clone(),
                 cancel_requested: None,
-            },
-            Box::new(move |result| {
-                if let FileOperationEvent::Finished(result) = result {
-                    result_command.send(result);
-                }
             }),
+            result_command,
         );
     }
 

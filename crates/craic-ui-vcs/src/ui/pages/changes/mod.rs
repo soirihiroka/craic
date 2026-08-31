@@ -6,13 +6,11 @@ use super::{
     PageRefreshComplete,
 };
 use crate::git::{
-    self, BytesComparison, FileComparison, GitRepoHandle, OperationCallback, RepositorySnapshot,
-    WorkspaceSnapshot,
+    self, BytesComparison, FileComparison, GitRepoHandle, RepositorySnapshot, WorkspaceSnapshot,
 };
 use crate::github::CommitEmailOption;
 use crate::gitignore::{self, IgnoreTargetKind};
-use crate::system::capabilities::open::{DesktopOpenActivation, DesktopOpenTargetKind};
-use crate::system::capabilities::url::UrlOpenActivation;
+use crate::system::capabilities::open::DesktopOpenTargetKind;
 use crate::system::path::ProviderKind;
 use crate::ui::components::context_menu;
 use crate::ui::file_manager;
@@ -29,7 +27,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -86,8 +84,20 @@ struct WorktreePreviewWorkerResult {
 }
 
 struct ActivePreviewWatch {
-    _git: git::FileDiffSubscription,
+    git: Option<git::FileDiffSubscription>,
     _updates: command_mailbox::UiCommandSubscription,
+    bridge: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ActivePreviewWatch {
+    fn drop(&mut self) {
+        self.git.take();
+        if let Some(bridge) = self.bridge.take()
+            && bridge.join().is_err()
+        {
+            log::warn!("changes preview watch bridge panicked during shutdown");
+        }
+    }
 }
 
 struct BoundedPreviewCache<K, V> {
@@ -243,7 +253,8 @@ impl ChangesPage {
                     ctx.workspace_key(),
                     files.len()
                 );
-                let completion = command_mailbox::once({
+                let receiver = git_handle.commit_paths(&summary, &description, &files);
+                command_mailbox::poll_oneshot_result(receiver, {
                     let ctx = ctx.clone();
                     let panel = panel.clone();
                     let summary_entry = summary_entry.clone();
@@ -274,14 +285,6 @@ impl ChangesPage {
                         }
                     }
                 });
-                git_handle.commit_paths(
-                    &summary,
-                    &description,
-                    &files,
-                    Box::new(move |result| {
-                        completion.send(result);
-                    }),
-                );
             }
         });
 
@@ -712,13 +715,11 @@ fn initialize_git_repository(ctx: &PageContext) {
     };
 
     let ctx = ctx.clone();
-    let completion = command_mailbox::once(move |result: Result<String, String>| match result {
+    let receiver = git_handle.initialize_repository();
+    command_mailbox::poll_oneshot_result(receiver, move |result| match result {
         Ok(message) => ctx.refresh(Some(message)),
         Err(err) => ctx.show_error("Initialize Repository Failed", &err),
     });
-    git_handle.initialize_repository(Box::new(move |result| {
-        completion.send(result);
-    }));
 }
 
 fn show_worktree_preview(
@@ -825,67 +826,80 @@ fn show_worktree_preview(
         }
     });
 
-    let git = start_worktree_preview_watch(git_handle, signature, sender);
-    active_preview_subscription.replace(Some(ActivePreviewWatch {
-        _git: git,
-        _updates: updates,
-    }));
+    let watch = start_worktree_preview_watch(git_handle, signature, sender, updates);
+    active_preview_subscription.replace(Some(watch));
 }
 
 fn start_worktree_preview_watch(
     git_handle: Arc<GitRepoHandle>,
     signature: WorktreePreviewSignature,
     sender: command_mailbox::UiCommandSender<WorktreePreviewWorkerResult>,
-) -> git::FileDiffSubscription {
-    let mut start = Instant::now();
-    let mut cacheable = true;
+    updates: command_mailbox::UiCommandSubscription,
+) -> ActivePreviewWatch {
     let path = signature.path.clone();
-    match signature.kind {
+    let (git, bridge) = match signature.kind {
         PreviewKind::Image
         | PreviewKind::Audio
         | PreviewKind::Video
         | PreviewKind::Font
-        | PreviewKind::Pdf => git_handle.watch_bytes_comparison(
-            &path,
-            Box::new(move |result| {
-                let result = match result.map(WorktreePreview::Bytes) {
-                    Ok(preview) => Ok(preview),
-                    Err(err) if is_preview_limit_message(&err) => {
-                        Ok(WorktreePreview::PreviewLimit(err))
-                    }
-                    Err(err) => Err(err),
-                };
-                sender.send(WorktreePreviewWorkerResult {
-                    signature: signature.clone(),
-                    result,
-                    duration: start.elapsed(),
-                    cacheable,
-                });
-                start = Instant::now();
-                cacheable = false;
-            }),
-        ),
-        _ => git_handle.watch_comparison(
-            &path,
-            Box::new(move |result| {
-                let result = match result.map(WorktreePreview::Diff) {
-                    Ok(preview) => Ok(preview),
-                    Err(err) if is_preview_limit_message(&err) => {
-                        Ok(WorktreePreview::PreviewLimit(err))
-                    }
-                    Err(err) => Err(err),
-                };
-                sender.send(WorktreePreviewWorkerResult {
-                    signature: signature.clone(),
-                    result,
-                    duration: start.elapsed(),
-                    cacheable,
-                });
-                start = Instant::now();
-                cacheable = false;
-            }),
-        ),
+        | PreviewKind::Pdf => {
+            let (git, receiver) = git_handle.watch_bytes_comparison(&path);
+            let bridge =
+                spawn_worktree_preview_bridge(receiver, signature, sender, WorktreePreview::Bytes);
+            (git, bridge)
+        }
+        _ => {
+            let (git, receiver) = git_handle.watch_comparison(&path);
+            let bridge =
+                spawn_worktree_preview_bridge(receiver, signature, sender, WorktreePreview::Diff);
+            (git, bridge)
+        }
+    };
+    ActivePreviewWatch {
+        git: Some(git),
+        _updates: updates,
+        bridge: Some(bridge),
     }
+}
+
+fn spawn_worktree_preview_bridge<T>(
+    mut receiver: git::FileDiffReceiver<T>,
+    signature: WorktreePreviewSignature,
+    sender: command_mailbox::UiCommandSender<WorktreePreviewWorkerResult>,
+    wrap: fn(T) -> WorktreePreview,
+) -> thread::JoinHandle<()>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    thread::spawn(move || {
+        let mut start = Instant::now();
+        let mut cacheable = true;
+        while receiver.blocking_changed().is_ok() {
+            let Some(result) = receiver.borrow_and_update().clone() else {
+                continue;
+            };
+            let result = match result.map(wrap) {
+                Ok(preview) => Ok(preview),
+                Err(err) if is_preview_limit_message(&err) => {
+                    Ok(WorktreePreview::PreviewLimit(err))
+                }
+                Err(err) => Err(err),
+            };
+            sender.send(WorktreePreviewWorkerResult {
+                signature: signature.clone(),
+                result,
+                duration: start.elapsed(),
+                cacheable,
+            });
+            start = Instant::now();
+            cacheable = false;
+        }
+        log::debug!(
+            "changes preview watch bridge stopped path={} kind={:?}",
+            signature.path,
+            signature.kind
+        );
+    })
 }
 
 fn show_worktree_preview_outcome(right: &ChangesRight, file_path: &str, preview: &WorktreePreview) {
@@ -1030,26 +1044,24 @@ fn generate_commit_message(
         }
     });
 
-    git_handle.commit_message_context(
-        &files,
-        Box::new(move |context_result| {
-            let completion = completion.clone();
-            let provider_id = provider_id.clone();
-            let model = model.clone();
-            let cancellation = cancellation.clone();
-            thread::spawn(move || {
-                let result = context_result.and_then(|context| {
-                    crate::ai_commit::generate_from_context(
-                        context,
-                        &provider_id,
-                        model.as_deref(),
-                        &cancellation,
-                    )
-                });
-                completion.send(result);
+    let receiver = git_handle.commit_message_context(&files);
+    command_mailbox::poll_oneshot_result(receiver, move |context_result| {
+        let completion = completion.clone();
+        let provider_id = provider_id.clone();
+        let model = model.clone();
+        let cancellation = cancellation.clone();
+        thread::spawn(move || {
+            let result = context_result.and_then(|context| {
+                crate::ai_commit::generate_from_context(
+                    context,
+                    &provider_id,
+                    model.as_deref(),
+                    &cancellation,
+                )
             });
-        }),
-    );
+            completion.send(result);
+        });
+    });
 }
 
 fn cancel_commit_message_generation(
@@ -1163,13 +1175,10 @@ fn show_commit_author_email_selector(
                     Err(err) => ctx.show_error("Author Selection Failed", &err),
                 }
             });
-            git_handle.save_author_identity(
-                &option.name,
-                &option.email,
-                Box::new(move |result| {
-                    completion.send(result);
-                }),
-            );
+            let receiver = git_handle.save_author_identity(&option.name, &option.email);
+            command_mailbox::poll_oneshot_result(receiver, move |result| {
+                completion.send(result);
+            });
         }
     });
 
@@ -1411,9 +1420,10 @@ fn show_changed_file_selector_context_menu(
                 "Stash Failed",
                 Some("Changes stashed.".to_string()),
             );
-            git_handle.stash_changes(Box::new(move |result| {
+            let receiver = git_handle.stash_changes();
+            command_mailbox::poll_oneshot_result(receiver, move |result| {
                 completion.send(result);
-            }));
+            });
         }
     });
     stash_all.set_enabled(has_changed_files);
@@ -1500,22 +1510,19 @@ fn append_changed_file_ignore_section(
 fn changed_file_action_group(ctx: &PageContext, local_workspace: bool) -> gio::SimpleActionGroup {
     let actions = gio::SimpleActionGroup::new();
     let desktop_open_available = local_workspace && ctx.desktop_opener().is_some();
-    let parent_window = ctx.window().map(|window| window.upcast::<gtk::Window>());
 
     let open_default = context_menu::add_string_menu_action(&actions, "open-default", {
         let ctx = ctx.clone();
-        let parent_window = parent_window.clone();
         move |file_path| {
             let Some(desktop_opener) = ctx.desktop_opener() else {
                 ctx.show_error("Open Failed", &ctx.desktop_opener_unavailable_message());
                 return;
             };
             let path = ctx.workspace_node_path(file_path);
-            match desktop_opener.open_path(
-                &path,
-                DesktopOpenTargetKind::File,
-                DesktopOpenActivation::from_parent(parent_window.as_ref()),
-            ) {
+            match desktop_opener
+                .resolve_open_path(&path, DesktopOpenTargetKind::File)
+                .and_then(|effect| ctx.execute_effect(effect))
+            {
                 Ok(_) => ctx.refresh(Some("Opened file.".to_string())),
                 Err(err) => ctx.show_error("Open Failed", &err),
             }
@@ -1539,17 +1546,16 @@ fn changed_file_action_group(ctx: &PageContext, local_workspace: bool) -> gio::S
     open_code.set_enabled(local_workspace);
     let show_folder = context_menu::add_string_menu_action(&actions, "show-folder", {
         let ctx = ctx.clone();
-        let parent_window = parent_window.clone();
         move |file_path| {
             let Some(desktop_opener) = ctx.desktop_opener() else {
                 ctx.show_error("Open Failed", &ctx.desktop_opener_unavailable_message());
                 return;
             };
             let path = ctx.workspace_node_path(file_path);
-            match desktop_opener.reveal_path(
-                &path,
-                DesktopOpenActivation::from_parent(parent_window.as_ref()),
-            ) {
+            match desktop_opener
+                .resolve_reveal_path(&path)
+                .and_then(|effect| ctx.execute_effect(effect))
+            {
                 Ok(_) => ctx.refresh(Some("Opened file manager.".to_string())),
                 Err(err) => ctx.show_error("Open Failed", &err),
             }
@@ -1681,43 +1687,21 @@ fn confirm_discard_changes(ctx: &PageContext, paths: Vec<String>) {
                 "Discarded all changes.".to_string()
             };
             let completion = changes_git_unit_command(&ctx, "Discard Failed", message);
-            discard_paths(
-                git_handle,
-                paths.clone(),
-                Box::new(move |result| {
+            let paths = paths.clone();
+            thread::spawn(move || {
+                for path in paths {
+                    let result = match git_handle.discard_path(&path).blocking_recv() {
+                        Ok(Ok(_)) => continue,
+                        Ok(Err(err)) => Err(err),
+                        Err(_) => Err("Discard operation ended without a result.".to_string()),
+                    };
                     completion.send(result);
-                }),
-            );
+                    return;
+                }
+                completion.send(Ok(()));
+            });
         }
     });
-}
-
-fn discard_paths(
-    git_handle: Arc<GitRepoHandle>,
-    paths: Vec<String>,
-    callback: OperationCallback<()>,
-) {
-    discard_path_at(git_handle, Arc::new(paths), 0, callback);
-}
-
-fn discard_path_at(
-    git_handle: Arc<GitRepoHandle>,
-    paths: Arc<Vec<String>>,
-    index: usize,
-    callback: OperationCallback<()>,
-) {
-    let Some(path) = paths.get(index).cloned() else {
-        callback(Ok(()));
-        return;
-    };
-    let next_handle = git_handle.clone();
-    git_handle.discard_path(
-        &path,
-        Box::new(move |result| match result {
-            Ok(_) => discard_path_at(next_handle, paths, index + 1, callback),
-            Err(err) => callback(Err(err)),
-        }),
-    );
 }
 
 fn changes_git_string_command(
@@ -1766,13 +1750,20 @@ fn ignore_pattern(ctx: &PageContext, pattern: &str) {
         Ok(message) => ctx.refresh(Some(message)),
         Err(err) => ctx.show_error("Ignore Failed", &err),
     });
-    gitignore::add_pattern_to_workspace(
-        files,
-        pattern.to_string(),
-        Box::new(move |result| {
-            completion.send(result);
-        }),
-    );
+    let receiver = gitignore::add_pattern_to_workspace(files, pattern.to_string());
+    gtk::glib::timeout_add_local(Duration::from_millis(40), move || {
+        match receiver.try_recv() {
+            Ok(result) => {
+                completion.send(result);
+                gtk::glib::ControlFlow::Break
+            }
+            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(TryRecvError::Disconnected) => {
+                completion.send(Err("Ignore operation ended without a result.".to_string()));
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn open_repository_in_files(ctx: &PageContext) {
@@ -1781,13 +1772,10 @@ fn open_repository_in_files(ctx: &PageContext) {
         return;
     };
     let path = ctx.workspace_root_node_path();
-    let parent_window = ctx.window().map(|window| window.upcast::<gtk::Window>());
-
-    match desktop_opener.open_path(
-        &path,
-        DesktopOpenTargetKind::Folder,
-        DesktopOpenActivation::from_parent(parent_window.as_ref()),
-    ) {
+    match desktop_opener
+        .resolve_open_path(&path, DesktopOpenTargetKind::Folder)
+        .and_then(|effect| ctx.execute_effect(effect))
+    {
         Ok(_) => ctx.refresh(Some("Opened in Files.".to_string())),
         Err(err) => ctx.show_error("Open Failed", &err),
     }
@@ -1920,7 +1908,10 @@ fn open_remote_repository(ctx: &PageContext) {
                 ctx.show_error("Open Failed", &ctx.url_opener_unavailable_message());
                 return;
             };
-            match url_opener.open_url(&url, UrlOpenActivation::default()) {
+            match url_opener
+                .resolve_url(&url)
+                .and_then(|effect| ctx.execute_effect(effect))
+            {
                 Ok(_) => ctx.refresh(Some(format!("Opened {url}."))),
                 Err(err) => ctx.show_error("Open Failed", &err),
             }

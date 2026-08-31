@@ -8,7 +8,7 @@ use crate::system::capabilities::shell::{
 };
 use crate::system::path::WorkspaceRef;
 use std::path::Path;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct LocalGitHubAccess {
@@ -66,28 +66,16 @@ impl LocalGitHubAccess {
     }
 
     fn run_command(&self, request: ShellCommandRunRequest) -> Result<ShellCommandOutput, String> {
-        let (sender, receiver) = mpsc::channel();
-        self.shell.run_fast_command(
-            request,
-            Box::new(move |result| {
-                let _ = sender.send(result);
-            }),
-        );
-        receiver
-            .recv()
+        self.shell
+            .run_fast_command(request)
+            .blocking_recv()
             .map_err(|_| "Local gh command did not return a result.".to_string())?
     }
 
     fn run_script(&self, request: ShellRunRequest) -> Result<ShellCommandOutput, String> {
-        let (sender, receiver) = mpsc::channel();
-        self.shell.run_fast_script(
-            request,
-            Box::new(move |result| {
-                let _ = sender.send(result);
-            }),
-        );
-        receiver
-            .recv()
+        self.shell
+            .run_fast_script(request)
+            .blocking_recv()
             .map_err(|_| "Local gh script did not return a result.".to_string())?
     }
 

@@ -1,5 +1,5 @@
 use super::super::widgets;
-use crate::git::RepositorySnapshot;
+use crate::git::{RepositorySnapshot, default_commit_summary};
 use adw::prelude::*;
 use craic_ui_core::ui::file_status;
 use gtk::glib;
@@ -306,51 +306,4 @@ pub fn update_commit_button_sensitivity_for_paths(
         default_summary.as_deref().unwrap_or("Summary (required)"),
     ));
     commit_button.set_sensitive(!commit_running && has_summary && has_checked_file);
-}
-
-pub fn default_commit_summary(
-    files: &[String],
-    file_signature: &[(String, String)],
-) -> Option<String> {
-    match files {
-        [file] => Some(format!(
-            "{} {}",
-            action_for(status_for(file, file_signature)),
-            file_name(file)
-        )),
-        [first, second] => Some(format!(
-            "{} {} and {} {}",
-            action_for(status_for(first, file_signature)),
-            file_name(first),
-            action_for(status_for(second, file_signature)).to_lowercase(),
-            file_name(second)
-        )),
-        _ => None,
-    }
-}
-
-fn file_name(path: &str) -> &str {
-    path.rsplit('/')
-        .find(|segment| !segment.is_empty())
-        .unwrap_or(path)
-}
-
-fn status_for<'a>(path: &str, file_signature: &'a [(String, String)]) -> &'a str {
-    file_signature
-        .iter()
-        .find(|(file_path, _)| file_path == path)
-        .map(|(_, status)| status.as_str())
-        .unwrap_or_default()
-}
-
-fn action_for(status: &str) -> &'static str {
-    if status.contains('D') {
-        "Delete"
-    } else if status == "M-" {
-        "Clean up"
-    } else if status.contains('A') || status.contains('?') {
-        "Create"
-    } else {
-        "Update"
-    }
 }

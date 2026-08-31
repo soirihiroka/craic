@@ -9,9 +9,9 @@ use crate::git::WorkspaceSnapshot;
 use crate::gitignore;
 use crate::system::capabilities::docker::ComposeFileAction;
 use crate::system::capabilities::files::{
-    FileAccess, FileKind, FileNodeInfo, FileOperationEvent, FileReadRequest, FileWatchCallback,
+    FileAccess, FileKind, FileNodeInfo, FileOperation, FileOperationEvent, FileReadRequest,
     FileWatchChanges, FileWatchRequest, FileWatchSubscription, FileWriteMode, FileWritePayload,
-    FileWriteRequest,
+    FileWriteRequest, wait_file_operation,
 };
 use crate::system::path::ProviderKind;
 use crate::system::{FileNodePath, WorkspacePath, WorkspaceRef};
@@ -26,6 +26,7 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::Duration;
 
 const MAX_EDITOR_FILE_BYTES: u64 = 1024 * 1024;
@@ -83,6 +84,7 @@ struct OpenedFileMonitorTarget {
 struct OpenedFileMonitor {
     target: RefCell<Option<OpenedFileMonitorTarget>>,
     subscription: RefCell<Option<FileWatchSubscription>>,
+    bridge: RefCell<Option<thread::JoinHandle<()>>>,
     event_subscription: RefCell<Option<command_mailbox::UiCommandSubscription>>,
     debounce_source: RefCell<Option<glib::SourceId>>,
     generation: Cell<u64>,
@@ -111,6 +113,7 @@ impl OpenedFileMonitor {
         Rc::new(Self {
             target: RefCell::new(None),
             subscription: RefCell::new(None),
+            bridge: RefCell::new(None),
             event_subscription: RefCell::new(None),
             debounce_source: RefCell::new(None),
             generation: Cell::new(0),
@@ -178,9 +181,8 @@ impl OpenedFileMonitor {
                 monitor_state.queue_reload(&ctx, &right, &pending_save, generation);
             }
         });
-        let callback: FileWatchCallback = Arc::new(move |changes| events.send(changes));
-        let subscription = match files.watch(request, callback) {
-            Ok(subscription) => subscription,
+        let (subscription, mut receiver) = match files.watch(request) {
+            Ok(watch) => watch,
             Err(err) => {
                 log::warn!(
                     "opened-file monitor unavailable file_path={} reason={}",
@@ -190,7 +192,13 @@ impl OpenedFileMonitor {
                 return;
             }
         };
+        let bridge = thread::spawn(move || {
+            while let Some(changes) = receiver.blocking_recv() {
+                events.send(changes);
+            }
+        });
         self.subscription.replace(Some(subscription));
+        self.bridge.replace(Some(bridge));
         self.event_subscription.replace(Some(event_subscription));
     }
 
@@ -226,8 +234,13 @@ impl OpenedFileMonitor {
         if let Some(source_id) = self.debounce_source.borrow_mut().take() {
             source_id.remove();
         }
-        self.event_subscription.borrow_mut().take();
         self.subscription.borrow_mut().take();
+        if let Some(bridge) = self.bridge.borrow_mut().take()
+            && bridge.join().is_err()
+        {
+            log::warn!("opened-file monitor bridge panicked during shutdown");
+        }
+        self.event_subscription.borrow_mut().take();
         self.target.borrow_mut().take();
     }
 
@@ -1185,15 +1198,18 @@ fn load_repository_item_with_access(
     let local_path = files.local_path(&node_path);
     let request_path = node_path.clone();
     let item_files = Arc::clone(&files);
-    let (sender, receiver) = mpsc::channel();
-    files.read_with_info(
-        FileReadRequest {
-            path: request_path.clone(),
-            max_bytes: Some(MAX_EDITOR_FILE_BYTES),
-            cancel_requested: None,
-        },
-        Box::new(move |event| {
-            if let FileOperationEvent::Finished(result) = event {
+    let mut receiver = files.read_with_info_events(FileReadRequest {
+        path: request_path.clone(),
+        max_bytes: Some(MAX_EDITOR_FILE_BYTES),
+        cancel_requested: None,
+    });
+
+    let retry_ctx = ctx.clone();
+    let retry_node_path = request_path;
+    gtk::glib::timeout_add_local(FILE_EVENT_POLL_INTERVAL, move || {
+        match receiver.try_recv() {
+            Ok(FileOperationEvent::Progress(_)) => gtk::glib::ControlFlow::Continue,
+            Ok(FileOperationEvent::Finished(result)) => {
                 let result = result
                     .map(|mut read| {
                         if !allow_sudo {
@@ -1209,16 +1225,6 @@ fn load_repository_item_with_access(
                         }
                     })
                     .map_err(|err| err.to_string());
-                let _ = sender.send(result);
-            }
-        }),
-    );
-
-    let retry_ctx = ctx.clone();
-    let retry_node_path = request_path;
-    gtk::glib::timeout_add_local(FILE_EVENT_POLL_INTERVAL, move || {
-        match receiver.try_recv() {
-            Ok(result) => {
                 if allow_sudo
                     && result
                         .as_ref()
@@ -1256,8 +1262,8 @@ fn load_repository_item_with_access(
                 }
                 gtk::glib::ControlFlow::Break
             }
-            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                 if let Some(callback) = callback.borrow_mut().take() {
                     callback(Err("Read operation did not return a result.".to_string()));
                 }
@@ -1353,14 +1359,7 @@ fn add_gitignore_pattern_with_access(
     files: Arc<dyn FileAccess>,
     allow_sudo: bool,
 ) {
-    let (sender, receiver) = mpsc::channel();
-    gitignore::add_pattern_to_workspace(
-        files.clone(),
-        pattern.clone(),
-        Box::new(move |result| {
-            let _ = sender.send(result);
-        }),
-    );
+    let receiver = gitignore::add_pattern_to_workspace(files.clone(), pattern.clone());
 
     gtk::glib::timeout_add_local(FILE_EVENT_POLL_INTERVAL, move || {
         match receiver.try_recv() {
@@ -1786,32 +1785,24 @@ fn write_repository_file(
     if !info.kind.is_file() {
         return Err("Select a file to edit.".to_string());
     }
-    write_text_via_callback(files, path, text)
+    write_text_via_events(files, path, text)
 }
 
-fn write_text_via_callback(
+fn write_text_via_events(
     files: &dyn FileAccess,
     path: &FileNodePath,
     text: &str,
 ) -> Result<(), String> {
-    let (sender, receiver) = mpsc::channel();
-    files.write_node(
-        FileWriteRequest {
+    wait_file_operation(
+        files.write_node_events(FileWriteRequest {
             path: path.clone(),
             mode: FileWriteMode::Replace,
             payload: FileWritePayload::File(text.as_bytes().to_vec()),
             cancel_requested: None,
-        },
-        Box::new(move |event| {
-            if let FileOperationEvent::Finished(result) = event {
-                let _ = sender.send(result);
-            }
         }),
-    );
-    receiver
-        .recv()
-        .map_err(|_| "Write operation did not return a result.".to_string())?
-        .map_err(|err| err.to_string())
+        FileOperation::Write,
+    )
+    .map_err(|err| err.to_string())
 }
 
 fn native_node_path(ctx: &PageContext, file_path: &str) -> FileNodePath {

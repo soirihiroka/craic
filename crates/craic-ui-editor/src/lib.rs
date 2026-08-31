@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 pub use craic_config as config;
 pub use craic_language as language_support;
 pub use craic_language::{markdown_lint, spellcheck};

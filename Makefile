@@ -5,6 +5,10 @@ SED ?= sed
 GTK_UPDATE_ICON_CACHE ?= gtk-update-icon-cache
 UPDATE_DESKTOP_DATABASE ?= update-desktop-database
 FC_CACHE ?= fc-cache
+CARGO_TARGET_DIR ?= target
+export CARGO_TARGET_DIR
+
+UNAME_S := $(shell uname -s)
 
 APP_ID := dev.craic.Craic
 APP_NAME := Craic
@@ -27,11 +31,18 @@ FONT_FILES := $(wildcard crates/craic-ui-core/assets/fonts/JetBrainsMono/*.ttf)
 DOCS_DIR := docs
 DOCS_SOURCE_DIR := $(DOCS_DIR)/source
 DOCS_BUILD_DIR := $(DOCS_DIR)/build
+DEBUG_APP_BUNDLE := $(CARGO_TARGET_DIR)/debug/$(APP_NAME).app
+DEBUG_APP_EXECUTABLE := $(DEBUG_APP_BUNDLE)/Contents/MacOS/$(BIN_NAME)
 
-.PHONY: dev run build release check test doc resource-watch clean install uninstall
+.PHONY: dev run build release check test doc resource-watch macos-app run-macos clean install uninstall
 
+ifeq ($(UNAME_S),Darwin)
+dev: macos-app
+	RUST_LOG=$(RUST_LOG) "$(DEBUG_APP_EXECUTABLE)"
+else
 dev:
 	RUST_LOG=$(RUST_LOG) $(CARGO) run
+endif
 
 run: dev
 
@@ -53,6 +64,24 @@ doc:
 resource-watch:
 	@test -n "$(PID)" || { echo "usage: make resource-watch PID=<craic-pid> [INTERVAL=<seconds>]" >&2; exit 2; }
 	./tools/watch-craic-resources.sh "$(PID)" "$(or $(INTERVAL),5)"
+
+macos-app:
+	PATH="$$(dirname "$$(xcrun --find clang)"):$$PATH" \
+	CLANG_PATH="$$(xcrun --find clang)" \
+	CLANGCC="$$(xcrun --find clang)" \
+	CLANGCXX="$$(xcrun --find clang++)" \
+	CC="$$(xcrun --find clang)" \
+	CXX="$$(xcrun --find clang++)" \
+	SDKROOT="$$(xcrun --sdk macosx --show-sdk-path)" \
+	LIBCLANG_PATH="$$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" \
+	$(CARGO) build
+	$(INSTALL) -d "$(DEBUG_APP_BUNDLE)/Contents/MacOS"
+	$(INSTALL) -d "$(DEBUG_APP_BUNDLE)/Contents/Resources"
+	$(INSTALL) -m 0644 "data/macos/Info.plist" "$(DEBUG_APP_BUNDLE)/Contents/Info.plist"
+	$(INSTALL) -m 0755 "$(CARGO_TARGET_DIR)/debug/$(BIN_NAME)" "$(DEBUG_APP_EXECUTABLE)"
+
+run-macos: macos-app
+	open "$(DEBUG_APP_BUNDLE)"
 
 clean:
 	$(CARGO) clean

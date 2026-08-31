@@ -1,14 +1,15 @@
 use super::{SshCommandRunner, shell_quote};
 use crate::system::capabilities::shell::{
     ShellAccess, ShellCommandActivity, ShellCommandEvent, ShellCommandGenerator,
-    ShellCommandRunRequest, ShellCommandSpec, ShellRunCallback, ShellRunRequest,
+    ShellCommandResult, ShellCommandRunRequest, ShellCommandSpec, ShellRunRequest,
 };
 use crate::system::path::{WorkspacePath, WorkspaceRef};
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
+use tokio::sync::mpsc as tokio_mpsc;
 
 const REMOTE_SHELL_ACTIVITY_NOTIFICATION: &str = "craic-terminal-activity";
 const REMOTE_SHELL_ACTIVITY_MONITOR: &str = r#"
@@ -156,7 +157,8 @@ impl ShellAccess for SshShellAccess {
         )
     }
 
-    fn run_script(&self, request: ShellRunRequest, callback: ShellRunCallback) {
+    fn run_script(&self, request: ShellRunRequest) -> ShellCommandResult {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         let host = self.host.clone();
         thread::spawn(move || {
             let remote = format!(
@@ -164,15 +166,17 @@ impl ShellAccess for SshShellAccess {
                 shell_quote(&request.working_dir.absolute),
                 request.script
             );
-            callback(SshCommandRunner::new(host).run_script_output_with_stdin(
+            let _ = sender.send(SshCommandRunner::new(host).run_script_output_with_stdin(
                 &request.operation,
                 &remote,
                 request.stdin.as_deref(),
             ));
         });
+        receiver
     }
 
-    fn run_fast_script(&self, request: ShellRunRequest, callback: ShellRunCallback) {
+    fn run_fast_script(&self, request: ShellRunRequest) -> ShellCommandResult {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         let host = self.host.clone();
         thread::spawn(move || {
             let remote = format!(
@@ -180,28 +184,32 @@ impl ShellAccess for SshShellAccess {
                 shell_quote(&request.working_dir.absolute),
                 request.script
             );
-            callback(SshCommandRunner::new(host).run_script_output_with_stdin(
+            let _ = sender.send(SshCommandRunner::new(host).run_script_output_with_stdin(
                 &request.operation,
                 &remote,
                 request.stdin.as_deref(),
             ));
         });
+        receiver
     }
 
-    fn run_fast_command(&self, request: ShellCommandRunRequest, callback: ShellRunCallback) {
+    fn run_fast_command(&self, request: ShellCommandRunRequest) -> ShellCommandResult {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         let host = self.host.clone();
         thread::spawn(move || {
             let remote = fast_remote_command(&request.working_dir, &request.program, &request.args);
-            callback(SshCommandRunner::new(host).run_script_output_with_stdin(
+            let _ = sender.send(SshCommandRunner::new(host).run_script_output_with_stdin(
                 &request.operation,
                 &remote,
                 request.stdin.as_deref(),
             ));
         });
+        receiver
     }
 
     fn stream_fast_command(&self, request: ShellCommandRunRequest) -> ShellCommandGenerator {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) =
+            tokio_mpsc::channel(crate::system::capabilities::shell::SHELL_EVENT_CAPACITY);
         let host = self.host.clone();
         thread::spawn(move || {
             let remote = fast_remote_command(&request.working_dir, &request.program, &request.args);
@@ -211,7 +219,7 @@ impl ShellAccess for SshShellAccess {
                 request.stdin.as_deref(),
                 &sender,
             );
-            let _ = sender.send(ShellCommandEvent::Finished(result.map(Into::into)));
+            let _ = sender.blocking_send(ShellCommandEvent::Finished(result.map(Into::into)));
         });
         receiver
     }

@@ -9,6 +9,10 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::mpsc as tokio_mpsc;
+
+pub(crate) const FILE_OPERATION_EVENT_CAPACITY: usize = 32;
+pub(crate) const FILE_WATCH_EVENT_CAPACITY: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileNodeKind {
@@ -219,9 +223,10 @@ pub struct FileWatchRequest {
 }
 
 pub type FileWatchChanges = HashSet<FileNodePath>;
-pub type FileWatchCallback = Arc<dyn Fn(FileWatchChanges) + Send + Sync + 'static>;
+pub type FileWatchReceiver = tokio_mpsc::Receiver<FileWatchChanges>;
 pub type FileCancellation = Arc<AtomicBool>;
-pub type FileOperationCallback<T> = Box<dyn Fn(FileOperationEvent<T>) + Send + 'static>;
+pub type FileOperationReceiver<T> = tokio_mpsc::Receiver<FileOperationEvent<T>>;
+pub(crate) type FileOperationEmitter<T> = dyn Fn(FileOperationEvent<T>) + Send + 'static;
 
 pub struct FileSudoPassword(zeroize::Zeroizing<Vec<u8>>);
 
@@ -403,6 +408,25 @@ pub enum FileOperationEvent<T> {
     Finished(Result<T, FileOperationError>),
 }
 
+pub fn wait_file_operation<T>(
+    mut events: FileOperationReceiver<T>,
+    operation: FileOperation,
+) -> Result<T, FileOperationError> {
+    loop {
+        match events.blocking_recv() {
+            Some(FileOperationEvent::Progress(_)) => {}
+            Some(FileOperationEvent::Finished(result)) => return result,
+            None => {
+                return Err(FileOperationError::new(
+                    operation,
+                    FileOperationErrorKind::Protocol,
+                    format!("{} operation did not return a result.", operation.label()),
+                ));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FileReadRequest {
     pub path: FileNodePath,
@@ -505,13 +529,13 @@ impl FileWatchSubscription {
         label: impl Into<String>,
         interval: Duration,
         mut snapshot: F,
-        callback: FileWatchCallback,
-    ) -> Self
+    ) -> (Self, FileWatchReceiver)
     where
         F: FnMut() -> Result<HashMap<FileNodePath, Option<FileSignature>>, String> + Send + 'static,
     {
         let label = label.into();
         let (stop_sender, stop_receiver) = mpsc::channel();
+        let (sender, receiver) = tokio_mpsc::channel(FILE_WATCH_EVENT_CAPACITY);
         let thread_label = label.clone();
         let thread = thread::spawn(move || {
             log::info!(
@@ -548,7 +572,9 @@ impl FileWatchSubscription {
                                     thread_label,
                                     changes.len()
                                 );
-                                callback(changes);
+                                if sender.blocking_send(changes).is_err() {
+                                    break;
+                                }
                             }
                         } else {
                             log::debug!(
@@ -578,10 +604,15 @@ impl FileWatchSubscription {
             log::info!("file watcher stopped label={thread_label}");
         });
 
-        Self::new(label, move || {
-            let _ = stop_sender.send(());
-            drop(thread);
-        })
+        (
+            Self::new(label, move || {
+                let _ = stop_sender.send(());
+                if thread.join().is_err() {
+                    log::warn!("file watcher worker panicked during shutdown");
+                }
+            }),
+            receiver,
+        )
     }
 }
 
@@ -665,17 +696,15 @@ pub trait FileAccess: Send + Sync {
         paths.iter().map(|path| self.info(path)).collect()
     }
 
-    fn read_with_info(&self, request: FileReadRequest, callback: FileOperationCallback<FileRead>);
-
-    fn write_node(&self, request: FileWriteRequest, callback: FileOperationCallback<()>);
-    fn copy_node(&self, request: FileCopyRequest, callback: FileOperationCallback<FileNodePath>);
-    fn move_node(&self, request: FileMoveRequest, callback: FileOperationCallback<FileNodePath>);
-    fn delete(&self, request: FileDeleteRequest, callback: FileOperationCallback<()>);
+    fn read_with_info_events(&self, request: FileReadRequest) -> FileOperationReceiver<FileRead>;
+    fn write_node_events(&self, request: FileWriteRequest) -> FileOperationReceiver<()>;
+    fn copy_node_events(&self, request: FileCopyRequest) -> FileOperationReceiver<FileNodePath>;
+    fn move_node_events(&self, request: FileMoveRequest) -> FileOperationReceiver<FileNodePath>;
+    fn delete_events(&self, request: FileDeleteRequest) -> FileOperationReceiver<()>;
 
     fn watch(
         &self,
         request: FileWatchRequest,
-        callback: FileWatchCallback,
-    ) -> Result<FileWatchSubscription, String>;
+    ) -> Result<(FileWatchSubscription, FileWatchReceiver), String>;
     fn search_text(&self, query: FileSearchQuery) -> Result<FileSearchOutput, String>;
 }

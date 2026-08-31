@@ -2,6 +2,7 @@ use super::{PreviewMatchRequest, PreviewRequest};
 use crate::git::FileComparison;
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::thread;
 
 struct TextPreviewLoad {
     text: String,
@@ -130,12 +131,11 @@ fn show_text(request: PreviewRequest<'_>, selection: Option<(usize, usize)>) {
 
                 if let Some(git) = git.clone() {
                     let (sender, receiver) = mpsc::channel();
-                    git.comparison(
-                        &apply_file_path,
-                        Box::new(move |result| {
-                            let _ = sender.send(result.ok());
-                        }),
-                    );
+                    let comparison = git.comparison(&apply_file_path);
+                    thread::spawn(move || {
+                        let result = comparison.blocking_recv().ok().and_then(Result::ok);
+                        let _ = sender.send(result);
+                    });
                     super::receive_preview_load(
                         Rc::clone(&deferred_right),
                         load_token,

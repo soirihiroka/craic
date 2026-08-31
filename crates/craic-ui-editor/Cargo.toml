@@ -7,10 +7,11 @@ license.workspace = true
 [features]
 editor-bench = []
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 adw.workspace = true
 craic-config.workspace = true
 craic-language.workspace = true
+craic-render-skia.workspace = true
 craic-file-support.workspace = true
 craic-text-layout.workspace = true
 craic-ui-core.workspace = true

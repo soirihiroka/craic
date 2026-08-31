@@ -1,12 +1,13 @@
 use super::{diff_canvas::DiffCanvas, widgets};
-use crate::git::{DiffKind, FileComparison, FileDiffRow};
+use crate::git::{DiffKind, FileComparison};
 use crate::ui::components::search::SearchPanel;
 use adw::prelude::*;
+use craic_render_skia::{
+    DiffFoldRange, DiffRow, DiffRowKind, build_initial_diff_folds, display_diff_rows,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-const FOLD_KEEP_CONTEXT: usize = 3;
-const FOLD_MIN_HIDDEN: usize = 8;
 #[derive(Clone)]
 pub struct DiffView {
     pub root: gtk::Box,
@@ -16,7 +17,7 @@ pub struct DiffView {
     deleted: gtk::Label,
     search_panel: SearchPanel,
     canvas: DiffCanvas,
-    full_rows: Rc<RefCell<Vec<FileDiffRow>>>,
+    full_rows: Rc<RefCell<Vec<DiffRow>>>,
     folds: Rc<RefCell<Vec<DiffFoldRange>>>,
     current_signature: Rc<RefCell<Option<DiffSignature>>>,
 }
@@ -120,8 +121,19 @@ impl DiffView {
         } else {
             Vec::new()
         };
-        self.full_rows.replace(comparison.rows.clone());
-        let next_folds = build_initial_folds(&comparison.rows, &previous_folds);
+        let rows = comparison
+            .rows
+            .iter()
+            .map(|row| DiffRow {
+                left_number: row.left_number,
+                right_number: row.right_number,
+                left_text: row.left_text.clone(),
+                right_text: row.right_text.clone(),
+                left_kind: portable_kind(row.left_kind),
+                right_kind: portable_kind(row.right_kind),
+            })
+            .collect::<Vec<_>>();
+        let next_folds = build_initial_diff_folds(&rows, &previous_folds);
         log::debug!(
             "diff_view refresh path={} rows={} folds={} previous_folds={} preserve_scroll={} scroll_y={:.1} fingerprint={:016x}",
             file_path,
@@ -132,9 +144,13 @@ impl DiffView {
             scroll_y,
             signature.fingerprint
         );
+        self.full_rows.replace(rows);
         self.folds.replace(next_folds);
-        self.canvas
-            .set_syntax_for_file(file_path, comparison.fingerprint, &comparison.rows);
+        self.canvas.set_syntax_for_file(
+            file_path,
+            comparison.fingerprint,
+            &self.full_rows.borrow(),
+        );
         refresh_canvas(&self.canvas, &self.full_rows, &self.folds, scroll_y);
         self.search_panel.set_status(&self.canvas.search_status());
         self.current_signature.replace(Some(signature));
@@ -172,17 +188,10 @@ impl DiffSignature {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DiffFoldRange {
-    start: usize,
-    end: usize,
-    expanded: bool,
-}
-
 fn connect_diff_folds(
     canvas: &DiffCanvas,
     search_panel: &SearchPanel,
-    full_rows: &Rc<RefCell<Vec<FileDiffRow>>>,
+    full_rows: &Rc<RefCell<Vec<DiffRow>>>,
     folds: &Rc<RefCell<Vec<DiffFoldRange>>>,
 ) {
     canvas.set_fold_callback({
@@ -264,48 +273,27 @@ fn toggle_fold(folds: &Rc<RefCell<Vec<DiffFoldRange>>>, fold_index: usize) -> bo
 
 fn normalize_diff_folds(folds: &mut Vec<DiffFoldRange>, row_count: usize) {
     let before = folds.clone();
-    let mut normalized: Vec<DiffFoldRange> = Vec::with_capacity(folds.len());
-
-    folds.sort_by_key(|fold| (fold.start, fold.end));
-    for mut fold in folds.iter().copied() {
-        fold.start = fold.start.min(row_count);
-        fold.end = fold.end.min(row_count);
-        if fold.start >= fold.end {
-            continue;
-        }
-        if let Some(previous) = normalized.last() {
-            if fold.start < previous.end {
-                fold.start = previous.end;
-            }
-            if fold.start >= fold.end {
-                continue;
-            }
-        }
-        normalized.push(fold);
-    }
-
-    if *folds == normalized {
+    if !craic_render_skia::normalize_diff_folds(folds, row_count) {
         return;
     }
 
     log::debug!(
         "diff_view normalized folds before={} after={} row_count={row_count}",
         before.len(),
-        normalized.len()
+        folds.len()
     );
-    *folds = normalized;
 }
 
 fn refresh_canvas(
     canvas: &DiffCanvas,
-    full_rows: &Rc<RefCell<Vec<FileDiffRow>>>,
+    full_rows: &Rc<RefCell<Vec<DiffRow>>>,
     folds: &Rc<RefCell<Vec<DiffFoldRange>>>,
     scroll_y: f64,
 ) {
     let full_rows = full_rows.borrow();
     let mut folds = folds.borrow_mut();
     normalize_diff_folds(&mut folds, full_rows.len());
-    let display_rows = display_rows(&full_rows, &folds);
+    let display_rows = display_diff_rows(&full_rows, &folds);
     log::debug!(
         "diff_view canvas refresh source_rows={} display_rows={} folds={} expanded_folds={} scroll_y={:.1}",
         full_rows.len(),
@@ -318,108 +306,13 @@ fn refresh_canvas(
     canvas.set_scroll_y(scroll_y);
 }
 
-fn build_initial_folds(
-    rows: &[FileDiffRow],
-    previous_folds: &[DiffFoldRange],
-) -> Vec<DiffFoldRange> {
-    let mut folds = Vec::new();
-    let mut index = 0;
-
-    while index < rows.len() {
-        if !is_context_row(&rows[index]) {
-            index += 1;
-            continue;
-        }
-
-        let run_start = index;
-        while index < rows.len() && is_context_row(&rows[index]) {
-            index += 1;
-        }
-        let run_end = index;
-        let has_before = run_start > 0;
-        let has_after = run_end < rows.len();
-        let keep_before = if has_before { FOLD_KEEP_CONTEXT } else { 0 };
-        let keep_after = if has_after { FOLD_KEEP_CONTEXT } else { 0 };
-        let fold_start = (run_start + keep_before).min(run_end);
-        let fold_end = run_end.saturating_sub(keep_after).max(fold_start);
-
-        if fold_end.saturating_sub(fold_start) >= FOLD_MIN_HIDDEN {
-            let previous = previous_folds
-                .iter()
-                .find(|fold| fold.start == fold_start && fold.end == fold_end)
-                .copied();
-            folds.push(previous.unwrap_or(DiffFoldRange {
-                start: fold_start,
-                end: fold_end,
-                expanded: false,
-            }));
-        }
+fn portable_kind(kind: DiffKind) -> DiffRowKind {
+    match kind {
+        DiffKind::Context => DiffRowKind::Context,
+        DiffKind::Deleted => DiffRowKind::Deleted,
+        DiffKind::Added => DiffRowKind::Added,
+        DiffKind::Fold => DiffRowKind::Fold,
     }
-
-    folds
-}
-
-fn display_rows(full_rows: &[FileDiffRow], folds: &[DiffFoldRange]) -> Vec<FileDiffRow> {
-    if folds.is_empty() {
-        return full_rows.to_vec();
-    }
-
-    let mut rows = Vec::new();
-    let mut source_index = 0;
-
-    for (fold_index, fold) in folds.iter().copied().enumerate() {
-        while source_index < fold.start {
-            if let Some(row) = full_rows.get(source_index) {
-                rows.push(row.clone());
-            }
-            source_index += 1;
-        }
-
-        rows.push(fold_row(fold_index, fold));
-
-        if fold.expanded {
-            while source_index < fold.end {
-                if let Some(row) = full_rows.get(source_index) {
-                    rows.push(row.clone());
-                }
-                source_index += 1;
-            }
-        } else {
-            source_index = fold.end;
-        }
-    }
-
-    while source_index < full_rows.len() {
-        if let Some(row) = full_rows.get(source_index) {
-            rows.push(row.clone());
-        }
-        source_index += 1;
-    }
-
-    rows
-}
-
-fn fold_row(fold_index: usize, fold: DiffFoldRange) -> FileDiffRow {
-    let count = fold.end.saturating_sub(fold.start);
-    let label = match (fold.expanded, count) {
-        (true, 1) => "- 1 shown line".to_string(),
-        (true, count) => format!("- {count} shown lines"),
-        (false, 1) => "+ 1 hidden line".to_string(),
-        (false, count) => format!("+ {count} hidden lines"),
-    };
-
-    FileDiffRow {
-        left_number: Some(fold_index),
-        right_number: Some(fold_index),
-        left_text: Some(label.clone()),
-        right_text: Some(label),
-        left_kind: DiffKind::Fold,
-        right_kind: DiffKind::Fold,
-    }
-}
-
-fn is_context_row(row: &FileDiffRow) -> bool {
-    row.left_kind == DiffKind::Context && row.right_kind == DiffKind::Context
 }
 
 fn stats_label(text: &str) -> gtk::Label {

@@ -1,6 +1,6 @@
 use super::{PreviewMatchRequest, PreviewRequest};
-use crate::system::capabilities::files::{FileOperationEvent, FileReadRequest};
-use std::sync::mpsc;
+use crate::system::capabilities::files::{FileOperation, FileReadRequest, wait_file_operation};
+use std::{sync::mpsc, thread};
 
 const MAX_FONT_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -18,24 +18,20 @@ pub fn show(request: PreviewRequest<'_>) {
     if len > MAX_FONT_PREVIEW_BYTES {
         let _ = sender.send(Err(format!("{file_path} is too large to preview.")));
     } else {
-        request.files.read_with_info(
-            FileReadRequest {
-                path: node_path,
-                max_bytes: Some(MAX_FONT_PREVIEW_BYTES),
-                cancel_requested: None,
-            },
-            Box::new(move |event| {
-                if let FileOperationEvent::Finished(result) = event {
-                    let result = result
+        let events = request.files.read_with_info_events(FileReadRequest {
+            path: node_path,
+            max_bytes: Some(MAX_FONT_PREVIEW_BYTES),
+            cancel_requested: None,
+        });
+        thread::spawn(move || {
+            let result = wait_file_operation(events, FileOperation::Read)
+                .map_err(|err| format!("Unable to preview font: {err}"))
+                .and_then(|read| {
+                    read.into_bytes()
                         .map_err(|err| format!("Unable to preview font: {err}"))
-                        .and_then(|read| {
-                            read.into_bytes()
-                                .map_err(|err| format!("Unable to preview font: {err}"))
-                        });
-                    let _ = sender.send(result);
-                }
-            }),
-        );
+                });
+            let _ = sender.send(result);
+        });
     }
 
     super::receive_preview_load(

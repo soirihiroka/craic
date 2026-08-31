@@ -1,10 +1,10 @@
 use super::{FileBrowser, tree::BrowserRow};
 use crate::system::FileNodePath;
-use crate::system::capabilities::files::{FileWatchCallback, FileWatchRequest};
+use crate::system::capabilities::files::{FileWatchReceiver, FileWatchRequest};
 use craic_ui_core::ui::command_mailbox;
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -46,7 +46,20 @@ impl FileBrowser {
                 };
                 browser.refresh_watched_folder_view(event_generation, changed_paths);
             });
-        let (changes_sender, changes_receiver) = mpsc::channel();
+        let request = FileWatchRequest {
+            paths: signature.directories.clone(),
+        };
+        let (subscription, changes_receiver) = match file_access.watch(request) {
+            Ok(watch) => watch,
+            Err(err) => {
+                log::warn!(
+                    "file browser watch registration failed workspace={} watched_dirs={} err={err}",
+                    workspace.display_name,
+                    signature.directories.len()
+                );
+                return;
+            }
+        };
         let (stop_sender, stop_receiver) = mpsc::channel();
         let debounce_workspace = signature.workspace_id.clone();
         let debounce_thread = thread::spawn(move || {
@@ -58,40 +71,16 @@ impl FileBrowser {
                 updates,
             );
         });
-        let mut subscriptions = Vec::new();
-
-        let request = FileWatchRequest {
-            paths: signature.directories.clone(),
-        };
-        let callback: FileWatchCallback = Arc::new(move |changes| {
-            let _ = changes_sender.send(changes);
-        });
-        match file_access.watch(request, callback) {
-            Ok(subscription) => subscriptions.push(subscription),
-            Err(err) => {
-                log::warn!(
-                    "file browser watch registration failed workspace={} watched_dirs={} err={err}",
-                    workspace.display_name,
-                    signature.directories.len()
-                );
-            }
-        }
 
         log::info!(
             "file browser watch scope updated workspace={} watched_dirs={} subscriptions={}",
             workspace.display_name,
             signature.directories.len(),
-            subscriptions.len()
+            1
         );
 
-        if subscriptions.is_empty() {
-            let _ = stop_sender.send(());
-            let _ = debounce_thread.join();
-            return;
-        }
-
         self.file_watch_signature.replace(Some(signature.clone()));
-        self.file_watch_subscriptions.replace(subscriptions);
+        self.file_watch_subscriptions.replace(vec![subscription]);
         self.file_watch_event_subscription
             .replace(Some(event_subscription));
         self.file_watch_debounce_stop.replace(Some(stop_sender));
@@ -195,7 +184,7 @@ impl FileBrowser {
 fn debounce_file_watch_events(
     workspace_id: String,
     generation: u64,
-    changes: mpsc::Receiver<HashSet<FileNodePath>>,
+    mut changes: FileWatchReceiver,
     stop: mpsc::Receiver<()>,
     updates: command_mailbox::UiCommandSender<(u64, HashSet<FileNodePath>)>,
 ) {
@@ -207,19 +196,18 @@ fn debounce_file_watch_events(
     let mut pending = HashSet::new();
     let mut pending_since = None;
     let mut last_change_at = None;
-    loop {
-        if stop.try_recv().is_ok() {
-            break;
-        }
-        match changes.recv_timeout(Duration::from_millis(50)) {
-            Ok(paths) => {
-                let now = Instant::now();
-                pending_since.get_or_insert(now);
-                last_change_at = Some(now);
-                pending.extend(paths);
+    'watch: loop {
+        loop {
+            match changes.try_recv() {
+                Ok(paths) => {
+                    let now = Instant::now();
+                    pending_since.get_or_insert(now);
+                    last_change_at = Some(now);
+                    pending.extend(paths);
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break 'watch,
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
 
         let now = Instant::now();
@@ -231,6 +219,11 @@ fn debounce_file_watch_events(
             updates.send((generation, std::mem::take(&mut pending)));
             pending_since = None;
             last_change_at = None;
+        }
+
+        match stop.recv_timeout(Duration::from_millis(50)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
     log::info!(

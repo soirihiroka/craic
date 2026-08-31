@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 craic-language.workspace = true
 gtk.workspace = true
 pulldown-cmark.workspace = true

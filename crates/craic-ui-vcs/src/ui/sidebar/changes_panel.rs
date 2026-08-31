@@ -1,11 +1,11 @@
 use super::super::{canvas_scroll, widgets};
 use super::changes::{
-    ChangedFileContextCallback, ChangedFileItem, changed_file_factory, default_commit_summary,
-    file_signature, install_empty_space_unselect, set_realized_file_checks,
+    ChangedFileContextCallback, ChangedFileItem, changed_file_factory, file_signature,
+    install_empty_space_unselect, set_realized_file_checks,
     update_commit_button_sensitivity_for_paths,
 };
 use super::commit_panel::CommitPanel;
-use crate::git::RepositorySnapshot;
+use crate::git::{RepositorySnapshot, default_commit_summary};
 use crate::ui::components::search::SearchPanel;
 use adw::prelude::*;
 use gtk::gio;

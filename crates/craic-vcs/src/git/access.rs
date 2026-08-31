@@ -10,7 +10,9 @@ use crate::system::capabilities::{
         ShellAccess, ShellCommandEvent, ShellCommandOutput, ShellCommandRunRequest,
         ShellCommandSpec, ShellRunRequest,
     },
+    terminal_link::{TerminalLinkAccess, TerminalLinkTarget},
 };
+use crate::system::path::FileNodePath;
 use crate::system::path::WorkspaceRef;
 use crate::{bitbucket, gitlab};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -22,6 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch};
 
 const GIT_CHANGE_LISTENER_INTERVAL: Duration = Duration::from_secs(2);
 const GIT_BACKGROUND_PULL_INTERVAL: Duration = Duration::from_secs(60);
@@ -42,9 +45,9 @@ fn successful_fetch_times() -> &'static Mutex<HashMap<String, SystemTime>> {
     FETCH_TIMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub type OperationCallback<T> = Box<dyn FnOnce(Result<T, String>) + Send + 'static>;
-pub type WatchCallback<T> = Box<dyn FnMut(Result<T, String>) + Send + 'static>;
 pub type ChangeListener = Arc<dyn Fn() + Send + Sync + 'static>;
+pub type GitOperationReceiver<T> = oneshot::Receiver<Result<T, String>>;
+pub type FileDiffReceiver<T> = watch::Receiver<Option<Result<T, String>>>;
 
 #[derive(Debug)]
 pub enum GitCommandEvent {
@@ -53,7 +56,9 @@ pub enum GitCommandEvent {
     Failed { message: String },
 }
 
-pub type GitCommandGenerator = mpsc::Receiver<GitCommandEvent>;
+pub type GitCommandGenerator = tokio_mpsc::Receiver<GitCommandEvent>;
+
+const GIT_COMMAND_EVENT_CAPACITY: usize = 256;
 
 pub trait GitOperationHook: Send + Sync {
     fn pre(&self) -> Result<Box<dyn GitOperationPostHook>, String>;
@@ -74,15 +79,9 @@ pub fn clone_repository_with_shell(
         remote.trim().to_string(),
         destination_name.to_string(),
     ];
-    let (sender, receiver) = mpsc::channel();
-    shell.run_fast_command(
-        ShellCommandRunRequest::new("git clone", working_dir, "git").args(args),
-        Box::new(move |result| {
-            let _ = sender.send(result);
-        }),
-    );
-    let output = receiver
-        .recv()
+    let output = shell
+        .run_fast_command(ShellCommandRunRequest::new("git clone", working_dir, "git").args(args))
+        .blocking_recv()
         .map_err(|_| "git clone command did not return a result.".to_string())??;
     if output.status_success(&[0]) {
         Ok("Repository cloned.".to_string())
@@ -210,8 +209,9 @@ impl Drop for ChangeListenerSubscription {
 
 pub struct FileDiffSubscription {
     stop_sender: Option<mpsc::Sender<()>>,
+    wake_sender: Option<mpsc::Sender<()>>,
     _listener: ChangeListenerSubscription,
-    _thread: Option<thread::JoinHandle<()>>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl FileDiffSubscription {
@@ -221,19 +221,20 @@ impl FileDiffSubscription {
         file_path: String,
         listener: ChangeListenerSubscription,
         events: mpsc::Receiver<()>,
-        mut callback: WatchCallback<T>,
+        wake_sender: mpsc::Sender<()>,
         mut load: F,
-    ) -> Self
+    ) -> (Self, FileDiffReceiver<T>)
     where
-        T: Send + 'static,
+        T: Send + Sync + 'static,
         F: FnMut(&GitRepoHandle, &str) -> Result<T, String> + Send + 'static,
     {
         let label = label.into();
         let (stop_sender, stop_receiver) = mpsc::channel();
+        let (sender, receiver) = watch::channel(None);
         let thread_label = label.clone();
         let thread = thread::spawn(move || {
             log::info!("git file diff watcher started label={thread_label} path={file_path}");
-            callback(load(&git, &file_path));
+            sender.send_replace(Some(load(&git, &file_path)));
 
             loop {
                 if stop_receiver.try_recv().is_ok() {
@@ -246,7 +247,7 @@ impl FileDiffSubscription {
                         if stop_receiver.try_recv().is_ok() {
                             break;
                         }
-                        callback(load(&git, &file_path));
+                        sender.send_replace(Some(load(&git, &file_path)));
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -256,11 +257,15 @@ impl FileDiffSubscription {
             log::info!("git file diff watcher stopped label={thread_label}");
         });
 
-        Self {
-            stop_sender: Some(stop_sender),
-            _listener: listener,
-            _thread: Some(thread),
-        }
+        (
+            Self {
+                stop_sender: Some(stop_sender),
+                wake_sender: Some(wake_sender),
+                _listener: listener,
+                thread: Some(thread),
+            },
+            receiver,
+        )
     }
 }
 
@@ -268,6 +273,14 @@ impl Drop for FileDiffSubscription {
     fn drop(&mut self) {
         if let Some(stop_sender) = self.stop_sender.take() {
             let _ = stop_sender.send(());
+        }
+        if let Some(wake_sender) = self.wake_sender.take() {
+            let _ = wake_sender.send(());
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            log::warn!("git file diff watcher panicked during shutdown");
         }
     }
 }
@@ -399,6 +412,7 @@ pub struct GitRepoHandle {
     workspace: WorkspaceRef,
     shell: Arc<dyn ShellAccess>,
     files: Arc<dyn FileAccess>,
+    terminal_links: Option<Arc<dyn TerminalLinkAccess>>,
     hooks: Vec<Arc<dyn GitOperationHook>>,
 }
 
@@ -417,8 +431,14 @@ impl GitRepoHandle {
             workspace,
             shell,
             files,
+            terminal_links: None,
             hooks: Vec::new(),
         }
+    }
+
+    pub fn with_terminal_links(mut self, terminal_links: Arc<dyn TerminalLinkAccess>) -> Self {
+        self.terminal_links = Some(terminal_links);
+        self
     }
 
     pub fn with_hook(mut self, hook: Arc<dyn GitOperationHook>) -> Self {
@@ -437,8 +457,8 @@ impl GitRepoHandle {
     ) -> Result<String, String> {
         let request = ShellCommandRunRequest::new("git", self.workspace.root.clone(), "git")
             .args(args.iter().cloned());
-        let events = self.shell.stream_fast_command(request);
-        for event in events {
+        let mut events = self.shell.stream_fast_command(request);
+        while let Some(event) = events.blocking_recv() {
             match event {
                 ShellCommandEvent::Record { text, .. } => {
                     progress(text);
@@ -495,19 +515,14 @@ impl GitRepoHandle {
         stdin: Option<&[u8]>,
         success_codes: &[i32],
     ) -> Result<ShellCommandOutput, String> {
-        let (sender, receiver) = mpsc::channel();
         let mut request = ShellRunRequest::new(operation, self.workspace.root.clone(), script);
         if let Some(stdin) = stdin {
             request = request.stdin(stdin.to_vec());
         }
-        self.shell.run_fast_script(
-            request,
-            Box::new(move |result| {
-                let _ = sender.send(result);
-            }),
-        );
-        let output = receiver
-            .recv()
+        let output = self
+            .shell
+            .run_fast_script(request)
+            .blocking_recv()
             .map_err(|_| format!("{operation} shell command did not return a result."))??;
         if output.status_success(success_codes) {
             Ok(output)
@@ -541,21 +556,16 @@ impl GitRepoHandle {
         stdin: Option<&[u8]>,
         success_codes: &[i32],
     ) -> Result<ShellCommandOutput, String> {
-        let (sender, receiver) = mpsc::channel();
         let mut request =
             ShellCommandRunRequest::new(operation, self.workspace.root.clone(), program)
                 .args(args.iter().cloned());
         if let Some(stdin) = stdin {
             request = request.stdin(stdin.to_vec());
         }
-        self.shell.run_fast_command(
-            request,
-            Box::new(move |result| {
-                let _ = sender.send(result);
-            }),
-        );
-        let output = receiver
-            .recv()
+        let output = self
+            .shell
+            .run_fast_command(request)
+            .blocking_recv()
             .map_err(|_| format!("{operation} command did not return a result."))??;
         if output.status_success(success_codes) {
             Ok(output)
@@ -665,11 +675,12 @@ fn shell_script_with_args(script: &str, args: &[String]) -> String {
     command
 }
 
-fn run_operation<T, F>(operation: &'static str, callback: OperationCallback<T>, run: F)
+fn run_operation<T, F>(operation: &'static str, run: F) -> GitOperationReceiver<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
+    let (sender, receiver) = oneshot::channel();
     thread::spawn(move || {
         let start = Instant::now();
         let result = run();
@@ -679,20 +690,21 @@ where
             if result.is_ok() { "ok" } else { "error" },
             start.elapsed().as_millis()
         );
-        callback(result);
+        let _ = sender.send(result);
     });
+    receiver
 }
 
 fn git_command_generator<F>(operation: &'static str, run: F) -> GitCommandGenerator
 where
     F: FnOnce(&mut dyn FnMut(String)) -> Result<String, String> + Send + 'static,
 {
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = tokio_mpsc::channel(GIT_COMMAND_EVENT_CAPACITY);
     thread::spawn(move || {
         let start = Instant::now();
         let progress_sender = sender.clone();
         let result = run(&mut move |message| {
-            let _ = progress_sender.send(GitCommandEvent::Progress { message });
+            let _ = progress_sender.blocking_send(GitCommandEvent::Progress { message });
         });
         log::debug!(
             "git command generator complete operation={} status={} elapsed_ms={}",
@@ -706,12 +718,95 @@ where
             },
             Err(message) => GitCommandEvent::Failed { message },
         };
-        let _ = sender.send(event);
+        let _ = sender.blocking_send(event);
     });
     receiver
 }
 
 impl GitRepoHandle {
+    pub fn workspace_files(&self) -> Arc<dyn FileAccess> {
+        self.files.clone()
+    }
+
+    pub fn interactive_shell_command(&self) -> Result<(ShellCommandSpec, String), String> {
+        let command = self.shell.interactive_shell(Some(&self.workspace.root))?;
+        let title = self.shell.command_display(&command);
+        Ok((command, title))
+    }
+
+    pub fn interactive_shell_command_at(
+        &self,
+        directory: &FileNodePath,
+    ) -> Result<(ShellCommandSpec, String), String> {
+        let working_directory = directory
+            .to_workspace_path(&self.workspace)
+            .ok_or_else(|| "The terminal directory is outside the active workspace.".to_string())?;
+        let command = self.shell.interactive_shell(Some(&working_directory))?;
+        let title = self.shell.command_display(&command);
+        Ok((command, title))
+    }
+
+    pub fn terminal_command(
+        &self,
+        program: &str,
+        args: &[String],
+    ) -> Result<ShellCommandSpec, String> {
+        self.shell.command(&self.workspace.root, program, args)
+    }
+
+    pub fn terminal_command_at(
+        &self,
+        directory: &FileNodePath,
+        program: &str,
+        args: &[String],
+    ) -> Result<ShellCommandSpec, String> {
+        let working_directory = directory
+            .to_workspace_path(&self.workspace)
+            .ok_or_else(|| "The terminal directory is outside the active workspace.".to_string())?;
+        self.shell.command(&working_directory, program, args)
+    }
+
+    pub fn resolved_terminal_command(
+        &self,
+        program: &str,
+        args: &[String],
+    ) -> Result<ShellCommandSpec, String> {
+        let resolved = self
+            .shell
+            .which(program)?
+            .ok_or_else(|| format!("{program} was not found on the workspace shell path."))?;
+        log::debug!("terminal command resolved program={program} path={resolved}");
+        self.shell.command(&self.workspace.root, &resolved, args)
+    }
+
+    pub fn resolve_workspace_file_link(&self, target: &str) -> Result<TerminalLinkTarget, String> {
+        self.terminal_links
+            .as_ref()
+            .ok_or_else(|| "File-link navigation is unavailable for this workspace.".to_string())?
+            .resolve_file(&self.workspace.root.absolute, target)
+    }
+
+    pub fn github_commit_email_options(
+        &self,
+    ) -> Result<Vec<crate::github::CommitEmailOption>, String> {
+        let gh = self
+            .shell
+            .which("gh")?
+            .ok_or_else(|| "gh was not found on the user shell path.".to_string())?;
+        crate::github::commit_email_options_with_gh(&gh)
+    }
+
+    pub fn github_avatar_url_for_email(&self, email: &str) -> Result<String, String> {
+        if crate::github::login_from_noreply_email(email).is_some() {
+            return crate::github::avatar_url_for_email(email);
+        }
+        let gh = self
+            .shell
+            .which("gh")?
+            .ok_or_else(|| "gh was not found on the user shell path.".to_string())?;
+        crate::github::avatar_url_for_email_with_gh(email, &gh)
+    }
+
     pub fn load_repository_snapshot(&self) -> Result<RepositorySnapshot, String> {
         self.repository_snapshot_blocking()
     }
@@ -720,18 +815,18 @@ impl GitRepoHandle {
         self.workspace_snapshot_blocking()
     }
 
-    pub fn snapshot(&self, callback: OperationCallback<RepositorySnapshot>) {
+    pub fn snapshot(&self) -> GitOperationReceiver<RepositorySnapshot> {
         let handle = self.clone();
-        run_operation("git snapshot", callback, move || {
+        run_operation("git snapshot", move || {
             handle.repository_snapshot_blocking()
-        });
+        })
     }
 
-    pub fn workspace_snapshot(&self, callback: OperationCallback<WorkspaceSnapshot>) {
+    pub fn workspace_snapshot(&self) -> GitOperationReceiver<WorkspaceSnapshot> {
         let handle = self.clone();
-        run_operation("git workspace snapshot", callback, move || {
+        run_operation("git workspace snapshot", move || {
             handle.workspace_snapshot_blocking()
-        });
+        })
     }
 
     pub fn add_on_change_listener(&self, listener: ChangeListener) -> ChangeListenerSubscription {
@@ -761,33 +856,63 @@ impl GitRepoHandle {
     pub fn workspace_metadata(
         &self,
         github: Option<Arc<dyn GitHubAccess>>,
-        callback: OperationCallback<git::WorkspaceRepositoryMetadata>,
-    ) {
+    ) -> GitOperationReceiver<git::WorkspaceRepositoryMetadata> {
         let handle = self.clone();
-        run_operation("git workspace metadata", callback, move || {
+        run_operation("git workspace metadata", move || {
             handle.run_with_hooks("git workspace metadata", || {
                 Ok(handle.workspace_metadata_blocking(github.as_deref()))
             })
-        });
+        })
     }
 
-    pub fn initialize_repository(&self, callback: OperationCallback<String>) {
+    pub async fn workspace_metadata_async(
+        &self,
+        github: Option<Arc<dyn GitHubAccess>>,
+    ) -> Result<git::WorkspaceRepositoryMetadata, String> {
         let handle = self.clone();
-        run_operation("git initialize repository", callback, move || {
+        tokio::task::spawn_blocking(move || {
+            handle.run_with_hooks("git workspace metadata", || {
+                Ok(handle.workspace_metadata_blocking(github.as_deref()))
+            })
+        })
+        .await
+        .map_err(|error| format!("Git workspace metadata task did not complete: {error}"))?
+    }
+
+    pub fn initialize_repository(&self) -> GitOperationReceiver<String> {
+        let handle = self.clone();
+        run_operation("git initialize repository", move || {
             handle.initialize_repository_blocking()
-        });
+        })
+    }
+
+    pub async fn initialize_repository_async(&self) -> Result<String, String> {
+        let handle = self.clone();
+        tokio::task::spawn_blocking(move || handle.initialize_repository_blocking())
+            .await
+            .map_err(|error| format!("Git initialization task did not complete: {error}"))?
     }
 
     pub fn commit_message_context(
         &self,
         files: &[String],
-        callback: OperationCallback<CommitMessageContext>,
-    ) {
+    ) -> GitOperationReceiver<CommitMessageContext> {
         let handle = self.clone();
         let files = files.to_vec();
-        run_operation("git commit message context", callback, move || {
+        run_operation("git commit message context", move || {
             handle.commit_message_context_blocking(&files)
-        });
+        })
+    }
+
+    pub async fn commit_message_context_async(
+        &self,
+        files: &[String],
+    ) -> Result<CommitMessageContext, String> {
+        let handle = self.clone();
+        let files = files.to_vec();
+        tokio::task::spawn_blocking(move || handle.commit_message_context_blocking(&files))
+            .await
+            .map_err(|error| format!("Git commit-message context task did not complete: {error}"))?
     }
 
     pub fn commit_paths(
@@ -795,64 +920,109 @@ impl GitRepoHandle {
         summary: &str,
         description: &str,
         files: &[String],
-        callback: OperationCallback<String>,
-    ) {
+    ) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let summary = summary.to_string();
         let description = description.to_string();
         let files = files.to_vec();
-        run_operation("git commit", callback, move || {
+        run_operation("git commit", move || {
             handle.commit_paths_blocking(&summary, &description, &files)
-        });
+        })
     }
 
-    pub fn discard_path(&self, file_path: &str, callback: OperationCallback<String>) {
+    pub async fn commit_paths_async(
+        &self,
+        summary: &str,
+        description: &str,
+        files: &[String],
+    ) -> Result<String, String> {
+        let handle = self.clone();
+        let summary = summary.to_string();
+        let description = description.to_string();
+        let files = files.to_vec();
+        tokio::task::spawn_blocking(move || {
+            handle.commit_paths_blocking(&summary, &description, &files)
+        })
+        .await
+        .map_err(|error| format!("Git commit task did not complete: {error}"))?
+    }
+
+    pub fn discard_path(&self, file_path: &str) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let file_path = file_path.to_string();
-        run_operation("git discard", callback, move || {
+        run_operation("git discard", move || {
             handle.discard_path_blocking(&file_path)
-        });
+        })
+    }
+
+    pub async fn discard_path_async(&self, file_path: &str) -> Result<String, String> {
+        let handle = self.clone();
+        let file_path = file_path.to_string();
+        tokio::task::spawn_blocking(move || handle.discard_path_blocking(&file_path))
+            .await
+            .map_err(|error| format!("Git discard task did not complete: {error}"))?
     }
 
     pub fn check_ignored_paths(
         &self,
         checks: &[gitignore::IgnoreCheck],
-        callback: OperationCallback<HashSet<String>>,
-    ) {
+    ) -> GitOperationReceiver<HashSet<String>> {
         let handle = self.clone();
         let checks = checks.to_vec();
-        run_operation("git check ignored paths", callback, move || {
+        run_operation("git check ignored paths", move || {
             handle.check_ignored_paths_blocking(&checks)
-        });
+        })
     }
 
-    pub fn settings(&self, callback: OperationCallback<GitSettings>) {
+    pub fn settings(&self) -> GitOperationReceiver<GitSettings> {
         let handle = self.clone();
-        run_operation("git settings", callback, move || {
-            Ok(handle.settings_blocking())
-        });
+        run_operation("git settings", move || Ok(handle.settings_blocking()))
     }
 
-    pub fn save_settings(&self, settings: &GitSettings, callback: OperationCallback<()>) {
+    pub async fn settings_async(&self) -> Result<GitSettings, String> {
+        let handle = self.clone();
+        tokio::task::spawn_blocking(move || handle.settings_blocking())
+            .await
+            .map_err(|error| format!("Git settings task did not complete: {error}"))
+    }
+
+    pub fn save_settings(&self, settings: &GitSettings) -> GitOperationReceiver<()> {
         let handle = self.clone();
         let settings = settings.clone();
-        run_operation("git save settings", callback, move || {
+        run_operation("git save settings", move || {
             handle.save_settings_blocking(&settings)
-        });
+        })
     }
 
-    pub fn save_author_identity(&self, name: &str, email: &str, callback: OperationCallback<()>) {
+    pub async fn save_settings_async(&self, settings: &GitSettings) -> Result<(), String> {
+        let handle = self.clone();
+        let settings = settings.clone();
+        tokio::task::spawn_blocking(move || handle.save_settings_blocking(&settings))
+            .await
+            .map_err(|error| format!("Git settings save task did not complete: {error}"))?
+    }
+
+    pub fn save_author_identity(&self, name: &str, email: &str) -> GitOperationReceiver<()> {
         let handle = self.clone();
         let name = name.to_string();
         let email = email.to_string();
-        run_operation("git save author identity", callback, move || {
+        run_operation("git save author identity", move || {
             handle.save_author_identity_blocking(&name, &email)
-        });
+        })
     }
 
-    pub fn push(&self, callback: OperationCallback<String>) {
+    pub async fn save_author_identity_async(&self, name: &str, email: &str) -> Result<(), String> {
         let handle = self.clone();
-        run_operation("git push", callback, move || handle.push_blocking());
+        let name = name.to_string();
+        let email = email.to_string();
+        tokio::task::spawn_blocking(move || handle.save_author_identity_blocking(&name, &email))
+            .await
+            .map_err(|error| format!("Git author update task did not complete: {error}"))?
+    }
+
+    pub fn push(&self) -> GitOperationReceiver<String> {
+        let handle = self.clone();
+        run_operation("git push", move || handle.push_blocking())
     }
 
     pub fn push_with_progress(&self) -> GitCommandGenerator {
@@ -862,9 +1032,9 @@ impl GitRepoHandle {
         })
     }
 
-    pub fn pull(&self, callback: OperationCallback<String>) {
+    pub fn pull(&self) -> GitOperationReceiver<String> {
         let handle = self.clone();
-        run_operation("git pull", callback, move || handle.pull_blocking());
+        run_operation("git pull", move || handle.pull_blocking())
     }
 
     pub fn pull_with_progress(&self) -> GitCommandGenerator {
@@ -884,13 +1054,13 @@ impl GitRepoHandle {
         })
     }
 
-    pub fn publish(&self, remote: &str, branch: &str, callback: OperationCallback<String>) {
+    pub fn publish(&self, remote: &str, branch: &str) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let remote = remote.to_string();
         let branch = branch.to_string();
-        run_operation("git publish", callback, move || {
+        run_operation("git publish", move || {
             handle.publish_blocking(&remote, &branch)
-        });
+        })
     }
 
     pub fn publish_with_progress(&self, remote: &str, branch: &str) -> GitCommandGenerator {
@@ -910,150 +1080,186 @@ impl GitRepoHandle {
         })
     }
 
-    pub fn checkout_branch(&self, branch: &str, callback: OperationCallback<String>) {
+    pub fn checkout_branch(&self, branch: &str) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let branch = branch.to_string();
-        run_operation("git checkout branch", callback, move || {
+        run_operation("git checkout branch", move || {
             handle.checkout_branch_blocking(&branch)
-        });
+        })
+    }
+
+    pub async fn checkout_branch_async(&self, branch: &str) -> Result<String, String> {
+        let handle = self.clone();
+        let branch = branch.to_string();
+        tokio::task::spawn_blocking(move || handle.checkout_branch_blocking(&branch))
+            .await
+            .map_err(|error| format!("Git checkout task did not complete: {error}"))?
     }
 
     pub fn checkout_remote_branch(
         &self,
         remote_branch: &str,
         local_branch: &str,
-        callback: OperationCallback<String>,
-    ) {
+    ) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let remote_branch = remote_branch.to_string();
         let local_branch = local_branch.to_string();
-        run_operation("git checkout remote branch", callback, move || {
+        run_operation("git checkout remote branch", move || {
             handle.checkout_remote_branch_blocking(&remote_branch, &local_branch)
-        });
+        })
     }
 
-    pub fn checkout_pull_request(&self, number: u32, callback: OperationCallback<String>) {
+    pub fn checkout_pull_request(&self, number: u32) -> GitOperationReceiver<String> {
         let handle = self.clone();
-        run_operation("git checkout pull request", callback, move || {
+        run_operation("git checkout pull request", move || {
             handle.checkout_pull_request_blocking(number)
-        });
+        })
     }
 
-    pub fn create_branch(&self, branch: &str, callback: OperationCallback<String>) {
+    pub fn create_branch(&self, branch: &str) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let branch = branch.to_string();
-        run_operation("git create branch", callback, move || {
+        run_operation("git create branch", move || {
             handle.create_branch_blocking(&branch)
-        });
+        })
     }
 
-    pub fn merge_branch(&self, branch: &str, callback: OperationCallback<git::MergeResult>) {
+    pub async fn create_branch_async(&self, branch: &str) -> Result<String, String> {
         let handle = self.clone();
         let branch = branch.to_string();
-        run_operation("git merge branch", callback, move || {
-            handle.merge_branch_blocking(&branch)
-        });
+        tokio::task::spawn_blocking(move || handle.create_branch_blocking(&branch))
+            .await
+            .map_err(|error| format!("Git branch-creation task did not complete: {error}"))?
     }
 
-    pub fn checkout_commit(&self, hash: &str, callback: OperationCallback<String>) {
+    pub fn merge_branch(&self, branch: &str) -> GitOperationReceiver<git::MergeResult> {
+        let handle = self.clone();
+        let branch = branch.to_string();
+        run_operation("git merge branch", move || {
+            handle.merge_branch_blocking(&branch)
+        })
+    }
+
+    pub async fn merge_branch_async(&self, branch: &str) -> Result<git::MergeResult, String> {
+        let handle = self.clone();
+        let branch = branch.to_string();
+        tokio::task::spawn_blocking(move || handle.merge_branch_blocking(&branch))
+            .await
+            .map_err(|error| format!("Git merge task did not complete: {error}"))?
+    }
+
+    pub fn checkout_commit(&self, hash: &str) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let hash = hash.to_string();
-        run_operation("git checkout commit", callback, move || {
+        run_operation("git checkout commit", move || {
             handle.checkout_commit_blocking(&hash)
-        });
+        })
     }
 
     pub fn create_branch_at_commit(
         &self,
         branch: &str,
         hash: &str,
-        callback: OperationCallback<String>,
-    ) {
+    ) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let branch = branch.to_string();
         let hash = hash.to_string();
-        run_operation("git create branch at commit", callback, move || {
+        run_operation("git create branch at commit", move || {
             handle.create_branch_at_commit_blocking(&branch, &hash)
-        });
+        })
     }
 
-    pub fn create_tag(&self, tag: &str, hash: &str, callback: OperationCallback<String>) {
+    pub fn create_tag(&self, tag: &str, hash: &str) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let tag = tag.to_string();
         let hash = hash.to_string();
-        run_operation("git create tag", callback, move || {
+        run_operation("git create tag", move || {
             handle.create_tag_blocking(&tag, &hash)
-        });
+        })
     }
 
     pub fn reset_to_commit(
         &self,
         hash: &str,
         mode: git::ResetMode,
-        callback: OperationCallback<String>,
-    ) {
+    ) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let hash = hash.to_string();
-        run_operation("git reset", callback, move || {
+        run_operation("git reset", move || {
             handle.reset_to_commit_blocking(&hash, mode)
-        });
+        })
     }
 
-    pub fn revert_commit(&self, hash: &str, callback: OperationCallback<String>) {
+    pub fn revert_commit(&self, hash: &str) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let hash = hash.to_string();
-        run_operation("git revert", callback, move || {
-            handle.revert_commit_blocking(&hash)
-        });
+        run_operation("git revert", move || handle.revert_commit_blocking(&hash))
     }
 
-    pub fn cherry_pick_commit(&self, hash: &str, callback: OperationCallback<String>) {
+    pub fn cherry_pick_commit(&self, hash: &str) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let hash = hash.to_string();
-        run_operation("git cherry-pick", callback, move || {
+        run_operation("git cherry-pick", move || {
             handle.cherry_pick_commit_blocking(&hash)
-        });
+        })
     }
 
-    pub fn amend_head(
-        &self,
-        summary: &str,
-        description: &str,
-        callback: OperationCallback<String>,
-    ) {
+    pub fn amend_head(&self, summary: &str, description: &str) -> GitOperationReceiver<String> {
         let handle = self.clone();
         let summary = summary.to_string();
         let description = description.to_string();
-        run_operation("git amend head", callback, move || {
+        run_operation("git amend head", move || {
             handle.amend_head_blocking(&summary, &description)
-        });
+        })
     }
 
-    pub fn stash_changes(&self, callback: OperationCallback<String>) {
+    pub fn stash_changes(&self) -> GitOperationReceiver<String> {
         let handle = self.clone();
-        run_operation("git stash", callback, move || {
-            handle.stash_changes_blocking()
-        });
+        run_operation("git stash", move || handle.stash_changes_blocking())
     }
 
-    pub fn pop_stash(&self, callback: OperationCallback<String>) {
+    pub async fn stash_changes_async(&self) -> Result<String, String> {
         let handle = self.clone();
-        run_operation("git stash pop", callback, move || {
-            handle.pop_stash_blocking()
-        });
+        tokio::task::spawn_blocking(move || handle.stash_changes_blocking())
+            .await
+            .map_err(|error| format!("Git stash task did not complete: {error}"))?
+    }
+
+    pub fn add_ignore_pattern(&self, pattern: String) -> GitOperationReceiver<String> {
+        let receiver = gitignore::add_pattern_to_workspace(self.files.clone(), pattern);
+        run_operation("git ignore", move || {
+            receiver
+                .recv()
+                .unwrap_or_else(|_| Err("Ignore operation ended without a result.".to_string()))
+        })
+    }
+
+    pub async fn add_ignore_pattern_async(&self, pattern: String) -> Result<String, String> {
+        let receiver = gitignore::add_pattern_to_workspace(self.files.clone(), pattern);
+        tokio::task::spawn_blocking(move || {
+            receiver
+                .recv()
+                .unwrap_or_else(|_| Err("Ignore operation ended without a result.".to_string()))
+        })
+        .await
+        .map_err(|error| format!("Ignore operation task did not complete: {error}"))?
+    }
+
+    pub fn pop_stash(&self) -> GitOperationReceiver<String> {
+        let handle = self.clone();
+        run_operation("git stash pop", move || handle.pop_stash_blocking())
     }
 
     pub fn commit_page(
         &self,
         after: Option<&str>,
         limit: usize,
-        callback: OperationCallback<git::CommitPage>,
-    ) {
+    ) -> GitOperationReceiver<git::CommitPage> {
         let handle = self.clone();
         let after = after.map(ToString::to_string);
-        run_operation("git commit page", callback, move || {
+        run_operation("git commit page", move || {
             handle.commit_page_blocking(after.as_deref(), limit)
-        });
+        })
     }
 
     pub fn commit_search_page(
@@ -1061,66 +1267,126 @@ impl GitRepoHandle {
         query: &str,
         after: Option<&str>,
         limit: usize,
-        callback: OperationCallback<git::CommitPage>,
-    ) {
+    ) -> GitOperationReceiver<git::CommitPage> {
         let handle = self.clone();
         let query = query.to_string();
         let after = after.map(ToString::to_string);
-        run_operation("git commit search page", callback, move || {
+        run_operation("git commit search page", move || {
             handle.commit_search_page_blocking(&query, after.as_deref(), limit)
-        });
+        })
     }
 
-    pub fn commit_details(&self, hash: &str, callback: OperationCallback<git::Commit>) {
+    pub async fn commit_page_async(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<git::CommitPage, String> {
+        let handle = self.clone();
+        let after = after.map(ToString::to_string);
+        tokio::task::spawn_blocking(move || handle.commit_page_blocking(after.as_deref(), limit))
+            .await
+            .map_err(|error| format!("Git history page task did not complete: {error}"))?
+    }
+
+    pub async fn commit_search_page_async(
+        &self,
+        query: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<git::CommitPage, String> {
+        let handle = self.clone();
+        let query = query.to_string();
+        let after = after.map(ToString::to_string);
+        tokio::task::spawn_blocking(move || {
+            handle.commit_search_page_blocking(&query, after.as_deref(), limit)
+        })
+        .await
+        .map_err(|error| format!("Git history search task did not complete: {error}"))?
+    }
+
+    pub fn commit_details(&self, hash: &str) -> GitOperationReceiver<git::Commit> {
         let handle = self.clone();
         let hash = hash.to_string();
-        run_operation("git commit details", callback, move || {
+        run_operation("git commit details", move || {
             handle.commit_details_blocking(&hash)
-        });
+        })
     }
 
-    pub fn commit_message(&self, hash: &str, callback: OperationCallback<git::CommitMessage>) {
+    pub async fn commit_details_async(&self, hash: &str) -> Result<git::Commit, String> {
         let handle = self.clone();
         let hash = hash.to_string();
-        run_operation("git commit message", callback, move || {
+        tokio::task::spawn_blocking(move || handle.commit_details_blocking(&hash))
+            .await
+            .map_err(|error| format!("Git commit-details task did not complete: {error}"))?
+    }
+
+    pub fn commit_message(&self, hash: &str) -> GitOperationReceiver<git::CommitMessage> {
+        let handle = self.clone();
+        let hash = hash.to_string();
+        run_operation("git commit message", move || {
             handle.commit_message_blocking(&hash)
-        });
+        })
     }
 
-    pub fn commit_parent_hash(&self, hash: &str, callback: OperationCallback<Option<String>>) {
+    pub fn commit_parent_hash(&self, hash: &str) -> GitOperationReceiver<Option<String>> {
         let handle = self.clone();
         let hash = hash.to_string();
-        run_operation("git commit parent hash", callback, move || {
+        run_operation("git commit parent hash", move || {
             handle.commit_parent_hash_blocking(&hash)
-        });
+        })
     }
 
-    pub fn commit_changed_files(
+    pub fn commit_changed_files(&self, hash: &str) -> GitOperationReceiver<Vec<git::ChangedFile>> {
+        let handle = self.clone();
+        let hash = hash.to_string();
+        run_operation("git commit changed files", move || {
+            handle.commit_changed_files_blocking(&hash)
+        })
+    }
+
+    pub async fn commit_changed_files_async(
         &self,
         hash: &str,
-        callback: OperationCallback<Vec<git::ChangedFile>>,
-    ) {
+    ) -> Result<Vec<git::ChangedFile>, String> {
         let handle = self.clone();
         let hash = hash.to_string();
-        run_operation("git commit changed files", callback, move || {
-            handle.commit_changed_files_blocking(&hash)
-        });
+        tokio::task::spawn_blocking(move || handle.commit_changed_files_blocking(&hash))
+            .await
+            .map_err(|error| format!("Git changed-files task did not complete: {error}"))?
     }
 
-    pub fn comparison(&self, file_path: &str, callback: OperationCallback<git::FileComparison>) {
+    pub fn comparison(&self, file_path: &str) -> GitOperationReceiver<git::FileComparison> {
         let handle = self.clone();
         let file_path = file_path.to_string();
-        run_operation("git comparison", callback, move || {
+        run_operation("git comparison", move || {
             handle.comparison_blocking(&file_path)
-        });
+        })
+    }
+
+    pub async fn comparison_async(&self, file_path: &str) -> Result<git::FileComparison, String> {
+        let handle = self.clone();
+        let file_path = file_path.to_string();
+        tokio::task::spawn_blocking(move || handle.comparison_blocking(&file_path))
+            .await
+            .map_err(|error| format!("Git comparison task did not complete: {error}"))?
+    }
+
+    pub async fn bytes_comparison_async(
+        &self,
+        file_path: &str,
+    ) -> Result<git::BytesComparison, String> {
+        let handle = self.clone();
+        let file_path = file_path.to_string();
+        tokio::task::spawn_blocking(move || handle.bytes_comparison_blocking(&file_path))
+            .await
+            .map_err(|error| format!("Git byte-comparison task did not complete: {error}"))?
     }
 
     pub fn watch_comparison(
         &self,
         file_path: &str,
-        callback: WatchCallback<git::FileComparison>,
-    ) -> FileDiffSubscription {
-        self.watch_file_diff(file_path, callback, |handle, file_path| {
+    ) -> (FileDiffSubscription, FileDiffReceiver<git::FileComparison>) {
+        self.watch_file_diff(file_path, |handle, file_path| {
             handle.comparison_blocking(file_path)
         })
     }
@@ -1128,9 +1394,8 @@ impl GitRepoHandle {
     pub fn watch_bytes_comparison(
         &self,
         file_path: &str,
-        callback: WatchCallback<git::BytesComparison>,
-    ) -> FileDiffSubscription {
-        self.watch_file_diff(file_path, callback, |handle, file_path| {
+    ) -> (FileDiffSubscription, FileDiffReceiver<git::BytesComparison>) {
+        self.watch_file_diff(file_path, |handle, file_path| {
             handle.bytes_comparison_blocking(file_path)
         })
     }
@@ -1139,41 +1404,67 @@ impl GitRepoHandle {
         &self,
         hash: &str,
         file_path: &str,
-        callback: OperationCallback<git::FileComparison>,
-    ) {
+    ) -> GitOperationReceiver<git::FileComparison> {
         let handle = self.clone();
         let hash = hash.to_string();
         let file_path = file_path.to_string();
-        run_operation("git commit comparison", callback, move || {
+        run_operation("git commit comparison", move || {
             handle.commit_comparison_blocking(&hash, &file_path)
-        });
+        })
+    }
+
+    pub async fn commit_comparison_async(
+        &self,
+        hash: &str,
+        file_path: &str,
+    ) -> Result<git::FileComparison, String> {
+        let handle = self.clone();
+        let hash = hash.to_string();
+        let file_path = file_path.to_string();
+        tokio::task::spawn_blocking(move || handle.commit_comparison_blocking(&hash, &file_path))
+            .await
+            .map_err(|error| format!("Git commit-comparison task did not complete: {error}"))?
     }
 
     pub fn commit_bytes_comparison(
         &self,
         hash: &str,
         file_path: &str,
-        callback: OperationCallback<git::BytesComparison>,
-    ) {
+    ) -> GitOperationReceiver<git::BytesComparison> {
         let handle = self.clone();
         let hash = hash.to_string();
         let file_path = file_path.to_string();
-        run_operation("git commit bytes comparison", callback, move || {
+        run_operation("git commit bytes comparison", move || {
             handle.commit_bytes_comparison_blocking(&hash, &file_path)
-        });
+        })
+    }
+
+    pub async fn commit_bytes_comparison_async(
+        &self,
+        hash: &str,
+        file_path: &str,
+    ) -> Result<git::BytesComparison, String> {
+        let handle = self.clone();
+        let hash = hash.to_string();
+        let file_path = file_path.to_string();
+        tokio::task::spawn_blocking(move || {
+            handle.commit_bytes_comparison_blocking(&hash, &file_path)
+        })
+        .await
+        .map_err(|error| format!("Git commit byte-comparison task did not complete: {error}"))?
     }
 
     fn watch_file_diff<T, F>(
         &self,
         file_path: &str,
-        callback: WatchCallback<T>,
         load: F,
-    ) -> FileDiffSubscription
+    ) -> (FileDiffSubscription, FileDiffReceiver<T>)
     where
-        T: Send + 'static,
+        T: Send + Sync + 'static,
         F: FnMut(&GitRepoHandle, &str) -> Result<T, String> + Send + 'static,
     {
         let (sender, receiver) = mpsc::channel();
+        let wake_sender = sender.clone();
         let sender = Arc::new(Mutex::new(sender));
         let listener: ChangeListener = Arc::new(move || {
             if let Ok(sender) = sender.lock() {
@@ -1187,7 +1478,7 @@ impl GitRepoHandle {
             file_path.to_string(),
             subscription,
             receiver,
-            callback,
+            wake_sender,
             load,
         )
     }
@@ -1690,40 +1981,45 @@ impl GitRepoHandle {
                 config.github_auth_account,
             )
         };
+        let global_user_name = self
+            .git_ok(&[
+                "config".into(),
+                "--global".into(),
+                "--get".into(),
+                "user.name".into(),
+            ])
+            .ok();
+        let global_user_email = self
+            .git_ok(&[
+                "config".into(),
+                "--global".into(),
+                "--get".into(),
+                "user.email".into(),
+            ])
+            .ok();
+        let local_user_name = self
+            .git_ok(&[
+                "config".into(),
+                "--local".into(),
+                "--get".into(),
+                "user.name".into(),
+            ])
+            .ok();
+        let local_user_email = self
+            .git_ok(&[
+                "config".into(),
+                "--local".into(),
+                "--get".into(),
+                "user.email".into(),
+            ])
+            .ok();
+        let use_global_user = local_user_name.is_none() && local_user_email.is_none();
         GitSettings {
-            global_user_name: self
-                .git_ok(&[
-                    "config".into(),
-                    "--global".into(),
-                    "--get".into(),
-                    "user.name".into(),
-                ])
-                .ok(),
-            global_user_email: self
-                .git_ok(&[
-                    "config".into(),
-                    "--global".into(),
-                    "--get".into(),
-                    "user.email".into(),
-                ])
-                .ok(),
-            local_user_name: self
-                .git_ok(&[
-                    "config".into(),
-                    "--local".into(),
-                    "--get".into(),
-                    "user.name".into(),
-                ])
-                .ok(),
-            local_user_email: self
-                .git_ok(&[
-                    "config".into(),
-                    "--local".into(),
-                    "--get".into(),
-                    "user.email".into(),
-                ])
-                .ok(),
-            use_global_user: false,
+            global_user_name,
+            global_user_email,
+            local_user_name,
+            local_user_email,
+            use_global_user,
             commit_timezone,
             warn_if_remote_owner_mismatch,
             use_system_timezone,

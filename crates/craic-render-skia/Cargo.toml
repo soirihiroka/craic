@@ -1,0 +1,19 @@
+[package]
+name = "craic-render-skia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+craic-language.workspace = true
+craic-text-layout.workspace = true
+libc.workspace = true
+log.workspace = true
+polling.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+skia-safe.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+skia-safe = { version = "0.99", default-features = false, features = ["binary-cache", "embed-icudtl", "metal", "svg", "textlayout"] }

@@ -10,30 +10,38 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 adw = { package = "libadwaita", version = "0.9", features = ["v1_9"] }
+alacritty_terminal = "0.26.0"
+async-trait = "0.1"
 base64 = "0.22.1"
+block2 = "0.6.2"
 cairo = { package = "cairo-rs", version = "0.22", features = ["freetype"] }
 criterion = "0.7"
 craic-agent = { path = "crates/craic-agent" }
+craic-app-core = { path = "crates/craic-app-core" }
 craic-config = { path = "crates/craic-config" }
 craic-codex-app-server = { path = "crates/craic-codex-app-server" }
 craic-dynamic-data = { path = "crates/craic-dynamic-data" }
 craic-file-support = { path = "crates/craic-file-support" }
 craic-language = { path = "crates/craic-language" }
 craic-project = { path = "crates/craic-project" }
+craic-platform = { path = "crates/craic-platform" }
+craic-render-skia = { path = "crates/craic-render-skia" }
 craic-system = { path = "crates/craic-system" }
 craic-text-layout = { path = "crates/craic-text-layout" }
 craic-vcs = { path = "crates/craic-vcs" }
-craic-ui-core = { path = "crates/craic-ui-core" }
+craic-ui-core = { package = "craic-ui-gtk-core", path = "crates/craic-ui-core" }
 craic-ui-agent = { path = "crates/craic-ui-agent" }
 craic-ui-containers = { path = "crates/craic-ui-containers" }
 craic-ui-editor = { path = "crates/craic-ui-editor" }
 craic-ui-file = { path = "crates/craic-ui-file" }
 craic-ui-markdown = { path = "crates/craic-ui-markdown" }
+craic-ui-macos = { path = "crates/craic-ui-macos" }
 craic-ui-object-viewer = { path = "crates/craic-ui-object-viewer" }
 craic-ui-preview = { path = "crates/craic-ui-preview" }
 craic-ui-terminal = { path = "crates/craic-ui-terminal" }
 craic-ui-vcs = { path = "crates/craic-ui-vcs" }
 craic-ui = { path = "crates/craic-ui" }
+dispatch2 = "0.3.1"
 env_logger = "0.11"
 freetype = { package = "freetype-rs", version = "0.38" }
 gdk4-wayland = "0.11"
@@ -47,17 +55,29 @@ log = "0.4"
 jsonc-parser = { version = "0.33.0", features = ["error_unicode_width", "serde"] }
 moka = { version = "0.12", default-features = false, features = ["sync"] }
 nbformat = "3.0.0"
+notify = "8.2"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["objc2-uniform-type-identifiers"] }
+objc2-core-foundation = "0.3.2"
+objc2-core-text = { version = "0.3.2", default-features = false, features = ["std", "block2", "CTFont", "CTFontDescriptor", "CTFontManager"] }
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+objc2-pdf-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-app-kit", "objc2-core-foundation", "objc2-core-graphics", "PDFDocument", "PDFKitPlatform", "PDFView"] }
+objc2-quartz-core = "0.3.2"
+objc2-uniform-type-identifiers = "0.3.2"
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKNavigation", "WKNavigationAction", "WKNavigationDelegate", "WKUserContentController", "WKUserScript", "WKWebView", "WKWebViewConfiguration", "WKWebpagePreferences"] }
 pango = { version = "0.22", features = ["v1_56"] }
 pangocairo = "0.22"
 poppler = { package = "poppler-rs", version = "0.26", features = ["v26_1"] }
+polling = "3.11"
 pulldown-cmark = "0.13"
 regex = "1"
-reqwest = { version = "0.13.4", features = ["blocking"] }
+reqwest = "0.13.4"
 rayon = "1.11"
 rst_parser = "0.4"
 rst_renderer = "0.4"
 rumdl = { version = "0.2.27", default-features = false }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 safetensors = "0.8.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -65,6 +85,8 @@ skia-safe = { version = "0.99", default-features = false, features = ["binary-ca
 sourceview5 = "0.11.0"
 syntect = "5"
 toml = "1"
+tokio = { version = "1.52", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tree-sitter = "0.26"
 tree-sitter-bash = "0.25"
 tree-sitter-c = "0.24"
@@ -98,8 +120,16 @@ typos = "0.10.43"
 typos-dict = "0.13.31"
 unicase = "2.9.0"
 unicode-segmentation = "1.13"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["serde", "v4"] }
 vte4 = { version = "0.10", features = ["v0_84"] }
 walkdir = "2"
 webkit6 = "0.6"
 zeroize = "1"
+
+# The native terminal executes these crates on every PTY update and rendered frame. Keep the
+# application debuggable while avoiding pathologically slow terminal parsing/painting in `make dev`.
+[profile.dev.package.alacritty_terminal]
+opt-level = 2
+
+[profile.dev.package.craic-render-skia]
+opt-level = 2

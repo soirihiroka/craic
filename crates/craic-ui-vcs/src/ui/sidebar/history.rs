@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 const HISTORY_PAGE_SIZE: usize = 32;
@@ -360,24 +361,17 @@ impl HistoryList {
             cursor.as_deref().map(short_hash),
             search_query.len()
         );
-        if search_query.is_empty() {
-            git_handle.commit_page(
-                cursor.as_deref(),
-                HISTORY_PAGE_SIZE,
-                Box::new(move |result| {
-                    let _ = sender.send(result);
-                }),
-            );
+        let operation = if search_query.is_empty() {
+            git_handle.commit_page(cursor.as_deref(), HISTORY_PAGE_SIZE)
         } else {
-            git_handle.commit_search_page(
-                &search_query,
-                cursor.as_deref(),
-                HISTORY_PAGE_SIZE,
-                Box::new(move |result| {
-                    let _ = sender.send(result);
-                }),
-            );
-        }
+            git_handle.commit_search_page(&search_query, cursor.as_deref(), HISTORY_PAGE_SIZE)
+        };
+        thread::spawn(move || {
+            let result = operation
+                .blocking_recv()
+                .unwrap_or_else(|_| Err("History loading ended without a result.".to_string()));
+            let _ = sender.send(result);
+        });
 
         gtk::glib::timeout_add_local(Duration::from_millis(75), {
             let history = self.clone();

@@ -2,7 +2,7 @@ use crate::git::{ChangedFile, GitRepoHandle};
 use crate::spellcheck::SpellcheckAllowlist;
 use crate::system::capabilities::{
     files::{FileAccess, FileNodeInfo, FileNodeKind, FileWatchSubscription},
-    open::{DesktopOpenAccess, DesktopOpenActivation},
+    open::DesktopOpenAccess,
 };
 use crate::system::{FileNodePath, WorkspaceRef};
 use crate::ui::components::context_menu;
@@ -1083,12 +1083,7 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
         let browser = browser.clone();
         let target = target.clone();
         let parent_window = parent_window.clone();
-        move || {
-            browser.open_external(
-                &target,
-                DesktopOpenActivation::from_parent(parent_window.as_ref()),
-            )
-        }
+        move || browser.open_external(&target, parent_window.clone())
     });
     let desktop_open_available =
         browser.desktop_opener.borrow().is_some() && target.capabilities.native;
@@ -1097,12 +1092,7 @@ fn show_row_context_menu<W: IsA<gtk::Widget>>(
         let browser = browser.clone();
         let target = target.clone();
         let parent_window = parent_window.clone();
-        move || {
-            browser.open_containing_folder(
-                &target,
-                DesktopOpenActivation::from_parent(parent_window.as_ref()),
-            )
-        }
+        move || browser.open_containing_folder(&target, parent_window.clone())
     });
     open_containing_folder.set_enabled(desktop_open_available && target.capabilities.reveal);
     let open_terminal = add_menu_action(&actions, "open-terminal", {

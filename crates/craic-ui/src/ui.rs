@@ -25,6 +25,7 @@ use crate::system::{SystemProviderRegistry, SystemRef, WorkspacePath, WorkspaceR
 use adw::prelude::*;
 use app_menu::{app_menu, install_actions, launch_workspace_location_in_new_instance};
 use branch_actions::connect_branch_actions;
+use craic_app_core::{Generation, PageRefreshCoordinator};
 use craic_ui_core::ui::command_mailbox;
 use dialogs::show_error_dialog;
 use dialogs::show_startup_crash_dialog;
@@ -330,7 +331,7 @@ pub fn build_ui(
     startup.mark("build-content");
 
     let page_host = pages::PageHost::new(&sidebar.page_slot(), &content.page_slot());
-    let page_refresh_generations = (0..pages.len()).map(|_| Cell::new(0)).collect();
+    let page_refreshes = PageRefreshCoordinator::new(pages.iter().map(|page| page.id()));
     startup.mark("build-page-host");
 
     let main_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
@@ -366,8 +367,8 @@ pub fn build_ui(
         content,
         pages,
         page_host,
-        active_page: Cell::new(usize::MAX),
-        page_refresh_generations,
+        active_page: RefCell::new(None),
+        page_refreshes: RefCell::new(page_refreshes),
         git_action_running,
         last_error: RefCell::new(None),
         last_snapshot: RefCell::new(initial_snapshot.clone()),
@@ -840,8 +841,8 @@ struct AppState {
     content: content::ContentPane,
     pages: Vec<pages::PageRef>,
     page_host: pages::PageHost,
-    active_page: Cell<usize>,
-    page_refresh_generations: Vec<Cell<u64>>,
+    active_page: RefCell<Option<pages::PageId>>,
+    page_refreshes: RefCell<PageRefreshCoordinator>,
     git_action_running: Rc<Cell<bool>>,
     last_error: RefCell<Option<String>>,
     last_snapshot: RefCell<Option<git::WorkspaceSnapshot>>,
@@ -1620,48 +1621,60 @@ where
 }
 
 fn refresh_active_page(state: &Rc<AppState>) {
-    let index = state.active_page.get();
-    let Some(page) = state.pages.get(index).cloned() else {
-        log::warn!("active page refresh ignored invalid index={index}");
+    let Some(page_id) = state.active_page.borrow().clone() else {
+        log::warn!("active page refresh ignored because no page is active");
         return;
     };
-    let Some(generation_cell) = state.page_refresh_generations.get(index) else {
-        log::warn!("active page refresh ignored missing generation index={index}");
+    let Some(index) = state.pages.iter().position(|page| page.id() == page_id) else {
+        log::warn!(
+            "active page refresh ignored unknown page={}",
+            page_id.as_str()
+        );
         return;
     };
-
-    let generation = generation_cell.get().wrapping_add(1).max(1);
-    generation_cell.set(generation);
+    let page = state.pages[index].clone();
+    let generation = state.page_refreshes.borrow_mut().begin(&page_id);
     state.sidebar.set_page_refreshing(index, true);
 
     let label = page.label();
-    log::info!("page refresh requested index={index} label={label}");
+    log::info!(
+        "page refresh requested page={} label={label}",
+        page_id.as_str()
+    );
     let state_weak = Rc::downgrade(state);
     let refresh_page = page.clone();
+    let initialize_page_id = page_id.clone();
     page.initialize(Box::new(move |_, _| {
         let Some(state) = state_weak.upgrade() else {
             return;
         };
-        if !page_refresh_generation_is_current(&state, index, generation) {
+        if !page_refresh_generation_is_current(&state, &initialize_page_id, generation) {
             log::trace!(
-                "ignored page refresh after stale initialization index={} label={} generation={}",
-                index,
+                "ignored page refresh after stale initialization page={} label={} generation={}",
+                initialize_page_id.as_str(),
                 label,
-                generation
+                generation.get()
             );
             return;
         }
 
         let state_weak = Rc::downgrade(&state);
+        let completion_page_id = initialize_page_id.clone();
         let completion: pages::PageRefreshComplete = Rc::new(move || {
             if let Some(state) = state_weak.upgrade() {
-                complete_page_refresh(&state, index, generation);
+                complete_page_refresh(&state, &completion_page_id, index, generation);
             }
         });
 
         match refresh_page.refresh_page(completion) {
             PageRefreshRequest::WorkspaceSnapshot => {
-                refresh_workspace_page(&state, index, generation, refresh_page);
+                refresh_workspace_page(
+                    &state,
+                    initialize_page_id.clone(),
+                    index,
+                    generation,
+                    refresh_page,
+                );
             }
             PageRefreshRequest::Custom => {
                 log::debug!("page refresh delegated to page index={index} label={label}");
@@ -1672,8 +1685,9 @@ fn refresh_active_page(state: &Rc<AppState>) {
 
 fn refresh_workspace_page(
     state: &Rc<AppState>,
+    page_id: pages::PageId,
     index: usize,
-    generation: u64,
+    generation: Generation,
     page: pages::PageRef,
 ) {
     let repo_path = state.repo_path.borrow().clone();
@@ -1697,7 +1711,7 @@ fn refresh_workspace_page(
             &snapshot,
             Rc::new(move || {
                 if let Some(state) = state_weak.upgrade() {
-                    complete_page_refresh(&state, index, generation);
+                    complete_page_refresh(&state, &page_id, index, generation);
                 }
             }),
         );
@@ -1707,12 +1721,12 @@ fn refresh_workspace_page(
     request_provider_workspace_snapshot(workspace_key.clone(), git_handle, {
         let state = state.clone();
         move |response_workspace_key, result| {
-            if !page_refresh_generation_is_current(&state, index, generation) {
+            if !page_refresh_generation_is_current(&state, &page_id, generation) {
                 log::trace!(
                     "discarding stale page refresh result index={} label={} generation={}",
                     index,
                     label,
-                    generation
+                    generation.get()
                 );
                 return;
             }
@@ -1723,7 +1737,7 @@ fn refresh_workspace_page(
                     response_workspace_key,
                     workspace_key,
                 );
-                complete_page_refresh(&state, index, generation);
+                complete_page_refresh(&state, &page_id, index, generation);
                 return;
             }
 
@@ -1732,7 +1746,7 @@ fn refresh_workspace_page(
                     "discarding page refresh for inactive workspace {}",
                     workspace_key
                 );
-                complete_page_refresh(&state, index, generation);
+                complete_page_refresh(&state, &page_id, index, generation);
                 return;
             }
 
@@ -1740,11 +1754,17 @@ fn refresh_workspace_page(
                 Ok(snapshot) => {
                     log::info!("page refresh completed index={index} label={label}");
                     let state_weak = Rc::downgrade(&state);
+                    let completion_page_id = page_id.clone();
                     page.refresh(
                         &snapshot,
                         Rc::new(move || {
                             if let Some(state) = state_weak.upgrade() {
-                                complete_page_refresh(&state, index, generation);
+                                complete_page_refresh(
+                                    &state,
+                                    &completion_page_id,
+                                    index,
+                                    generation,
+                                );
                             }
                         }),
                     );
@@ -1757,26 +1777,47 @@ fn refresh_workspace_page(
                 }
             }
 
-            complete_page_refresh(&state, index, generation);
+            complete_page_refresh(&state, &page_id, index, generation);
         }
     });
 }
 
-fn complete_page_refresh(state: &Rc<AppState>, index: usize, generation: u64) {
-    if !page_refresh_generation_is_current(state, index, generation) {
-        log::trace!("ignored stale page refresh completion index={index} generation={generation}");
+fn complete_page_refresh(
+    state: &Rc<AppState>,
+    page_id: &pages::PageId,
+    index: usize,
+    generation: Generation,
+) {
+    if !state
+        .page_refreshes
+        .borrow_mut()
+        .finish(page_id, generation)
+    {
+        log::trace!(
+            "ignored stale page refresh completion page={} generation={}",
+            page_id.as_str(),
+            generation.get()
+        );
         return;
     }
 
     state.sidebar.set_page_refreshing(index, false);
-    log::debug!("page refresh indicator cleared index={index} generation={generation}");
+    log::debug!(
+        "page refresh indicator cleared page={} generation={}",
+        page_id.as_str(),
+        generation.get()
+    );
 }
 
-fn page_refresh_generation_is_current(state: &AppState, index: usize, generation: u64) -> bool {
+fn page_refresh_generation_is_current(
+    state: &AppState,
+    page_id: &pages::PageId,
+    generation: Generation,
+) -> bool {
     state
-        .page_refresh_generations
-        .get(index)
-        .is_some_and(|cell| cell.get() == generation)
+        .page_refreshes
+        .borrow()
+        .is_current(page_id, generation)
 }
 
 fn activate_page(state: &Rc<AppState>, index: usize) {
@@ -1784,8 +1825,9 @@ fn activate_page(state: &Rc<AppState>, index: usize) {
         return;
     }
 
-    if state.active_page.get() != index {
-        state.active_page.set(index);
+    let page_id = state.pages[index].id();
+    if state.active_page.borrow().as_ref() != Some(&page_id) {
+        state.active_page.replace(Some(page_id));
         state.page_host.show(&state.pages, index);
         let page = state.pages[index].clone();
         let activate_page = page.clone();

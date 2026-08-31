@@ -17,9 +17,7 @@ use craic_codex_app_server::protocol::{
     Request, RequestId, RpcError, ThreadStartParams, TurnInterruptParams, TurnStartParams,
     TurnSteerParams, UserInput,
 };
-use craic_codex_app_server::{
-    AppServer, AppServerConfig, AppServerEvent, ConnectionState, ExitStatus,
-};
+use craic_codex_app_server::{AppServer, AppServerEvent, ConnectionState, ExitStatus};
 use craic_ui_core::ui::command_mailbox;
 use gtk::{gio, glib};
 use serde_json::{Value, json};
@@ -36,8 +34,7 @@ use super::codex_chat::{
 };
 use super::remote_image::RemoteImage;
 use super::thread_picker::CodexThreadPicker;
-use crate::system::capabilities::shell::ShellAccess;
-use crate::system::{ProviderKind, WorkspaceRef};
+use crate::system::ProviderKind;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_EVENTS_PER_POLL: usize = 256;
@@ -214,8 +211,12 @@ impl AppChatSession {
             .name(format!("codex-app-session-start-{id}"))
             .spawn(move || {
                 log::info!("native Codex startup worker started session_id={id}");
-                let result = app_server_config(shell.as_ref(), &startup_workspace, provider_kind)
-                    .and_then(|config| AppServer::spawn(config).map_err(|error| error.to_string()));
+                let result = craic_agent::app_server::config(
+                    shell.as_ref(),
+                    &startup_workspace,
+                    provider_kind,
+                )
+                .and_then(|config| AppServer::spawn(config).map_err(|error| error.to_string()));
                 log::info!(
                     "native Codex startup worker finished session_id={id} success={}",
                     result.is_ok()
@@ -1480,12 +1481,15 @@ impl AppChatSessionInner {
             attachment_kind(&reference)
         };
         if !mention
-            && matches!(kind, ComposerAttachmentKind::Image)
+            && matches!(
+                kind,
+                ComposerAttachmentKind::Image | ComposerAttachmentKind::Audio
+            )
             && self.ctx.system_ref().provider_kind != ProviderKind::Local
             && !is_http_url(&reference)
         {
             let attachment_id = format!("file:{reference}");
-            self.upload_remote_image(attachment_id, label, PathBuf::from(reference));
+            self.upload_remote_media(attachment_id, label, PathBuf::from(reference), kind);
             return;
         }
         self.view.add_attachment(ComposerAttachment {
@@ -1518,7 +1522,12 @@ impl AppChatSessionInner {
             TemporaryAttachment::Local(path.clone()),
         );
         if self.ctx.system_ref().provider_kind != ProviderKind::Local {
-            self.upload_remote_image(attachment_id, "Pasted image".to_owned(), path);
+            self.upload_remote_media(
+                attachment_id,
+                "Pasted image".to_owned(),
+                path,
+                ComposerAttachmentKind::Image,
+            );
             return;
         }
         self.view.add_attachment(ComposerAttachment {
@@ -1529,10 +1538,24 @@ impl AppChatSessionInner {
         });
     }
 
-    fn upload_remote_image(self: &Rc<Self>, attachment_id: String, label: String, source: PathBuf) {
+    fn upload_remote_media(
+        self: &Rc<Self>,
+        attachment_id: String,
+        label: String,
+        source: PathBuf,
+        kind: ComposerAttachmentKind,
+    ) {
         let Some(shell) = self.ctx.shell() else {
-            self.push_error("Shell access is unavailable for remote image upload".to_owned());
+            self.push_error("Shell access is unavailable for remote media upload".to_owned());
             return;
+        };
+        let remote_kind = match kind {
+            ComposerAttachmentKind::Image => craic_agent::remote_media::RemoteMediaKind::Image,
+            ComposerAttachmentKind::Audio => craic_agent::remote_media::RemoteMediaKind::Audio,
+            _ => {
+                self.push_error("Only image and audio attachments can be uploaded".to_owned());
+                return;
+            }
         };
         let working_dir = self.ctx.workspace_ref().root;
         let completion = command_mailbox::once({
@@ -1564,7 +1587,7 @@ impl AppChatSessionInner {
                     Ok(mut images) => {
                         let Some(image) = images.pop() else {
                             session.push_error(
-                                "Remote image upload returned no image path".to_owned(),
+                                "Remote media upload returned no attachment path".to_owned(),
                             );
                             return;
                         };
@@ -1578,7 +1601,7 @@ impl AppChatSessionInner {
                         session.view.add_attachment(ComposerAttachment {
                             id: attachment_id.clone(),
                             label: label.clone(),
-                            kind: ComposerAttachmentKind::Image,
+                            kind,
                             reference: image.path,
                         });
                     }
@@ -1589,9 +1612,13 @@ impl AppChatSessionInner {
                 }
             }
         });
-        super::remote_image::upload_images(shell, working_dir, vec![source], move |result| {
-            completion.send(result)
-        });
+        super::remote_image::upload_media(
+            shell,
+            working_dir,
+            vec![source],
+            remote_kind,
+            move |result| completion.send(result),
+        );
     }
 
     fn remove_temporary_attachment(&self, attachment_id: &str) {
@@ -1721,8 +1748,9 @@ impl Drop for AppChatSessionInner {
                 self.id
             );
         }
-        // `AppServer::drop` initiates shutdown and detaches its worker handles. Holding the
-        // value until this scope ends keeps this fallback non-blocking for GTK's main thread.
+        // Normal session teardown moves the server to a shutdown worker. This fallback retains it
+        // until the end of the drop scope, where AppServer performs its bounded joining shutdown
+        // rather than leaving transport tasks or a child process detached.
         let _server = self.server.get_mut().take();
         let attachments = self
             .temporary_attachments
@@ -1734,34 +1762,6 @@ impl Drop for AppChatSessionInner {
             self.cleanup_temporary_attachment(attachment);
         }
     }
-}
-
-fn app_server_config(
-    shell: &dyn ShellAccess,
-    workspace: &WorkspaceRef,
-    provider_kind: ProviderKind,
-) -> Result<AppServerConfig, String> {
-    let codex = shell
-        .which("codex")?
-        .ok_or_else(|| "Codex is not installed on this workspace target".to_owned())?;
-    let app_args = vec![
-        "app-server".to_owned(),
-        "--listen".to_owned(),
-        "stdio://".to_owned(),
-    ];
-    let app = shell.fast_command(&workspace.root, &codex, &app_args)?;
-    let version = shell.fast_command(&workspace.root, &codex, &["--version".to_owned()])?;
-    let mut config = AppServerConfig {
-        program: app.program,
-        args: app.args,
-        cwd: (provider_kind == ProviderKind::Local)
-            .then(|| PathBuf::from(app.working_dir.absolute)),
-        version_command: Some((version.program, version.args)),
-        ..AppServerConfig::default()
-    };
-    config.capabilities.experimental_api = true;
-    config.capabilities.mcp_server_openai_form_elicitation = true;
-    Ok(config)
 }
 
 fn submission_inputs(submission: &ComposerSubmission) -> Vec<UserInput> {

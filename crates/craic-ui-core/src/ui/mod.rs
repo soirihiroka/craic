@@ -10,6 +10,7 @@ pub mod file_type;
 pub mod left_clamp;
 pub mod pages;
 pub mod picker;
+pub mod platform;
 pub mod widgets;
 
 use std::path::PathBuf;

@@ -4,8 +4,10 @@ use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, Stdio};
 use std::ptr;
-use std::sync::mpsc;
 use std::thread;
+use tokio::sync::{mpsc, oneshot};
+
+pub const SHELL_EVENT_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellCommandSpec {
@@ -116,7 +118,7 @@ impl ShellCommandRunRequest {
     }
 }
 
-pub type ShellRunCallback = Box<dyn FnOnce(Result<ShellCommandOutput, String>) + Send + 'static>;
+pub type ShellCommandResult = oneshot::Receiver<Result<ShellCommandOutput, String>>;
 pub type ShellCommandGenerator = mpsc::Receiver<ShellCommandEvent>;
 
 impl ShellCommandOutput {
@@ -211,9 +213,9 @@ pub trait ShellAccess: Send + Sync {
         program: &str,
         args: &[String],
     ) -> Result<ShellCommandSpec, String>;
-    fn run_script(&self, request: ShellRunRequest, callback: ShellRunCallback);
-    fn run_fast_script(&self, request: ShellRunRequest, callback: ShellRunCallback);
-    fn run_fast_command(&self, request: ShellCommandRunRequest, callback: ShellRunCallback);
+    fn run_script(&self, request: ShellRunRequest) -> ShellCommandResult;
+    fn run_fast_script(&self, request: ShellRunRequest) -> ShellCommandResult;
+    fn run_fast_command(&self, request: ShellCommandRunRequest) -> ShellCommandResult;
     fn stream_fast_command(&self, request: ShellCommandRunRequest) -> ShellCommandGenerator;
     fn command_display(&self, command: &ShellCommandSpec) -> String;
 }
@@ -325,7 +327,7 @@ fn send_command_record(
 ) {
     let text = String::from_utf8_lossy(bytes).trim().to_string();
     if !text.is_empty() {
-        let _ = event_sender.send(ShellCommandEvent::Record { stream, text });
+        let _ = event_sender.blocking_send(ShellCommandEvent::Record { stream, text });
     }
 }
 

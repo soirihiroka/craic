@@ -1,11 +1,12 @@
 use super::path::FileNodePath;
 use crate::system::capabilities::files::{
-    FileAccess, FileNodeInfo, FileOperationEvent, FileReadRequest,
+    FileAccess, FileNodeInfo, FileOperation, FileReadRequest, wait_file_operation,
 };
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -57,41 +58,29 @@ impl Drop for MaterializedFile {
     }
 }
 
-pub fn materialize_for_view<F>(
+pub fn materialize_for_view(
     files: Arc<dyn FileAccess>,
     source: FileNodeInfo,
     max_bytes: Option<u64>,
-    callback: F,
-) where
-    F: FnOnce(Result<MaterializedFile, String>) + Send + 'static,
-{
+) -> mpsc::Receiver<Result<MaterializedFile, String>> {
     let path = source.path.clone();
-    let callback = Arc::new(Mutex::new(Some(callback)));
-    files.read_with_info(
-        FileReadRequest {
-            path,
-            max_bytes,
-            cancel_requested: None,
-        },
-        Box::new(move |event| {
-            if let FileOperationEvent::Finished(result) = event {
-                let result = result
-                    .map_err(|err| err.to_string())
-                    .and_then(|read| read.into_bytes())
-                    .and_then(|bytes| materialize_bytes(&source, bytes, max_bytes));
-                let callback = callback
-                    .lock()
-                    .ok()
-                    .and_then(|mut callback| callback.take());
-                if let Some(callback) = callback {
-                    callback(result);
-                }
-            }
-        }),
-    );
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let events = files.read_with_info_events(FileReadRequest {
+        path,
+        max_bytes,
+        cancel_requested: None,
+    });
+    thread::spawn(move || {
+        let result = wait_file_operation(events, FileOperation::Read)
+            .map_err(|err| err.to_string())
+            .and_then(|read| read.into_bytes())
+            .and_then(|bytes| materialize_bytes_for_view(&source, bytes, max_bytes));
+        let _ = sender.send(result);
+    });
+    receiver
 }
 
-fn materialize_bytes(
+pub fn materialize_bytes_for_view(
     source: &FileNodeInfo,
     bytes: Vec<u8>,
     max_bytes: Option<u64>,

@@ -1,6 +1,6 @@
 use crate::system::capabilities::shell::{
     ShellAccess, ShellCommandActivity, ShellCommandEvent, ShellCommandGenerator,
-    ShellCommandOutput, ShellCommandRunRequest, ShellCommandSpec, ShellRunCallback,
+    ShellCommandOutput, ShellCommandResult, ShellCommandRunRequest, ShellCommandSpec,
     ShellRunRequest, default_shell, run_streaming_command,
 };
 use crate::system::path::{WorkspacePath, WorkspaceRef};
@@ -8,9 +8,10 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
+use tokio::sync::mpsc as tokio_mpsc;
 
 #[derive(Clone, Debug)]
 pub struct LocalShellAccess {
@@ -110,43 +111,50 @@ impl ShellAccess for LocalShellAccess {
         Ok(command)
     }
 
-    fn run_script(&self, request: ShellRunRequest, callback: ShellRunCallback) {
+    fn run_script(&self, request: ShellRunRequest) -> ShellCommandResult {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         let workspace = self.workspace.display_name.clone();
         thread::spawn(move || {
-            callback(run_local_script(
+            let _ = sender.send(run_local_script(
                 workspace,
                 request,
                 default_shell(),
                 ShellScriptMode::UserInteractive,
             ));
         });
+        receiver
     }
 
-    fn run_fast_script(&self, request: ShellRunRequest, callback: ShellRunCallback) {
+    fn run_fast_script(&self, request: ShellRunRequest) -> ShellCommandResult {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         let workspace = self.workspace.display_name.clone();
         thread::spawn(move || {
-            callback(run_local_script(
+            let _ = sender.send(run_local_script(
                 workspace,
                 request,
                 OsString::from("/bin/sh"),
                 ShellScriptMode::Fast,
             ));
         });
+        receiver
     }
 
-    fn run_fast_command(&self, request: ShellCommandRunRequest, callback: ShellRunCallback) {
+    fn run_fast_command(&self, request: ShellCommandRunRequest) -> ShellCommandResult {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         let workspace = self.workspace.display_name.clone();
         thread::spawn(move || {
-            callback(run_local_command(workspace, request));
+            let _ = sender.send(run_local_command(workspace, request));
         });
+        receiver
     }
 
     fn stream_fast_command(&self, request: ShellCommandRunRequest) -> ShellCommandGenerator {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) =
+            tokio_mpsc::channel(crate::system::capabilities::shell::SHELL_EVENT_CAPACITY);
         let workspace = self.workspace.display_name.clone();
         thread::spawn(move || {
             let result = stream_local_command(&workspace, &request, &sender);
-            let _ = sender.send(ShellCommandEvent::Finished(result.map(Into::into)));
+            let _ = sender.blocking_send(ShellCommandEvent::Finished(result.map(Into::into)));
         });
         receiver
     }
@@ -376,7 +384,7 @@ fn run_local_command(
 fn stream_local_command(
     workspace_name: &str,
     request: &ShellCommandRunRequest,
-    event_sender: &mpsc::Sender<ShellCommandEvent>,
+    event_sender: &tokio_mpsc::Sender<ShellCommandEvent>,
 ) -> Result<ShellCommandOutput, String> {
     log::info!(
         "local streaming command start workspace={} operation={} working_dir={} program={} args={}",

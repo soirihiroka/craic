@@ -5,9 +5,9 @@ mod types;
 
 pub use crate::CommitMessageContext;
 pub use access::{
-    BackgroundPullSubscription, ChangeListener, ChangeListenerSubscription, FileDiffSubscription,
-    GitCommandEvent, GitCommandGenerator, GitOperationHook, GitOperationPostHook, GitRepoHandle,
-    OperationCallback, clone_repository_with_shell,
+    BackgroundPullSubscription, ChangeListener, ChangeListenerSubscription, FileDiffReceiver,
+    FileDiffSubscription, GitCommandEvent, GitCommandGenerator, GitOperationHook,
+    GitOperationPostHook, GitOperationReceiver, GitRepoHandle, clone_repository_with_shell,
 };
 pub use diff::*;
 pub use remote::*;

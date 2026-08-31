@@ -13,6 +13,7 @@ use crate::system::provider::SystemProvider;
 use crate::system::providers::local::LocalProvider;
 use crate::system::providers::ssh::{SshProvider, SshProviderConfig};
 use crate::ui::picker;
+use craic_ui_core::ui::command_mailbox;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{Arc, mpsc};
@@ -276,109 +277,85 @@ fn resolve_repo_kind_in_background(
     generation: u64,
     retry_attempt: usize,
 ) {
-    let (sender, receiver) = std::sync::mpsc::channel();
     let callback_workspace_key = workspace_key.clone();
     let callback_workspace_host = workspace_host.clone();
 
-    git_handle.workspace_metadata(
-        github_access.clone(),
-        Box::new(move |result| {
-            let properties = match result {
-                Ok(metadata) => {
-                    let properties =
-                        repo_properties_from_metadata(metadata, callback_workspace_host.as_deref());
-                    cache_resolved_repo_properties(callback_workspace_key.clone(), properties)
-                }
-                Err(err) => {
-                    log::warn!(
-                        "repo metadata refresh failed workspace={callback_workspace_key}: {err}"
-                    );
-                    cached_repo_properties(&callback_workspace_key).unwrap_or(RepoProperties {
-                        kind: RepoIconKind::Unknown,
-                        remote_label: None,
-                    })
-                }
-            };
-            let _ = sender.send(properties);
-        }),
-    );
-
-    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
-        match receiver.try_recv() {
-            Ok(properties) => {
-                if repo_icon_generation.get() != generation {
-                    log::debug!(
-                        "repo metadata result ignored workspace={} generation={} current_generation={}",
-                        workspace_key,
-                        generation,
-                        repo_icon_generation.get()
-                    );
-                    return gtk::glib::ControlFlow::Break;
-                }
-
-                if properties.kind == RepoIconKind::Unknown
-                    && properties.remote_label.is_some()
-                    && retry_attempt < REPO_ICON_RETRY_DELAYS.len()
-                {
-                    let delay = REPO_ICON_RETRY_DELAYS[retry_attempt];
-                    log::debug!(
-                        "repo metadata retry scheduled workspace={} attempt={} delay_ms={}",
-                        workspace_key,
-                        retry_attempt + 1,
-                        delay.as_millis()
-                    );
-                    gtk::glib::timeout_add_local_once(delay, {
-                        let workspace_key = workspace_key.clone();
-                        let item_id = item_id.clone();
-                        let workspace_host = workspace_host.clone();
-                        let git_handle = git_handle.clone();
-                        let github_access = github_access.clone();
-                        let repository_picker = repository_picker.clone();
-                        let repo_icon_generation = repo_icon_generation.clone();
-
-                        move || {
-                            if repo_icon_generation.get() != generation {
-                                return;
-                            }
-                            resolve_repo_kind_in_background(
-                                workspace_key,
-                                item_id,
-                                workspace_host,
-                                git_handle,
-                                github_access,
-                                repository_picker,
-                                repo_icon_generation,
-                                generation,
-                                retry_attempt + 1,
-                            );
-                        }
-                    });
-                    return gtk::glib::ControlFlow::Break;
-                }
-
-                if let Some(item_id) = item_id.as_deref() {
-                    repository_picker.update_item_metadata(
-                        item_id,
-                        properties.remote_label.as_deref(),
-                        properties.kind.icon_name(),
-                    );
-                }
-                repository_picker.set_button_icon(properties.kind.icon_name());
-                gtk::glib::ControlFlow::Break
+    let receiver = git_handle.workspace_metadata(github_access.clone());
+    command_mailbox::poll_oneshot_result(receiver, move |result| {
+        let properties = match result {
+            Ok(metadata) => {
+                let properties =
+                    repo_properties_from_metadata(metadata, callback_workspace_host.as_deref());
+                cache_resolved_repo_properties(callback_workspace_key.clone(), properties)
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(err) => {
                 log::warn!(
-                    "repo metadata result channel closed workspace={} generation={}",
-                    workspace_key,
-                    generation
+                    "repo metadata refresh failed workspace={callback_workspace_key}: {err}"
                 );
-                if repo_icon_generation.get() == generation {
-                    repository_picker.set_button_icon(RepoIconKind::Unknown.icon_name());
-                }
-                gtk::glib::ControlFlow::Break
+                cached_repo_properties(&callback_workspace_key).unwrap_or(RepoProperties {
+                    kind: RepoIconKind::Unknown,
+                    remote_label: None,
+                })
             }
+        };
+        if repo_icon_generation.get() != generation {
+            log::debug!(
+                "repo metadata result ignored workspace={} generation={} current_generation={}",
+                workspace_key,
+                generation,
+                repo_icon_generation.get()
+            );
+            return;
         }
+
+        if properties.kind == RepoIconKind::Unknown
+            && properties.remote_label.is_some()
+            && retry_attempt < REPO_ICON_RETRY_DELAYS.len()
+        {
+            let delay = REPO_ICON_RETRY_DELAYS[retry_attempt];
+            log::debug!(
+                "repo metadata retry scheduled workspace={} attempt={} delay_ms={}",
+                workspace_key,
+                retry_attempt + 1,
+                delay.as_millis()
+            );
+            gtk::glib::timeout_add_local_once(delay, {
+                let workspace_key = workspace_key.clone();
+                let item_id = item_id.clone();
+                let workspace_host = workspace_host.clone();
+                let git_handle = git_handle.clone();
+                let github_access = github_access.clone();
+                let repository_picker = repository_picker.clone();
+                let repo_icon_generation = repo_icon_generation.clone();
+
+                move || {
+                    if repo_icon_generation.get() != generation {
+                        return;
+                    }
+                    resolve_repo_kind_in_background(
+                        workspace_key,
+                        item_id,
+                        workspace_host,
+                        git_handle,
+                        github_access,
+                        repository_picker,
+                        repo_icon_generation,
+                        generation,
+                        retry_attempt + 1,
+                    );
+                }
+            });
+            return;
+        }
+
+        if let Some(item_id) = item_id.as_deref() {
+            repository_picker.update_item_metadata(
+                item_id,
+                properties.remote_label.as_deref(),
+                properties.kind.icon_name(),
+            );
+        }
+        repository_picker.set_button_icon(properties.kind.icon_name());
     });
 }
 
@@ -521,14 +498,9 @@ fn resolve_workspace_metadata_with_provider(
         git_handle = git_handle.with_hook(hook);
     }
 
-    let (sender, receiver) = mpsc::channel();
-    git_handle.workspace_metadata(
-        craic_vcs::github_access_for_provider(provider, workspace),
-        Box::new(move |result| {
-            let _ = sender.send(result);
-        }),
-    );
-    match receiver.recv() {
+    let receiver =
+        git_handle.workspace_metadata(craic_vcs::github_access_for_provider(provider, workspace));
+    match receiver.blocking_recv() {
         Ok(Ok(metadata)) => repo_properties_from_metadata(metadata, workspace_host),
         Ok(Err(err)) => {
             log::warn!(

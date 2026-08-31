@@ -9,7 +9,7 @@ use self::files::{LocalFileAccess, LocalFileWatchService};
 use self::open::LocalDesktopOpenAccess;
 use self::shell::LocalShellAccess;
 use self::terminal_link::LocalTerminalLinkAccess;
-use super::url::GioUrlOpenAccess;
+use super::url::UrlResolver;
 use crate::system::capabilities::{
     docker::DockerAccess, files::FileAccess, open::DesktopOpenAccess, shell::ShellAccess,
     terminal_link::TerminalLinkAccess, url::UrlOpenAccess,
@@ -190,7 +190,7 @@ impl SystemProvider for LocalProvider {
             workspace.display_name,
             workspace.root.absolute
         );
-        Some(Arc::new(GioUrlOpenAccess::new(
+        Some(Arc::new(UrlResolver::new(
             self.label(),
             workspace.clone(),
             None,

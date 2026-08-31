@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 pub use craic_agent::agent_provider;
 pub use craic_config as config;
 pub use craic_project::{quick_action, workspace_config};

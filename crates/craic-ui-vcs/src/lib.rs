@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 pub use craic_agent::{agent_provider, ai_commit};
 pub use craic_config as config;
 pub use craic_system::system;

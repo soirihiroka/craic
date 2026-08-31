@@ -1,11 +1,10 @@
 use crate::system::capabilities::files::{
-    FileAccess, FileOperationEvent, FileRead, FileReadRequest, FileWriteMode, FileWritePayload,
-    FileWriteRequest,
+    FileAccess, FileOperation, FileRead, FileReadRequest, FileWriteMode, FileWritePayload,
+    FileWriteRequest, wait_file_operation,
 };
 use crate::system::path::FileNodePath;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 
 const REPO_CONFIG_DIR: &str = ".craic";
 const REPO_CONFIG_FILE: &str = "config.toml";
@@ -315,7 +314,7 @@ fn load(path: &Path) -> LocalWorkspaceConfig {
 
 fn load_from_file_access(files: &dyn FileAccess) -> LocalWorkspaceConfig {
     let config_path = config_node(files);
-    let contents = match read_text_via_callback(files, &config_path, None) {
+    let contents = match read_text_via_events(files, &config_path, None) {
         Ok(contents) => contents,
         Err(err) => {
             log::debug!(
@@ -339,7 +338,7 @@ fn load_from_file_access(files: &dyn FileAccess) -> LocalWorkspaceConfig {
 
 fn load_repo_config_from_file_access(files: &dyn FileAccess) -> Result<toml::Value, String> {
     let config_path = repo_config_node(files);
-    let contents = match read_text_via_callback(files, &config_path, Some(MAX_REPO_CONFIG_BYTES)) {
+    let contents = match read_text_via_events(files, &config_path, Some(MAX_REPO_CONFIG_BYTES)) {
         Ok(contents) => contents,
         Err(_) => return Ok(toml::Value::Table(toml::map::Map::new())),
     };
@@ -351,61 +350,45 @@ fn load_repo_config_from_file_access(files: &dyn FileAccess) -> Result<toml::Val
     })
 }
 
-fn read_text_via_callback(
+fn read_text_via_events(
     files: &dyn FileAccess,
     path: &FileNodePath,
     max_bytes: Option<u64>,
 ) -> Result<String, String> {
-    read_with_info_via_callback(files, path, max_bytes)?.into_text()
+    read_with_info_via_events(files, path, max_bytes)?.into_text()
 }
 
-fn read_with_info_via_callback(
+fn read_with_info_via_events(
     files: &dyn FileAccess,
     path: &FileNodePath,
     max_bytes: Option<u64>,
 ) -> Result<FileRead, String> {
-    let (sender, receiver) = mpsc::channel();
-    files.read_with_info(
-        FileReadRequest {
+    wait_file_operation(
+        files.read_with_info_events(FileReadRequest {
             path: path.clone(),
             max_bytes,
             cancel_requested: None,
-        },
-        Box::new(move |event| {
-            if let FileOperationEvent::Finished(result) = event {
-                let _ = sender.send(result);
-            }
         }),
-    );
-    receiver
-        .recv()
-        .map_err(|_| "Read operation did not return a result.".to_string())?
-        .map_err(|err| err.to_string())
+        FileOperation::Read,
+    )
+    .map_err(|err| err.to_string())
 }
 
-fn write_text_via_callback(
+fn write_text_via_events(
     files: &dyn FileAccess,
     path: &FileNodePath,
     contents: &str,
 ) -> Result<(), String> {
-    let (sender, receiver) = mpsc::channel();
-    files.write_node(
-        FileWriteRequest {
+    wait_file_operation(
+        files.write_node_events(FileWriteRequest {
             path: path.clone(),
             mode: FileWriteMode::Replace,
             payload: FileWritePayload::File(contents.as_bytes().to_vec()),
             cancel_requested: None,
-        },
-        Box::new(move |event| {
-            if let FileOperationEvent::Finished(result) = event {
-                let _ = sender.send(result);
-            }
         }),
-    );
-    receiver
-        .recv()
-        .map_err(|_| "Write operation did not return a result.".to_string())?
-        .map_err(|err| err.to_string())
+        FileOperation::Write,
+    )
+    .map_err(|err| err.to_string())
 }
 
 fn parse_config(contents: &str, label: impl FnOnce() -> String) -> LocalWorkspaceConfig {
@@ -457,7 +440,7 @@ fn save_with_file_access(
 ) -> Result<(), String> {
     let local_dir = ensure_config_dir(files)?;
     let gitignore_path = ensure_file(files, &local_dir, LOCAL_GITIGNORE_FILE)?;
-    write_text_via_callback(files, &gitignore_path, LOCAL_GITIGNORE_CONTENTS)?;
+    write_text_via_events(files, &gitignore_path, LOCAL_GITIGNORE_CONTENTS)?;
     log::debug!(
         "initialized local workspace gitignore through file access workspace={} path={}",
         files.workspace().display_name,
@@ -467,7 +450,7 @@ fn save_with_file_access(
     let contents = toml::to_string_pretty(config)
         .map_err(|err| format!("Failed to serialize local workspace config: {err}"))?;
     let config_path = ensure_file(files, &local_dir, LOCAL_CONFIG_FILE)?;
-    write_text_via_callback(files, &config_path, &contents)?;
+    write_text_via_events(files, &config_path, &contents)?;
     log::info!(
         "saved local workspace config through file access workspace={} path={}",
         files.workspace().display_name,
@@ -484,7 +467,7 @@ fn save_repo_config_with_file_access(
     let config_path = ensure_file(files, &craic_dir, REPO_CONFIG_FILE)?;
     let contents = toml::to_string_pretty(config)
         .map_err(|err| format!("Failed to serialize repo config: {err}"))?;
-    write_text_via_callback(files, &config_path, &contents)?;
+    write_text_via_events(files, &config_path, &contents)?;
     log::info!(
         "saved repo config through file access workspace={} path={}",
         files.workspace().display_name,
@@ -547,7 +530,7 @@ fn ensure_file(
 }
 
 fn write_directory(files: &dyn FileAccess, path: &FileNodePath) -> Result<(), String> {
-    write_node_via_callback(
+    write_node_via_events(
         files,
         FileWriteRequest {
             path: path.clone(),
@@ -559,7 +542,7 @@ fn write_directory(files: &dyn FileAccess, path: &FileNodePath) -> Result<(), St
 }
 
 fn write_empty_file(files: &dyn FileAccess, path: &FileNodePath) -> Result<(), String> {
-    write_node_via_callback(
+    write_node_via_events(
         files,
         FileWriteRequest {
             path: path.clone(),
@@ -570,22 +553,8 @@ fn write_empty_file(files: &dyn FileAccess, path: &FileNodePath) -> Result<(), S
     )
 }
 
-fn write_node_via_callback(
-    files: &dyn FileAccess,
-    request: FileWriteRequest,
-) -> Result<(), String> {
-    let (sender, receiver) = mpsc::channel();
-    files.write_node(
-        request,
-        Box::new(move |event| {
-            if let FileOperationEvent::Finished(result) = event {
-                let _ = sender.send(result);
-            }
-        }),
-    );
-    receiver
-        .recv()
-        .map_err(|_| "Write operation did not return a result.".to_string())?
+fn write_node_via_events(files: &dyn FileAccess, request: FileWriteRequest) -> Result<(), String> {
+    wait_file_operation(files.write_node_events(request), FileOperation::Write)
         .map_err(|err| err.to_string())
 }
 

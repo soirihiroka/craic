@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 static NEXT_HANDLER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -100,6 +101,36 @@ where
     F: FnMut(T) + 'static,
 {
     register(handler, Delivery::Once).0
+}
+
+pub fn poll_oneshot_result<T, F>(
+    mut receiver: tokio::sync::oneshot::Receiver<Result<T, String>>,
+    handler: F,
+) -> gtk::glib::SourceId
+where
+    T: 'static,
+    F: FnOnce(Result<T, String>) + 'static,
+{
+    let mut handler = Some(handler);
+    gtk::glib::timeout_add_local(Duration::from_millis(25), move || {
+        match receiver.try_recv() {
+            Ok(result) => {
+                if let Some(handler) = handler.take() {
+                    handler(result);
+                }
+                gtk::glib::ControlFlow::Break
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                gtk::glib::ControlFlow::Continue
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                if let Some(handler) = handler.take() {
+                    handler(Err("Operation ended without a result.".to_string()));
+                }
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    })
 }
 
 fn register<T, F>(handler: F, delivery: Delivery) -> (UiCommandSender<T>, u64)

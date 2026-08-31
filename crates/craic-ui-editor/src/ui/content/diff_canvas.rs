@@ -8,16 +8,20 @@ use super::{
             selection_for_drag, selection_for_mode, word_bounds_at as text_word_bounds_at,
         },
     },
-    diff_layout, skia_gl_area,
+    skia_gl_area,
 };
 use crate::config;
-use crate::git::{DiffKind, FileDiffRow};
-use crate::language_support::{HighlightRange, SyntaxHighlighter, language_id_from_path};
 use crate::ui::components::context_menu;
 use crate::ui::{canvas_scroll, canvas_scrollbar};
 use adw::prelude::*;
+use craic_render_skia::{
+    DiffLayoutCache, DiffLayoutRequest, DiffLayoutSignature, DiffMarkerKind, DiffRow, DiffRowKind,
+    DiffRowLayout as RowLayout, DiffSearchMatch, DiffSide, DiffSyntaxSpan, DiffTextPoint,
+    DiffTextSelection, DiffWrappedLine as WrappedLine, build_diff_layout, build_diff_syntax,
+    diff_row_index_at_y, diff_text_for_side, find_diff_search_matches, select_all_diff_text,
+    selected_diff_text, visible_diff_row_range,
+};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
@@ -43,7 +47,7 @@ pub struct DiffCanvas {
 }
 
 struct DiffCanvasState {
-    rows: RefCell<Vec<FileDiffRow>>,
+    rows: RefCell<Vec<DiffRow>>,
     font_size: Cell<f64>,
     scroll_y: Cell<f64>,
     content_height: Cell<f64>,
@@ -63,28 +67,12 @@ struct DiffCanvasState {
     text_width_cache: RefCell<canvas::TextWidthCache>,
     max_line_number: Cell<usize>,
     fold_row_count: Cell<usize>,
-    syntax: RefCell<Option<DiffSyntaxState>>,
+    syntax: RefCell<Vec<DiffSyntaxSpan>>,
     syntax_signature: RefCell<Option<DiffSyntaxSignature>>,
     selection: RefCell<Option<DiffSelection>>,
     selection_drag: Cell<Option<DragSelection<DiffSelectionPoint>>>,
     active_side: Cell<DiffCanvasSide>,
     search: RefCell<DiffSearchState>,
-}
-
-type DiffLayoutCache = diff_layout::Cache;
-type DiffLayoutSignature = diff_layout::Signature;
-type RowLayout = diff_layout::RowLayout;
-type WrappedLine = diff_layout::WrappedLine;
-
-struct DiffSyntaxState {
-    left: DiffSyntaxSide,
-    right: DiffSyntaxSide,
-}
-
-struct DiffSyntaxSide {
-    source: String,
-    ranges_by_line: HashMap<usize, (usize, usize)>,
-    highlights: Vec<HighlightRange>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,11 +82,7 @@ struct DiffSyntaxSignature {
     fingerprint: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum DiffCanvasSide {
-    Left,
-    Right,
-}
+type DiffCanvasSide = DiffSide;
 
 type DiffSelection = AnchoredSelection<DiffSelectionPoint>;
 
@@ -107,14 +91,6 @@ struct DiffSelectionPoint {
     side: DiffCanvasSide,
     row: usize,
     byte: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DiffSearchMatch {
-    side: DiffCanvasSide,
-    row: usize,
-    start: usize,
-    end: usize,
 }
 
 #[derive(Default)]
@@ -206,7 +182,7 @@ impl DiffCanvas {
             text_width_cache: RefCell::new(canvas::TextWidthCache::new(font_size)),
             max_line_number: Cell::new(1),
             fold_row_count: Cell::new(0),
-            syntax: RefCell::new(None),
+            syntax: RefCell::new(Vec::new()),
             syntax_signature: RefCell::new(None),
             selection: RefCell::new(None),
             selection_drag: Cell::new(None),
@@ -241,7 +217,7 @@ impl DiffCanvas {
         }
     }
 
-    pub fn set_rows(&self, rows: Vec<FileDiffRow>) {
+    pub fn set_rows(&self, rows: Vec<DiffRow>) {
         let fold_rows = rows.iter().filter(|row| is_fold_row(row)).count();
         let max_line_number = rows
             .iter()
@@ -272,12 +248,7 @@ impl DiffCanvas {
         self.area.queue_render();
     }
 
-    pub fn set_syntax_for_file(
-        &self,
-        file_path: &str,
-        fingerprint: u64,
-        full_rows: &[FileDiffRow],
-    ) {
+    pub fn set_syntax_for_file(&self, file_path: &str, fingerprint: u64, full_rows: &[DiffRow]) {
         update_syntax_state(&self.state, file_path, fingerprint, full_rows);
     }
 
@@ -287,7 +258,7 @@ impl DiffCanvas {
         self.state.scroll_y.set(0.0);
         self.state.max_line_number.set(1);
         self.state.fold_row_count.set(0);
-        self.state.syntax.borrow_mut().take();
+        self.state.syntax.borrow_mut().clear();
         self.state.syntax_signature.borrow_mut().take();
         self.state.selection.borrow_mut().take();
         self.state.selection_drag.set(None);
@@ -394,55 +365,15 @@ fn update_syntax_state(
     state: &Rc<DiffCanvasState>,
     file_path: &str,
     fingerprint: u64,
-    rows: &[FileDiffRow],
+    rows: &[DiffRow],
 ) {
     let signature = DiffSyntaxSignature::new(file_path, rows.len(), fingerprint);
     if state.syntax_signature.borrow().as_ref() == Some(&signature) {
         return;
     }
 
-    let language = language_id_from_path(file_path);
-    let left = build_syntax_side(language, rows, DiffCanvasSide::Left);
-    let right = build_syntax_side(language, rows, DiffCanvasSide::Right);
-    state.syntax.replace(Some(DiffSyntaxState { left, right }));
+    state.syntax.replace(build_diff_syntax(file_path, rows));
     state.syntax_signature.replace(Some(signature));
-}
-
-fn build_syntax_side(
-    language: craic_file_support::LanguageId,
-    rows: &[FileDiffRow],
-    side: DiffCanvasSide,
-) -> DiffSyntaxSide {
-    let mut source = String::new();
-    let mut ranges_by_line = HashMap::new();
-    for row in rows {
-        if is_fold_row(row) {
-            continue;
-        }
-        let (number, text) = match side {
-            DiffCanvasSide::Left => (row.left_number, row.left_text.as_deref()),
-            DiffCanvasSide::Right => (row.right_number, row.right_text.as_deref()),
-        };
-        let (Some(number), Some(text)) = (number, text) else {
-            continue;
-        };
-        let start = source.len();
-        source.push_str(text);
-        let end = source.len();
-        ranges_by_line.insert(number, (start, end));
-        source.push('\n');
-    }
-
-    let mut highlighter = SyntaxHighlighter::new_id(language);
-    highlighter.set_source(&source);
-    let mut highlights = highlighter.highlight_current();
-    highlights.sort_by_key(|range| (range.start, range.end));
-
-    DiffSyntaxSide {
-        source,
-        ranges_by_line,
-        highlights,
-    }
 }
 
 impl DiffSyntaxSignature {
@@ -500,7 +431,7 @@ fn draw(
 
     let scroll_y = state.scroll_y.get();
     let visible_range =
-        diff_layout::visible_row_range(cache, scroll_y, height as f64, metrics.line_height * 8.0);
+        visible_diff_row_range(cache, scroll_y, height as f64, metrics.line_height * 8.0);
     for index in visible_range {
         let Some(row) = rows.get(index) else {
             continue;
@@ -567,8 +498,8 @@ fn request_layout(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, spinner: &adw
 
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let result = diff_layout::build(request);
-        let _ = sender.send(result);
+        let cache = build_diff_layout(request);
+        let _ = sender.send(cache);
     });
 
     gtk::glib::timeout_add_local(Duration::from_millis(16), {
@@ -576,18 +507,17 @@ fn request_layout(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, spinner: &adw
         let state = state.clone();
         let spinner = spinner.clone();
         move || match receiver.try_recv() {
-            Ok(result) => {
+            Ok(cache) => {
                 if state.layout_request_id.get() != request_id {
                     return gtk::glib::ControlFlow::Break;
                 }
-                if state.layout_pending_signature.borrow().as_ref() != Some(&result.cache.signature)
-                {
+                if state.layout_pending_signature.borrow().as_ref() != Some(&cache.signature) {
                     return gtk::glib::ControlFlow::Break;
                 }
 
-                let content_height = result.cache.content_height;
+                let content_height = cache.content_height;
                 state.content_height.set(content_height);
-                state.layout_cache.replace(Some(result.cache));
+                state.layout_cache.replace(Some(cache));
                 state.layout_pending_signature.borrow_mut().take();
                 spinner.set_visible(false);
                 clamp_scroll(&area, &state);
@@ -615,7 +545,7 @@ fn request_layout(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, spinner: &adw
 fn layout_request_for_area(
     area: &gtk::GLArea,
     state: &Rc<DiffCanvasState>,
-) -> Option<diff_layout::Request> {
+) -> Option<DiffLayoutRequest> {
     let rows = state.rows.borrow();
     if rows.is_empty() {
         return None;
@@ -630,7 +560,7 @@ fn layout_request_for_area(
     let half_width = (content_width as f64 / 2.0).floor();
     let text_width =
         (half_width - gutter_width - PREFIX_WIDTH - CELL_PADDING * 2.0).max(metrics.char_width);
-    let signature = diff_layout::Signature::new(
+    let signature = DiffLayoutSignature::new(
         state.layout_generation.get(),
         content_width,
         gutter_width,
@@ -640,7 +570,7 @@ fn layout_request_for_area(
         rows.len(),
     );
 
-    Some(diff_layout::Request {
+    Some(DiffLayoutRequest {
         signature,
         rows: rows.clone(),
         text_width,
@@ -654,7 +584,7 @@ fn draw_row(
     context: &skia_canvas::Context,
     state: &Rc<DiffCanvasState>,
     row_index: usize,
-    row: &FileDiffRow,
+    row: &DiffRow,
     layout: &RowLayout,
     y: f64,
     content_width: i32,
@@ -718,7 +648,7 @@ fn draw_row(
         row.left_number,
         row.left_kind,
         &layout.left_lines,
-        syntax.as_ref().map(|syntax| &syntax.left),
+        &syntax,
         DiffCanvasSide::Left,
         0.0,
         y,
@@ -737,7 +667,7 @@ fn draw_row(
         row.right_number,
         row.right_kind,
         &layout.right_lines,
-        syntax.as_ref().map(|syntax| &syntax.right),
+        &syntax,
         DiffCanvasSide::Right,
         half_width + DIVIDER_WIDTH,
         y,
@@ -756,9 +686,9 @@ fn draw_side(
     state: &Rc<DiffCanvasState>,
     row_index: usize,
     number: Option<usize>,
-    kind: DiffKind,
+    kind: DiffRowKind,
     lines: &[WrappedLine],
-    syntax: Option<&DiffSyntaxSide>,
+    syntax: &[DiffSyntaxSpan],
     side: DiffCanvasSide,
     x: f64,
     y: f64,
@@ -780,9 +710,9 @@ fn draw_side(
     fill_rect(context, gutter_x, y, gutter_width, row_height, theme.gutter);
 
     let text_color = match kind {
-        DiffKind::Added => theme.added_text,
-        DiffKind::Deleted => theme.deleted_text,
-        DiffKind::Context | DiffKind::Fold => theme.foreground,
+        DiffRowKind::Added => theme.added_text,
+        DiffRowKind::Deleted => theme.deleted_text,
+        DiffRowKind::Context | DiffRowKind::Fold => theme.foreground,
     };
     if let Some(number) = number {
         let number = number.to_string();
@@ -809,11 +739,6 @@ fn draw_side(
         );
     }
 
-    let source_range = number.and_then(|number| {
-        syntax
-            .and_then(|syntax| syntax.ranges_by_line.get(&number))
-            .copied()
-    });
     let selection = *state.selection.borrow();
     for (index, line) in lines.iter().enumerate() {
         let baseline = y + baseline_offset + index as f64 * line_height;
@@ -848,15 +773,15 @@ fn draw_side(
                 theme.selection_background,
             );
         }
-        if let (Some(syntax), Some((source_start, source_end))) = (syntax, source_range) {
+        if let Some(number) = number {
             draw_syntax_line(
                 area,
                 context,
                 state,
                 syntax,
+                side,
+                number,
                 line,
-                source_start,
-                source_end,
                 text_x,
                 baseline,
                 text_color.text(),
@@ -879,54 +804,55 @@ fn draw_syntax_line(
     area: &gtk::GLArea,
     context: &skia_canvas::Context,
     state: &Rc<DiffCanvasState>,
-    syntax: &DiffSyntaxSide,
+    syntax: &[DiffSyntaxSpan],
+    side: DiffSide,
+    line_number: usize,
     line: &WrappedLine,
-    source_start: usize,
-    source_end: usize,
     mut x: f64,
     baseline: f64,
     fallback: TextColor,
 ) {
     let font_size = state.font_size.get();
-    let absolute_start = source_start.saturating_add(line.start);
-    let absolute_end = source_start.saturating_add(line.end);
-    if absolute_start >= absolute_end
-        || absolute_end > source_end
-        || source_end > syntax.source.len()
-        || !syntax.source.is_char_boundary(absolute_start)
-        || !syntax.source.is_char_boundary(absolute_end)
-    {
+    if line.start >= line.end || line.end.saturating_sub(line.start) > line.text.len() {
         canvas::draw_plain_text(area, context, font_size, &line.text, x, baseline, fallback);
         return;
     }
 
-    let mut cursor = absolute_start;
-    let first_range = syntax
-        .highlights
-        .partition_point(|range| range.end <= absolute_start);
-    for range in &syntax.highlights[first_range..] {
-        if range.start >= absolute_end {
+    let mut cursor = line.start;
+    for span in syntax
+        .iter()
+        .filter(|span| span.side == side && span.line_number == line_number)
+    {
+        if span.end <= line.start {
+            continue;
+        }
+        if span.start >= line.end {
             break;
         }
-        if range.start >= range.end
-            || range.end > syntax.source.len()
-            || !syntax.source.is_char_boundary(range.start)
-            || !syntax.source.is_char_boundary(range.end)
+        let start = span.start.max(line.start).max(cursor);
+        let end = span.end.min(line.end);
+        if start >= end {
+            continue;
+        }
+        let plain_start = cursor.saturating_sub(line.start);
+        let plain_end = start.saturating_sub(line.start);
+        if let Some(plain) = line
+            .text
+            .get(plain_start..plain_end)
+            .filter(|plain| !plain.is_empty())
         {
-            continue;
-        }
-        let range_start = range.start.max(absolute_start).max(cursor);
-        let range_end = range.end.min(absolute_end);
-        if range_start >= range_end {
-            continue;
-        }
-        if cursor < range_start {
-            let plain = &syntax.source[cursor..range_start];
             canvas::draw_plain_text(area, context, font_size, plain, x, baseline, fallback);
             x += cached_text_width_for_state(area, state, plain);
         }
-        let segment = &syntax.source[range_start..range_end];
-        let color = range.style.color();
+        let segment_start = start.saturating_sub(line.start);
+        let segment_end = end.saturating_sub(line.start);
+        let Some(segment) = line
+            .text
+            .get(segment_start..segment_end)
+            .filter(|segment| !segment.is_empty())
+        else {
+            continue;
+        };
         canvas::draw_plain_text(
             area,
             context,
@@ -934,21 +860,22 @@ fn draw_syntax_line(
             segment,
             x,
             baseline,
-            TextColor::rgb(color.0, color.1, color.2),
+            TextColor::rgb(
+                span.color[0] as f64,
+                span.color[1] as f64,
+                span.color[2] as f64,
+            ),
         );
         x += cached_text_width_for_state(area, state, segment);
-        cursor = range_end;
+        cursor = end;
     }
-    if cursor < absolute_end {
-        canvas::draw_plain_text(
-            area,
-            context,
-            font_size,
-            &syntax.source[cursor..absolute_end],
-            x,
-            baseline,
-            fallback,
-        );
+    let remaining_start = cursor.saturating_sub(line.start);
+    if let Some(remaining) = line
+        .text
+        .get(remaining_start..)
+        .filter(|text| !text.is_empty())
+    {
+        canvas::draw_plain_text(area, context, font_size, remaining, x, baseline, fallback);
     }
 }
 
@@ -1030,14 +957,14 @@ fn draw_side_background(
     y: f64,
     width: f64,
     height: f64,
-    kind: DiffKind,
+    kind: DiffRowKind,
     theme: DiffCanvasTheme,
 ) {
     let color = match kind {
-        DiffKind::Added => theme.added_background,
-        DiffKind::Deleted => theme.deleted_background,
-        DiffKind::Context => theme.background,
-        DiffKind::Fold => theme.fold_background,
+        DiffRowKind::Added => theme.added_background,
+        DiffRowKind::Deleted => theme.deleted_background,
+        DiffRowKind::Context => theme.background,
+        DiffRowKind::Fold => theme.fold_background,
     };
     fill_rect(context, x, y, width, height, color);
 }
@@ -1104,7 +1031,11 @@ fn draw_scrollbar_markers(
             .min(track_y + track_height - marker_y);
         canvas_scrollbar::draw_marker(
             context,
-            marker.kind,
+            match marker.kind {
+                DiffMarkerKind::Added => canvas_scrollbar::MarkerKind::Added,
+                DiffMarkerKind::Deleted => canvas_scrollbar::MarkerKind::Deleted,
+                DiffMarkerKind::Mixed => canvas_scrollbar::MarkerKind::Mixed,
+            },
             track_x,
             marker_y,
             track_width,
@@ -1823,7 +1754,7 @@ fn show_context_menu(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, x: f64, y:
         .rows
         .borrow()
         .iter()
-        .any(|row| !is_fold_row(row) && text_for_side(row, side).is_some());
+        .any(|row| !is_fold_row(row) && diff_text_for_side(row, side).is_some());
     context_menu::popup_action_menu(
         area,
         x,
@@ -1861,147 +1792,56 @@ fn copy_selection(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) {
 fn selected_text(state: &Rc<DiffCanvasState>) -> Option<String> {
     let selection = *state.selection.borrow();
     let selection = selection?;
-    if selection.anchor.side != selection.focus.side {
-        return None;
-    }
-    let (start, end) = selection.ordered()?;
     let rows = state.rows.borrow();
-    let mut output = String::new();
-
-    for row_index in start.row..=end.row {
-        let Some(row) = rows.get(row_index) else {
-            continue;
-        };
-        if is_fold_row(row) {
-            continue;
-        }
-        let Some(text) = text_for_side(row, start.side) else {
-            continue;
-        };
-        let text_start = if row_index == start.row {
-            start.byte
-        } else {
-            0
-        };
-        let text_end = if row_index == end.row {
-            end.byte
-        } else {
-            text.len()
-        };
-        let text_start = text_start.min(text.len());
-        let text_end = text_end.min(text.len()).max(text_start);
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        if text.is_char_boundary(text_start) && text.is_char_boundary(text_end) {
-            output.push_str(&text[text_start..text_end]);
-        }
-    }
-
-    Some(output)
+    selected_diff_text(
+        &rows,
+        DiffTextSelection {
+            anchor: DiffTextPoint {
+                side: selection.anchor.side,
+                row: selection.anchor.row,
+                byte: selection.anchor.byte,
+            },
+            focus: DiffTextPoint {
+                side: selection.focus.side,
+                row: selection.focus.row,
+                byte: selection.focus.byte,
+            },
+        },
+    )
 }
 
 fn select_all_side(area: &gtk::GLArea, state: &Rc<DiffCanvasState>, side: DiffCanvasSide) {
     state.active_side.set(side);
     let rows = state.rows.borrow();
-    let start = rows
-        .iter()
-        .enumerate()
-        .find(|(_, row)| !is_fold_row(row) && text_for_side(row, side).is_some())
-        .map(|(row, _)| DiffSelectionPoint { side, row, byte: 0 });
-    let end = rows.iter().enumerate().rev().find_map(|(row, diff_row)| {
-        if is_fold_row(diff_row) {
-            return None;
-        }
-        let text = text_for_side(diff_row, side)?;
-        Some(DiffSelectionPoint {
-            side,
-            row,
-            byte: text.len(),
-        })
-    });
+    let selection = select_all_diff_text(&rows, side);
     drop(rows);
 
-    if let (Some(anchor), Some(focus)) = (start, end) {
-        state
-            .selection
-            .replace(Some(DiffSelection { anchor, focus }));
+    if let Some(selection) = selection {
+        state.selection.replace(Some(DiffSelection {
+            anchor: DiffSelectionPoint {
+                side: selection.anchor.side,
+                row: selection.anchor.row,
+                byte: selection.anchor.byte,
+            },
+            focus: DiffSelectionPoint {
+                side: selection.focus.side,
+                row: selection.focus.row,
+                byte: selection.focus.byte,
+            },
+        }));
         area.queue_render();
-    }
-}
-
-fn text_for_side(row: &FileDiffRow, side: DiffCanvasSide) -> Option<&str> {
-    match side {
-        DiffCanvasSide::Left => row.left_text.as_deref(),
-        DiffCanvasSide::Right => row.right_text.as_deref(),
     }
 }
 
 fn rebuild_search_matches(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) {
     let query = state.search.borrow().query.clone();
-    let matches = diff_search_matches(&state.rows.borrow(), &query);
+    let matches = find_diff_search_matches(&state.rows.borrow(), &query);
     {
         let mut search = state.search.borrow_mut();
         search.matches = matches;
         search.active = (!search.matches.is_empty()).then_some(0);
     }
     select_active_search_match(area, state);
-}
-
-fn diff_search_matches(rows: &[FileDiffRow], query: &str) -> Vec<DiffSearchMatch> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-
-    let mut matches = Vec::new();
-    for (row_index, row) in rows.iter().enumerate() {
-        if is_fold_row(row) {
-            continue;
-        }
-        if let Some(text) = row.left_text.as_deref() {
-            push_text_search_matches(&mut matches, DiffCanvasSide::Left, row_index, text, query);
-        }
-        if let Some(text) = row.right_text.as_deref() {
-            push_text_search_matches(&mut matches, DiffCanvasSide::Right, row_index, text, query);
-        }
-    }
-    matches
-}
-
-fn push_text_search_matches(
-    matches: &mut Vec<DiffSearchMatch>,
-    side: DiffCanvasSide,
-    row: usize,
-    text: &str,
-    query: &str,
-) {
-    let (haystack, needle) = if query.is_ascii() {
-        (text.to_ascii_lowercase(), query.to_ascii_lowercase())
-    } else {
-        (text.to_string(), query.to_string())
-    };
-    let mut cursor = 0usize;
-    while cursor <= haystack.len() {
-        let Some(relative) = haystack[cursor..].find(&needle) else {
-            break;
-        };
-        let start = cursor + relative;
-        let end = start + needle.len();
-        if text.is_char_boundary(start) && text.is_char_boundary(end) {
-            matches.push(DiffSearchMatch {
-                side,
-                row,
-                start,
-                end,
-            });
-            cursor = end.max(start.saturating_add(1));
-        } else {
-            cursor = start.saturating_add(1).min(text.len());
-            while cursor < text.len() && !text.is_char_boundary(cursor) {
-                cursor += 1;
-            }
-        }
-    }
 }
 
 fn select_active_search_match(area: &gtk::GLArea, state: &Rc<DiffCanvasState>) {
@@ -2081,7 +1921,7 @@ fn word_bounds_at_point(
     point: DiffSelectionPoint,
 ) -> Option<(DiffSelectionPoint, DiffSelectionPoint)> {
     let rows = state.rows.borrow();
-    let text = text_for_side(rows.get(point.row)?, point.side)?;
+    let text = diff_text_for_side(rows.get(point.row)?, point.side)?;
     let (start, end) = text_word_bounds_at(text, point.byte)?;
     Some((
         DiffSelectionPoint {
@@ -2097,7 +1937,7 @@ fn line_bounds_at_point(
     point: DiffSelectionPoint,
 ) -> Option<(DiffSelectionPoint, DiffSelectionPoint)> {
     let rows = state.rows.borrow();
-    let text = text_for_side(rows.get(point.row)?, point.side)?;
+    let text = diff_text_for_side(rows.get(point.row)?, point.side)?;
     Some((
         DiffSelectionPoint { byte: 0, ..point },
         DiffSelectionPoint {
@@ -2127,7 +1967,7 @@ fn fold_index_at(_area: &gtk::GLArea, state: &Rc<DiffCanvasState>, y: f64) -> Op
     let cache = state.layout_cache.borrow();
     let row_index = cache
         .as_ref()
-        .and_then(|cache| diff_layout::row_index_at_y(cache, document_y))?;
+        .and_then(|cache| diff_row_index_at_y(cache, document_y))?;
     let rows = state.rows.borrow();
     let row = rows.get(row_index)?;
     is_fold_row(row).then(|| row.left_number).flatten()
@@ -2168,12 +2008,12 @@ fn selection_point_at_side(
     let document_y = y + state.scroll_y.get();
     let cache = state.layout_cache.borrow();
     let cache = cache.as_ref()?;
-    let row_index = diff_layout::row_index_at_y(cache, document_y)?;
+    let row_index = diff_row_index_at_y(cache, document_y)?;
     let row = rows.get(row_index)?;
     if is_fold_row(row) {
         return None;
     }
-    let text = text_for_side(row, side)?;
+    let text = diff_text_for_side(row, side)?;
     let layout = cache.rows.get(row_index)?;
     let side_x = match side {
         DiffCanvasSide::Left => 0.0,
@@ -2241,28 +2081,20 @@ fn fill_rect(
     let _ = context.fill();
 }
 
-fn diff_prefix(kind: DiffKind) -> Option<&'static str> {
+fn diff_prefix(kind: DiffRowKind) -> Option<&'static str> {
     match kind {
-        DiffKind::Added => Some("+"),
-        DiffKind::Deleted => Some("-"),
-        DiffKind::Context | DiffKind::Fold => None,
+        DiffRowKind::Added => Some("+"),
+        DiffRowKind::Deleted => Some("-"),
+        DiffRowKind::Context | DiffRowKind::Fold => None,
     }
 }
 
-fn is_fold_row(row: &FileDiffRow) -> bool {
-    row.left_kind == DiffKind::Fold || row.right_kind == DiffKind::Fold
+fn is_fold_row(row: &DiffRow) -> bool {
+    row.left_kind == DiffRowKind::Fold || row.right_kind == DiffRowKind::Fold
 }
 
-fn diff_rows_equal(left: &[FileDiffRow], right: &[FileDiffRow]) -> bool {
-    left.len() == right.len()
-        && left.iter().zip(right.iter()).all(|(left, right)| {
-            left.left_number == right.left_number
-                && left.right_number == right.right_number
-                && left.left_text == right.left_text
-                && left.right_text == right.right_text
-                && left.left_kind == right.left_kind
-                && left.right_kind == right.right_kind
-        })
+fn diff_rows_equal(left: &[DiffRow], right: &[DiffRow]) -> bool {
+    left == right
 }
 
 fn font_size_delta_for_key(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> Option<f64> {

@@ -1,4 +1,4 @@
-//! Synchronous connector and transport for the Codex App Server JSONL protocol.
+//! Bounded connector and Tokio transport for the Codex App Server JSONL protocol.
 //!
 //! The wire protocol deliberately remains represented as tolerant JSON values. The small typed
 //! request helpers in [`protocol`] cover the common chat path without coupling Craic to a

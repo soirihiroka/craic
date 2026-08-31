@@ -1,17 +1,17 @@
 use crate::system::capabilities::files::{
-    DirectoryListing, FileAccess, FileCopyRequest, FileDeleteRequest, FileKind, FileMoveRequest,
-    FileNodeCapabilities, FileNodeInfo, FileOperation, FileOperationCallback, FileOperationError,
-    FileOperationErrorKind, FileOperationEvent, FileOperationProgress, FileRead, FileReadRequest,
+    DirectoryListing, FILE_OPERATION_EVENT_CAPACITY, FILE_WATCH_EVENT_CAPACITY, FileAccess,
+    FileCopyRequest, FileDeleteRequest, FileKind, FileMoveRequest, FileNodeCapabilities,
+    FileNodeInfo, FileOperation, FileOperationEmitter, FileOperationError, FileOperationErrorKind,
+    FileOperationEvent, FileOperationProgress, FileOperationReceiver, FileRead, FileReadRequest,
     FileSearchMatch, FileSearchOutput, FileSearchQuery, FileSignature, FileSudoError,
-    FileSudoErrorKind, FileSudoPassword, FileWatchCallback, FileWatchChanges, FileWatchRequest,
+    FileSudoErrorKind, FileSudoPassword, FileWatchChanges, FileWatchReceiver, FileWatchRequest,
     FileWatchSubscription, FileWriteMode, FileWritePayload, FileWriteRequest,
     file_operation_canceled,
 };
 use crate::system::path::{
     ArchiveFormat, FileNodePath, FileNodeRef, SystemRef, WorkspacePath, WorkspaceRef,
 };
-use gtk::prelude::*;
-use gtk::{gio, glib};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
 use zeroize::Zeroizing;
 
-const LOCAL_FILE_MONITOR_RATE_LIMIT_MS: i32 = 250;
+const LOCAL_FILE_MONITOR_RATE_LIMIT: Duration = Duration::from_millis(250);
 const LOCAL_FILE_MONITOR_SERVICE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const LOCAL_FILE_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(750);
 const LOCAL_ARCHIVE_PYTHON_CANDIDATES: &[&str] = &["python3", "python"];
@@ -866,14 +866,14 @@ impl LocalFileAccess {
         }
     }
 
-    fn emit_progress<T>(callback: &FileOperationCallback<T>, progress: FileOperationProgress) {
+    fn emit_progress<T>(callback: &FileOperationEmitter<T>, progress: FileOperationProgress) {
         callback(FileOperationEvent::Progress(progress));
     }
 
     fn perform_read_with_info(
         &self,
         request: &FileReadRequest,
-        callback: &FileOperationCallback<FileRead>,
+        callback: &FileOperationEmitter<FileRead>,
     ) -> Result<FileRead, FileOperationError> {
         let operation = FileOperation::Read;
         Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
@@ -1050,7 +1050,7 @@ impl LocalFileAccess {
     fn perform_write_node(
         &self,
         request: &FileWriteRequest,
-        callback: &FileOperationCallback<()>,
+        callback: &FileOperationEmitter<()>,
     ) -> Result<(), FileOperationError> {
         let operation = FileOperation::Write;
         Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
@@ -1262,7 +1262,7 @@ impl LocalFileAccess {
         &self,
         request: &FileCopyRequest,
         operation: FileOperation,
-        callback: &FileOperationCallback<FileNodePath>,
+        callback: &FileOperationEmitter<FileNodePath>,
     ) -> Result<FileNodePath, FileOperationError> {
         Self::check_canceled(operation, &request.source, &request.cancel_requested)?;
         if request.source.contains_archive() || request.destination.contains_archive() {
@@ -1388,7 +1388,7 @@ impl LocalFileAccess {
         operation: FileOperation,
         cancel_requested: &Option<crate::system::capabilities::files::FileCancellation>,
         progress: &mut LocalCopyProgress,
-        callback: &FileOperationCallback<FileNodePath>,
+        callback: &FileOperationEmitter<FileNodePath>,
     ) -> Result<(), FileOperationError> {
         Self::check_canceled(operation, source, cancel_requested)?;
         let metadata = fs::symlink_metadata(source_path).map_err(|err| {
@@ -1546,7 +1546,7 @@ impl LocalFileAccess {
     fn perform_move_node(
         &self,
         request: &FileMoveRequest,
-        callback: &FileOperationCallback<FileNodePath>,
+        callback: &FileOperationEmitter<FileNodePath>,
     ) -> Result<FileNodePath, FileOperationError> {
         let operation = FileOperation::Move;
         Self::check_canceled(operation, &request.source, &request.cancel_requested)?;
@@ -1698,7 +1698,7 @@ impl LocalFileAccess {
     fn perform_delete(
         &self,
         request: &FileDeleteRequest,
-        callback: Option<&FileOperationCallback<()>>,
+        callback: Option<&FileOperationEmitter<()>>,
     ) -> Result<(), FileOperationError> {
         let operation = FileOperation::Delete;
         Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
@@ -1848,8 +1848,7 @@ impl FileAccess for LocalFileAccess {
     fn watch(
         &self,
         request: FileWatchRequest,
-        callback: FileWatchCallback,
-    ) -> Result<FileWatchSubscription, String> {
+    ) -> Result<(FileWatchSubscription, FileWatchReceiver), String> {
         let requested_paths = if request.paths.is_empty() {
             vec![self.root_node()]
         } else {
@@ -1879,18 +1878,20 @@ impl FileAccess for LocalFileAccess {
             )
         };
         log::info!(
-            "local file watch requested workspace={} paths={} mode=shared-gio",
+            "local file watch requested workspace={} paths={} mode=shared-notify",
             self.workspace.display_name,
             local_paths.len()
         );
-        self.file_watch_service.register(
+        let (sender, receiver) = tokio::sync::mpsc::channel(FILE_WATCH_EVENT_CAPACITY);
+        let subscription = self.file_watch_service.register(
             label,
             local_paths,
             self.root_path.clone(),
             self.system.clone(),
             self.workspace.clone(),
-            callback,
-        )
+            sender,
+        )?;
+        Ok((subscription, receiver))
     }
 
     fn info(&self, path: &FileNodePath) -> Result<FileNodeInfo, String> {
@@ -1985,9 +1986,13 @@ impl FileAccess for LocalFileAccess {
         Ok(listings)
     }
 
-    fn read_with_info(&self, request: FileReadRequest, callback: FileOperationCallback<FileRead>) {
+    fn read_with_info_events(&self, request: FileReadRequest) -> FileOperationReceiver<FileRead> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(FILE_OPERATION_EVENT_CAPACITY);
         let access = self.clone();
         thread::spawn(move || {
+            let callback = move |event| {
+                let _ = sender.blocking_send(event);
+            };
             log::info!(
                 "local file read worker start path={} max_bytes={:?}",
                 request.path.display(),
@@ -1996,11 +2001,16 @@ impl FileAccess for LocalFileAccess {
             let result = access.perform_read_with_info(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
+        receiver
     }
 
-    fn write_node(&self, request: FileWriteRequest, callback: FileOperationCallback<()>) {
+    fn write_node_events(&self, request: FileWriteRequest) -> FileOperationReceiver<()> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(FILE_OPERATION_EVENT_CAPACITY);
         let access = self.clone();
         thread::spawn(move || {
+            let callback = move |event| {
+                let _ = sender.blocking_send(event);
+            };
             let payload_label = match &request.payload {
                 FileWritePayload::File(contents) => format!("file bytes={}", contents.len()),
                 FileWritePayload::Directory => "directory".to_string(),
@@ -2013,11 +2023,16 @@ impl FileAccess for LocalFileAccess {
             let result = access.perform_write_node(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
+        receiver
     }
 
-    fn copy_node(&self, request: FileCopyRequest, callback: FileOperationCallback<FileNodePath>) {
+    fn copy_node_events(&self, request: FileCopyRequest) -> FileOperationReceiver<FileNodePath> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(FILE_OPERATION_EVENT_CAPACITY);
         let access = self.clone();
         thread::spawn(move || {
+            let callback = move |event| {
+                let _ = sender.blocking_send(event);
+            };
             log::info!(
                 "local file copy worker start source={} destination={}",
                 request.source.display(),
@@ -2026,11 +2041,16 @@ impl FileAccess for LocalFileAccess {
             let result = access.perform_copy_node(&request, FileOperation::Copy, &callback);
             callback(FileOperationEvent::Finished(result));
         });
+        receiver
     }
 
-    fn move_node(&self, request: FileMoveRequest, callback: FileOperationCallback<FileNodePath>) {
+    fn move_node_events(&self, request: FileMoveRequest) -> FileOperationReceiver<FileNodePath> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(FILE_OPERATION_EVENT_CAPACITY);
         let access = self.clone();
         thread::spawn(move || {
+            let callback = move |event| {
+                let _ = sender.blocking_send(event);
+            };
             log::info!(
                 "local file move worker start source={} destination_parent={} new_name={}",
                 request.source.display(),
@@ -2040,11 +2060,16 @@ impl FileAccess for LocalFileAccess {
             let result = access.perform_move_node(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
+        receiver
     }
 
-    fn delete(&self, request: FileDeleteRequest, callback: FileOperationCallback<()>) {
+    fn delete_events(&self, request: FileDeleteRequest) -> FileOperationReceiver<()> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(FILE_OPERATION_EVENT_CAPACITY);
         let access = self.clone();
         thread::spawn(move || {
+            let callback = move |event| {
+                let _ = sender.blocking_send(event);
+            };
             log::info!(
                 "local file delete worker start path={}",
                 request.path.display()
@@ -2052,6 +2077,7 @@ impl FileAccess for LocalFileAccess {
             let result = access.perform_delete(&request, Some(&callback));
             callback(FileOperationEvent::Finished(result));
         });
+        receiver
     }
 
     fn search_text(&self, query: FileSearchQuery) -> Result<FileSearchOutput, String> {
@@ -2188,7 +2214,7 @@ enum LocalFileWatchCommand {
         root_path: PathBuf,
         system: SystemRef,
         workspace: WorkspaceRef,
-        callback: FileWatchCallback,
+        sender: tokio::sync::mpsc::Sender<FileWatchChanges>,
         response: mpsc::Sender<Result<(), String>>,
     },
     Unregister {
@@ -2202,27 +2228,28 @@ struct LocalFileWatchRegistration {
     root_path: PathBuf,
     system: SystemRef,
     workspace: WorkspaceRef,
-    callback: FileWatchCallback,
+    sender: tokio::sync::mpsc::Sender<FileWatchChanges>,
     monitored_paths: Vec<PathBuf>,
     fallback_paths: Vec<(FileNodePath, PathBuf)>,
     fallback_signatures: HashMap<FileNodePath, Option<FileSignature>>,
     next_fallback_poll: Instant,
+    pending_changes: FileWatchChanges,
+    next_delivery: Option<Instant>,
     started_at: Instant,
     raw_events: u64,
-    callback_batches: u64,
+    delivered_batches: u64,
     changed_paths: u64,
 }
 
 struct SharedLocalMonitor {
-    monitor: gio::FileMonitor,
+    _watcher: RecommendedWatcher,
+    directory: bool,
     registrations: HashSet<u64>,
 }
 
 struct LocalFileMonitorEvent {
     watched_path: PathBuf,
-    file: Option<PathBuf>,
-    other_file: Option<PathBuf>,
-    event_type: gio::FileMonitorEvent,
+    result: notify::Result<Event>,
 }
 
 impl LocalFileWatchService {
@@ -2246,7 +2273,7 @@ impl LocalFileWatchService {
         root_path: PathBuf,
         system: SystemRef,
         workspace: WorkspaceRef,
-        callback: FileWatchCallback,
+        sender: tokio::sync::mpsc::Sender<FileWatchChanges>,
     ) -> Result<FileWatchSubscription, String> {
         let id = NEXT_LOCAL_FILE_WATCH_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed);
         let (response, result) = mpsc::channel();
@@ -2258,7 +2285,7 @@ impl LocalFileWatchService {
                 root_path,
                 system,
                 workspace,
-                callback,
+                sender,
                 response,
             })
             .map_err(|_| "Local file watch service is unavailable.".to_string())?;
@@ -2299,58 +2326,50 @@ impl Drop for LocalFileWatchService {
 }
 
 fn run_local_file_watch_service(command_receiver: mpsc::Receiver<LocalFileWatchCommand>) {
-    let context = glib::MainContext::new();
-    let result = context.with_thread_default(|| {
-        let (event_sender, event_receiver) = mpsc::channel();
-        let mut registrations = HashMap::new();
-        let mut monitors = HashMap::new();
-        let mut running = true;
+    let (event_sender, event_receiver) = mpsc::channel();
+    let mut registrations = HashMap::new();
+    let mut monitors = HashMap::new();
+    let mut running = true;
 
-        while running {
-            while let Ok(command) = command_receiver.try_recv() {
+    while running {
+        while let Ok(command) = command_receiver.try_recv() {
+            running = handle_local_file_watch_command(
+                command,
+                &event_sender,
+                &mut registrations,
+                &mut monitors,
+            );
+            if !running {
+                break;
+            }
+        }
+        if !running {
+            break;
+        }
+
+        while let Ok(event) = event_receiver.try_recv() {
+            dispatch_local_file_monitor_event(event, &monitors, &mut registrations);
+        }
+        flush_local_file_watch_changes(&mut registrations);
+        poll_local_file_watch_fallbacks(&mut registrations);
+
+        match command_receiver.recv_timeout(LOCAL_FILE_MONITOR_SERVICE_POLL_INTERVAL) {
+            Ok(command) => {
                 running = handle_local_file_watch_command(
                     command,
                     &event_sender,
                     &mut registrations,
                     &mut monitors,
                 );
-                if !running {
-                    break;
-                }
             }
-            if !running {
-                break;
-            }
-
-            while context.pending() {
-                context.iteration(false);
-            }
-            while let Ok(event) = event_receiver.try_recv() {
-                dispatch_local_file_monitor_event(event, &monitors, &mut registrations);
-            }
-            poll_local_file_watch_fallbacks(&mut registrations);
-
-            match command_receiver.recv_timeout(LOCAL_FILE_MONITOR_SERVICE_POLL_INTERVAL) {
-                Ok(command) => {
-                    running = handle_local_file_watch_command(
-                        command,
-                        &event_sender,
-                        &mut registrations,
-                        &mut monitors,
-                    );
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
 
-        let ids = registrations.keys().copied().collect::<Vec<_>>();
-        for id in ids {
-            unregister_local_file_watch(id, &mut registrations, &mut monitors);
-        }
-    });
-    if let Err(err) = result {
-        log::warn!("local file watch service context failed: {err}");
+    let ids = registrations.keys().copied().collect::<Vec<_>>();
+    for id in ids {
+        unregister_local_file_watch(id, &mut registrations, &mut monitors);
     }
 }
 
@@ -2368,7 +2387,7 @@ fn handle_local_file_watch_command(
             root_path,
             system,
             workspace,
-            callback,
+            sender,
             response,
         } => {
             let result = register_local_file_watch(
@@ -2378,7 +2397,7 @@ fn handle_local_file_watch_command(
                 root_path,
                 system,
                 workspace,
-                callback,
+                sender,
                 event_sender,
                 registrations,
                 monitors,
@@ -2402,12 +2421,11 @@ fn register_local_file_watch(
     root_path: PathBuf,
     system: SystemRef,
     workspace: WorkspaceRef,
-    callback: FileWatchCallback,
+    sender: tokio::sync::mpsc::Sender<FileWatchChanges>,
     event_sender: &mpsc::Sender<LocalFileMonitorEvent>,
     registrations: &mut HashMap<u64, LocalFileWatchRegistration>,
     monitors: &mut HashMap<PathBuf, SharedLocalMonitor>,
 ) -> Result<(), String> {
-    let flags = gio::FileMonitorFlags::WATCH_MOVES | gio::FileMonitorFlags::SEND_MOVED;
     let mut monitored_paths = Vec::new();
     let mut fallback_paths = Vec::new();
 
@@ -2418,29 +2436,31 @@ fn register_local_file_watch(
             continue;
         }
 
-        let file = gio::File::for_path(&local_path);
-        let monitor_result = if local_path.is_dir() {
-            file.monitor_directory(flags, None::<&gio::Cancellable>)
+        let directory = local_path.is_dir();
+        let watch_root = if directory {
+            local_path.as_path()
         } else {
-            file.monitor_file(flags, None::<&gio::Cancellable>)
+            local_path.parent().unwrap_or(local_path.as_path())
         };
+        let watched_path = local_path.clone();
+        let sender = event_sender.clone();
+        let monitor_result = notify::recommended_watcher(move |result| {
+            let _ = sender.send(LocalFileMonitorEvent {
+                watched_path: watched_path.clone(),
+                result,
+            });
+        })
+        .and_then(|mut watcher| {
+            watcher.watch(watch_root, RecursiveMode::NonRecursive)?;
+            Ok(watcher)
+        });
         match monitor_result {
-            Ok(monitor) => {
-                monitor.set_rate_limit(LOCAL_FILE_MONITOR_RATE_LIMIT_MS);
-                let watched_path = local_path.clone();
-                let event_sender = event_sender.clone();
-                monitor.connect_changed(move |_, file, other_file, event_type| {
-                    let _ = event_sender.send(LocalFileMonitorEvent {
-                        watched_path: watched_path.clone(),
-                        file: file.path(),
-                        other_file: other_file.and_then(gio::File::path),
-                        event_type,
-                    });
-                });
+            Ok(watcher) => {
                 monitors.insert(
                     local_path.clone(),
                     SharedLocalMonitor {
-                        monitor,
+                        _watcher: watcher,
+                        directory,
                         registrations: HashSet::from([id]),
                     },
                 );
@@ -2448,8 +2468,9 @@ fn register_local_file_watch(
             }
             Err(err) => {
                 log::warn!(
-                    "local gio file watch unavailable path={} err={err}; using shared polling fallback",
-                    local_path.display()
+                    "local notify file watch unavailable path={} watch_root={} err={err}; using shared polling fallback",
+                    local_path.display(),
+                    watch_root.display(),
                 );
                 fallback_paths.push((node_path, local_path));
             }
@@ -2458,7 +2479,7 @@ fn register_local_file_watch(
 
     let fallback_signatures = local_file_watch_signatures(&fallback_paths);
     log::info!(
-        "local file watch registered id={} label={} gio_paths={} fallback_paths={} shared_monitors={}",
+        "local file watch registered id={} label={} notify_paths={} fallback_paths={} shared_monitors={}",
         id,
         label,
         monitored_paths.len(),
@@ -2472,14 +2493,16 @@ fn register_local_file_watch(
             root_path,
             system,
             workspace,
-            callback,
+            sender,
             monitored_paths,
             fallback_paths,
             fallback_signatures,
             next_fallback_poll: Instant::now() + LOCAL_FILE_FALLBACK_POLL_INTERVAL,
+            pending_changes: FileWatchChanges::new(),
+            next_delivery: None,
             started_at: Instant::now(),
             raw_events: 0,
-            callback_batches: 0,
+            delivered_batches: 0,
             changed_paths: 0,
         },
     );
@@ -2499,17 +2522,17 @@ fn unregister_local_file_watch(
             monitor.registrations.remove(&id);
             monitor.registrations.is_empty()
         });
-        if remove_monitor && let Some(monitor) = monitors.remove(path) {
-            monitor.monitor.cancel();
+        if remove_monitor {
+            monitors.remove(path);
         }
     }
     log::info!(
-        "local file watch unregistered id={} label={} lifetime_ms={} raw_events={} callback_batches={} changed_paths={} shared_monitors={}",
+        "local file watch unregistered id={} label={} lifetime_ms={} raw_events={} delivered_batches={} changed_paths={} shared_monitors={}",
         id,
         registration.label,
         registration.started_at.elapsed().as_millis(),
         registration.raw_events,
-        registration.callback_batches,
+        registration.delivered_batches,
         registration.changed_paths,
         monitors.len()
     );
@@ -2520,11 +2543,19 @@ fn dispatch_local_file_monitor_event(
     monitors: &HashMap<PathBuf, SharedLocalMonitor>,
     registrations: &mut HashMap<u64, LocalFileWatchRegistration>,
 ) {
-    if !local_file_monitor_event_should_notify(event.event_type) {
-        return;
-    }
     let Some(monitor) = monitors.get(&event.watched_path) else {
         return;
+    };
+    let native_event = match event.result {
+        Ok(event) if local_file_monitor_event_should_notify(event.kind) => event,
+        Ok(_) => return,
+        Err(err) => {
+            log::warn!(
+                "local notify file watch event failed path={} err={err}",
+                event.watched_path.display()
+            );
+            return;
+        }
     };
     let registration_ids = monitor.registrations.iter().copied().collect::<Vec<_>>();
     for id in registration_ids {
@@ -2536,15 +2567,37 @@ fn dispatch_local_file_monitor_event(
             &registration.root_path,
             &registration.system,
             &registration.workspace,
-            event.file.as_deref(),
-            event.other_file.as_deref(),
+            &event.watched_path,
+            monitor.directory,
+            &native_event.paths,
         );
         if changes.is_empty() {
             continue;
         }
-        registration.callback_batches += 1;
+        registration.pending_changes.extend(changes);
+        registration
+            .next_delivery
+            .get_or_insert_with(|| Instant::now() + LOCAL_FILE_MONITOR_RATE_LIMIT);
+    }
+}
+
+fn flush_local_file_watch_changes(registrations: &mut HashMap<u64, LocalFileWatchRegistration>) {
+    let now = Instant::now();
+    for registration in registrations.values_mut() {
+        if registration
+            .next_delivery
+            .is_none_or(|deadline| now < deadline)
+        {
+            continue;
+        }
+        registration.next_delivery = None;
+        let changes = std::mem::take(&mut registration.pending_changes);
+        if changes.is_empty() {
+            continue;
+        }
+        registration.delivered_batches += 1;
         registration.changed_paths += changes.len() as u64;
-        (registration.callback)(changes);
+        let _ = registration.sender.blocking_send(changes);
     }
 }
 
@@ -2561,9 +2614,9 @@ fn poll_local_file_watch_fallbacks(registrations: &mut HashMap<u64, LocalFileWat
         if changes.is_empty() {
             continue;
         }
-        registration.callback_batches += 1;
+        registration.delivered_batches += 1;
         registration.changed_paths += changes.len() as u64;
-        (registration.callback)(changes);
+        let _ = registration.sender.blocking_send(changes);
     }
 }
 
@@ -2606,12 +2659,10 @@ fn changed_signature_paths(
     changes
 }
 
-fn local_file_monitor_event_should_notify(event_type: gio::FileMonitorEvent) -> bool {
+fn local_file_monitor_event_should_notify(event_type: EventKind) -> bool {
     !matches!(
         event_type,
-        gio::FileMonitorEvent::AttributeChanged
-            | gio::FileMonitorEvent::PreUnmount
-            | gio::FileMonitorEvent::Unmounted
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))
     )
 }
 
@@ -2619,15 +2670,20 @@ fn local_file_monitor_path_changes(
     root_path: &Path,
     system: &SystemRef,
     workspace: &WorkspaceRef,
-    file: Option<&Path>,
-    other_file: Option<&Path>,
+    watched_path: &Path,
+    directory: bool,
+    event_paths: &[PathBuf],
 ) -> FileWatchChanges {
     let mut changes = FileWatchChanges::new();
-    if let Some(file) = file {
-        collect_local_file_monitor_path(&mut changes, root_path, system, workspace, file);
-    }
-    if let Some(other_file) = other_file {
-        collect_local_file_monitor_path(&mut changes, root_path, system, workspace, other_file);
+    for path in event_paths {
+        let matches_watch = if directory {
+            path.parent() == Some(watched_path)
+        } else {
+            path == watched_path
+        };
+        if matches_watch {
+            collect_local_file_monitor_path(&mut changes, root_path, system, workspace, path);
+        }
     }
     changes
 }

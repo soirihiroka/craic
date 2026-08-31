@@ -1442,7 +1442,11 @@ fn wait_for_jupyter_notebook(
 ) -> Result<(), String> {
     let deadline = Instant::now() + JUPYTER_READY_TIMEOUT;
     let status_url = format!("{origin}/api/status?token={}", percent_encode_query(token));
-    let client = reqwest::blocking::Client::builder()
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("Unable to start Jupyter readiness runtime: {err}"))?;
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(900))
         .build()
         .map_err(|err| format!("Unable to create Jupyter readiness client: {err}"))?;
@@ -1454,11 +1458,14 @@ fn wait_for_jupyter_notebook(
                 child_output(stdout_path, stderr_path)
             ));
         }
-        if client
-            .get(&status_url)
-            .send()
-            .is_ok_and(|response| response.status().is_success())
-        {
+        let ready = runtime.block_on(async {
+            client
+                .get(&status_url)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+        });
+        if ready {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(250));

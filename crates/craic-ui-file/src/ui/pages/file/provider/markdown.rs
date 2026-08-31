@@ -4,6 +4,7 @@ use craic_ui_preview::markdown_preview::MarkdownPreviewDocument;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::thread;
 
 struct MarkdownPreviewLoad {
     text: String,
@@ -114,12 +115,11 @@ fn show_markup(
             Ok(load) => {
                 if let Some(git) = git.clone() {
                     let (sender, receiver) = mpsc::channel();
-                    git.comparison(
-                        &apply_file_path,
-                        Box::new(move |result| {
-                            let _ = sender.send(result.ok());
-                        }),
-                    );
+                    let comparison = git.comparison(&apply_file_path);
+                    thread::spawn(move || {
+                        let result = comparison.blocking_recv().ok().and_then(Result::ok);
+                        let _ = sender.send(result);
+                    });
                     let node_path = apply_node_path.clone();
                     let file_path = apply_file_path.clone();
                     let preview_base_path = local_path.clone();

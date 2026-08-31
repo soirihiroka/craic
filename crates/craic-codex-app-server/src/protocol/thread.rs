@@ -15,6 +15,15 @@ pub struct ThreadStartParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "super::serde_helpers::deserialize_double_option",
+        serialize_with = "super::serde_helpers::serialize_double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub service_tier: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral: Option<bool>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub experimental_raw_events: bool,
@@ -34,6 +43,15 @@ pub struct ThreadResumeParams {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "super::serde_helpers::deserialize_double_option",
+        serialize_with = "super::serde_helpers::serialize_double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub service_tier: Option<Option<String>>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -194,7 +212,7 @@ pub struct ThreadMetadataUpdateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_info: Option<ThreadMetadataGitInfoUpdateParams>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub is_pinned: Option<bool>,
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

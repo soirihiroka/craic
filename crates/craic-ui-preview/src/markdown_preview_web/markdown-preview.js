@@ -242,13 +242,13 @@
     return anchors[anchors.length - 1].offset;
   }
 
-  function scrollToSourceOffset(offset) {
+  function scrollToSourceOffset(offset, report = true) {
     const y = yForSourceOffset(offset);
     if (y === null) return false;
 
     const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
     window.scrollTo({ top: clamp(y, 0, maxY), behavior: "auto" });
-    postSourceOffset();
+    if (report) postSourceOffset();
     return true;
   }
 

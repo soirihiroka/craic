@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::Duration;
+use tokio::sync::mpsc::error::TryRecvError as TokioTryRecvError;
 
 #[derive(Clone, Debug)]
 pub(super) enum GitAction {
@@ -175,7 +176,7 @@ fn fetch_before_sync(
         remote_name
     );
 
-    let receiver = git_handle.fetch_with_progress(None);
+    let mut receiver = git_handle.fetch_with_progress(None);
 
     gtk::glib::timeout_add_local(Duration::from_millis(100), {
         let state = state.clone();
@@ -281,8 +282,8 @@ fn fetch_before_sync(
                         refresh(&state, None);
                         return gtk::glib::ControlFlow::Break;
                     }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
+                    Err(TokioTryRecvError::Empty) => break,
+                    Err(TokioTryRecvError::Disconnected) => {
                         state.git_action_running.set(false);
                         state.content.clear_git_action_progress();
                         show_error_dialog(
@@ -871,7 +872,7 @@ fn execute_git_action_with_snapshot(
         state.workspace_ref.borrow().display_name
     );
 
-    let receiver = match action.clone() {
+    let mut receiver = match action.clone() {
         GitAction::Push => git_handle.push_with_progress(),
         GitAction::Pull => git_handle.pull_with_progress(),
         GitAction::PullPush => git_handle.pull_push_with_progress(),
@@ -932,8 +933,8 @@ fn execute_git_action_with_snapshot(
                         refresh(&state, None);
                         return gtk::glib::ControlFlow::Break;
                     }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
+                    Err(TokioTryRecvError::Empty) => break,
+                    Err(TokioTryRecvError::Disconnected) => {
                         state.git_action_running.set(false);
                         state.content.clear_git_action_progress();
                         show_error_dialog(
@@ -1034,7 +1035,11 @@ fn stash_changes_and_retry_git_action(
         action
     );
 
-    git_handle.stash_changes(Box::new(move |result| {
+    let stash_receiver = git_handle.stash_changes();
+    thread::spawn(move || {
+        let result = stash_receiver
+            .blocking_recv()
+            .unwrap_or_else(|_| Err("Stash worker stopped unexpectedly.".to_string()));
         let result = result.map(|output| {
             if output.is_empty() {
                 "Changes stashed.".to_string()
@@ -1043,7 +1048,7 @@ fn stash_changes_and_retry_git_action(
             }
         });
         let _ = sender.send(GitActionEvent::Finished(result));
-    }));
+    });
 
     gtk::glib::timeout_add_local(Duration::from_millis(100), {
         let state = state.clone();

@@ -97,11 +97,17 @@ pub fn fetch_avatar(avatar: &adw::Avatar, source: AvatarSource) {
 
     if should_fetch {
         thread::spawn(move || {
-            let result = match source {
-                AvatarSource::Url(url) => github::download_avatar(&url),
-                AvatarSource::Email(email) => github::avatar_url_for_email(&email)
-                    .and_then(|url| github::download_avatar(&url)),
+            let url = match source {
+                AvatarSource::Url(url) => Ok(url),
+                AvatarSource::Email(email) => github::avatar_url_for_email(&email),
             };
+            let result = url.and_then(|url| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("Failed to start avatar download runtime: {error}"))?;
+                runtime.block_on(github::download_avatar_async(&url))
+            });
 
             if let Ok(bytes) = result.as_ref() {
                 cache_avatar(cache_key.clone(), bytes);

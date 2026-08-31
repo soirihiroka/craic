@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+craic-codex-app-server.workspace = true
 craic-config.workspace = true
 craic-system.workspace = true
 craic-vcs.workspace = true
@@ -14,5 +15,5 @@ reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 uuid.workspace = true
-

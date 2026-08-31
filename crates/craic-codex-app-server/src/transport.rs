@@ -1,13 +1,15 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStderr, ChildStdout};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{SyncSender, TrySendError as StdTrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdout};
+use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
+use tokio::time::{Instant, sleep_until};
 
 use crate::lifecycle::{AppServerError, AppServerEvent, ConnectionState};
 use crate::protocol::{
@@ -28,7 +30,7 @@ pub(crate) enum ProcessCommand {
 }
 
 pub(crate) fn enqueue_value<T: Serialize>(
-    sender: &SyncSender<WriterCommand>,
+    sender: &Sender<WriterCommand>,
     message: T,
 ) -> Result<(), AppServerError> {
     let value = serde_json::to_value(message).map_err(AppServerError::Serialize)?;
@@ -36,29 +38,29 @@ pub(crate) fn enqueue_value<T: Serialize>(
         .try_send(WriterCommand::Value(value))
         .map_err(|error| match error {
             TrySendError::Full(_) => AppServerError::CommandQueueFull,
-            TrySendError::Disconnected(_) => AppServerError::Disconnected,
+            TrySendError::Closed(_) => AppServerError::Disconnected,
         })
 }
 
-pub(crate) fn run_writer(
-    mut stdin: impl Write,
-    commands: Receiver<WriterCommand>,
+pub(crate) async fn run_writer(
+    mut stdin: impl AsyncWrite + Unpin,
+    mut commands: Receiver<WriterCommand>,
     state: Arc<Mutex<ConnectionState>>,
     events: SyncSender<AppServerEvent>,
     saturated: Arc<AtomicBool>,
-    process: SyncSender<ProcessCommand>,
+    process: Sender<ProcessCommand>,
 ) {
-    while let Ok(command) = commands.recv() {
+    while let Some(command) = commands.recv().await {
         match command {
             WriterCommand::Value(value) => {
-                if let Err(error) = write_json_line(&mut stdin, &value) {
+                if let Err(error) = write_json_line(&mut stdin, &value).await {
                     transport_failed(&state, &events, &saturated, &process, error);
                     break;
                 }
             }
             WriterCommand::InitializeAck(initialize) => {
                 let initialized = serde_json::json!({ "method": "initialized" });
-                if let Err(error) = write_json_line(&mut stdin, &initialized) {
+                if let Err(error) = write_json_line(&mut stdin, &initialized).await {
                     transport_failed(&state, &events, &saturated, &process, error);
                     break;
                 }
@@ -70,17 +72,21 @@ pub(crate) fn run_writer(
     }
 }
 
-fn write_json_line(writer: &mut impl Write, value: &Value) -> Result<(), std::io::Error> {
-    serde_json::to_writer(&mut *writer, value).map_err(std::io::Error::other)?;
-    writer.write_all(b"\n")?;
-    writer.flush()
+async fn write_json_line(
+    writer: &mut (impl AsyncWrite + Unpin),
+    value: &Value,
+) -> Result<(), std::io::Error> {
+    let mut bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    writer.write_all(&bytes).await?;
+    writer.flush().await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_stdout_reader(
+pub(crate) async fn run_stdout_reader(
     stdout: ChildStdout,
-    commands: SyncSender<WriterCommand>,
-    process: SyncSender<ProcessCommand>,
+    commands: Sender<WriterCommand>,
+    process: Sender<ProcessCommand>,
     state: Arc<Mutex<ConnectionState>>,
     pending: Arc<Mutex<HashMap<RequestId, String>>>,
     events: SyncSender<AppServerEvent>,
@@ -90,7 +96,7 @@ pub(crate) fn run_stdout_reader(
     let mut buffer = Vec::new();
     loop {
         buffer.clear();
-        match reader.read_until(b'\n', &mut buffer) {
+        match reader.read_until(b'\n', &mut buffer).await {
             Ok(0) => break,
             Ok(_) => {}
             Err(error) => {
@@ -132,8 +138,8 @@ pub(crate) fn run_stdout_reader(
 #[allow(clippy::too_many_arguments)]
 fn route_message(
     value: Value,
-    commands: &SyncSender<WriterCommand>,
-    process: &SyncSender<ProcessCommand>,
+    commands: &Sender<WriterCommand>,
+    process: &Sender<ProcessCommand>,
     state: &Arc<Mutex<ConnectionState>>,
     pending: &Arc<Mutex<HashMap<RequestId, String>>>,
     events: &SyncSender<AppServerEvent>,
@@ -177,7 +183,7 @@ fn route_message(
                                     TrySendError::Full(_) => {
                                         "writer queue full before initialized acknowledgement"
                                     }
-                                    TrySendError::Disconnected(_) => {
+                                    TrySendError::Closed(_) => {
                                         "writer disconnected before initialized acknowledgement"
                                     }
                                 };
@@ -239,7 +245,7 @@ fn route_message(
     }
 }
 
-pub(crate) fn run_stderr_reader(
+pub(crate) async fn run_stderr_reader(
     stderr: ChildStderr,
     events: SyncSender<AppServerEvent>,
     saturated: Arc<AtomicBool>,
@@ -248,7 +254,7 @@ pub(crate) fn run_stderr_reader(
     let mut buffer = Vec::new();
     loop {
         buffer.clear();
-        match reader.read_until(b'\n', &mut buffer) {
+        match reader.read_until(b'\n', &mut buffer).await {
             Ok(0) => break,
             Ok(_) => {
                 let diagnostic = String::from_utf8_lossy(&buffer)
@@ -272,18 +278,33 @@ pub(crate) fn run_stderr_reader(
     }
 }
 
-pub(crate) fn run_process_waiter(
+pub(crate) async fn run_process_waiter(
     mut child: Child,
-    commands: Receiver<ProcessCommand>,
+    mut commands: Receiver<ProcessCommand>,
     state: Arc<Mutex<ConnectionState>>,
     events: SyncSender<AppServerEvent>,
     saturated: Arc<AtomicBool>,
     process_group_id: u32,
 ) {
-    let mut shutdown_deadline = None;
+    let mut shutdown_deadline: Option<Instant> = None;
+    let mut commands_open = true;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
+        tokio::select! {
+            status = child.wait() => {
+                let status = match status {
+                    Ok(status) => status,
+                    Err(error) => {
+                        set_state(&state, &events, &saturated, ConnectionState::Crashed);
+                        emit_event(
+                            &events,
+                            &saturated,
+                            AppServerEvent::ProtocolError(format!(
+                                "failed waiting for App Server: {error}"
+                            )),
+                        );
+                        break;
+                    }
+                };
                 let target = if *lock(&state) == ConnectionState::Stopping {
                     ConnectionState::Stopped
                 } else {
@@ -297,45 +318,46 @@ pub(crate) fn run_process_waiter(
                 );
                 break;
             }
-            Ok(None) => {}
-            Err(error) => {
-                set_state(&state, &events, &saturated, ConnectionState::Crashed);
-                emit_event(
-                    &events,
-                    &saturated,
-                    AppServerEvent::ProtocolError(format!(
-                        "failed waiting for App Server: {error}"
-                    )),
-                );
-                break;
+            command = commands.recv(), if commands_open => {
+                match command {
+                    Some(ProcessCommand::GracefulShutdown(timeout)) => {
+                        shutdown_deadline = Some(Instant::now() + timeout);
+                    }
+                    Some(ProcessCommand::Terminate) => {
+                        if let Err(error) = terminate_process_group(&mut child, process_group_id) {
+                            emit_event(
+                                &events,
+                                &saturated,
+                                AppServerEvent::ProtocolError(format!(
+                                    "failed to terminate App Server: {error}"
+                                )),
+                            );
+                        }
+                    }
+                    None => {
+                        commands_open = false;
+                        shutdown_deadline
+                            .get_or_insert(Instant::now() + Duration::from_secs(2));
+                    }
+                }
             }
-        }
-
-        if shutdown_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            if let Err(error) = terminate_process_group(&mut child, process_group_id) {
-                emit_event(
-                    &events,
-                    &saturated,
-                    AppServerEvent::ProtocolError(format!(
-                        "failed to terminate App Server: {error}"
-                    )),
-                );
-            }
-            let _ = child.wait();
-            continue;
-        }
-
-        match commands.recv_timeout(Duration::from_millis(50)) {
-            Ok(ProcessCommand::GracefulShutdown(timeout)) => {
-                shutdown_deadline = Some(Instant::now() + timeout);
-            }
-            Ok(ProcessCommand::Terminate) => {
-                let _ = terminate_process_group(&mut child, process_group_id);
-                let _ = child.wait();
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                shutdown_deadline.get_or_insert(Instant::now() + Duration::from_secs(2));
+            _ = async {
+                if let Some(deadline) = shutdown_deadline {
+                    sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                shutdown_deadline = None;
+                if let Err(error) = terminate_process_group(&mut child, process_group_id) {
+                    emit_event(
+                        &events,
+                        &saturated,
+                        AppServerEvent::ProtocolError(format!(
+                            "failed to terminate App Server after shutdown deadline: {error}"
+                        )),
+                    );
+                }
             }
         }
     }
@@ -349,20 +371,20 @@ fn terminate_process_group(child: &mut Child, process_group_id: u32) -> std::io:
     if unsafe { libc::kill(-process_group_id, libc::SIGKILL) } == 0 {
         Ok(())
     } else {
-        child.kill()
+        child.start_kill()
     }
 }
 
 #[cfg(not(unix))]
 fn terminate_process_group(child: &mut Child, _process_group_id: u32) -> std::io::Result<()> {
-    child.kill()
+    child.start_kill()
 }
 
 fn transport_failed(
     state: &Arc<Mutex<ConnectionState>>,
     events: &SyncSender<AppServerEvent>,
     saturated: &Arc<AtomicBool>,
-    process: &SyncSender<ProcessCommand>,
+    process: &Sender<ProcessCommand>,
     error: std::io::Error,
 ) {
     set_state(state, events, saturated, ConnectionState::Crashed);
@@ -378,7 +400,7 @@ fn initialization_failed(
     state: &Arc<Mutex<ConnectionState>>,
     events: &SyncSender<AppServerEvent>,
     saturated: &Arc<AtomicBool>,
-    process: &SyncSender<ProcessCommand>,
+    process: &Sender<ProcessCommand>,
     message: &str,
 ) {
     set_state(state, events, saturated, ConnectionState::Crashed);
@@ -412,16 +434,23 @@ pub(crate) fn emit_event(
     event: AppServerEvent,
 ) {
     match sender.try_send(event) {
-        Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-        Err(TrySendError::Full(event)) => {
+        Ok(()) | Err(StdTrySendError::Disconnected(_)) => {}
+        Err(StdTrySendError::Full(event)) => {
             if !saturated.swap(true, Ordering::Relaxed) {
                 log::warn!(
                     "Codex App Server event queue is saturated; applying transport backpressure"
                 );
             }
-            // This only blocks a dedicated transport worker. Shutdown drops the event receiver
-            // before joining workers, which wakes this send with Disconnected.
-            let _ = sender.send(event);
+            // Shutdown drops the event receiver before joining the runtime, which wakes this send.
+            // On the transport's multithreaded Tokio runtime, block_in_place keeps other async I/O
+            // tasks schedulable while the bounded compatibility receiver applies backpressure.
+            if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+                handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            }) {
+                let _ = tokio::task::block_in_place(|| sender.send(event));
+            } else {
+                let _ = sender.send(event);
+            }
         }
     }
 }

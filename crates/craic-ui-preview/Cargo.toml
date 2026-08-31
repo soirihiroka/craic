@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+craic-language.workspace = true
+pulldown-cmark.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
 adw.workspace = true
 craic-language.workspace = true
 craic-ui-core.workspace = true
@@ -14,8 +20,6 @@ gtk.workspace = true
 libc.workspace = true
 log.workspace = true
 poppler.workspace = true
-pulldown-cmark.workspace = true
-regex.workspace = true
 rst_parser.workspace = true
 rst_renderer.workspace = true
 webkit6.workspace = true

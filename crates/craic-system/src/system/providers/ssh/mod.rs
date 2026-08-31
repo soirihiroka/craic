@@ -7,7 +7,7 @@ use self::docker::SshDockerAccess;
 use self::files::SshFileAccess;
 use self::shell::SshShellAccess;
 use self::terminal_link::SshTerminalLinkAccess;
-use super::url::GioUrlOpenAccess;
+use super::url::UrlResolver;
 use crate::system::capabilities::{
     docker::DockerAccess,
     files::FileAccess,
@@ -28,7 +28,6 @@ use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc,
 };
 use std::thread;
 use std::time::Duration;
@@ -248,7 +247,7 @@ impl SystemProvider for SshProvider {
             workspace.display_name,
             workspace.root.absolute
         );
-        Some(Arc::new(GioUrlOpenAccess::new(
+        Some(Arc::new(UrlResolver::new(
             self.label(),
             workspace.clone(),
             Some(self.config.host.clone()),
@@ -296,7 +295,7 @@ impl SshCommandRunner {
         operation: &str,
         script: &str,
         stdin: Option<&[u8]>,
-        event_sender: &mpsc::Sender<ShellCommandEvent>,
+        event_sender: &tokio::sync::mpsc::Sender<ShellCommandEvent>,
     ) -> Result<ShellCommandOutput, String> {
         let remote_command = format!("sh -lc {}", shell_quote(script));
         log::info!(

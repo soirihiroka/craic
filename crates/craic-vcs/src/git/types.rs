@@ -43,6 +43,88 @@ pub struct RepositorySnapshot {
     pub history_head: Option<String>,
 }
 
+impl RepositorySnapshot {
+    pub fn remote_author_warning_text(&self) -> Option<String> {
+        if !self.warn_if_remote_owner_mismatch {
+            return None;
+        }
+
+        let remote_owner = self.remote_owner.as_deref()?;
+        let local_author = self
+            .user_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                self.user_email
+                    .as_deref()
+                    .and_then(github::login_from_noreply_email)
+            })?;
+        if local_author.eq_ignore_ascii_case(remote_owner)
+            || self
+                .user_email
+                .as_deref()
+                .and_then(github::login_from_noreply_email)
+                .is_some_and(|login| login.eq_ignore_ascii_case(remote_owner))
+        {
+            return None;
+        }
+
+        log::debug!(
+            "remote owner mismatch warning: local={local_author} remote_owner={remote_owner}"
+        );
+        Some(format!(
+            "Current git author {local_author} does not match remote owner {remote_owner}."
+        ))
+    }
+}
+
+pub fn default_commit_summary(
+    files: &[String],
+    file_signature: &[(String, String)],
+) -> Option<String> {
+    let status_for = |path: &str| {
+        file_signature
+            .iter()
+            .find(|(file_path, _)| file_path == path)
+            .map(|(_, status)| status.as_str())
+            .unwrap_or_default()
+    };
+    let action_for = |status: &str| {
+        if status.contains('D') {
+            "Delete"
+        } else if status == "M-" {
+            "Clean up"
+        } else if status.contains('A') || status.contains('?') {
+            "Create"
+        } else {
+            "Update"
+        }
+    };
+    let file_name = |path: &str| {
+        path.rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .unwrap_or(path)
+            .to_string()
+    };
+
+    match files {
+        [file] => Some(format!(
+            "{} {}",
+            action_for(status_for(file)),
+            file_name(file)
+        )),
+        [first, second] => Some(format!(
+            "{} {} and {} {}",
+            action_for(status_for(first)),
+            file_name(first),
+            action_for(status_for(second)).to_lowercase(),
+            file_name(second)
+        )),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct GitSettings {
     pub global_user_name: Option<String>,

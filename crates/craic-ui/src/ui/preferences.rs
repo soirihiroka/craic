@@ -6,6 +6,7 @@ use crate::git::GitSettings;
 use crate::github::GitHubAccess;
 use crate::github::GitHubAuthAccount;
 use adw::prelude::*;
+use craic_ui_core::ui::command_mailbox;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -247,19 +248,16 @@ pub(super) fn show_preferences_window(
         workspace_page.add(&loading_group);
         prefs_window.add(&workspace_page);
 
-        let (sender, receiver) = mpsc::channel();
-        git_handle.settings(Box::new(move |result| {
-            let _ = sender.send(result);
-        }));
-        gtk::glib::timeout_add_local(Duration::from_millis(75), {
+        let receiver = git_handle.settings();
+        command_mailbox::poll_oneshot_result(receiver, {
             let parent = parent.clone();
             let workspace_page = workspace_page.clone();
             let loading_group = loading_group.clone();
             let github_access = github_access.clone();
             let git_handle = git_handle.clone();
 
-            move || match receiver.try_recv() {
-                Ok(Ok(settings)) => {
+            move |result| match result {
+                Ok(settings) => {
                     loading_group.set_visible(false);
                     add_workspace_preferences_page(
                         &parent,
@@ -268,20 +266,9 @@ pub(super) fn show_preferences_window(
                         github_access.clone(),
                         settings,
                     );
-                    gtk::glib::ControlFlow::Break
                 }
-                Ok(Err(err)) => {
+                Err(err) => {
                     show_error_dialog(&parent, "Failed to Load Preferences", &err);
-                    gtk::glib::ControlFlow::Break
-                }
-                Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-                Err(TryRecvError::Disconnected) => {
-                    show_error_dialog(
-                        &parent,
-                        "Failed to Load Preferences",
-                        "Git settings did not return a result.",
-                    );
-                    gtk::glib::ControlFlow::Break
                 }
             }
         });
@@ -446,29 +433,12 @@ fn add_workspace_preferences_page(
                 use_system_timezone: use_system_timezone_switch.is_active(),
                 github_auth_account,
             };
-            let (sender, receiver) = mpsc::channel();
-            git_handle.save_settings(
-                &next_settings,
-                Box::new(move |result| {
-                    let _ = sender.send(result);
-                }),
-            );
-            gtk::glib::timeout_add_local(Duration::from_millis(75), {
+            let receiver = git_handle.save_settings(&next_settings);
+            command_mailbox::poll_oneshot_result(receiver, {
                 let parent = parent.clone();
-                move || match receiver.try_recv() {
-                    Ok(Ok(())) => gtk::glib::ControlFlow::Break,
-                    Ok(Err(err)) => {
+                move |result| {
+                    if let Err(err) = result {
                         show_error_dialog(&parent, "Failed to Save Preferences", &err);
-                        gtk::glib::ControlFlow::Break
-                    }
-                    Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-                    Err(TryRecvError::Disconnected) => {
-                        show_error_dialog(
-                            &parent,
-                            "Failed to Save Preferences",
-                            "Git settings save did not return a result.",
-                        );
-                        gtk::glib::ControlFlow::Break
                     }
                 }
             });

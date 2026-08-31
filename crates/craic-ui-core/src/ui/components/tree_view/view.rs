@@ -1128,6 +1128,7 @@ where
     }
 
     fn draw_canvas_scrollbar(&self, context: &gtk::cairo::Context, width: i32, height: i32) {
+        let context = crate::ui::canvas_painter::CairoPainter::new(context);
         let Some(scrollbar) = &self.scrollbar else {
             return;
         };
@@ -1138,9 +1139,9 @@ where
         let hover = scrollbar.hover_progress.get().clamp(0.0, 1.0);
         let active = scrollbar.active.get();
         let theme = canvas_scrollbar::Theme::for_widget(&scrollbar.area);
-        canvas_scrollbar::draw_track(context, width, height, total_height, hover, theme);
+        canvas_scrollbar::draw_track(&context, width, height, total_height, hover, theme);
         canvas_scrollbar::draw_thumb(
-            context,
+            &context,
             width,
             height,
             total_height,

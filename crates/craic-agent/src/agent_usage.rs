@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "linux")]
 use std::fs;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -21,6 +22,7 @@ impl AgentResourceUsage {
 
 pub struct ProcessUsageTracker {
     previous_samples: HashMap<u64, UsageSample>,
+    #[cfg(target_os = "linux")]
     cpu_count: f64,
 }
 
@@ -28,6 +30,7 @@ impl ProcessUsageTracker {
     pub fn new() -> Self {
         Self {
             previous_samples: HashMap::new(),
+            #[cfg(target_os = "linux")]
             cpu_count: std::thread::available_parallelism()
                 .map(|count| count.get() as f64)
                 .unwrap_or(1.0),
@@ -57,7 +60,10 @@ impl ProcessUsageTracker {
                 if system_delta <= 0.0 {
                     0.0
                 } else {
-                    (process_delta / system_delta) * self.cpu_count * 100.0
+                    let normalized = process_delta / system_delta;
+                    #[cfg(target_os = "linux")]
+                    let normalized = normalized * self.cpu_count;
+                    normalized * 100.0
                 }
             })
             .unwrap_or(0.0);
@@ -94,6 +100,20 @@ pub struct ProcessSnapshot {
 
 impl ProcessSnapshot {
     pub fn read() -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            return Self::read_linux();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return Self::read_macos();
+        }
+        #[allow(unreachable_code)]
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_linux() -> Option<Self> {
         let system_cpu_ticks = system_cpu_ticks()?;
         let page_size = page_size();
         let mut processes = HashMap::new();
@@ -114,9 +134,94 @@ impl ProcessSnapshot {
             let Some(stat) = parse_process_stat(pid, &stat_text, page_size) else {
                 continue;
             };
-            children.entry(stat.parent_pid).or_default().push(stat.pid);
-            processes.insert(stat.pid, stat);
+            children.entry(stat.parent_pid).or_default().push(pid);
+            processes.insert(pid, stat);
         }
+
+        Some(Self {
+            processes,
+            children,
+            system_cpu_ticks,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_macos() -> Option<Self> {
+        const PROC_PIDTBSDINFO: i32 = 3;
+        const RUSAGE_INFO_V4: i32 = 4;
+
+        unsafe extern "C" {
+            fn proc_listallpids(buffer: *mut libc::c_void, buffer_size: i32) -> i32;
+            fn proc_pidinfo(
+                pid: i32,
+                flavor: i32,
+                arg: u64,
+                buffer: *mut libc::c_void,
+                buffer_size: i32,
+            ) -> i32;
+            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut libc::c_void) -> i32;
+        }
+
+        let count = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
+        if count <= 0 {
+            return None;
+        }
+        let mut pids = vec![0i32; count as usize + 64];
+        let bytes = i32::try_from(pids.len().checked_mul(std::mem::size_of::<i32>())?).ok()?;
+        let listed = unsafe { proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        if listed <= 0 {
+            return None;
+        }
+        pids.truncate(listed as usize);
+
+        let mut processes = HashMap::new();
+        let mut children: HashMap<libc::pid_t, Vec<libc::pid_t>> = HashMap::new();
+        for pid in pids.into_iter().filter(|pid| *pid > 0) {
+            let mut bsd_info = [0u8; 256];
+            let bsd_size = unsafe {
+                proc_pidinfo(
+                    pid,
+                    PROC_PIDTBSDINFO,
+                    0,
+                    bsd_info.as_mut_ptr().cast(),
+                    bsd_info.len() as i32,
+                )
+            };
+            if bsd_size < 20 {
+                continue;
+            }
+            let parent_pid = i32::from_ne_bytes(bsd_info[16..20].try_into().ok()?);
+
+            let mut usage = [0u64; 48];
+            if unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V4, usage.as_mut_ptr().cast()) } != 0 {
+                continue;
+            }
+            let process = ProcessStat {
+                parent_pid,
+                // rusage_info_v4 reports the process' user/system time at indices 2/3 and
+                // already-reaped descendants at 12/13. Live descendants are added while
+                // walking the process tree below, matching the Linux cutime/cstime totals.
+                cpu_ticks: usage[2]
+                    .saturating_add(usage[3])
+                    .saturating_add(usage[12])
+                    .saturating_add(usage[13]),
+                memory_bytes: usage[8],
+            };
+            children.entry(process.parent_pid).or_default().push(pid);
+            processes.insert(pid, process);
+        }
+
+        let mut monotonic = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut monotonic) } != 0 {
+            return None;
+        }
+        let system_cpu_ticks = u64::try_from(monotonic.tv_sec)
+            .ok()?
+            .saturating_mul(1_000_000_000)
+            .saturating_add(u64::try_from(monotonic.tv_nsec).ok()?);
 
         Some(Self {
             processes,
@@ -168,12 +273,12 @@ struct ProcessSubtreeUsage {
 }
 
 struct ProcessStat {
-    pid: libc::pid_t,
     parent_pid: libc::pid_t,
     cpu_ticks: u64,
     memory_bytes: u64,
 }
 
+#[cfg(target_os = "linux")]
 fn parse_process_stat(
     expected_pid: libc::pid_t,
     stat_text: &str,
@@ -197,7 +302,6 @@ fn parse_process_stat(
     let resident_pages = parse_i64_field(&fields, 21)?.max(0) as u64;
 
     Some(ProcessStat {
-        pid,
         parent_pid,
         cpu_ticks: utime
             .saturating_add(stime)
@@ -207,14 +311,17 @@ fn parse_process_stat(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn parse_u64_field(fields: &[&str], index: usize) -> Option<u64> {
     fields.get(index)?.parse().ok()
 }
 
+#[cfg(target_os = "linux")]
 fn parse_i64_field(fields: &[&str], index: usize) -> Option<i64> {
     fields.get(index)?.parse().ok()
 }
 
+#[cfg(target_os = "linux")]
 fn system_cpu_ticks() -> Option<u64> {
     let stat = fs::read_to_string("/proc/stat").ok()?;
     let cpu_line = stat.lines().next()?;
@@ -226,6 +333,7 @@ fn system_cpu_ticks() -> Option<u64> {
     Some(parts.filter_map(|part| part.parse::<u64>().ok()).sum())
 }
 
+#[cfg(target_os = "linux")]
 fn page_size() -> u64 {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size > 0 {

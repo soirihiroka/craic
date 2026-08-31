@@ -4,7 +4,6 @@ use gtk::gio;
 
 use super::super::super::{PageCommand, PageContext};
 use crate::system::capabilities::terminal_link::TerminalLinkTarget;
-use crate::system::capabilities::url::UrlOpenActivation;
 
 pub(super) fn activate(ctx: &PageContext, workspace_root: &str, target: LinkTarget) {
     match target {
@@ -42,7 +41,10 @@ fn confirm_open_url(ctx: PageContext, url: String) {
                 return;
             }
 
-            match url_opener.open_url(&url, UrlOpenActivation::default()) {
+            match url_opener
+                .resolve_url(&url)
+                .and_then(|effect| ctx.execute_effect(effect))
+            {
                 Ok(message) => {
                     log::info!("Codex chat link opened url={url} message={message}");
                     ctx.show_toast(&message);

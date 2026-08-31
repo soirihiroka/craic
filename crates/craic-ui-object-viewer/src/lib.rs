@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use craic_dynamic_data::{DocumentKind, DynamicDocument, DynamicEntry, DynamicValue, ParseError};
 use gtk::prelude::*;
 use gtk::{gio, glib};

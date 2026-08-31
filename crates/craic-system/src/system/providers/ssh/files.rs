@@ -2,13 +2,14 @@ use super::{
     SshCommandRunner, SshOutput, remote_workspace_path, shell_quote, workspace_path_for_remote,
 };
 use crate::system::capabilities::files::{
-    DirectoryListing, FileAccess, FileCopyRequest, FileDeleteRequest, FileDownloadDestination,
-    FileDownloadRequest, FileKind, FileMoveRequest, FileNodeCapabilities, FileNodeInfo,
-    FileOperation, FileOperationCallback, FileOperationError, FileOperationErrorKind,
-    FileOperationEvent, FileOperationProgress, FileRead, FileReadRequest, FileSearchMatch,
-    FileSearchOutput, FileSearchQuery, FileSignature, FileSudoError, FileSudoErrorKind,
-    FileSudoPassword, FileWatchCallback, FileWatchRequest, FileWatchSubscription, FileWriteMode,
-    FileWritePayload, FileWriteRequest, file_operation_canceled,
+    DirectoryListing, FILE_OPERATION_EVENT_CAPACITY, FileAccess, FileCopyRequest,
+    FileDeleteRequest, FileDownloadDestination, FileDownloadRequest, FileKind, FileMoveRequest,
+    FileNodeCapabilities, FileNodeInfo, FileOperation, FileOperationEmitter, FileOperationError,
+    FileOperationErrorKind, FileOperationEvent, FileOperationProgress, FileOperationReceiver,
+    FileRead, FileReadRequest, FileSearchMatch, FileSearchOutput, FileSearchQuery, FileSignature,
+    FileSudoError, FileSudoErrorKind, FileSudoPassword, FileWatchReceiver, FileWatchRequest,
+    FileWatchSubscription, FileWriteMode, FileWritePayload, FileWriteRequest,
+    file_operation_canceled,
 };
 use crate::system::path::{ArchiveFormat, FileNodePath, SystemRef, WorkspacePath, WorkspaceRef};
 use serde::Deserialize;
@@ -437,14 +438,14 @@ impl SshFileAccess {
         }
     }
 
-    fn emit_progress<T>(callback: &FileOperationCallback<T>, progress: FileOperationProgress) {
+    fn emit_progress<T>(callback: &FileOperationEmitter<T>, progress: FileOperationProgress) {
         callback(FileOperationEvent::Progress(progress));
     }
 
     fn perform_read_with_info(
         &self,
         request: &FileReadRequest,
-        callback: &FileOperationCallback<FileRead>,
+        callback: &FileOperationEmitter<FileRead>,
     ) -> Result<FileRead, FileOperationError> {
         let operation = FileOperation::Read;
         Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
@@ -531,7 +532,7 @@ impl SshFileAccess {
     fn perform_write_node(
         &self,
         request: &FileWriteRequest,
-        callback: &FileOperationCallback<()>,
+        callback: &FileOperationEmitter<()>,
     ) -> Result<(), FileOperationError> {
         let operation = FileOperation::Write;
         Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
@@ -644,7 +645,7 @@ impl SshFileAccess {
     fn perform_copy_node(
         &self,
         request: &FileCopyRequest,
-        callback: &FileOperationCallback<FileNodePath>,
+        callback: &FileOperationEmitter<FileNodePath>,
     ) -> Result<FileNodePath, FileOperationError> {
         let operation = FileOperation::Copy;
         Self::check_canceled(operation, &request.source, &request.cancel_requested)?;
@@ -709,7 +710,7 @@ impl SshFileAccess {
     fn perform_move_node(
         &self,
         request: &FileMoveRequest,
-        callback: &FileOperationCallback<FileNodePath>,
+        callback: &FileOperationEmitter<FileNodePath>,
     ) -> Result<FileNodePath, FileOperationError> {
         let operation = FileOperation::Move;
         Self::check_canceled(operation, &request.source, &request.cancel_requested)?;
@@ -790,7 +791,7 @@ impl SshFileAccess {
     fn perform_delete(
         &self,
         request: &FileDeleteRequest,
-        callback: &FileOperationCallback<()>,
+        callback: &FileOperationEmitter<()>,
     ) -> Result<(), FileOperationError> {
         let operation = FileOperation::Delete;
         Self::check_canceled(operation, &request.path, &request.cancel_requested)?;
@@ -1058,9 +1059,13 @@ impl FileAccess for SshFileAccess {
         Ok(listings)
     }
 
-    fn read_with_info(&self, request: FileReadRequest, callback: FileOperationCallback<FileRead>) {
+    fn read_with_info_events(&self, request: FileReadRequest) -> FileOperationReceiver<FileRead> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(FILE_OPERATION_EVENT_CAPACITY);
         let access = self.clone();
         thread::spawn(move || {
+            let callback = move |event| {
+                let _ = sender.blocking_send(event);
+            };
             log::info!(
                 "ssh file read worker start path={} max_bytes={:?}",
                 request.path.display(),
@@ -1069,11 +1074,16 @@ impl FileAccess for SshFileAccess {
             let result = access.perform_read_with_info(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
+        receiver
     }
 
-    fn write_node(&self, request: FileWriteRequest, callback: FileOperationCallback<()>) {
+    fn write_node_events(&self, request: FileWriteRequest) -> FileOperationReceiver<()> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(FILE_OPERATION_EVENT_CAPACITY);
         let access = self.clone();
         thread::spawn(move || {
+            let callback = move |event| {
+                let _ = sender.blocking_send(event);
+            };
             let payload_label = match &request.payload {
                 FileWritePayload::File(contents) => format!("file bytes={}", contents.len()),
                 FileWritePayload::Directory => "directory".to_string(),
@@ -1086,11 +1096,16 @@ impl FileAccess for SshFileAccess {
             let result = access.perform_write_node(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
+        receiver
     }
 
-    fn copy_node(&self, request: FileCopyRequest, callback: FileOperationCallback<FileNodePath>) {
+    fn copy_node_events(&self, request: FileCopyRequest) -> FileOperationReceiver<FileNodePath> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(FILE_OPERATION_EVENT_CAPACITY);
         let access = self.clone();
         thread::spawn(move || {
+            let callback = move |event| {
+                let _ = sender.blocking_send(event);
+            };
             log::info!(
                 "ssh file copy worker start source={} destination={}",
                 request.source.display(),
@@ -1099,11 +1114,16 @@ impl FileAccess for SshFileAccess {
             let result = access.perform_copy_node(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
+        receiver
     }
 
-    fn move_node(&self, request: FileMoveRequest, callback: FileOperationCallback<FileNodePath>) {
+    fn move_node_events(&self, request: FileMoveRequest) -> FileOperationReceiver<FileNodePath> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(FILE_OPERATION_EVENT_CAPACITY);
         let access = self.clone();
         thread::spawn(move || {
+            let callback = move |event| {
+                let _ = sender.blocking_send(event);
+            };
             log::info!(
                 "ssh file move worker start source={} destination_parent={} new_name={}",
                 request.source.display(),
@@ -1113,11 +1133,16 @@ impl FileAccess for SshFileAccess {
             let result = access.perform_move_node(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
+        receiver
     }
 
-    fn delete(&self, request: FileDeleteRequest, callback: FileOperationCallback<()>) {
+    fn delete_events(&self, request: FileDeleteRequest) -> FileOperationReceiver<()> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(FILE_OPERATION_EVENT_CAPACITY);
         let access = self.clone();
         thread::spawn(move || {
+            let callback = move |event| {
+                let _ = sender.blocking_send(event);
+            };
             log::info!(
                 "ssh file delete worker start path={}",
                 request.path.display()
@@ -1125,13 +1150,13 @@ impl FileAccess for SshFileAccess {
             let result = access.perform_delete(&request, &callback);
             callback(FileOperationEvent::Finished(result));
         });
+        receiver
     }
 
     fn watch(
         &self,
         request: FileWatchRequest,
-        callback: FileWatchCallback,
-    ) -> Result<FileWatchSubscription, String> {
+    ) -> Result<(FileWatchSubscription, FileWatchReceiver), String> {
         let requested_paths = if request.paths.is_empty() {
             vec![self.root()]
         } else {
@@ -1168,7 +1193,6 @@ impl FileAccess for SshFileAccess {
             label,
             SSH_FILE_WATCH_POLL_INTERVAL,
             move || remote_file_signatures(&runner, &requested),
-            callback,
         ))
     }
 

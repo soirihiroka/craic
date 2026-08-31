@@ -2573,10 +2573,10 @@ fn confirm_open_agent_terminal_url(ctx: PageContext, url: String) {
                 return;
             }
 
-            match url_opener.open_url(
-                &url,
-                crate::system::capabilities::url::UrlOpenActivation::default(),
-            ) {
+            match url_opener
+                .resolve_url(&url)
+                .and_then(|effect| ctx.execute_effect(effect))
+            {
                 Ok(message) => {
                     log::info!("agent terminal url opened url={url} message={message}");
                     ctx.show_toast(&message);

@@ -35,10 +35,7 @@ pub fn show(request: PreviewRequest<'_>) {
     let source = request.info.clone();
     let file_path = request.file_path.to_string();
     let apply_file_path = file_path.clone();
-    let (sender, receiver) = mpsc::channel();
-    crate::system::materialize::materialize_for_view(files, source, None, move |result| {
-        let _ = sender.send(result);
-    });
+    let receiver = crate::system::materialize::materialize_for_view(files, source, None);
     super::receive_preview_load(
         request.right,
         request.load_token,

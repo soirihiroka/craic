@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::process::Command;
+use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::mpsc::Sender;
 
 use crate::lifecycle::{AppServerConfig, AppServerError, AppServerEvent, ConnectionState};
 use crate::protocol::ApprovalResponse;
@@ -109,22 +110,22 @@ use crate::transport::{
 use crate::version::check_codex_version;
 
 pub struct AppServer {
-    command_tx: Option<SyncSender<WriterCommand>>,
-    process_tx: Option<SyncSender<ProcessCommand>>,
+    command_tx: Option<Sender<WriterCommand>>,
+    process_tx: Option<Sender<ProcessCommand>>,
     event_tx: SyncSender<AppServerEvent>,
     event_queue_saturated: Arc<AtomicBool>,
     events_rx: Receiver<AppServerEvent>,
     state: Arc<Mutex<ConnectionState>>,
     pending: Arc<Mutex<HashMap<RequestId, String>>>,
     next_request_id: AtomicI64,
-    threads: Vec<JoinHandle<()>>,
+    supervisor: Option<JoinHandle<()>>,
     shutdown_timeout: Duration,
 }
 
 impl AppServer {
     pub fn spawn(config: AppServerConfig) -> Result<Self, AppServerError> {
         if let Some((program, args)) = &config.version_command {
-            let mut command = Command::new(program);
+            let mut command = StdCommand::new(program);
             command.args(args);
             if let Some(cwd) = &config.cwd {
                 command.current_dir(cwd);
@@ -138,114 +139,10 @@ impl AppServer {
         let event_capacity = config.channel_capacity.max(2);
         let state = Arc::new(Mutex::new(ConnectionState::Starting));
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let (command_tx, command_rx) = mpsc::sync_channel(command_capacity);
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(command_capacity);
         let (event_tx, events_rx) = mpsc::sync_channel(event_capacity);
-        let (process_tx, process_rx) = mpsc::sync_channel(2);
+        let (process_tx, process_rx) = tokio::sync::mpsc::channel(2);
         let event_queue_saturated = Arc::new(AtomicBool::new(false));
-
-        let mut command = Command::new(&config.program);
-        command
-            .args(&config.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        if let Some(cwd) = &config.cwd {
-            command.current_dir(cwd);
-        }
-        let mut child = command.spawn().map_err(AppServerError::Spawn)?;
-        let process_group_id = child.id();
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or(AppServerError::MissingPipe("stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(AppServerError::MissingPipe("stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or(AppServerError::MissingPipe("stderr"))?;
-
-        emit_event(
-            &event_tx,
-            &event_queue_saturated,
-            AppServerEvent::StateChanged(ConnectionState::Starting),
-        );
-        set_state(
-            &state,
-            &event_tx,
-            &event_queue_saturated,
-            ConnectionState::Initializing,
-        );
-
-        let writer_state = Arc::clone(&state);
-        let writer_events = event_tx.clone();
-        let writer_saturated = Arc::clone(&event_queue_saturated);
-        let writer_process = process_tx.clone();
-        let writer = thread::Builder::new()
-            .name("codex-app-server-writer".to_owned())
-            .spawn(move || {
-                run_writer(
-                    stdin,
-                    command_rx,
-                    writer_state,
-                    writer_events,
-                    writer_saturated,
-                    writer_process,
-                )
-            })
-            .map_err(AppServerError::Spawn)?;
-
-        let reader_state = Arc::clone(&state);
-        let reader_pending = Arc::clone(&pending);
-        let reader_events = event_tx.clone();
-        let reader_saturated = Arc::clone(&event_queue_saturated);
-        let reader_commands = command_tx.clone();
-        let reader_process = process_tx.clone();
-        let reader = thread::Builder::new()
-            .name("codex-app-server-reader".to_owned())
-            .spawn(move || {
-                run_stdout_reader(
-                    stdout,
-                    reader_commands,
-                    reader_process,
-                    reader_state,
-                    reader_pending,
-                    reader_events,
-                    reader_saturated,
-                )
-            })
-            .map_err(AppServerError::Spawn)?;
-
-        let stderr_events = event_tx.clone();
-        let stderr_saturated = Arc::clone(&event_queue_saturated);
-        let stderr_reader = thread::Builder::new()
-            .name("codex-app-server-stderr".to_owned())
-            .spawn(move || run_stderr_reader(stderr, stderr_events, stderr_saturated))
-            .map_err(AppServerError::Spawn)?;
-
-        let process_state = Arc::clone(&state);
-        let process_events = event_tx.clone();
-        let process_saturated = Arc::clone(&event_queue_saturated);
-        let waiter = thread::Builder::new()
-            .name("codex-app-server-waiter".to_owned())
-            .spawn(move || {
-                run_process_waiter(
-                    child,
-                    process_rx,
-                    process_state,
-                    process_events,
-                    process_saturated,
-                    process_group_id,
-                )
-            })
-            .map_err(AppServerError::Spawn)?;
 
         let initialize = Request {
             id: RequestId::Integer(INITIALIZE_REQUEST_ID),
@@ -259,11 +156,159 @@ impl AppServer {
             ),
             trace: None,
         };
+        let program = config.program;
+        let args = config.args;
+        let cwd = config.cwd;
+        let shutdown_timeout = config.graceful_shutdown_timeout;
+        let runtime_state = Arc::clone(&state);
+        let runtime_pending = Arc::clone(&pending);
+        let runtime_events = event_tx.clone();
+        let runtime_saturated = Arc::clone(&event_queue_saturated);
+        let runtime_commands = command_tx.clone();
+        let runtime_process = process_tx.clone();
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let supervisor = thread::Builder::new()
+            .name("codex-app-server-runtime".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_name("codex-app-server-io")
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(AppServerError::Spawn(error)));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    let mut command = tokio::process::Command::new(program);
+                    command
+                        .args(args)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .kill_on_drop(true);
+                    #[cfg(unix)]
+                    command.process_group(0);
+                    if let Some(cwd) = cwd {
+                        command.current_dir(cwd);
+                    }
+                    let mut child = match command.spawn() {
+                        Ok(child) => child,
+                        Err(error) => {
+                            let _ = startup_tx.send(Err(AppServerError::Spawn(error)));
+                            return;
+                        }
+                    };
+                    let Some(process_group_id) = child.id() else {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        let _ = startup_tx.send(Err(AppServerError::Spawn(std::io::Error::other(
+                            "Codex App Server did not report a process ID",
+                        ))));
+                        return;
+                    };
+                    let Some(stdin) = child.stdin.take() else {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        let _ = startup_tx.send(Err(AppServerError::MissingPipe("stdin")));
+                        return;
+                    };
+                    let Some(stdout) = child.stdout.take() else {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        let _ = startup_tx.send(Err(AppServerError::MissingPipe("stdout")));
+                        return;
+                    };
+                    let Some(stderr) = child.stderr.take() else {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        let _ = startup_tx.send(Err(AppServerError::MissingPipe("stderr")));
+                        return;
+                    };
+
+                    emit_event(
+                        &runtime_events,
+                        &runtime_saturated,
+                        AppServerEvent::StateChanged(ConnectionState::Starting),
+                    );
+                    set_state(
+                        &runtime_state,
+                        &runtime_events,
+                        &runtime_saturated,
+                        ConnectionState::Initializing,
+                    );
+
+                    let writer = tokio::spawn(run_writer(
+                        stdin,
+                        command_rx,
+                        Arc::clone(&runtime_state),
+                        runtime_events.clone(),
+                        Arc::clone(&runtime_saturated),
+                        runtime_process.clone(),
+                    ));
+                    let reader = tokio::spawn(run_stdout_reader(
+                        stdout,
+                        runtime_commands,
+                        runtime_process,
+                        Arc::clone(&runtime_state),
+                        runtime_pending,
+                        runtime_events.clone(),
+                        Arc::clone(&runtime_saturated),
+                    ));
+                    let stderr_reader = tokio::spawn(run_stderr_reader(
+                        stderr,
+                        runtime_events.clone(),
+                        Arc::clone(&runtime_saturated),
+                    ));
+                    if startup_tx.send(Ok(())).is_err() {
+                        writer.abort();
+                        reader.abort();
+                        stderr_reader.abort();
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        return;
+                    }
+                    run_process_waiter(
+                        child,
+                        process_rx,
+                        runtime_state,
+                        runtime_events,
+                        runtime_saturated,
+                        process_group_id,
+                    )
+                    .await;
+                    writer.abort();
+                    reader.abort();
+                    stderr_reader.abort();
+                    let _ = writer.await;
+                    let _ = reader.await;
+                    let _ = stderr_reader.await;
+                });
+            })
+            .map_err(AppServerError::Spawn)?;
+        match startup_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = supervisor.join();
+                return Err(error);
+            }
+            Err(error) => {
+                let _ = supervisor.join();
+                return Err(AppServerError::Spawn(std::io::Error::other(format!(
+                    "Codex App Server runtime stopped during startup: {error}"
+                ))));
+            }
+        }
         lock(&pending).insert(initialize.id.clone(), initialize.method.clone());
-        enqueue_value(&command_tx, initialize).map_err(|error| {
+        if let Err(error) = enqueue_value(&command_tx, initialize) {
             let _ = process_tx.try_send(ProcessCommand::Terminate);
-            error
-        })?;
+            drop(events_rx);
+            let _ = supervisor.join();
+            return Err(error);
+        }
 
         Ok(Self {
             command_tx: Some(command_tx),
@@ -274,8 +319,8 @@ impl AppServer {
             state,
             pending,
             next_request_id: AtomicI64::new(INITIALIZE_REQUEST_ID + 1),
-            threads: vec![writer, reader, stderr_reader, waiter],
-            shutdown_timeout: config.graceful_shutdown_timeout,
+            supervisor: Some(supervisor),
+            shutdown_timeout,
         })
     }
 
@@ -1146,12 +1191,12 @@ impl AppServer {
     }
 
     pub fn shutdown(&mut self) {
-        if self.threads.is_empty() {
+        if self.supervisor.is_none() {
             return;
         }
         self.initiate_shutdown();
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
+        if let Some(supervisor) = self.supervisor.take() {
+            let _ = supervisor.join();
         }
     }
 
@@ -1219,10 +1264,9 @@ impl AppServer {
 
 impl Drop for AppServer {
     fn drop(&mut self) {
-        if !self.threads.is_empty() {
-            log::info!("Codex App Server dropped; scheduling non-blocking shutdown");
-            self.initiate_shutdown();
-            self.threads.clear();
+        if self.supervisor.is_some() {
+            log::info!("Codex App Server dropped; completing bounded shutdown");
+            self.shutdown();
         }
     }
 }

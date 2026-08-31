@@ -143,8 +143,11 @@ fn connect_open_search_shortcut(state: &Rc<AppState>) {
                 return gtk::glib::Propagation::Proceed;
             }
 
-            let index = state.active_page.get();
-            let Some(page) = state.pages.get(index) else {
+            let active_page = state.active_page.borrow().clone();
+            let Some(page) = active_page
+                .as_ref()
+                .and_then(|page_id| state.pages.iter().find(|page| page.id() == page_id.clone()))
+            else {
                 return gtk::glib::Propagation::Proceed;
             };
 

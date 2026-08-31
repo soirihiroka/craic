@@ -1,5 +1,5 @@
 use super::super::widgets;
-use crate::{git::RepositorySnapshot, github};
+use crate::git::RepositorySnapshot;
 use adw::prelude::*;
 use gtk::gdk;
 use std::cell::RefCell;
@@ -177,7 +177,7 @@ impl CommitPanel {
         self.avatar_button
             .set_tooltip_text(Some(&format!("{text}\nClick to select commit email")));
 
-        let warning = remote_author_warning_text(snapshot);
+        let warning = snapshot.remote_author_warning_text();
         self.remote_owner_warning.set_visible(warning.is_some());
         self.remote_owner_warning
             .set_tooltip_text(warning.as_deref());
@@ -207,47 +207,4 @@ impl CommitPanel {
             widgets::fetch_avatar(&self.avatar, source);
         }
     }
-}
-
-fn remote_author_warning_text(snapshot: &RepositorySnapshot) -> Option<String> {
-    if !snapshot.warn_if_remote_owner_mismatch {
-        return None;
-    }
-
-    let remote_owner = snapshot.remote_owner.as_deref()?;
-    let local_author = local_commit_identity(snapshot)?;
-
-    if local_author.eq_ignore_ascii_case(remote_owner) {
-        return None;
-    }
-
-    if let Some(local_email_login) = snapshot
-        .user_email
-        .as_deref()
-        .and_then(|email| github::login_from_noreply_email(email))
-    {
-        if local_email_login.eq_ignore_ascii_case(remote_owner) {
-            return None;
-        }
-    }
-
-    log::debug!("remote owner mismatch warning: local={local_author} remote_owner={remote_owner}");
-
-    Some(format!(
-        "Current git author {local_author} does not match remote owner {remote_owner}."
-    ))
-}
-
-fn local_commit_identity(snapshot: &RepositorySnapshot) -> Option<String> {
-    snapshot
-        .user_name
-        .as_deref()
-        .filter(|name| !name.trim().is_empty())
-        .map(ToString::to_string)
-        .or_else(|| {
-            snapshot
-                .user_email
-                .as_deref()
-                .and_then(github::login_from_noreply_email)
-        })
 }

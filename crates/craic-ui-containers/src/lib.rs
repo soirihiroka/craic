@@ -1,6 +1,11 @@
 pub use craic_system::system;
+#[path = "ui/pages/containers/docker.rs"]
+pub mod docker;
+
+#[cfg(target_os = "linux")]
 pub use craic_vcs::git;
 
+#[cfg(target_os = "linux")]
 pub mod ui {
     pub use craic_ui_core::ui::components;
 
@@ -17,4 +22,5 @@ pub mod ui {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub use ui::pages::ContainersPage;

@@ -265,10 +265,14 @@ fn show_media(request: PreviewRequest<'_>, kind: MediaKind) {
     let disk_signature = disk_signature(request.info);
     let apply_file_path = file_path.clone();
 
-    let (sender, receiver) = mpsc::channel();
     if !is_file {
-        let _ = sender.send(Err("Select a file to preview.".to_string()));
-    } else if let Some(path) = local_path {
+        request
+            .right
+            .show_unavailable(&apply_file_path, "Select a file to preview.");
+        return;
+    }
+    if let Some(path) = local_path {
+        let (sender, receiver) = mpsc::channel();
         let _ = sender.send(Ok(MediaPreviewLoad {
             kind,
             file_path,
@@ -276,31 +280,42 @@ fn show_media(request: PreviewRequest<'_>, kind: MediaKind) {
             materialized: None,
             disk_signature,
         }));
-    } else {
-        crate::system::materialize::materialize_for_view(
-            files,
-            source,
-            Some(MAX_MEDIA_PREVIEW_BYTES),
-            move |result| {
-                let result = result.map(|materialized| MediaPreviewLoad {
-                    kind,
-                    file_path,
-                    full_path: materialized.path().to_path_buf(),
-                    materialized: Some(materialized),
-                    disk_signature,
-                });
-                let _ = sender.send(result);
+        super::receive_preview_load(
+            request.right,
+            request.load_token,
+            apply_file_path.clone(),
+            receiver,
+            move |right, result| match result {
+                Ok(load) => {
+                    let file_path = load.file_path.clone();
+                    right.file_media_preview.set_media(load);
+                    right.show_media_preview(&file_path, "");
+                }
+                Err(message) => right.show_unavailable(&apply_file_path, &message),
             },
         );
+        return;
     }
 
+    let receiver = crate::system::materialize::materialize_for_view(
+        files,
+        source,
+        Some(MAX_MEDIA_PREVIEW_BYTES),
+    );
     super::receive_preview_load(
         request.right,
         request.load_token,
         apply_file_path.clone(),
         receiver,
         move |right, result| match result {
-            Ok(load) => {
+            Ok(materialized) => {
+                let load = MediaPreviewLoad {
+                    kind,
+                    file_path,
+                    full_path: materialized.path().to_path_buf(),
+                    materialized: Some(materialized),
+                    disk_signature,
+                };
                 let file_path = load.file_path.clone();
                 right.file_media_preview.set_media(load);
                 right.show_media_preview(&file_path, "");

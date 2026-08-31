@@ -5,7 +5,7 @@ use crate::system::WorkspacePath;
 use crate::system::capabilities::{
     shell::ShellAccess,
     terminal_link::{TerminalLinkAccess, TerminalLinkTarget},
-    url::{UrlOpenAccess, UrlOpenActivation},
+    url::UrlOpenAccess,
 };
 use crate::terminal;
 use crate::ui::components::tabbed_picker::{
@@ -722,7 +722,10 @@ fn confirm_open_terminal_url<C: RepositoryActionContext + 'static>(context: C, u
             return;
         }
 
-        match url_opener.open_url(&url, UrlOpenActivation::default()) {
+        match url_opener.resolve_url(&url).and_then(|effect| {
+            let window = context.window();
+            craic_ui_core::ui::platform::execute_effect(effect, Some(&window))
+        }) {
             Ok(message) => {
                 log::info!("terminal url opened url={url} message={message}");
                 context.show_toast(&message);

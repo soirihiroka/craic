@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use moka::sync::Cache;
@@ -189,6 +189,10 @@ pub fn avatar_url_for_login(login: &str) -> String {
 }
 
 pub fn avatar_url_for_email(email: &str) -> Result<String, String> {
+    avatar_url_for_email_with_gh(email, "gh")
+}
+
+pub fn avatar_url_for_email_with_gh(email: &str, gh: &str) -> Result<String, String> {
     let email = email.trim();
     if email.is_empty() {
         return Err("Email is required to resolve a GitHub avatar.".to_string());
@@ -204,20 +208,24 @@ pub fn avatar_url_for_email(email: &str) -> Result<String, String> {
         return Ok(url);
     }
 
-    let url = login_for_email(email).map(|login| avatar_url_for_login(&login))?;
+    let url = login_for_email_with_gh(email, gh).map(|login| avatar_url_for_login(&login))?;
     avatar_url_cache().insert(cache_key.clone(), url.clone());
     cache_avatar_url(&cache_key, &url);
     Ok(url)
 }
 
 pub fn login_for_email(email: &str) -> Result<String, String> {
+    login_for_email_with_gh(email, "gh")
+}
+
+fn login_for_email_with_gh(email: &str, gh: &str) -> Result<String, String> {
     let email = email.trim();
     if let Some(login) = login_from_noreply_email(email) {
         return Ok(login);
     }
 
     let query = format!("{email} in:email");
-    let output = Command::new("gh")
+    let output = Command::new(gh)
         .arg("api")
         .arg("-X")
         .arg("GET")
@@ -265,27 +273,31 @@ pub struct CommitEmailOption {
 }
 
 pub fn commit_email_options() -> Result<Vec<CommitEmailOption>, String> {
+    commit_email_options_with_gh("gh")
+}
+
+pub fn commit_email_options_with_gh(gh: &str) -> Result<Vec<CommitEmailOption>, String> {
     log::debug!("loading commit email options from gh");
 
     let mut options = Vec::new();
     let mut errors = Vec::new();
 
-    match gh_authenticated_accounts() {
+    match gh_authenticated_accounts(gh) {
         Ok(accounts) if !accounts.is_empty() => {
             log::debug!("loaded gh authenticated accounts count={}", accounts.len());
             for account in accounts {
-                collect_account_commit_emails(&account, &mut options, &mut errors);
+                collect_account_commit_emails(gh, &account, &mut options, &mut errors);
             }
         }
         Ok(_) => {
             log::warn!("gh auth status returned no accounts; falling back to active account");
             errors.push("gh auth status returned no accounts.".to_string());
-            collect_active_account_commit_emails(&mut options, &mut errors);
+            collect_active_account_commit_emails(gh, &mut options, &mut errors);
         }
         Err(err) => {
             log::warn!("failed to load gh authenticated accounts: {err}");
             errors.push(err);
-            collect_active_account_commit_emails(&mut options, &mut errors);
+            collect_active_account_commit_emails(gh, &mut options, &mut errors);
         }
     }
 
@@ -368,8 +380,8 @@ struct GitHubEmail {
     email: Option<String>,
 }
 
-fn gh_authenticated_accounts() -> Result<Vec<GitHubAccount>, String> {
-    let output = Command::new("gh")
+fn gh_authenticated_accounts(gh: &str) -> Result<Vec<GitHubAccount>, String> {
+    let output = Command::new(gh)
         .arg("auth")
         .arg("status")
         .arg("--json")
@@ -501,15 +513,12 @@ fn run_gh_hook_command(
     gh_path: &str,
     args: &[String],
 ) -> Result<ShellCommandOutput, String> {
-    let (sender, receiver) = mpsc::channel();
-    shell.run_fast_command(
-        ShellCommandRunRequest::new(operation, working_dir.clone(), gh_path).args(args.to_vec()),
-        Box::new(move |result| {
-            let _ = sender.send(result);
-        }),
-    );
-    let output = receiver
-        .recv()
+    let output = shell
+        .run_fast_command(
+            ShellCommandRunRequest::new(operation, working_dir.clone(), gh_path)
+                .args(args.to_vec()),
+        )
+        .blocking_recv()
         .map_err(|_| format!("{operation} command did not return a result."))??;
     if output.status_success(&[0]) {
         Ok(output)
@@ -631,12 +640,13 @@ fn push_account(accounts: &mut Vec<GitHubAccount>, host: &str, login: &str) {
 }
 
 fn collect_account_commit_emails(
+    gh: &str,
     account: &GitHubAccount,
     options: &mut Vec<CommitEmailOption>,
     errors: &mut Vec<String>,
 ) {
-    match gh_auth_token(account) {
-        Ok(token) => collect_token_commit_emails(account, &token, options, errors),
+    match gh_auth_token(gh, account) {
+        Ok(token) => collect_token_commit_emails(gh, account, &token, options, errors),
         Err(err) => {
             log::warn!(
                 "failed to get gh token for account={} host={}: {err}",
@@ -644,18 +654,19 @@ fn collect_account_commit_emails(
                 account.host
             );
             errors.push(err);
-            collect_public_noreply_emails(account, options, errors);
+            collect_public_noreply_emails(gh, account, options, errors);
         }
     }
 }
 
 fn collect_active_account_commit_emails(
+    gh: &str,
     options: &mut Vec<CommitEmailOption>,
     errors: &mut Vec<String>,
 ) {
     let mut display_name = None;
     let mut avatar_url = None;
-    match gh_api_json::<GitHubUser>("user") {
+    match gh_api_json::<GitHubUser>(gh, "user") {
         Ok(user) => {
             let login = user.login;
             let name = user.name;
@@ -675,7 +686,7 @@ fn collect_active_account_commit_emails(
     }
 
     for endpoint in ["user/emails", "user/public_emails"] {
-        match gh_api_json::<Vec<GitHubEmail>>(endpoint) {
+        match gh_api_json::<Vec<GitHubEmail>>(gh, endpoint) {
             Ok(entries) => push_email_entries(
                 options,
                 entries,
@@ -688,6 +699,7 @@ fn collect_active_account_commit_emails(
 }
 
 fn collect_token_commit_emails(
+    gh: &str,
     account: &GitHubAccount,
     token: &str,
     options: &mut Vec<CommitEmailOption>,
@@ -695,7 +707,7 @@ fn collect_token_commit_emails(
 ) {
     let mut display_name = Some(account.login.clone());
     let mut avatar_url = None;
-    match gh_api_json_for_account::<GitHubUser>(account, token, "user") {
+    match gh_api_json_for_account::<GitHubUser>(gh, account, token, "user") {
         Ok(user) => {
             let login = user.login;
             let name = user.name;
@@ -719,12 +731,12 @@ fn collect_token_commit_emails(
                 account.host
             );
             errors.push(err);
-            collect_public_noreply_emails(account, options, errors);
+            collect_public_noreply_emails(gh, account, options, errors);
         }
     }
 
     for endpoint in ["user/emails", "user/public_emails"] {
-        match gh_api_json_for_account::<Vec<GitHubEmail>>(account, token, endpoint) {
+        match gh_api_json_for_account::<Vec<GitHubEmail>>(gh, account, token, endpoint) {
             Ok(entries) => push_email_entries(
                 options,
                 entries,
@@ -745,12 +757,13 @@ fn collect_token_commit_emails(
 }
 
 fn collect_public_noreply_emails(
+    gh: &str,
     account: &GitHubAccount,
     options: &mut Vec<CommitEmailOption>,
     errors: &mut Vec<String>,
 ) {
     let endpoint = format!("users/{}", account.login);
-    match gh_api_json_for_host::<GitHubUser>(&account.host, &endpoint) {
+    match gh_api_json_for_host::<GitHubUser>(gh, &account.host, &endpoint) {
         Ok(user) => {
             let avatar_url = user.avatar_url;
             let display_name =
@@ -826,8 +839,8 @@ fn push_email_entries(
     }
 }
 
-fn gh_auth_token(account: &GitHubAccount) -> Result<String, String> {
-    let output = Command::new("gh")
+fn gh_auth_token(gh: &str, account: &GitHubAccount) -> Result<String, String> {
+    let output = Command::new(gh)
         .arg("auth")
         .arg("token")
         .arg("--hostname")
@@ -868,8 +881,8 @@ fn gh_auth_token(account: &GitHubAccount) -> Result<String, String> {
     }
 }
 
-fn gh_api_json<T: for<'de> Deserialize<'de>>(endpoint: &str) -> Result<T, String> {
-    let output = Command::new("gh")
+fn gh_api_json<T: for<'de> Deserialize<'de>>(gh: &str, endpoint: &str) -> Result<T, String> {
+    let output = Command::new(gh)
         .arg("api")
         .arg(endpoint)
         .output()
@@ -890,10 +903,11 @@ fn gh_api_json<T: for<'de> Deserialize<'de>>(endpoint: &str) -> Result<T, String
 }
 
 fn gh_api_json_for_host<T: for<'de> Deserialize<'de>>(
+    gh: &str,
     host: &str,
     endpoint: &str,
 ) -> Result<T, String> {
-    let output = Command::new("gh")
+    let output = Command::new(gh)
         .arg("api")
         .arg("--hostname")
         .arg(host)
@@ -905,11 +919,12 @@ fn gh_api_json_for_host<T: for<'de> Deserialize<'de>>(
 }
 
 fn gh_api_json_for_account<T: for<'de> Deserialize<'de>>(
+    gh: &str,
     account: &GitHubAccount,
     token: &str,
     endpoint: &str,
 ) -> Result<T, String> {
-    let output = Command::new("gh")
+    let output = Command::new(gh)
         .arg("api")
         .arg("--hostname")
         .arg(&account.host)
@@ -1000,17 +1015,19 @@ fn push_email_option(
     });
 }
 
-pub fn download_avatar(url: &str) -> Result<Vec<u8>, String> {
-    reqwest::blocking::Client::builder()
+pub async fn download_avatar_async(url: &str) -> Result<Vec<u8>, String> {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|err| format!("Failed to create HTTP client: {err}"))?
         .get(url)
         .header("User-Agent", "Craic")
         .send()
+        .await
         .and_then(|response| response.error_for_status())
         .map_err(|err| format!("Failed to fetch avatar: {err}"))?
         .bytes()
+        .await
         .map(|bytes| bytes.to_vec())
         .map_err(|err| format!("Failed to read avatar: {err}"))
 }
