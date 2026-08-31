@@ -625,6 +625,7 @@ struct ContainersUi {
     loading: Cell<bool>,
     dirty: Cell<bool>,
     detail_request_id: Cell<u64>,
+    action_request_id: Cell<u64>,
     action_in_progress: Cell<bool>,
     context_selection: Cell<bool>,
 }
@@ -1278,12 +1279,16 @@ enum RepositoryRequest {
         access: Arc<dyn DockerAccess>,
         container_id: String,
         action: docker::ContainerAction,
+        request_id: u64,
+        cancellation: WorkspaceCancellationToken,
     },
     RunComposeAction {
         workspace_id: String,
         access: Arc<dyn DockerAccess>,
         compose: ComposeProject,
         action: docker::ComposeAction,
+        request_id: u64,
+        cancellation: WorkspaceCancellationToken,
     },
     LoadAvatar {
         cache_key: String,
@@ -1631,6 +1636,7 @@ enum RepositoryCompletion {
     },
     ContainerActionFinished {
         workspace_id: String,
+        request_id: u64,
         result: Result<String, String>,
     },
     Avatar {
@@ -2249,7 +2255,16 @@ define_class!(
                     )
                 };
                 menu_item.setTitle(&NSString::from_str(&title));
-                return enabled.into();
+                let lifecycle_action = action == sel!(startContainer:)
+                    || action == sel!(stopContainer:)
+                    || action == sel!(restartContainer:)
+                    || action == sel!(removeContainer:);
+                let action_in_progress = self
+                    .ivars()
+                    .containers
+                    .get()
+                    .is_some_and(|containers| containers.action_in_progress.get());
+                return (enabled && (!lifecycle_action || !action_in_progress)).into();
             }
             if action == sel!(pullRemote:) || action == sel!(pushRemote:) {
                 return (self.ivars().git_handle.borrow().is_some()
@@ -14567,6 +14582,7 @@ impl AppDelegate {
         let selected = self.selected_container();
         let compose = self.selected_compose_project();
         let available = selected.is_some() || compose.is_some();
+        let action_available = !containers.action_in_progress.get();
         containers.logs.setEnabled(available);
         containers.inspect.setEnabled(selected.is_some());
         containers.shell.setEnabled(
@@ -14575,20 +14591,24 @@ impl AppDelegate {
                 .is_some_and(|container| docker::state_is_running(&container.state)),
         );
         containers.start.setEnabled(
-            compose.is_some()
-                || available && selected.as_ref().is_some_and(ContainerSummary::can_start),
+            action_available
+                && (compose.is_some()
+                    || available && selected.as_ref().is_some_and(ContainerSummary::can_start)),
         );
         containers.stop.setEnabled(
-            compose.is_some()
-                || available && selected.as_ref().is_some_and(ContainerSummary::can_stop),
+            action_available
+                && (compose.is_some()
+                    || available && selected.as_ref().is_some_and(ContainerSummary::can_stop)),
         );
         containers.restart.setEnabled(
-            compose.is_some()
-                || available && selected.as_ref().is_some_and(ContainerSummary::can_restart),
+            action_available
+                && (compose.is_some()
+                    || available && selected.as_ref().is_some_and(ContainerSummary::can_restart)),
         );
         containers.remove.setEnabled(
-            compose.is_some()
-                || available && selected.as_ref().is_some_and(ContainerSummary::can_remove),
+            action_available
+                && (compose.is_some()
+                    || available && selected.as_ref().is_some_and(ContainerSummary::can_remove)),
         );
         containers
             .remove
@@ -14752,6 +14772,12 @@ impl AppDelegate {
         let Some(containers) = self.ivars().containers.get() else {
             return;
         };
+        if containers.action_in_progress.get() {
+            log::debug!(
+                "native container lifecycle request ignored while another action is active"
+            );
+            return;
+        }
         let container = self.selected_container();
         let compose = self.selected_compose_project();
         if container.is_none() && compose.is_none() {
@@ -14767,6 +14793,11 @@ impl AppDelegate {
                 return;
             }
         };
+        let Some(cancellation) = self.workspace_cancellation_token() else {
+            return;
+        };
+        let request_id = containers.action_request_id.get().wrapping_add(1);
+        containers.action_request_id.set(request_id);
         containers.action_in_progress.set(true);
         self.update_container_actions();
         containers
@@ -14783,6 +14814,8 @@ impl AppDelegate {
                 access,
                 container_id: container.id,
                 action,
+                request_id,
+                cancellation,
             }
         } else if let Some(compose) = compose {
             let action = match action {
@@ -14796,6 +14829,8 @@ impl AppDelegate {
                 access,
                 compose,
                 action,
+                request_id,
+                cancellation,
             }
         } else {
             unreachable!("container action requires a selected container or Compose project")
@@ -14810,21 +14845,31 @@ impl AppDelegate {
         }
     }
 
-    fn finish_container_action(&self, workspace_id: &str, result: Result<String, String>) {
+    fn finish_container_action(
+        &self,
+        workspace_id: &str,
+        request_id: u64,
+        result: Result<String, String>,
+    ) {
         if self.ivars().active_workspace_id.borrow().as_deref() != Some(workspace_id) {
             return;
         }
-        if let Some(containers) = self.ivars().containers.get() {
-            containers.action_in_progress.set(false);
-            self.update_container_actions();
+        let Some(containers) = self.ivars().containers.get() else {
+            return;
+        };
+        if containers.action_request_id.get() != request_id {
+            log::debug!(
+                "discarding stale container action workspace={workspace_id} request={request_id}"
+            );
+            return;
         }
+        containers.action_in_progress.set(false);
+        self.update_container_actions();
         match result {
             Ok(message) => {
-                if let Some(containers) = self.ivars().containers.get() {
-                    containers
-                        .subtitle
-                        .setStringValue(&NSString::from_str(&message));
-                }
+                containers
+                    .subtitle
+                    .setStringValue(&NSString::from_str(&message));
                 self.show_native_toast(&message);
                 self.request_containers();
             }
@@ -21182,6 +21227,9 @@ impl AppDelegate {
             containers
                 .detail_request_id
                 .set(containers.detail_request_id.get().wrapping_add(1));
+            containers
+                .action_request_id
+                .set(containers.action_request_id.get().wrapping_add(1));
             containers.rows.borrow_mut().clear();
             containers.expanded_groups.borrow_mut().clear();
             containers.selected_id.borrow_mut().take();
@@ -22175,8 +22223,9 @@ impl AppDelegate {
             }
             RepositoryCompletion::ContainerActionFinished {
                 workspace_id,
+                request_id,
                 result,
-            } => self.finish_container_action(&workspace_id, result),
+            } => self.finish_container_action(&workspace_id, request_id, result),
             RepositoryCompletion::Avatar { cache_key, result } => {
                 self.apply_avatar(&cache_key, result)
             }
@@ -24090,6 +24139,7 @@ impl AppDelegate {
             loading: Cell::new(false),
             dirty: Cell::new(true),
             detail_request_id: Cell::new(0),
+            action_request_id: Cell::new(0),
             action_in_progress: Cell::new(false),
             context_selection: Cell::new(false),
         }
@@ -29174,18 +29224,26 @@ pub fn run() {
                         access,
                         container_id,
                         action,
+                        request_id,
+                        cancellation,
                     } => {
-                        let result = tokio::task::spawn_blocking(move || {
+                        let task = tokio::task::spawn_blocking(move || {
                             docker::run_container_action(access.as_ref(), &container_id, action)
-                        })
-                        .await
-                        .unwrap_or_else(|error| {
+                        });
+                        let Some(result) = until_workspace_change(&cancellation, task).await else {
+                            log::debug!(
+                                "container action canceled workspace={workspace_id} request={request_id}"
+                            );
+                            continue;
+                        };
+                        let result = result.unwrap_or_else(|error| {
                             Err(format!("Container action task failed: {error}"))
                         });
                         if repository_completion_tx
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::ContainerActionFinished {
                                     workspace_id,
+                                    request_id,
                                     result,
                                 },
                             ))
@@ -29199,18 +29257,26 @@ pub fn run() {
                         access,
                         compose,
                         action,
+                        request_id,
+                        cancellation,
                     } => {
-                        let result = tokio::task::spawn_blocking(move || {
+                        let task = tokio::task::spawn_blocking(move || {
                             docker::run_compose_action(access.as_ref(), &compose, action)
-                        })
-                        .await
-                        .unwrap_or_else(|error| {
+                        });
+                        let Some(result) = until_workspace_change(&cancellation, task).await else {
+                            log::debug!(
+                                "compose action canceled workspace={workspace_id} request={request_id}"
+                            );
+                            continue;
+                        };
+                        let result = result.unwrap_or_else(|error| {
                             Err(format!("Compose action task failed: {error}"))
                         });
                         if repository_completion_tx
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::ContainerActionFinished {
                                     workspace_id,
+                                    request_id,
                                     result,
                                 },
                             ))
