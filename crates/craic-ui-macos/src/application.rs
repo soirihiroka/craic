@@ -1132,6 +1132,7 @@ enum RepositoryRequest {
         snapshot: RepositorySnapshot,
         action: NativeRemoteAction,
         stash_before: bool,
+        cancellation: WorkspaceCancellationToken,
     },
     LoadQuickActions {
         workspace_id: String,
@@ -5998,6 +5999,10 @@ impl AppDelegate {
         let Some(snapshot) = self.ivars().repository_snapshot.borrow().clone() else {
             return;
         };
+        let Some(cancellation) = self.workspace_cancellation_token() else {
+            log::warn!("git action ignored because workspace cancellation is unavailable");
+            return;
+        };
         let Some(requests) = self.ivars().repository_requests.get() else {
             log::warn!("git action ignored because repository service is unavailable");
             return;
@@ -6008,6 +6013,7 @@ impl AppDelegate {
             snapshot,
             action,
             stash_before: false,
+            cancellation,
         }) {
             self.repository_action_failed(
                 &workspace_id,
@@ -22051,6 +22057,14 @@ impl AppDelegate {
                 );
                 return;
             };
+            let Some(cancellation) = delegate.workspace_cancellation_token() else {
+                delegate.repository_action_failed(
+                    &workspace_id,
+                    "Stash Failed",
+                    "Workspace cancellation is unavailable.",
+                );
+                return;
+            };
             delegate.set_repository_action_progress(&workspace_id, "Stashing changes…");
             if let Err(error) = requests.try_send(RepositoryRequest::RunGitAction {
                 workspace_id: workspace_id.clone(),
@@ -22058,6 +22072,7 @@ impl AppDelegate {
                 snapshot: snapshot.clone(),
                 action,
                 stash_before: true,
+                cancellation,
             }) {
                 delegate.repository_action_failed(
                     &workspace_id,
@@ -29361,7 +29376,15 @@ pub fn run() {
                         snapshot,
                         action,
                         stash_before,
+                        cancellation,
                     } => {
+                        let mut snapshot = snapshot;
+                        if cancellation.is_cancelled() {
+                            log::debug!(
+                                "native git action discarded before start workspace={workspace_id}"
+                            );
+                            continue;
+                        }
                         if stash_before {
                             let _ = repository_completion_tx.send(
                                 FrontendCompletion::Repository(
@@ -29400,6 +29423,224 @@ pub fn run() {
                                 }
                             }
                         }
+
+                        if matches!(action, NativeRemoteAction::Contextual)
+                            && !stash_before
+                        {
+                            let _ = repository_completion_tx.send(
+                                FrontendCompletion::Repository(
+                                    RepositoryCompletion::ActionProgress {
+                                        workspace_id: workspace_id.clone(),
+                                        message: "Checking repository status…".to_string(),
+                                    },
+                                ),
+                            );
+                            let refresh_handle = handle.clone();
+                            let refresh_task = tokio::task::spawn_blocking(move || {
+                                refresh_handle.load_workspace_snapshot()
+                            });
+                            let Some(refreshed) =
+                                until_workspace_change(&cancellation, refresh_task).await
+                            else {
+                                log::debug!(
+                                    "native contextual sync canceled before initial snapshot workspace={workspace_id}"
+                                );
+                                continue;
+                            };
+                            let refreshed = refreshed.unwrap_or_else(|error| {
+                                Err(format!("Repository refresh task failed: {error}"))
+                            });
+                            snapshot = match refreshed {
+                                Ok(WorkspaceSnapshot::Repository(refreshed)) => refreshed,
+                                Ok(WorkspaceSnapshot::NonRepository { .. }) => {
+                                    let _ = repository_completion_tx.send(
+                                        FrontendCompletion::Repository(
+                                            RepositoryCompletion::ActionFailed {
+                                                workspace_id: workspace_id.clone(),
+                                                title: "Repository Error",
+                                                message: "The workspace is no longer a Git repository."
+                                                    .to_string(),
+                                            },
+                                        ),
+                                    );
+                                    continue;
+                                }
+                                Err(message) => {
+                                    let _ = repository_completion_tx.send(
+                                        FrontendCompletion::Repository(
+                                            RepositoryCompletion::ActionFailed {
+                                                workspace_id: workspace_id.clone(),
+                                                title: "Repository Error",
+                                                message,
+                                            },
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            };
+                        }
+
+                        if matches!(action, NativeRemoteAction::Contextual)
+                            && snapshot.has_upstream
+                            && !stash_before
+                        {
+                            let remote_name = snapshot
+                                .remote_name
+                                .clone()
+                                .unwrap_or_else(|| "remote".to_string());
+                            let _ = repository_completion_tx.send(
+                                FrontendCompletion::Repository(
+                                    RepositoryCompletion::ActionProgress {
+                                        workspace_id: workspace_id.clone(),
+                                        message: format!("Fetching {remote_name}…"),
+                                    },
+                                ),
+                            );
+                            log::info!(
+                                "native contextual sync fetching before action workspace={} remote={}",
+                                workspace_id,
+                                remote_name
+                            );
+
+                            let mut fetch_events = handle.fetch_with_progress(None);
+                            let fetch_result = loop {
+                                let Some(event) = fetch_events.recv().await else {
+                                    break Err(
+                                        "Fetch ended before reporting completion.".to_string()
+                                    );
+                                };
+                                match event {
+                                    GitCommandEvent::Progress { message } => {
+                                        if !cancellation.is_cancelled() {
+                                            let _ = repository_completion_tx.send(
+                                                FrontendCompletion::Repository(
+                                                    RepositoryCompletion::ActionProgress {
+                                                        workspace_id: workspace_id.clone(),
+                                                        message,
+                                                    },
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    GitCommandEvent::Completed { message } => {
+                                        break Ok(message
+                                            .map(|message| message.trim().to_string())
+                                            .filter(|message| !message.is_empty()));
+                                    }
+                                    GitCommandEvent::Failed { message } => {
+                                        break Err(message);
+                                    }
+                                }
+                            };
+                            if cancellation.is_cancelled() {
+                                log::debug!(
+                                    "native contextual sync canceled after fetch workspace={workspace_id}"
+                                );
+                                continue;
+                            }
+                            let fetch_completion_message = match fetch_result {
+                                Ok(message) => message,
+                                Err(message) => {
+                                    let _ = repository_completion_tx.send(
+                                        FrontendCompletion::Repository(
+                                            RepositoryCompletion::ActionFailed {
+                                                workspace_id: workspace_id.clone(),
+                                                title: "Git Operation Failed",
+                                                message,
+                                            },
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let _ = repository_completion_tx.send(
+                                FrontendCompletion::Repository(
+                                    RepositoryCompletion::ActionProgress {
+                                        workspace_id: workspace_id.clone(),
+                                        message: "Checking remote status…".to_string(),
+                                    },
+                                ),
+                            );
+                            let reload_handle = handle.clone();
+                            let reload_task = tokio::task::spawn_blocking(move || {
+                                reload_handle.load_workspace_snapshot()
+                            });
+                            let Some(refreshed) =
+                                until_workspace_change(&cancellation, reload_task).await
+                            else {
+                                log::debug!(
+                                    "native contextual sync canceled before post-fetch snapshot workspace={workspace_id}"
+                                );
+                                continue;
+                            };
+                            let refreshed = refreshed.unwrap_or_else(|error| {
+                                Err(format!("Repository refresh task failed: {error}"))
+                            });
+                            let refreshed = match refreshed {
+                                Ok(WorkspaceSnapshot::Repository(refreshed)) => refreshed,
+                                Ok(WorkspaceSnapshot::NonRepository { .. }) => {
+                                    let _ = repository_completion_tx.send(
+                                        FrontendCompletion::Repository(
+                                            RepositoryCompletion::ActionFailed {
+                                                workspace_id: workspace_id.clone(),
+                                                title: "Repository Error",
+                                                message: "The workspace is no longer a Git repository."
+                                                    .to_string(),
+                                            },
+                                        ),
+                                    );
+                                    continue;
+                                }
+                                Err(message) => {
+                                    let _ = repository_completion_tx.send(
+                                        FrontendCompletion::Repository(
+                                            RepositoryCompletion::ActionFailed {
+                                                workspace_id: workspace_id.clone(),
+                                                title: "Repository Error",
+                                                message,
+                                            },
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            };
+                            log::info!(
+                                "native contextual sync selected post-fetch state workspace={} ahead={} behind={}",
+                                workspace_id,
+                                refreshed.ahead,
+                                refreshed.behind
+                            );
+                            snapshot = refreshed;
+
+                            if snapshot.ahead == 0 && snapshot.behind == 0 {
+                                let result = Ok(WorkspaceSnapshot::Repository(snapshot));
+                                if repository_completion_tx
+                                    .send(FrontendCompletion::Repository(
+                                        RepositoryCompletion::ActionFinished {
+                                            workspace_id,
+                                            handle,
+                                            result,
+                                            message: fetch_completion_message.or_else(|| {
+                                                Some(format!("Fetched {remote_name}."))
+                                            }),
+                                        },
+                                    ))
+                                    .is_err()
+                                {
+                                    log::warn!("git completion dropped during shutdown");
+                                }
+                                continue;
+                            }
+                        }
+
+                        if cancellation.is_cancelled() {
+                            log::debug!(
+                                "native git action discarded before mutation workspace={workspace_id}"
+                            );
+                            continue;
+                        }
+
                         let _ = repository_completion_tx.send(FrontendCompletion::Repository(
                             RepositoryCompletion::ActionProgress {
                                 workspace_id: workspace_id.clone(),
