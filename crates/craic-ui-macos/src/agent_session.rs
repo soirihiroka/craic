@@ -226,6 +226,7 @@ pub struct PendingRequest {
     pub message: String,
     pub options: Vec<RequestOption>,
     pub allows_text: bool,
+    pub multiline_text: bool,
     pub text_placeholder: Option<String>,
     pub secret: bool,
 }
@@ -2822,6 +2823,7 @@ fn pending_request_from_server(key: &str, method: &str, params: &Value) -> Optio
         message: approval_description(params, fallback),
         options: approval_options(params, command),
         allows_text: false,
+        multiline_text: false,
         text_placeholder: None,
         secret: false,
     };
@@ -2846,6 +2848,7 @@ fn pending_request_from_server(key: &str, method: &str, params: &Value) -> Optio
                 request_option("decline", "Decline", true),
             ],
             allows_text: false,
+            multiline_text: false,
             text_placeholder: None,
             secret: false,
         }),
@@ -2892,6 +2895,7 @@ fn pending_request_from_server(key: &str, method: &str, params: &Value) -> Optio
                 allows_text: multiple
                     || options.is_empty()
                     || first.get("isOther").and_then(Value::as_bool) == Some(true),
+                multiline_text: false,
                 options,
                 text_placeholder: Some(if multiple {
                     r#"{"question_id":"answer"}"#.to_owned()
@@ -2929,10 +2933,40 @@ fn pending_request_from_server(key: &str, method: &str, params: &Value) -> Optio
                     Vec::new()
                 },
                 allows_text: mode != Some("url"),
+                multiline_text: false,
                 text_placeholder: (mode != Some("url")).then(|| "Enter JSON response".to_owned()),
                 secret: params
                     .get("requestedSchema")
                     .is_some_and(schema_contains_secret),
+            })
+        }
+        "item/tool/call" => {
+            let tool = params
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let qualified_tool = params
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|namespace| !namespace.is_empty())
+                .map(|namespace| format!("{namespace}/{tool}"))
+                .unwrap_or_else(|| tool.to_owned());
+            let mut display_tool = qualified_tool.chars().take(96).collect::<String>();
+            if display_tool.chars().count() < qualified_tool.chars().count() {
+                display_tool.push('…');
+            }
+            Some(PendingRequest {
+                key: key.to_owned(),
+                title: format!("Dynamic tool: {display_tool}"),
+                message: params
+                    .get("arguments")
+                    .map(compact_request_json)
+                    .unwrap_or_default(),
+                options: vec![request_option("fail", "Report Failure", true)],
+                allows_text: true,
+                multiline_text: true,
+                text_placeholder: Some(format!("Return output for {display_tool}")),
+                secret: false,
             })
         }
         _ => None,
@@ -3044,6 +3078,22 @@ fn response_for_server_request(
     params: &Value,
     response: RequestResponse,
 ) -> Result<Value, String> {
+    if method == "item/tool/call" {
+        return match response {
+            RequestResponse::Text(text) => Ok(serde_json::json!({
+                "contentItems": [{ "type": "inputText", "text": text }],
+                "success": true
+            })),
+            RequestResponse::Choice(text) if text != "fail" => Ok(serde_json::json!({
+                "contentItems": [{ "type": "inputText", "text": text }],
+                "success": true
+            })),
+            RequestResponse::Choice(_) | RequestResponse::Cancel => Ok(serde_json::json!({
+                "contentItems": [],
+                "success": false
+            })),
+        };
+    }
     let value = match response {
         RequestResponse::Choice(value) | RequestResponse::Text(value) => value,
         RequestResponse::Cancel => match method {
@@ -4071,6 +4121,21 @@ fn compact_json(value: &Value) -> String {
         }
         rendered.truncate(boundary);
         rendered.push_str("\n… output truncated …");
+    }
+    rendered
+}
+
+fn compact_request_json(value: &Value) -> String {
+    const MAX_REQUEST_ARGUMENT_BYTES: usize = 4 * 1024;
+
+    let mut rendered = compact_json(value);
+    if rendered.len() > MAX_REQUEST_ARGUMENT_BYTES {
+        let mut boundary = MAX_REQUEST_ARGUMENT_BYTES;
+        while !rendered.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        rendered.truncate(boundary);
+        rendered.push_str("\n… arguments truncated …");
     }
     rendered
 }

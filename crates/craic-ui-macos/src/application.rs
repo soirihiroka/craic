@@ -990,6 +990,9 @@ pub(crate) struct AppDelegateIvars {
     repository_requests: OnceCell<tokio::sync::mpsc::Sender<RepositoryRequest>>,
     agent_commands: OnceCell<tokio::sync::mpsc::Sender<NativeAgentCommand>>,
     agent_request_alerts: RefCell<HashMap<String, Retained<NSAlert>>>,
+    agent_pending_request_keys: RefCell<HashSet<String>>,
+    agent_request_multiline_inputs:
+        RefCell<HashMap<String, (Retained<NSTextView>, Retained<NSButton>)>>,
     close_confirmation: RefCell<Option<Retained<NSAlert>>>,
     shortcuts_window: RefCell<Option<Retained<NSWindow>>>,
     quit_requested_during_close_confirmation: Cell<bool>,
@@ -1965,6 +1968,22 @@ define_class!(
     unsafe impl NSTextDelegate for AppDelegate {
         #[unsafe(method(textDidChange:))]
         fn text_did_change(&self, notification: &NSNotification) {
+            if let Some(object) = notification.object() {
+                for (input, submit) in self
+                    .ivars()
+                    .agent_request_multiline_inputs
+                    .borrow()
+                    .values()
+                {
+                    if std::ptr::eq(
+                        &*object,
+                        (&**input as *const NSTextView).cast::<AnyObject>(),
+                    ) {
+                        submit.setEnabled(!input.string().to_string().trim().is_empty());
+                        return;
+                    }
+                }
+            }
             if let (Some(agents), Some(object)) =
                 (self.ivars().agents.get(), notification.object())
                 && std::ptr::eq(
@@ -10026,6 +10045,10 @@ impl AppDelegate {
             }
             NativeAgentEvent::Request { identity, request } => {
                 if self.agent_event_is_current(&identity) {
+                    self.ivars()
+                        .agent_pending_request_keys
+                        .borrow_mut()
+                        .insert(request.key.clone());
                     self.present_native_agent_request(identity, request);
                 }
             }
@@ -10033,14 +10056,23 @@ impl AppDelegate {
                 identity,
                 request_key,
             } => {
-                if self.agent_event_is_current(&identity)
-                    && let Some(alert) = self
+                if self.agent_event_is_current(&identity) {
+                    self.ivars()
+                        .agent_pending_request_keys
+                        .borrow_mut()
+                        .remove(&request_key);
+                    self.ivars()
+                        .agent_request_multiline_inputs
+                        .borrow_mut()
+                        .remove(&request_key);
+                    if let Some(alert) = self
                         .ivars()
                         .agent_request_alerts
                         .borrow_mut()
                         .remove(&request_key)
-                {
-                    alert.window().close();
+                    {
+                        alert.window().close();
+                    }
                 }
             }
             NativeAgentEvent::BackgroundTerminals {
@@ -10092,31 +10124,78 @@ impl AppDelegate {
         let alert = NSAlert::new(self.mtm());
         alert.setAlertStyle(NSAlertStyle::Warning);
         alert.setMessageText(&NSString::from_str(&request.title));
-        alert.setInformativeText(&NSString::from_str(&request.message));
+        let informative_text = if request.multiline_text {
+            request
+                .text_placeholder
+                .as_deref()
+                .map(|placeholder| {
+                    if request.message.trim().is_empty() {
+                        placeholder.to_owned()
+                    } else {
+                        format!("{}\n\n{placeholder}", request.message)
+                    }
+                })
+                .unwrap_or_else(|| request.message.clone())
+        } else {
+            request.message.clone()
+        };
+        alert.setInformativeText(&NSString::from_str(&informative_text));
 
-        let input: Option<Retained<NSTextField>> = request.allows_text.then(|| {
-            let input: Retained<NSTextField> = if request.secret {
-                NSSecureTextField::initWithFrame(
-                    NSSecureTextField::alloc(self.mtm()),
-                    NSRect::new(NSPoint::ZERO, NSSize::new(420.0, 26.0)),
-                )
-                .into_super()
-            } else {
-                NSTextField::initWithFrame(
-                    NSTextField::alloc(self.mtm()),
-                    NSRect::new(NSPoint::ZERO, NSSize::new(420.0, 26.0)),
-                )
-            };
-            if let Some(placeholder) = request.text_placeholder.as_deref() {
-                input.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+        let single_line_input: Option<Retained<NSTextField>> =
+            (request.allows_text && !request.multiline_text).then(|| {
+                let input: Retained<NSTextField> = if request.secret {
+                    NSSecureTextField::initWithFrame(
+                        NSSecureTextField::alloc(self.mtm()),
+                        NSRect::new(NSPoint::ZERO, NSSize::new(420.0, 26.0)),
+                    )
+                    .into_super()
+                } else {
+                    NSTextField::initWithFrame(
+                        NSTextField::alloc(self.mtm()),
+                        NSRect::new(NSPoint::ZERO, NSSize::new(420.0, 26.0)),
+                    )
+                };
+                if let Some(placeholder) = request.text_placeholder.as_deref() {
+                    input.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+                }
+                alert.setAccessoryView(Some(&input));
+                input
+            });
+        let multiline_input: Option<Retained<NSTextView>> = request.multiline_text.then(|| {
+            let frame = NSRect::new(NSPoint::ZERO, NSSize::new(420.0, 112.0));
+            let input = NSTextView::initWithFrame(NSTextView::alloc(self.mtm()), frame);
+            input.setEditable(true);
+            input.setSelectable(true);
+            input.setRichText(false);
+            input.setDrawsBackground(true);
+            if let Some(font) = NSFont::userFixedPitchFontOfSize(12.0) {
+                input.setFont(Some(&font));
             }
-            alert.setAccessoryView(Some(&input));
+            input.setTextContainerInset(NSSize::new(8.0, 8.0));
+            input.setDelegate(Some(ProtocolObject::from_ref(self)));
+
+            let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(self.mtm()), frame);
+            scroll.setBorderType(NSBorderType::BezelBorder);
+            scroll.setDrawsBackground(true);
+            scroll.setHasVerticalScroller(true);
+            scroll.setAutohidesScrollers(true);
+            scroll.setDocumentView(Some(&input));
+            alert.setAccessoryView(Some(&scroll));
             input
         });
 
         let mut responses = Vec::new();
-        let text_button = input.as_ref().map(|_| {
-            alert.addButtonWithTitle(&NSString::from_str("Submit"));
+        let mut text_submit = None;
+        let text_button = request.allows_text.then(|| {
+            let button = alert.addButtonWithTitle(&NSString::from_str(if request.multiline_text {
+                "Return Output"
+            } else {
+                "Submit"
+            }));
+            if request.multiline_text {
+                button.setEnabled(false);
+            }
+            text_submit = Some(button);
             responses.push(NativeAgentRequestResponse::Text(String::new()));
             responses.len() - 1
         });
@@ -10125,11 +10204,12 @@ impl AppDelegate {
             button.setHasDestructiveAction(option.destructive);
             responses.push(NativeAgentRequestResponse::Choice(option.value.clone()));
         }
-        if request.allows_text
-            || !request
-                .options
-                .iter()
-                .any(|option| matches!(option.value.as_str(), "decline" | "cancel"))
+        if !request.multiline_text
+            && (request.allows_text
+                || !request
+                    .options
+                    .iter()
+                    .any(|option| matches!(option.value.as_str(), "decline" | "cancel")))
         {
             let button = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
             button.setHasDestructiveAction(true);
@@ -10138,12 +10218,19 @@ impl AppDelegate {
 
         let request_key = request.key.clone();
         let completion_key = request.key.clone();
-        let completion_input = input.clone();
+        let completion_input = single_line_input.clone();
+        let completion_multiline_input = multiline_input.clone();
+        let retry_request = request.clone();
         let delegate = self.retain();
         let completion = RcBlock::new(move |response| {
             delegate
                 .ivars()
                 .agent_request_alerts
+                .borrow_mut()
+                .remove(&completion_key);
+            delegate
+                .ivars()
+                .agent_request_multiline_inputs
                 .borrow_mut()
                 .remove(&completion_key);
             if !delegate.agent_event_is_current(&identity) {
@@ -10155,12 +10242,21 @@ impl AppDelegate {
             let Some(mut response) = responses.get(index).cloned() else {
                 return;
             };
-            if text_button == Some(index)
-                && let Some(input) = completion_input.as_ref()
-            {
-                response = NativeAgentRequestResponse::Text(input.stringValue().to_string());
+            if text_button == Some(index) {
+                if let Some(input) = completion_multiline_input.as_ref() {
+                    response = NativeAgentRequestResponse::Text(
+                        input.string().to_string().trim().to_owned(),
+                    );
+                } else if let Some(input) = completion_input.as_ref() {
+                    response = NativeAgentRequestResponse::Text(input.stringValue().to_string());
+                }
             }
             let Some(commands) = delegate.ivars().agent_commands.get() else {
+                delegate.present_native_agent_response_queue_error(
+                    identity.clone(),
+                    retry_request.clone(),
+                    "The native Codex command service is unavailable.",
+                );
                 return;
             };
             if let Err(error) = commands.try_send(NativeAgentCommand::Respond {
@@ -10168,8 +10264,9 @@ impl AppDelegate {
                 request_key: completion_key.clone(),
                 response,
             }) {
-                delegate.present_path_action_error(
-                    "Unable to Answer Codex",
+                delegate.present_native_agent_response_queue_error(
+                    identity.clone(),
+                    retry_request.clone(),
                     &format!("The response could not be queued: {error}"),
                 );
             }
@@ -10178,10 +10275,56 @@ impl AppDelegate {
             .agent_request_alerts
             .borrow_mut()
             .insert(request_key, alert.clone());
+        if let (Some(input), Some(submit)) = (multiline_input.as_ref(), text_submit) {
+            self.ivars()
+                .agent_request_multiline_inputs
+                .borrow_mut()
+                .insert(request.key.clone(), (input.clone(), submit));
+        }
         alert.beginSheetModalForWindow_completionHandler(window, Some(&completion));
-        if let Some(input) = input {
+        if let Some(input) = multiline_input {
+            alert.window().makeFirstResponder(Some(&input));
+        } else if let Some(input) = single_line_input {
             alert.window().makeFirstResponder(Some(&input));
         }
+    }
+
+    fn present_native_agent_response_queue_error(
+        &self,
+        identity: AgentIdentity,
+        request: NativeAgentPendingRequest,
+        message: &str,
+    ) {
+        if !self.agent_event_is_current(&identity)
+            || !self
+                .ivars()
+                .agent_pending_request_keys
+                .borrow()
+                .contains(&request.key)
+        {
+            return;
+        }
+        let Some(window) = self.ivars().window.get() else {
+            return;
+        };
+        let alert = NSAlert::new(self.mtm());
+        alert.setAlertStyle(NSAlertStyle::Critical);
+        alert.setMessageText(&NSString::from_str("Unable to Answer Codex"));
+        alert.setInformativeText(&NSString::from_str(message));
+        alert.addButtonWithTitle(&NSString::from_str("OK"));
+        let delegate = self.retain();
+        let completion = RcBlock::new(move |_| {
+            if delegate.agent_event_is_current(&identity)
+                && delegate
+                    .ivars()
+                    .agent_pending_request_keys
+                    .borrow()
+                    .contains(&request.key)
+            {
+                delegate.present_native_agent_request(identity.clone(), request.clone());
+            }
+        });
+        alert.beginSheetModalForWindow_completionHandler(window, Some(&completion));
     }
 
     fn apply_native_agent_state(
@@ -11590,6 +11733,11 @@ impl AppDelegate {
         for (_, alert) in self.ivars().agent_request_alerts.borrow_mut().drain() {
             alert.window().close();
         }
+        self.ivars()
+            .agent_request_multiline_inputs
+            .borrow_mut()
+            .clear();
+        self.ivars().agent_pending_request_keys.borrow_mut().clear();
         agents.state.set(NativeAgentState::Closed);
         agents
             .new_chat
