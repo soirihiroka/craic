@@ -74,6 +74,7 @@ use craic_system::system::capabilities::terminal_link::TerminalLinkTarget;
 use craic_system::system::materialize::{MaterializedFile, materialize_bytes_for_view};
 use craic_system::system::providers::local::LocalProvider;
 use craic_system::system::providers::ssh::{SshProvider, SshProviderConfig};
+use craic_system::system::transfer::transfer_file_node;
 use craic_system::system::{FileNodePath, WorkspacePath};
 use craic_system::workspace::WorkspaceEntry;
 use craic_ui_containers::docker::{
@@ -793,6 +794,12 @@ enum NativeFileMutation {
         destination_parent: FileNodePath,
         new_name: String,
     },
+    Transfer {
+        source_workspace: craic_config::ConfiguredWorkspace,
+        source_workspace_id: String,
+        source_relative: String,
+        destination: FileNodePath,
+    },
     Upload {
         sources: Vec<PathBuf>,
         destination_parent: FileNodePath,
@@ -825,6 +832,7 @@ impl NativeFileMutation {
             Self::Rename { .. } => "Renaming item…",
             Self::Copy { .. } => "Copying item…",
             Self::Move { .. } => "Moving item…",
+            Self::Transfer { .. } => "Copying item…",
             Self::Upload { .. } => "Uploading items…",
             Self::Delete { .. } => "Deleting item…",
         }
@@ -2323,13 +2331,28 @@ define_class!(
             else {
                 return false.into();
             };
+            let Some(workspace) = self
+                .ivars()
+                .active_workspace_id
+                .borrow()
+                .as_deref()
+                .and_then(|active| {
+                    self.ivars()
+                        .workspaces
+                        .borrow()
+                        .iter()
+                        .find(|workspace| workspace.selection_id() == active)
+                        .map(|workspace| workspace.workspace.clone())
+                })
+            else {
+                return false.into();
+            };
             let drag_type = workspace_file_drag_type();
             pasteboard.clearContents();
-            let payload = format!(
-                "{}\n{}",
-                access.workspace().id.as_str(),
-                row.info.path.display()
-            );
+            let Some(payload) = workspace_file_drag_payload(&workspace, access.as_ref(), &row.info.path)
+            else {
+                return false.into();
+            };
             if !pasteboard.setString_forType(&NSString::from_str(&payload), &drag_type) {
                 return false.into();
             }
@@ -2368,8 +2391,24 @@ define_class!(
             let drag_type = workspace_file_drag_type();
             let internal_types = NSArray::from_slice(&[&*drag_type]);
             if pasteboard.availableTypeFromArray(&internal_types).is_some()
-                && let Some(source) = workspace_file_path_from_drag(info, access.as_ref())
+                && let Some(drag) = workspace_file_drag_source(info)
             {
+                if !self
+                    .ivars()
+                    .workspaces
+                    .borrow()
+                    .iter()
+                    .any(|workspace| {
+                        workspace.selection_id() == drag.workspace_selection_id
+                    })
+                {
+                    return NSDragOperation::None;
+                }
+                if drag.workspace_id != access.workspace().id.as_str() {
+                    table.setDropRow_dropOperation(row, NSTableViewDropOperation::On);
+                    return NSDragOperation::Copy;
+                }
+                let source = access.root().join_child(&drag.relative);
                 let Some(source_info) = files
                     .rows
                     .borrow()
@@ -2428,7 +2467,41 @@ define_class!(
                 return false.into();
             };
             self.clear_file_drop_hover();
-            if let Some(source) = workspace_file_path_from_drag(info, access.as_ref()) {
+            if let Some(drag) = workspace_file_drag_source(info) {
+                if drag.workspace_id != access.workspace().id.as_str() {
+                    let Some(source_workspace) = self
+                        .ivars()
+                        .workspaces
+                        .borrow()
+                        .iter()
+                        .find(|workspace| {
+                            workspace.selection_id() == drag.workspace_selection_id
+                        })
+                        .map(|workspace| workspace.workspace.clone())
+                    else {
+                        return false.into();
+                    };
+                    let Some(name) = drag
+                        .relative
+                        .rsplit('/')
+                        .next()
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                    else {
+                        return false.into();
+                    };
+                    self.request_file_mutation(
+                        access,
+                        NativeFileMutation::Transfer {
+                            source_workspace,
+                            source_workspace_id: drag.workspace_id,
+                            source_relative: drag.relative,
+                            destination: destination_parent.join_child(name),
+                        },
+                    );
+                    return true.into();
+                }
+                let source = access.root().join_child(&drag.relative);
                 let Some(source_info) = files
                     .rows
                     .borrow()
@@ -15804,6 +15877,7 @@ impl AppDelegate {
                     NativeFileMutation::Rename { .. } => "Item renamed.",
                     NativeFileMutation::Copy { .. } => "Item copied.",
                     NativeFileMutation::Move { .. } => "Item moved.",
+                    NativeFileMutation::Transfer { .. } => "Item copied.",
                     NativeFileMutation::Upload { sources, .. } => {
                         if sources.len() == 1 {
                             "Item uploaded."
@@ -15832,6 +15906,11 @@ impl AppDelegate {
                             .insert(destination_parent.clone());
                     }
                     NativeFileMutation::Copy { destination, .. } => {
+                        if let Some(parent) = destination.parent() {
+                            files.expanded.borrow_mut().insert(parent);
+                        }
+                    }
+                    NativeFileMutation::Transfer { destination, .. } => {
                         if let Some(parent) = destination.parent() {
                             files.expanded.borrow_mut().insert(parent);
                         }
@@ -26404,6 +26483,30 @@ fn workspace_file_drag_type() -> Retained<NSString> {
     NSString::from_str("dev.craic.workspace-file-path")
 }
 
+struct NativeWorkspaceFileDrag {
+    workspace_selection_id: String,
+    workspace_id: String,
+    relative: String,
+}
+
+fn workspace_file_drag_payload(
+    workspace: &craic_config::ConfiguredWorkspace,
+    access: &dyn FileAccess,
+    path: &FileNodePath,
+) -> Option<String> {
+    let relative = path.native_relative()?;
+    if relative.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&serde_json::json!({
+        "version": 2,
+        "workspace_selection_id": workspace.selection_id(),
+        "workspace_id": access.workspace().id.as_str(),
+        "relative": relative,
+    }))
+    .ok()
+}
+
 fn workspace_file_clipboard_type() -> Retained<NSString> {
     NSString::from_str("dev.craic.workspace-file-clipboard")
 }
@@ -26428,21 +26531,29 @@ fn workspace_file_clipboard_from_pasteboard(
     (!relative.is_empty()).then(|| (access.root().join_child(relative), move_item))
 }
 
-fn workspace_file_path_from_drag(
+fn workspace_file_drag_source(
     info: &ProtocolObject<dyn NSDraggingInfo>,
-    access: &dyn FileAccess,
-) -> Option<FileNodePath> {
+) -> Option<NativeWorkspaceFileDrag> {
     let drag_type = workspace_file_drag_type();
-    let relative = info
+    let payload = info
         .draggingPasteboard()
         .stringForType(&drag_type)?
         .to_string();
-    let (workspace_id, relative) = relative.split_once('\n')?;
-    if workspace_id != access.workspace().id.as_str() {
+    let value = serde_json::from_str::<serde_json::Value>(&payload).ok()?;
+    if value.get("version")?.as_u64()? != 2 {
         return None;
     }
-    let relative = relative.trim().trim_start_matches('/');
-    (!relative.is_empty()).then(|| access.root().join_child(relative))
+    let workspace_selection_id = value.get("workspace_selection_id")?.as_str()?;
+    let workspace_id = value.get("workspace_id")?.as_str()?;
+    let relative = value.get("relative")?.as_str()?;
+    if workspace_selection_id.is_empty() || workspace_id.is_empty() || relative.is_empty() {
+        return None;
+    }
+    Some(NativeWorkspaceFileDrag {
+        workspace_selection_id: workspace_selection_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        relative: relative.to_string(),
+    })
 }
 
 fn workspace_path_is_descendant(path: &FileNodePath, ancestor: &FileNodePath) -> bool {
@@ -28693,6 +28804,45 @@ pub fn run() {
                                 )
                                 .await
                                 .map(|result| result.map(Some))
+                            }
+                            NativeFileMutation::Transfer {
+                                source_workspace,
+                                source_workspace_id,
+                                source_relative,
+                                destination,
+                            } => {
+                                let worker_cancel = cancel_requested.clone();
+                                let mut worker = tokio::task::spawn_blocking(move || {
+                                    let source_access = craic_system::workspace::file_access_for_configured_workspace(
+                                        &source_workspace,
+                                    )?;
+                                    if source_access.workspace().id.as_str() != source_workspace_id {
+                                        return Err(
+                                            "The dragged workspace identity is no longer valid."
+                                                .to_string(),
+                                        );
+                                    }
+                                    let source = source_access.root().join_child(source_relative);
+                                    transfer_file_node(
+                                        source_access,
+                                        access,
+                                        source,
+                                        destination,
+                                        worker_cancel,
+                                    )
+                                    .map(Some)
+                                });
+                                tokio::select! {
+                                    biased;
+                                    _ = cancellation.cancelled() => {
+                                        cancel_requested.store(true, Ordering::Relaxed);
+                                        let _ = worker.await;
+                                        None
+                                    }
+                                    joined = &mut worker => Some(joined.unwrap_or_else(|error| {
+                                        Err(format!("Cross-provider transfer task failed: {error}"))
+                                    })),
+                                }
                             }
                             NativeFileMutation::Upload {
                                 sources,

@@ -18,7 +18,10 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use zeroize::Zeroizing;
@@ -27,6 +30,7 @@ const SSH_FILE_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const SSH_LIST_DIR_CACHE_TTL: Duration = Duration::from_millis(500);
 const COPY_PATH_SCRIPT: &str = include_str!("scripts/copy_path.sh");
 const FILE_SIGNATURES_SCRIPT: &str = include_str!("scripts/file_signatures.sh");
+const FINALIZE_STAGED_PATH_SCRIPT: &str = include_str!("../finalize_staged_path.sh");
 const LIST_DIRS_SCRIPT: &str = include_str!("scripts/list_dirs.sh");
 const METADATA_SCRIPT: &str = include_str!("scripts/metadata.sh");
 const MOVE_PATH_SCRIPT: &str = include_str!("scripts/move_path.sh");
@@ -878,6 +882,25 @@ impl FileAccess for SshFileAccess {
 
     fn root(&self) -> FileNodePath {
         self.workspace.root_node_path(&self.system)
+    }
+
+    fn finalize_staged_node(
+        &self,
+        source: &FileNodePath,
+        destination: &FileNodePath,
+        cancel_requested: &AtomicBool,
+    ) -> Result<FileNodePath, String> {
+        if cancel_requested.load(Ordering::Relaxed) {
+            return Err("Operation canceled.".to_string());
+        }
+        let source = self.resolve_native_node(source, "finalize_staged_source")?;
+        let destination = self.resolve_native_node(destination, "finalize_staged_destination")?;
+        let script = shell_script_with_args(
+            FINALIZE_STAGED_PATH_SCRIPT,
+            &[source.remote_path, destination.remote_path],
+        );
+        self.run_file_script("finalize staged path", &script)?;
+        Ok(destination.path)
     }
 
     fn sudo_access(

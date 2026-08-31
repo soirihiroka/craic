@@ -5,6 +5,7 @@ pub mod materialize;
 pub mod path;
 pub mod provider;
 pub mod providers;
+pub mod transfer;
 
 pub use path::{
     ArchiveFormat, FileNodePath, ProviderKind, SystemId, SystemPath, SystemRef, WorkspaceId,

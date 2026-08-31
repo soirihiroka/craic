@@ -1,4 +1,5 @@
 use crate::config::{ConfiguredWorkspace, WorkspaceProvider};
+use crate::system::capabilities::files::FileAccess;
 use crate::system::provider::{
     ProviderWorkspaceEntry, ProviderWorkspaceListRequest, ProviderWorkspaceSource, SystemProvider,
 };
@@ -6,6 +7,7 @@ use crate::system::providers::local::LocalProvider;
 use crate::system::providers::ssh::{SshProvider, SshProviderConfig};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceEntry {
@@ -214,6 +216,29 @@ pub fn workspace_from_selection_id(id: &str) -> ConfiguredWorkspace {
         provider: WorkspaceProvider::parse(Some(provider)),
         display_name: None,
         color: None,
+    }
+}
+
+pub fn file_access_for_configured_workspace(
+    workspace: &ConfiguredWorkspace,
+) -> Result<Arc<dyn FileAccess>, String> {
+    match &workspace.provider {
+        WorkspaceProvider::Local => {
+            let path = crate::config::expand_config_path_for_ui(&workspace.path)
+                .unwrap_or_else(|| PathBuf::from(&workspace.path));
+            let provider = LocalProvider::new();
+            let workspace_ref = LocalProvider::workspace_for_path(&path);
+            provider
+                .files(&workspace_ref)
+                .ok_or_else(|| "File access is unavailable for this workspace.".to_string())
+        }
+        WorkspaceProvider::Ssh { host } => {
+            let provider = SshProvider::new(SshProviderConfig::new(host.clone()));
+            let workspace_ref = provider.workspace_for_remote_path(workspace.path.clone());
+            provider
+                .files(&workspace_ref)
+                .ok_or_else(|| "File access is unavailable for this SSH workspace.".to_string())
+        }
     }
 }
 

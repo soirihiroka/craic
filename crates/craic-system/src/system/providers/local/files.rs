@@ -15,6 +15,8 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
@@ -25,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
 use std::thread;
@@ -38,6 +40,7 @@ const LOCAL_FILE_MONITOR_SERVICE_POLL_INTERVAL: Duration = Duration::from_millis
 const LOCAL_FILE_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(750);
 const LOCAL_ARCHIVE_PYTHON_CANDIDATES: &[&str] = &["python3", "python"];
 const LOCAL_FILE_OPERATION_CHUNK_BYTES: usize = 256 * 1024;
+const FINALIZE_STAGED_PATH_SCRIPT: &str = include_str!("../finalize_staged_path.sh");
 
 #[derive(Clone, Debug)]
 pub struct LocalFileAccess {
@@ -1811,6 +1814,63 @@ impl LocalFileAccess {
     }
 }
 
+fn finalize_local_staged_path(
+    source: &Path,
+    destination: &Path,
+    cancel_requested: &AtomicBool,
+) -> Result<(), String> {
+    if cancel_requested.load(Ordering::Relaxed) {
+        return Err("Operation canceled.".to_string());
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| "The staged path contains a null byte.".to_string())?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| "The destination path contains a null byte.".to_string())?;
+
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        unsafe extern "C" {
+            fn renameatx_np(
+                fromfd: libc::c_int,
+                from: *const libc::c_char,
+                tofd: libc::c_int,
+                to: *const libc::c_char,
+                flags: libc::c_uint,
+            ) -> libc::c_int;
+        }
+        renameatx_np(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            0x0000_0004,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return Err("Atomic no-replace file finalization is unavailable on this platform.".to_string());
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Unable to finalize without replacing an existing item: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
 impl FileAccess for LocalFileAccess {
     fn workspace(&self) -> WorkspaceRef {
         self.workspace.clone()
@@ -1843,6 +1903,36 @@ impl FileAccess for LocalFileAccess {
         (!self.sudo)
             .then(|| self.local_path_for_node(path).ok())
             .flatten()
+    }
+
+    fn finalize_staged_node(
+        &self,
+        source: &FileNodePath,
+        destination: &FileNodePath,
+        cancel_requested: &AtomicBool,
+    ) -> Result<FileNodePath, String> {
+        if cancel_requested.load(Ordering::Relaxed) {
+            return Err("Operation canceled.".to_string());
+        }
+        let source_path = self.local_path_for_node(source)?;
+        let destination_path = self.local_path_for_node(destination)?;
+        if self.sudo {
+            self.run_sudo_command(
+                "finalize staged path",
+                "sh",
+                &[
+                    std::ffi::OsStr::new("-c"),
+                    std::ffi::OsStr::new(FINALIZE_STAGED_PATH_SCRIPT),
+                    std::ffi::OsStr::new("sh"),
+                    source_path.as_os_str(),
+                    destination_path.as_os_str(),
+                ],
+                None,
+            )?;
+        } else {
+            finalize_local_staged_path(&source_path, &destination_path, cancel_requested)?;
+        }
+        Ok(destination.clone())
     }
 
     fn watch(

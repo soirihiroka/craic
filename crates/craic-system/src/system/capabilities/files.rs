@@ -701,6 +701,12 @@ pub trait FileAccess: Send + Sync {
     fn copy_node_events(&self, request: FileCopyRequest) -> FileOperationReceiver<FileNodePath>;
     fn move_node_events(&self, request: FileMoveRequest) -> FileOperationReceiver<FileNodePath>;
     fn delete_events(&self, request: FileDeleteRequest) -> FileOperationReceiver<()>;
+    fn finalize_staged_node(
+        &self,
+        source: &FileNodePath,
+        destination: &FileNodePath,
+        cancel_requested: &AtomicBool,
+    ) -> Result<FileNodePath, String>;
 
     fn watch(
         &self,
