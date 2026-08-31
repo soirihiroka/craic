@@ -44,8 +44,9 @@ use craic_agent::remote_media::{self, RemoteMedia, RemoteMediaKind};
 use craic_app_core::{
     ActionId, AppCommand, AppHandle, ApplicationRuntime, ApplicationViewState, Badge,
     PAGE_DESCRIPTORS, PageCommand, PageId, PageServiceRequest, PageViewState, RefreshScope,
-    RuntimeConfig, ServiceCompletion, UiEvent, WorkspaceId, WorkspaceRefreshCompletion,
-    WorkspaceRefreshIdentity, WorkspaceRefreshRequest, WorkspaceSelection, page_descriptor,
+    RetiredJobSender, RuntimeConfig, ServiceCompletion, UiEvent, WorkspaceId,
+    WorkspaceRefreshCompletion, WorkspaceRefreshIdentity, WorkspaceRefreshRequest,
+    WorkspaceSelection, page_descriptor,
 };
 use craic_file_support::{FileProbe, FileRole, resolve as resolve_file_support};
 use craic_language::markdown_lint::MarkdownLintIssue;
@@ -279,12 +280,95 @@ enum NativeWebPreviewMode {
 
 async fn until_workspace_change<T>(
     cancellation: &WorkspaceCancellationToken,
-    future: impl Future<Output = T>,
-) -> Option<T> {
+    retired_jobs: &RetiredJobSender,
+    label: &'static str,
+    mut task: tokio::task::JoinHandle<T>,
+) -> Option<Result<T, tokio::task::JoinError>>
+where
+    T: Send + 'static,
+{
     tokio::select! {
         biased;
-        _ = cancellation.cancelled() => None,
-        result = future => Some(result),
+        _ = cancellation.cancelled() => {
+            retired_jobs.retire(label, task).await;
+            None
+        },
+        result = &mut task => Some(result),
+    }
+}
+
+enum NativeJobWait<T> {
+    Completed(Result<T, tokio::task::JoinError>),
+    WorkspaceChanged,
+    TimedOut,
+}
+
+async fn wait_workspace_job<T>(
+    cancellation: &WorkspaceCancellationToken,
+    retired_jobs: &RetiredJobSender,
+    label: &'static str,
+    mut task: tokio::task::JoinHandle<T>,
+    cancel_requested: Option<&Arc<AtomicBool>>,
+) -> NativeJobWait<T>
+where
+    T: Send + 'static,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            if let Some(cancel_requested) = cancel_requested {
+                cancel_requested.store(true, Ordering::SeqCst);
+            }
+            retired_jobs.retire(label, task).await;
+            NativeJobWait::WorkspaceChanged
+        },
+        _ = tokio::time::sleep(REPOSITORY_CALLBACK_TIMEOUT) => {
+            if let Some(cancel_requested) = cancel_requested {
+                cancel_requested.store(true, Ordering::SeqCst);
+            }
+            retired_jobs.retire(label, task).await;
+            NativeJobWait::TimedOut
+        },
+        result = &mut task => NativeJobWait::Completed(result),
+    }
+}
+
+async fn wait_workspace_future<T, F>(
+    cancellation: &WorkspaceCancellationToken,
+    retired_jobs: &RetiredJobSender,
+    label: &'static str,
+    future: F,
+) -> NativeJobWait<T>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    wait_workspace_job(
+        cancellation,
+        retired_jobs,
+        label,
+        tokio::spawn(future),
+        None,
+    )
+    .await
+}
+
+async fn wait_native_result<T, F>(
+    cancellation: &WorkspaceCancellationToken,
+    retired_jobs: &RetiredJobSender,
+    label: &'static str,
+    timeout_message: &'static str,
+    future: F,
+) -> Option<Result<T, String>>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, String>> + Send + 'static,
+{
+    match wait_workspace_future(cancellation, retired_jobs, label, future).await {
+        NativeJobWait::Completed(Ok(result)) => Some(result),
+        NativeJobWait::Completed(Err(error)) => Some(Err(format!("{label} task failed: {error}"))),
+        NativeJobWait::WorkspaceChanged => None,
+        NativeJobWait::TimedOut => Some(Err(timeout_message.to_string())),
     }
 }
 
@@ -1159,6 +1243,7 @@ enum RepositoryRequest {
         workspace_id: String,
         handle: Arc<GitRepoHandle>,
         action: BranchAction,
+        cancellation: WorkspaceCancellationToken,
     },
     LoadFileComparison {
         workspace_id: String,
@@ -1347,6 +1432,7 @@ enum RepositoryRequest {
         workspace_id: String,
         handle: Arc<GitRepoHandle>,
         option: CommitEmailOption,
+        cancellation: WorkspaceCancellationToken,
     },
     Commit {
         workspace_id: String,
@@ -1354,6 +1440,7 @@ enum RepositoryRequest {
         summary: String,
         description: String,
         files: Vec<String>,
+        cancellation: WorkspaceCancellationToken,
     },
     GenerateCommitMessage {
         workspace_id: String,
@@ -1361,6 +1448,7 @@ enum RepositoryRequest {
         files: Vec<String>,
         request_id: u64,
         cancellation: CancellationToken,
+        workspace_cancellation: WorkspaceCancellationToken,
     },
     LoadCommitMessageSettings {
         request_id: u64,
@@ -1382,26 +1470,31 @@ enum RepositoryRequest {
         request_id: u64,
         workspace: craic_config::ConfiguredWorkspace,
         handle: Arc<GitRepoHandle>,
+        cancellation: WorkspaceCancellationToken,
     },
     SaveWorkspaceSettings {
         workspace_id: String,
         request_id: u64,
         handle: Arc<GitRepoHandle>,
         settings: GitSettings,
+        cancellation: WorkspaceCancellationToken,
     },
     Discard {
         workspace_id: String,
         handle: Arc<GitRepoHandle>,
         paths: Vec<String>,
+        cancellation: WorkspaceCancellationToken,
     },
     Stash {
         workspace_id: String,
         handle: Arc<GitRepoHandle>,
+        cancellation: WorkspaceCancellationToken,
     },
     AddIgnorePattern {
         workspace_id: String,
         handle: Arc<GitRepoHandle>,
         pattern: String,
+        cancellation: WorkspaceCancellationToken,
     },
 }
 
@@ -1528,21 +1621,25 @@ struct NativeCreateWorkspaceRequest {
 enum RepositoryCompletion {
     Snapshot {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         handle: Option<Arc<GitRepoHandle>>,
         core_request: Option<RepositoryCoreRefreshRequest>,
         result: Result<WorkspaceSnapshot, String>,
     },
     ActionProgress {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         message: String,
     },
     ActionFailed {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         title: &'static str,
         message: String,
     },
     ActionNeedsStash {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         handle: Arc<GitRepoHandle>,
         snapshot: RepositorySnapshot,
         action: NativeRemoteAction,
@@ -1550,6 +1647,7 @@ enum RepositoryCompletion {
     },
     ActionFinished {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         handle: Arc<GitRepoHandle>,
         result: Result<WorkspaceSnapshot, String>,
         message: Option<String>,
@@ -1565,14 +1663,17 @@ enum RepositoryCompletion {
     },
     BranchProgress {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         message: String,
     },
     BranchFailed {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         message: String,
     },
     BranchFinished {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         handle: Arc<GitRepoHandle>,
         result: Result<WorkspaceSnapshot, String>,
         message: String,
@@ -1723,17 +1824,20 @@ enum RepositoryCompletion {
     },
     CommitAuthorFinished {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         handle: Arc<GitRepoHandle>,
         result: Result<WorkspaceSnapshot, String>,
     },
     CommitFinished {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         handle: Option<Arc<GitRepoHandle>>,
         snapshot: Option<Result<WorkspaceSnapshot, String>>,
         result: Result<String, String>,
     },
     CommitMessageGenerated {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         request_id: u64,
         provider_label: String,
         result: Result<CommitMessageDraft, String>,
@@ -1754,16 +1858,19 @@ enum RepositoryCompletion {
     },
     WorkspaceSettingsLoaded {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         request_id: u64,
         result: Result<NativeWorkspaceSettings, String>,
     },
     WorkspaceSettingsSaved {
         workspace_id: String,
+        cancellation: WorkspaceCancellationToken,
         request_id: u64,
         handle: Arc<GitRepoHandle>,
         result: Result<WorkspaceSnapshot, String>,
     },
     ChangesFailed {
+        cancellation: WorkspaceCancellationToken,
         title: &'static str,
         message: String,
     },
@@ -4500,11 +4607,15 @@ define_class!(
             let Some(requests) = self.ivars().repository_requests.get() else {
                 return;
             };
+            let Some(cancellation) = self.workspace_cancellation_token() else {
+                return;
+            };
             self.show_native_toast("Adding ignore pattern…");
             if let Err(error) = requests.try_send(RepositoryRequest::AddIgnorePattern {
                 workspace_id,
                 handle,
                 pattern,
+                cancellation,
             }) {
                 self.present_path_action_error(
                     "Ignore Failed",
@@ -5153,6 +5264,9 @@ define_class!(
             let Some(requests) = self.ivars().repository_requests.get() else {
                 return;
             };
+            let Some(cancellation) = self.workspace_cancellation_token() else {
+                return;
+            };
             let action = if self.ivars().branch_merge_mode.get() {
                 BranchAction::Merge(branch)
             } else {
@@ -5162,6 +5276,7 @@ define_class!(
                 workspace_id,
                 handle,
                 action,
+                cancellation,
             };
             if let Err(error) = requests.try_send(request) {
                 log::warn!("branch action queue rejected request error={error}");
@@ -5434,11 +5549,15 @@ define_class!(
             let Some(requests) = self.ivars().repository_requests.get() else {
                 return;
             };
+            let Some(cancellation) = self.workspace_cancellation_token() else {
+                return;
+            };
             self.set_changes_operation_progress("Adding ignore pattern…");
             if let Err(error) = requests.try_send(RepositoryRequest::AddIgnorePattern {
                 workspace_id,
                 handle,
                 pattern,
+                cancellation,
             }) {
                 self.changes_operation_failed(
                     "Ignore Failed",
@@ -5458,10 +5577,14 @@ define_class!(
             let Some(requests) = self.ivars().repository_requests.get() else {
                 return;
             };
+            let Some(cancellation) = self.workspace_cancellation_token() else {
+                return;
+            };
             self.set_changes_operation_progress("Stashing changes…");
             if let Err(error) = requests.try_send(RepositoryRequest::Stash {
                 workspace_id,
                 handle,
+                cancellation,
             }) {
                 self.changes_operation_failed(
                     "Stash Failed",
@@ -5581,10 +5704,14 @@ define_class!(
             let Some(requests) = self.ivars().repository_requests.get() else {
                 return;
             };
+            let Some(cancellation) = self.workspace_cancellation_token() else {
+                return;
+            };
             if let Err(error) = requests.try_send(RepositoryRequest::SaveCommitAuthor {
                 workspace_id,
                 handle,
                 option,
+                cancellation,
             }) {
                 self.present_path_action_error(
                     "Author Selection Failed",
@@ -5644,6 +5771,13 @@ define_class!(
                 .commit_message_generation_id
                 .set(request_id);
             let cancellation = CancellationToken::new();
+            let Some(workspace_cancellation) = self.workspace_cancellation_token() else {
+                self.present_path_action_error(
+                    "Generate Commit Message Failed",
+                    "The workspace is no longer active.",
+                );
+                return;
+            };
             self.ivars()
                 .commit_message_cancellation
                 .replace(Some(cancellation.clone()));
@@ -5663,6 +5797,7 @@ define_class!(
                 files,
                 request_id,
                 cancellation,
+                workspace_cancellation,
             }) {
                 self.cancel_commit_message_generation();
                 self.present_path_action_error(
@@ -5712,6 +5847,9 @@ define_class!(
             let Some(requests) = self.ivars().repository_requests.get() else {
                 return;
             };
+            let Some(cancellation) = self.workspace_cancellation_token() else {
+                return;
+            };
             composer.set_committing(true);
             let request = RepositoryRequest::Commit {
                 workspace_id,
@@ -5719,6 +5857,7 @@ define_class!(
                 summary: composer.summary(),
                 description: composer.description(),
                 files,
+                cancellation,
             };
             if let Err(error) = requests.try_send(request) {
                 composer.set_committing(false);
@@ -6234,10 +6373,14 @@ impl AppDelegate {
         let Some(requests) = self.ivars().repository_requests.get() else {
             return;
         };
+        let Some(cancellation) = self.workspace_cancellation_token() else {
+            return;
+        };
         if let Err(error) = requests.try_send(RepositoryRequest::SaveCommitAuthor {
             workspace_id,
             handle,
             option,
+            cancellation,
         }) {
             self.present_path_action_error(
                 "Author Selection Failed",
@@ -12925,6 +13068,9 @@ impl AppDelegate {
                 ));
             return;
         };
+        let Some(cancellation) = self.workspace_cancellation_token() else {
+            return;
+        };
         settings.workspace_loading.set(true);
         settings.workspace_settings.borrow_mut().take();
         let request_id = settings.workspace_request_id.get().wrapping_add(1);
@@ -12939,6 +13085,7 @@ impl AppDelegate {
             request_id,
             workspace,
             handle,
+            cancellation,
         }) {
             settings.workspace_loading.set(false);
             unsafe { settings.workspace_spinner.stopAnimation(None) };
@@ -13097,6 +13244,9 @@ impl AppDelegate {
         let Some(handle) = self.ivars().git_handle.borrow().clone() else {
             return;
         };
+        let Some(cancellation) = self.workspace_cancellation_token() else {
+            return;
+        };
         let selected_account = usize::try_from(ui.github_account.indexOfSelectedItem())
             .ok()
             .and_then(|index| ui.github_accounts.borrow().get(index).cloned())
@@ -13132,6 +13282,7 @@ impl AppDelegate {
             request_id,
             handle,
             settings,
+            cancellation,
         }) {
             ui.workspace_loading.set(false);
             unsafe { ui.workspace_spinner.stopAnimation(None) };
@@ -19740,6 +19891,9 @@ impl AppDelegate {
         let Some(handle) = self.ivars().git_handle.borrow().clone() else {
             return;
         };
+        let Some(cancellation) = self.workspace_cancellation_token() else {
+            return;
+        };
         let alert = NSAlert::new(self.mtm());
         alert.setMessageText(&NSString::from_str("New Branch"));
         alert.setInformativeText(&NSString::from_str(
@@ -19771,6 +19925,7 @@ impl AppDelegate {
                 workspace_id: workspace_id.clone(),
                 handle: handle.clone(),
                 action: BranchAction::Create(branch.to_string()),
+                cancellation: cancellation.clone(),
             }) {
                 log::warn!("create branch queue rejected request error={error}");
             }
@@ -22990,38 +23145,65 @@ impl AppDelegate {
         match completion {
             RepositoryCompletion::Snapshot {
                 workspace_id,
+                cancellation,
                 handle,
                 core_request,
                 result,
-            } => self.apply_repository_snapshot(&workspace_id, handle, core_request, result),
+            } => {
+                if cancellation.is_cancelled() {
+                    log::debug!("discarding stale repository snapshot workspace={workspace_id}");
+                    return;
+                }
+                self.apply_repository_snapshot(&workspace_id, handle, core_request, result);
+            }
             RepositoryCompletion::ActionProgress {
                 workspace_id,
+                cancellation,
                 message,
-            } => self.set_repository_action_progress(&workspace_id, &message),
+            } => {
+                if !cancellation.is_cancelled() {
+                    self.set_repository_action_progress(&workspace_id, &message);
+                }
+            }
             RepositoryCompletion::ActionFailed {
                 workspace_id,
+                cancellation,
                 title,
                 message,
-            } => self.repository_action_failed(&workspace_id, title, &message),
+            } => {
+                if !cancellation.is_cancelled() {
+                    self.repository_action_failed(&workspace_id, title, &message);
+                }
+            }
             RepositoryCompletion::ActionNeedsStash {
                 workspace_id,
+                cancellation,
                 handle,
                 snapshot,
                 action,
                 files,
-            } => self.show_local_changes_overwritten_dialog(
-                workspace_id,
-                handle,
-                snapshot,
-                action,
-                files,
-            ),
+            } => {
+                if !cancellation.is_cancelled() {
+                    self.show_local_changes_overwritten_dialog(
+                        workspace_id,
+                        handle,
+                        snapshot,
+                        action,
+                        files,
+                    );
+                }
+            }
             RepositoryCompletion::ActionFinished {
                 workspace_id,
+                cancellation,
                 handle,
                 result,
                 message,
             } => {
+                if cancellation.is_cancelled() {
+                    log::debug!("discarding stale git completion workspace={workspace_id}");
+                    return;
+                }
                 let current_workspace = self.ivars().active_workspace_id.borrow().as_deref()
                     == Some(workspace_id.as_str());
                 let succeeded = result.is_ok();
@@ -23056,18 +23238,33 @@ impl AppDelegate {
             }
             RepositoryCompletion::BranchProgress {
                 workspace_id,
+                cancellation,
                 message,
-            } => self.set_branch_action_progress(&workspace_id, &message),
+            } => {
+                if !cancellation.is_cancelled() {
+                    self.set_branch_action_progress(&workspace_id, &message);
+                }
+            }
             RepositoryCompletion::BranchFailed {
                 workspace_id,
+                cancellation,
                 message,
-            } => self.branch_action_failed(&workspace_id, &message),
+            } => {
+                if !cancellation.is_cancelled() {
+                    self.branch_action_failed(&workspace_id, &message);
+                }
+            }
             RepositoryCompletion::BranchFinished {
                 workspace_id,
+                cancellation,
                 handle,
                 result,
                 message,
             } => {
+                if cancellation.is_cancelled() {
+                    log::debug!("discarding stale branch completion workspace={workspace_id}");
+                    return;
+                }
                 let current_workspace = self.ivars().active_workspace_id.borrow().as_deref()
                     == Some(workspace_id.as_str());
                 let succeeded = result.is_ok();
@@ -23251,15 +23448,25 @@ impl AppDelegate {
             ),
             RepositoryCompletion::CommitAuthorFinished {
                 workspace_id,
+                cancellation,
                 handle,
                 result,
-            } => self.finish_commit_author(&workspace_id, handle, result),
+            } => {
+                if cancellation.is_cancelled() {
+                    return;
+                }
+                self.finish_commit_author(&workspace_id, handle, result);
+            }
             RepositoryCompletion::CommitFinished {
                 workspace_id,
+                cancellation,
                 handle,
                 snapshot,
                 result,
             } => {
+                if cancellation.is_cancelled() {
+                    return;
+                }
                 if let Some(snapshot) = snapshot {
                     self.apply_repository_snapshot(&workspace_id, handle, None, snapshot);
                 }
@@ -23267,15 +23474,21 @@ impl AppDelegate {
             }
             RepositoryCompletion::CommitMessageGenerated {
                 workspace_id,
+                cancellation,
                 request_id,
                 provider_label,
                 result,
-            } => self.apply_generated_commit_message(
-                &workspace_id,
-                request_id,
-                &provider_label,
-                result,
-            ),
+            } => {
+                if cancellation.is_cancelled() {
+                    return;
+                }
+                self.apply_generated_commit_message(
+                    &workspace_id,
+                    request_id,
+                    &provider_label,
+                    result,
+                );
+            }
             RepositoryCompletion::CommitMessageSettingsLoaded {
                 request_id,
                 provider_id,
@@ -23292,17 +23505,35 @@ impl AppDelegate {
             }
             RepositoryCompletion::WorkspaceSettingsLoaded {
                 workspace_id,
+                cancellation,
                 request_id,
                 result,
-            } => self.apply_workspace_settings(&workspace_id, request_id, result),
+            } => {
+                if cancellation.is_cancelled() {
+                    return;
+                }
+                self.apply_workspace_settings(&workspace_id, request_id, result);
+            }
             RepositoryCompletion::WorkspaceSettingsSaved {
                 workspace_id,
+                cancellation,
                 request_id,
                 handle,
                 result,
-            } => self.finish_workspace_settings_save(&workspace_id, request_id, handle, result),
-            RepositoryCompletion::ChangesFailed { title, message } => {
-                self.changes_operation_failed(title, &message)
+            } => {
+                if cancellation.is_cancelled() {
+                    return;
+                }
+                self.finish_workspace_settings_save(&workspace_id, request_id, handle, result);
+            }
+            RepositoryCompletion::ChangesFailed {
+                cancellation,
+                title,
+                message,
+            } => {
+                if !cancellation.is_cancelled() {
+                    self.changes_operation_failed(title, &message);
+                }
             }
         }
     }
@@ -23387,11 +23618,15 @@ impl AppDelegate {
                 let Some(requests) = self.ivars().repository_requests.get() else {
                     return;
                 };
+                let Some(cancellation) = self.workspace_cancellation_token() else {
+                    return;
+                };
                 self.set_changes_operation_progress("Discarding changes…");
                 if let Err(error) = requests.try_send(RepositoryRequest::Discard {
                     workspace_id,
                     handle,
                     paths,
+                    cancellation,
                 }) {
                     self.changes_operation_failed(
                         "Discard Failed",
@@ -29852,6 +30087,7 @@ pub fn run() {
     );
     let repository_completion_tx = frontend_completion_tx.clone();
     let repository_service_cancellation = runtime.cancellation_token();
+    let retired_jobs = runtime.retired_job_sender();
     runtime
         .spawn(async move {
             loop {
@@ -29871,7 +30107,14 @@ pub fn run() {
                         let task = tokio::task::spawn_blocking(move || {
                             load_workspace_snapshot(&workspace)
                         });
-                        let Some(result) = until_workspace_change(&cancellation, task).await else {
+                        let Some(result) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "repository-load",
+                            task,
+                        )
+                        .await
+                        else {
                             log::debug!("repository load canceled workspace={workspace_id}");
                             continue;
                         };
@@ -29886,6 +30129,7 @@ pub fn run() {
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
+                                    cancellation: cancellation.clone(),
                                     handle,
                                     core_request: None,
                                     result,
@@ -29906,7 +30150,14 @@ pub fn run() {
                         let task = tokio::task::spawn_blocking(move || {
                             refresh_handle.load_workspace_snapshot()
                         });
-                        let Some(result) = until_workspace_change(&cancellation, task).await else {
+                        let Some(result) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "repository-refresh",
+                            task,
+                        )
+                        .await
+                        else {
                             log::debug!("repository refresh canceled workspace={workspace_id}");
                             continue;
                         };
@@ -29917,6 +30168,7 @@ pub fn run() {
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
+                                    cancellation: cancellation.clone(),
                                     handle: Some(handle),
                                     core_request,
                                     result,
@@ -29951,7 +30203,14 @@ pub fn run() {
                                 configs,
                             })
                         });
-                        let Some(result) = until_workspace_change(&cancellation, task).await else {
+                        let Some(result) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "quick-action-discovery",
+                            task,
+                        )
+                        .await
+                        else {
                             log::debug!(
                                 "quick action discovery canceled workspace={workspace_id} generation={generation}"
                             );
@@ -30007,18 +30266,25 @@ pub fn run() {
                                 FrontendCompletion::Repository(
                                     RepositoryCompletion::ActionProgress {
                                         workspace_id: workspace_id.clone(),
+                                        cancellation: cancellation.clone(),
                                         message: "Stashing changes…".to_string(),
                                     },
                                 ),
                             );
-                            let stash_result = match tokio::time::timeout(
-                                REPOSITORY_CALLBACK_TIMEOUT,
-                                handle.stash_changes_async(),
+                            let stash_handle = handle.clone();
+                            let Some(stash_result) = wait_native_result(
+                                &cancellation,
+                                &retired_jobs,
+                                "stash-before-git-action",
+                                "Stash operation timed out.",
+                                async move { stash_handle.stash_changes_async().await },
                             )
                             .await
-                            {
-                                Ok(result) => result,
-                                Err(_) => Err("Stash operation timed out.".to_string()),
+                            else {
+                                log::debug!(
+                                    "stash before git action canceled workspace={workspace_id}"
+                                );
+                                continue;
                             };
                             match stash_result {
                                 Ok(message) => log::info!(
@@ -30031,6 +30297,7 @@ pub fn run() {
                                         FrontendCompletion::Repository(
                                             RepositoryCompletion::ActionFailed {
                                                 workspace_id: workspace_id.clone(),
+                                                cancellation: cancellation.clone(),
                                                 title: "Stash Failed",
                                                 message,
                                             },
@@ -30048,6 +30315,7 @@ pub fn run() {
                                 FrontendCompletion::Repository(
                                     RepositoryCompletion::ActionProgress {
                                         workspace_id: workspace_id.clone(),
+                                        cancellation: cancellation.clone(),
                                         message: "Checking repository status…".to_string(),
                                     },
                                 ),
@@ -30057,7 +30325,13 @@ pub fn run() {
                                 refresh_handle.load_workspace_snapshot()
                             });
                             let Some(refreshed) =
-                                until_workspace_change(&cancellation, refresh_task).await
+                                until_workspace_change(
+                                    &cancellation,
+                                    &retired_jobs,
+                                    "git-action-refresh",
+                                    refresh_task,
+                                )
+                                .await
                             else {
                                 log::debug!(
                                     "native contextual sync canceled before initial snapshot workspace={workspace_id}"
@@ -30074,6 +30348,7 @@ pub fn run() {
                                         FrontendCompletion::Repository(
                                             RepositoryCompletion::ActionFailed {
                                                 workspace_id: workspace_id.clone(),
+                                                cancellation: cancellation.clone(),
                                                 title: "Repository Error",
                                                 message: "The workspace is no longer a Git repository."
                                                     .to_string(),
@@ -30087,6 +30362,7 @@ pub fn run() {
                                         FrontendCompletion::Repository(
                                             RepositoryCompletion::ActionFailed {
                                                 workspace_id: workspace_id.clone(),
+                                                cancellation: cancellation.clone(),
                                                 title: "Repository Error",
                                                 message,
                                             },
@@ -30109,6 +30385,7 @@ pub fn run() {
                                 FrontendCompletion::Repository(
                                     RepositoryCompletion::ActionProgress {
                                         workspace_id: workspace_id.clone(),
+                                        cancellation: cancellation.clone(),
                                         message: format!("Fetching {remote_name}…"),
                                     },
                                 ),
@@ -30120,35 +30397,55 @@ pub fn run() {
                             );
 
                             let mut fetch_events = handle.fetch_with_progress(None);
-                            let fetch_result = loop {
-                                let Some(event) = fetch_events.recv().await else {
-                                    break Err(
-                                        "Fetch ended before reporting completion.".to_string()
-                                    );
-                                };
-                                match event {
-                                    GitCommandEvent::Progress { message } => {
-                                        if !cancellation.is_cancelled() {
-                                            let _ = repository_completion_tx.send(
-                                                FrontendCompletion::Repository(
-                                                    RepositoryCompletion::ActionProgress {
-                                                        workspace_id: workspace_id.clone(),
-                                                        message,
-                                                    },
-                                                ),
-                                            );
+                            let fetch_completion_tx = repository_completion_tx.clone();
+                            let fetch_workspace_id = workspace_id.clone();
+                            let fetch_cancellation = cancellation.clone();
+                            let task = tokio::spawn(async move {
+                                loop {
+                                    let Some(event) = fetch_events.recv().await else {
+                                        break Err(
+                                            "Fetch ended before reporting completion.".to_string()
+                                        );
+                                    };
+                                    match event {
+                                        GitCommandEvent::Progress { message } => {
+                                            if !fetch_cancellation.is_cancelled() {
+                                                let _ = fetch_completion_tx.send(
+                                                    FrontendCompletion::Repository(
+                                                        RepositoryCompletion::ActionProgress {
+                                                            workspace_id: fetch_workspace_id.clone(),
+                                                            cancellation: fetch_cancellation.clone(),
+                                                            message,
+                                                        },
+                                                    ),
+                                                );
+                                            }
                                         }
-                                    }
-                                    GitCommandEvent::Completed { message } => {
-                                        break Ok(message
-                                            .map(|message| message.trim().to_string())
-                                            .filter(|message| !message.is_empty()));
-                                    }
-                                    GitCommandEvent::Failed { message } => {
-                                        break Err(message);
+                                        GitCommandEvent::Completed { message } => {
+                                            break Ok(message
+                                                .map(|message| message.trim().to_string())
+                                                .filter(|message| !message.is_empty()));
+                                        }
+                                        GitCommandEvent::Failed { message } => break Err(message),
                                     }
                                 }
+                            });
+                            let Some(fetch_result) = until_workspace_change(
+                                &cancellation,
+                                &retired_jobs,
+                                "contextual-fetch-events",
+                                task,
+                            )
+                            .await
+                            else {
+                                log::debug!(
+                                    "native contextual fetch event drain retired workspace={workspace_id}"
+                                );
+                                continue;
                             };
+                            let fetch_result = fetch_result.unwrap_or_else(|error| {
+                                Err(format!("Fetch event task failed: {error}"))
+                            });
                             if cancellation.is_cancelled() {
                                 log::debug!(
                                     "native contextual sync canceled after fetch workspace={workspace_id}"
@@ -30162,6 +30459,7 @@ pub fn run() {
                                         FrontendCompletion::Repository(
                                             RepositoryCompletion::ActionFailed {
                                                 workspace_id: workspace_id.clone(),
+                                                cancellation: cancellation.clone(),
                                                 title: "Git Operation Failed",
                                                 message,
                                             },
@@ -30175,6 +30473,7 @@ pub fn run() {
                                 FrontendCompletion::Repository(
                                     RepositoryCompletion::ActionProgress {
                                         workspace_id: workspace_id.clone(),
+                                        cancellation: cancellation.clone(),
                                         message: "Checking remote status…".to_string(),
                                     },
                                 ),
@@ -30184,7 +30483,13 @@ pub fn run() {
                                 reload_handle.load_workspace_snapshot()
                             });
                             let Some(refreshed) =
-                                until_workspace_change(&cancellation, reload_task).await
+                                until_workspace_change(
+                                    &cancellation,
+                                    &retired_jobs,
+                                    "branch-action-refresh",
+                                    reload_task,
+                                )
+                                .await
                             else {
                                 log::debug!(
                                     "native contextual sync canceled before post-fetch snapshot workspace={workspace_id}"
@@ -30201,6 +30506,7 @@ pub fn run() {
                                         FrontendCompletion::Repository(
                                             RepositoryCompletion::ActionFailed {
                                                 workspace_id: workspace_id.clone(),
+                                                cancellation: cancellation.clone(),
                                                 title: "Repository Error",
                                                 message: "The workspace is no longer a Git repository."
                                                     .to_string(),
@@ -30214,6 +30520,7 @@ pub fn run() {
                                         FrontendCompletion::Repository(
                                             RepositoryCompletion::ActionFailed {
                                                 workspace_id: workspace_id.clone(),
+                                                cancellation: cancellation.clone(),
                                                 title: "Repository Error",
                                                 message,
                                             },
@@ -30236,6 +30543,7 @@ pub fn run() {
                                     .send(FrontendCompletion::Repository(
                                         RepositoryCompletion::ActionFinished {
                                             workspace_id,
+                                            cancellation: cancellation.clone(),
                                             handle,
                                             result,
                                             message: fetch_completion_message.or_else(|| {
@@ -30261,17 +30569,19 @@ pub fn run() {
                         let _ = repository_completion_tx.send(FrontendCompletion::Repository(
                             RepositoryCompletion::ActionProgress {
                                 workspace_id: workspace_id.clone(),
+                                cancellation: cancellation.clone(),
                                 message: "Working…".to_string(),
                             },
                         ));
 
-                        let mut events = match git_action_events(&handle, &snapshot, action) {
+                        let events = match git_action_events(&handle, &snapshot, action) {
                             Ok(events) => events,
                             Err(message) => {
                                 let _ = repository_completion_tx.send(
                                     FrontendCompletion::Repository(
                                         RepositoryCompletion::ActionFailed {
                                             workspace_id: workspace_id.clone(),
+                                            cancellation: cancellation.clone(),
                                             title: "Git Operation Failed",
                                             message,
                                         },
@@ -30280,95 +30590,118 @@ pub fn run() {
                                 continue;
                             }
                         };
-                        let mut completed = false;
-                        let mut failure_reported = false;
-                        let mut completion_message = None;
-                        while let Some(event) = events.recv().await {
-                            match event {
-                                GitCommandEvent::Progress { message } => {
-                                    let _ = repository_completion_tx.send(
-                                        FrontendCompletion::Repository(
-                                            RepositoryCompletion::ActionProgress {
-                                                workspace_id: workspace_id.clone(),
-                                                message,
-                                            },
-                                        ),
-                                    );
-                                }
-                                GitCommandEvent::Completed { message } => {
-                                    completion_message = message
-                                        .map(|message| message.trim().to_string())
-                                        .filter(|message| !message.is_empty());
-                                    if let Some(message) = completion_message.as_deref() {
-                                        log::info!(
-                                            "native git action completed workspace={} message={}",
-                                            workspace_id,
-                                            message
-                                        );
+                        let progress_completion_tx = repository_completion_tx.clone();
+                        let progress_workspace_id = workspace_id.clone();
+                        let progress_cancellation = cancellation.clone();
+                        let task = tokio::spawn(async move {
+                            let mut events = events;
+                            while let Some(event) = events.recv().await {
+                                match event {
+                                    GitCommandEvent::Progress { message } => {
+                                        if !progress_cancellation.is_cancelled() {
+                                            let _ = progress_completion_tx.send(
+                                                FrontendCompletion::Repository(
+                                                    RepositoryCompletion::ActionProgress {
+                                                        workspace_id: progress_workspace_id.clone(),
+                                                        cancellation: progress_cancellation.clone(),
+                                                        message,
+                                                    },
+                                                ),
+                                            );
+                                        }
                                     }
-                                    completed = true;
-                                    break;
-                                }
-                                GitCommandEvent::Failed { message } => {
-                                    failure_reported = true;
-                                    let completion = if !stash_before
-                                        && native_remote_action_pulls(action, &snapshot)
-                                        && is_local_changes_overwritten_error(&message)
-                                    {
-                                        let files = parse_files_to_be_overwritten(&message);
-                                        log::info!(
-                                            "native pull blocked by local changes workspace={} overwritten_files={}",
-                                            workspace_id,
-                                            files.len()
-                                        );
-                                        RepositoryCompletion::ActionNeedsStash {
-                                            workspace_id: workspace_id.clone(),
-                                            handle: handle.clone(),
-                                            snapshot: snapshot.clone(),
-                                            action,
-                                            files,
-                                        }
-                                    } else {
-                                        RepositoryCompletion::ActionFailed {
-                                            workspace_id: workspace_id.clone(),
-                                            title: "Git Operation Failed",
-                                            message,
-                                        }
-                                    };
-                                    let _ = repository_completion_tx
-                                        .send(FrontendCompletion::Repository(completion));
-                                    break;
+                                    GitCommandEvent::Completed { message } => {
+                                        return Ok(message
+                                            .map(|message| message.trim().to_string())
+                                            .filter(|message| !message.is_empty()));
+                                    }
+                                    GitCommandEvent::Failed { message } => return Err(message),
                                 }
                             }
-                        }
-                        if !completed {
-                            if !failure_reported {
-                                let message =
-                                    "Git operation ended before reporting completion.".to_string();
-                                let _ = repository_completion_tx.send(
-                                    FrontendCompletion::Repository(
-                                        RepositoryCompletion::ActionFailed {
-                                            workspace_id: workspace_id.clone(),
-                                            title: "Git Operation Failed",
-                                            message,
-                                        },
-                                    ),
-                                );
-                            }
+                            Err("Git operation ended before reporting completion.".to_string())
+                        });
+                        let Some(completion_message) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "git-action-events",
+                            task,
+                        )
+                        .await
+                        else {
+                            log::debug!(
+                                "git action event drain retired workspace={workspace_id}"
+                            );
                             continue;
+                        };
+                        let completion_message = completion_message.unwrap_or_else(|error| {
+                            Err(format!("Git event task failed: {error}"))
+                        });
+                        let completion_message = match completion_message {
+                            Ok(message) => message,
+                            Err(message) => {
+                                let completion = if !stash_before
+                                    && native_remote_action_pulls(action, &snapshot)
+                                    && is_local_changes_overwritten_error(&message)
+                                {
+                                    let files = parse_files_to_be_overwritten(&message);
+                                    log::info!(
+                                        "native pull blocked by local changes workspace={} overwritten_files={}",
+                                        workspace_id,
+                                        files.len()
+                                    );
+                                    RepositoryCompletion::ActionNeedsStash {
+                                        workspace_id: workspace_id.clone(),
+                                        cancellation: cancellation.clone(),
+                                        handle: handle.clone(),
+                                        snapshot: snapshot.clone(),
+                                        action,
+                                        files,
+                                    }
+                                } else {
+                                    RepositoryCompletion::ActionFailed {
+                                        workspace_id: workspace_id.clone(),
+                                        cancellation: cancellation.clone(),
+                                        title: "Git Operation Failed",
+                                        message,
+                                    }
+                                };
+                                let _ = repository_completion_tx
+                                    .send(FrontendCompletion::Repository(completion));
+                                continue;
+                            }
+                        };
+                        if let Some(message) = completion_message.as_deref() {
+                            log::info!(
+                                "native git action completed workspace={} message={}",
+                                workspace_id,
+                                message
+                            );
                         }
                         let reload_handle = handle.clone();
-                        let result = tokio::task::spawn_blocking(move || {
+                        let task = tokio::task::spawn_blocking(move || {
                             reload_handle.load_workspace_snapshot()
-                        })
+                        });
+                        let Some(result) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "git-action-final-refresh",
+                            task,
+                        )
                         .await
-                        .unwrap_or_else(|error| {
+                        else {
+                            log::debug!(
+                                "git action final refresh canceled workspace={workspace_id}"
+                            );
+                            continue;
+                        };
+                        let result = result.unwrap_or_else(|error| {
                             Err(format!("Repository refresh task failed: {error}"))
                         });
                         if repository_completion_tx
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::ActionFinished {
                                     workspace_id,
+                                    cancellation: cancellation.clone(),
                                     handle,
                                     result,
                                     message: completion_message,
@@ -30383,6 +30716,7 @@ pub fn run() {
                         workspace_id,
                         handle,
                         action,
+                        cancellation,
                     } => {
                         let (progress_label, operation_name, empty_success_message) = match &action {
                             BranchAction::Checkout(branch) => (
@@ -30404,21 +30738,25 @@ pub fn run() {
                         let _ = repository_completion_tx.send(FrontendCompletion::Repository(
                             RepositoryCompletion::BranchProgress {
                                 workspace_id: workspace_id.clone(),
+                                cancellation: cancellation.clone(),
                                 message: progress_label,
                             },
                         ));
 
-                        let operation = async {
+                        let operation_handle = handle.clone();
+                        let operation = async move {
                             match action {
                                 BranchAction::Checkout(branch) => {
-                                    handle.checkout_branch_async(&branch).await
+                                    operation_handle.checkout_branch_async(&branch).await
                                 }
                                 BranchAction::Create(branch) => {
-                                    handle.create_branch_async(&branch).await
+                                    operation_handle.create_branch_async(&branch).await
                                 }
                                 BranchAction::Merge(branch) => {
-                                    handle.merge_branch_async(&branch).await.and_then(|result| {
-                                        match result {
+                                    operation_handle
+                                        .merge_branch_async(&branch)
+                                        .await
+                                        .and_then(|result| match result {
                                             MergeResult::Success => {
                                                 Ok("Merge completed.".to_string())
                                             }
@@ -30428,18 +30766,23 @@ pub fn run() {
                                             MergeResult::Conflicts(details) => Err(format!(
                                                 "Merge stopped because of conflicts: {details}"
                                             )),
-                                        }
-                                    })
+                                        })
                                 }
                             }
                         };
-                        let completion_message = match tokio::time::timeout(
-                            REPOSITORY_CALLBACK_TIMEOUT,
+                        let Some(branch_result) = wait_native_result(
+                            &cancellation,
+                            &retired_jobs,
+                            "branch-operation",
+                            "Branch operation timed out.",
                             operation,
                         )
                         .await
-                        {
-                            Ok(Ok(message)) => {
+                        else {
+                            continue;
+                        };
+                        let completion_message = match branch_result {
+                            Ok(message) => {
                                 let message = if message.trim().is_empty() {
                                     empty_success_message
                                 } else {
@@ -30453,23 +30796,12 @@ pub fn run() {
                                 );
                                 message
                             }
-                            Ok(Err(message)) => {
+                            Err(message) => {
                                 let _ = repository_completion_tx.send(
                                     FrontendCompletion::Repository(
                                         RepositoryCompletion::BranchFailed {
                                             workspace_id: workspace_id.clone(),
-                                            message,
-                                        },
-                                    ),
-                                );
-                                continue;
-                            }
-                            Err(_) => {
-                                let message = "Branch operation timed out.".to_string();
-                                let _ = repository_completion_tx.send(
-                                    FrontendCompletion::Repository(
-                                        RepositoryCompletion::BranchFailed {
-                                            workspace_id: workspace_id.clone(),
+                                            cancellation: cancellation.clone(),
                                             message,
                                         },
                                     ),
@@ -30479,17 +30811,30 @@ pub fn run() {
                         };
 
                         let reload_handle = handle.clone();
-                        let result = tokio::task::spawn_blocking(move || {
+                        let task = tokio::task::spawn_blocking(move || {
                             reload_handle.load_workspace_snapshot()
-                        })
+                        });
+                        let Some(result) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "branch-final-refresh",
+                            task,
+                        )
                         .await
-                        .unwrap_or_else(|error| {
+                        else {
+                            log::debug!(
+                                "branch final refresh canceled workspace={workspace_id}"
+                            );
+                            continue;
+                        };
+                        let result = result.unwrap_or_else(|error| {
                             Err(format!("Repository refresh task failed: {error}"))
                         });
                         if repository_completion_tx
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::BranchFinished {
                                     workspace_id,
+                                    cancellation: cancellation.clone(),
                                     handle,
                                     result,
                                     message: completion_message,
@@ -30507,17 +30852,27 @@ pub fn run() {
                         request_id,
                         cancellation,
                     } => {
-                        let load = tokio::time::timeout(
-                            REPOSITORY_CALLBACK_TIMEOUT,
-                            handle.comparison_async(&path),
-                        );
-                        let Some(load) = until_workspace_change(&cancellation, load).await else {
-                            log::debug!("file comparison canceled workspace={workspace_id} path={path}");
-                            continue;
-                        };
-                        let result = match load {
-                            Ok(result) => result,
-                            Err(_) => Err("File comparison timed out.".to_string()),
+                        let load_handle = handle.clone();
+                        let load_path = path.clone();
+                        let result = match wait_workspace_future(
+                            &cancellation,
+                            &retired_jobs,
+                            "file-comparison",
+                            async move { load_handle.comparison_async(&load_path).await },
+                        )
+                        .await
+                        {
+                            NativeJobWait::Completed(Ok(result)) => result,
+                            NativeJobWait::Completed(Err(error)) => {
+                                Err(format!("File comparison task failed: {error}"))
+                            }
+                            NativeJobWait::WorkspaceChanged => {
+                                log::debug!("file comparison canceled workspace={workspace_id} path={path}");
+                                continue;
+                            }
+                            NativeJobWait::TimedOut => {
+                                Err("File comparison timed out.".to_string())
+                            }
                         };
                         let result = match result {
                             Ok(comparison) => {
@@ -30526,7 +30881,13 @@ pub fn run() {
                                     prepare_diff(&syntax_path, comparison)
                                 });
                                 let Some(result) =
-                                    until_workspace_change(&cancellation, task).await
+                                    until_workspace_change(
+                                        &cancellation,
+                                        &retired_jobs,
+                                        "file-diff-preparation",
+                                        task,
+                                    )
+                                    .await
                                 else {
                                     log::debug!(
                                         "diff preparation canceled workspace={workspace_id} path={path}"
@@ -30560,17 +30921,27 @@ pub fn run() {
                         request_id,
                         cancellation,
                     } => {
-                        let load = tokio::time::timeout(
-                            REPOSITORY_CALLBACK_TIMEOUT,
-                            handle.bytes_comparison_async(&path),
-                        );
-                        let Some(load) = until_workspace_change(&cancellation, load).await else {
-                            log::debug!("image comparison canceled workspace={workspace_id} path={path}");
-                            continue;
-                        };
-                        let result = match load {
-                            Ok(result) => result,
-                            Err(_) => Err("Image comparison timed out.".to_string()),
+                        let load_handle = handle.clone();
+                        let load_path = path.clone();
+                        let result = match wait_workspace_future(
+                            &cancellation,
+                            &retired_jobs,
+                            "file-bytes-comparison",
+                            async move { load_handle.bytes_comparison_async(&load_path).await },
+                        )
+                        .await
+                        {
+                            NativeJobWait::Completed(Ok(result)) => result,
+                            NativeJobWait::Completed(Err(error)) => {
+                                Err(format!("Image comparison task failed: {error}"))
+                            }
+                            NativeJobWait::WorkspaceChanged => {
+                                log::debug!("image comparison canceled workspace={workspace_id} path={path}");
+                                continue;
+                            }
+                            NativeJobWait::TimedOut => {
+                                Err("Image comparison timed out.".to_string())
+                            }
                         };
                         if repository_completion_tx
                             .send(FrontendCompletion::Repository(
@@ -30594,7 +30965,11 @@ pub fn run() {
                         generation,
                         cancellation,
                     } => {
-                        let load = tokio::time::timeout(REPOSITORY_CALLBACK_TIMEOUT, async {
+                        let result = match wait_workspace_future(
+                            &cancellation,
+                            &retired_jobs,
+                            "history-page",
+                            async move {
                             if query.is_empty() {
                                 handle.commit_page_async(after.as_deref(), 32).await
                             } else {
@@ -30602,14 +30977,19 @@ pub fn run() {
                                     .commit_search_page_async(&query, after.as_deref(), 32)
                                     .await
                             }
-                        });
-                        let Some(load) = until_workspace_change(&cancellation, load).await else {
-                            log::debug!("history page canceled workspace={workspace_id}");
-                            continue;
-                        };
-                        let result = match load {
-                            Ok(result) => result,
-                            Err(_) => Err("History page timed out.".to_string()),
+                            },
+                        )
+                        .await
+                        {
+                            NativeJobWait::Completed(Ok(result)) => result,
+                            NativeJobWait::Completed(Err(error)) => {
+                                Err(format!("History page task failed: {error}"))
+                            }
+                            NativeJobWait::WorkspaceChanged => {
+                                log::debug!("history page canceled workspace={workspace_id}");
+                                continue;
+                            }
+                            NativeJobWait::TimedOut => Err("History page timed out.".to_string()),
                         };
                         if repository_completion_tx
                             .send(FrontendCompletion::Repository(
@@ -30631,40 +31011,60 @@ pub fn run() {
                         request_id,
                         cancellation,
                     } => {
-                        let detail_load = tokio::time::timeout(
-                            REPOSITORY_CALLBACK_TIMEOUT,
-                            handle.commit_details_async(&hash),
-                        );
-                        let Some(detail_load) =
-                            until_workspace_change(&cancellation, detail_load).await
-                        else {
-                            log::debug!(
-                                "history commit canceled workspace={workspace_id} hash={hash}"
-                            );
-                            continue;
-                        };
-                        let detail = match detail_load {
-                            Ok(result) => result,
-                            Err(_) => Err("Commit details timed out.".to_string()),
+                        let detail_handle = handle.clone();
+                        let detail_hash = hash.clone();
+                        let detail = match wait_workspace_future(
+                            &cancellation,
+                            &retired_jobs,
+                            "history-commit-detail",
+                            async move { detail_handle.commit_details_async(&detail_hash).await },
+                        )
+                        .await
+                        {
+                            NativeJobWait::Completed(Ok(result)) => result,
+                            NativeJobWait::Completed(Err(error)) => {
+                                Err(format!("Commit details task failed: {error}"))
+                            }
+                            NativeJobWait::WorkspaceChanged => {
+                                log::debug!(
+                                    "history commit canceled workspace={workspace_id} hash={hash}"
+                                );
+                                continue;
+                            }
+                            NativeJobWait::TimedOut => {
+                                Err("Commit details timed out.".to_string())
+                            }
                         };
                         let result = match detail {
                             Ok(commit) => {
-                                let files_load = tokio::time::timeout(
-                                    REPOSITORY_CALLBACK_TIMEOUT,
-                                    handle.commit_changed_files_async(&hash),
-                                );
-                                let Some(files_load) =
-                                    until_workspace_change(&cancellation, files_load).await
-                                else {
-                                    log::debug!(
-                                        "history changed-files load canceled workspace={workspace_id} hash={hash}"
-                                    );
-                                    continue;
-                                };
-                                match files_load {
-                                    Ok(Ok(files)) => Ok((commit, files)),
-                                    Ok(Err(error)) => Err(error),
-                                    Err(_) => Err("Changed files timed out.".to_string()),
+                                let files_handle = handle.clone();
+                                let files_hash = hash.clone();
+                                match wait_workspace_future(
+                                    &cancellation,
+                                    &retired_jobs,
+                                    "history-changed-files",
+                                    async move {
+                                        files_handle.commit_changed_files_async(&files_hash).await
+                                    },
+                                )
+                                .await
+                                {
+                                    NativeJobWait::Completed(Ok(Ok(files))) => {
+                                        Ok((commit, files))
+                                    }
+                                    NativeJobWait::Completed(Ok(Err(error))) => Err(error),
+                                    NativeJobWait::Completed(Err(error)) => {
+                                        Err(format!("Changed files task failed: {error}"))
+                                    }
+                                    NativeJobWait::WorkspaceChanged => {
+                                        log::debug!(
+                                            "history changed-files load canceled workspace={workspace_id} hash={hash}"
+                                        );
+                                        continue;
+                                    }
+                                    NativeJobWait::TimedOut => {
+                                        Err("Changed files timed out.".to_string())
+                                    }
                                 }
                             }
                             Err(error) => Err(error),
@@ -30691,19 +31091,34 @@ pub fn run() {
                         request_id,
                         cancellation,
                     } => {
-                        let load = tokio::time::timeout(
-                            REPOSITORY_CALLBACK_TIMEOUT,
-                            handle.commit_comparison_async(&hash, &path),
-                        );
-                        let Some(load) = until_workspace_change(&cancellation, load).await else {
-                            log::debug!(
-                                "history comparison canceled workspace={workspace_id} hash={hash} path={path}"
-                            );
-                            continue;
-                        };
-                        let result = match load {
-                            Ok(result) => result,
-                            Err(_) => Err("History comparison timed out.".to_string()),
+                        let load_handle = handle.clone();
+                        let load_hash = hash.clone();
+                        let load_path = path.clone();
+                        let result = match wait_workspace_future(
+                            &cancellation,
+                            &retired_jobs,
+                            "history-comparison",
+                            async move {
+                                load_handle
+                                    .commit_comparison_async(&load_hash, &load_path)
+                                    .await
+                            },
+                        )
+                        .await
+                        {
+                            NativeJobWait::Completed(Ok(result)) => result,
+                            NativeJobWait::Completed(Err(error)) => {
+                                Err(format!("History comparison task failed: {error}"))
+                            }
+                            NativeJobWait::WorkspaceChanged => {
+                                log::debug!(
+                                    "history comparison canceled workspace={workspace_id} hash={hash} path={path}"
+                                );
+                                continue;
+                            }
+                            NativeJobWait::TimedOut => {
+                                Err("History comparison timed out.".to_string())
+                            }
                         };
                         let result = match result {
                             Ok(comparison) => {
@@ -30712,7 +31127,13 @@ pub fn run() {
                                     prepare_diff(&syntax_path, comparison)
                                 });
                                 let Some(result) =
-                                    until_workspace_change(&cancellation, task).await
+                                    until_workspace_change(
+                                        &cancellation,
+                                        &retired_jobs,
+                                        "history-diff-preparation",
+                                        task,
+                                    )
+                                    .await
                                 else {
                                     log::debug!(
                                         "history diff preparation canceled workspace={workspace_id} hash={hash} path={path}"
@@ -30748,19 +31169,33 @@ pub fn run() {
                         request_id,
                         cancellation,
                     } => {
-                        let load = tokio::time::timeout(
-                            REPOSITORY_CALLBACK_TIMEOUT,
-                            handle.commit_bytes_comparison_async(&hash, &path),
-                        );
-                        let Some(load) = until_workspace_change(&cancellation, load).await else {
-                            log::debug!(
-                                "history binary comparison canceled workspace={workspace_id} hash={hash} path={path}"
-                            );
-                            continue;
-                        };
-                        let result = match load {
-                            Ok(result) => result,
-                            Err(_) => Err("History binary comparison timed out.".to_string()),
+                        let load_hash = hash.clone();
+                        let load_path = path.clone();
+                        let result = match wait_workspace_future(
+                            &cancellation,
+                            &retired_jobs,
+                            "history-bytes-comparison",
+                            async move {
+                                handle
+                                    .commit_bytes_comparison_async(&load_hash, &load_path)
+                                    .await
+                            },
+                        )
+                        .await
+                        {
+                            NativeJobWait::Completed(Ok(result)) => result,
+                            NativeJobWait::Completed(Err(error)) => {
+                                Err(format!("History binary comparison task failed: {error}"))
+                            }
+                            NativeJobWait::WorkspaceChanged => {
+                                log::debug!(
+                                    "history binary comparison canceled workspace={workspace_id} hash={hash} path={path}"
+                                );
+                                continue;
+                            }
+                            NativeJobWait::TimedOut => {
+                                Err("History binary comparison timed out.".to_string())
+                            }
                         };
                         if repository_completion_tx
                             .send(FrontendCompletion::Repository(
@@ -30787,7 +31222,14 @@ pub fn run() {
                         let task = tokio::task::spawn_blocking(move || {
                             load_native_file_tree(&handle, &expanded)
                         });
-                        let Some(result) = until_workspace_change(&cancellation, task).await else {
+                        let Some(result) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "files-tree",
+                            task,
+                        )
+                        .await
+                        else {
                             log::debug!("workspace file tree canceled workspace={workspace_id}");
                             continue;
                         };
@@ -30816,7 +31258,14 @@ pub fn run() {
                         let task = tokio::task::spawn_blocking(move || {
                             docker::list_inventory(access.as_ref())
                         });
-                        let Some(result) = until_workspace_change(&cancellation, task).await else {
+                        let Some(result) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "container-inventory",
+                            task,
+                        )
+                        .await
+                        else {
                             log::debug!("container inventory canceled workspace={workspace_id}");
                             continue;
                         };
@@ -30848,7 +31297,14 @@ pub fn run() {
                         let task = tokio::task::spawn_blocking(move || {
                             docker::inspect_container(access.as_ref(), &worker_id)
                         });
-                        let Some(result) = until_workspace_change(&cancellation, task).await else {
+                        let Some(result) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "container-detail",
+                            task,
+                        )
+                        .await
+                        else {
                             log::debug!(
                                 "container detail canceled workspace={workspace_id} container={container_id}"
                             );
@@ -30883,7 +31339,14 @@ pub fn run() {
                         let task = tokio::task::spawn_blocking(move || {
                             docker::run_container_action(access.as_ref(), &container_id, action)
                         });
-                        let Some(result) = until_workspace_change(&cancellation, task).await else {
+                        let Some(result) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "container-action",
+                            task,
+                        )
+                        .await
+                        else {
                             log::debug!(
                                 "container action canceled workspace={workspace_id} request={request_id}"
                             );
@@ -30916,7 +31379,14 @@ pub fn run() {
                         let task = tokio::task::spawn_blocking(move || {
                             docker::run_compose_action(access.as_ref(), &compose, action)
                         });
-                        let Some(result) = until_workspace_change(&cancellation, task).await else {
+                        let Some(result) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "compose-action",
+                            task,
+                        )
+                        .await
+                        else {
                             log::debug!(
                                 "compose action canceled workspace={workspace_id} request={request_id}"
                             );
@@ -30981,7 +31451,10 @@ pub fn run() {
                         };
                         let mut result = match load {
                             Ok(result) => result,
-                            Err(_) => Err("Workspace file read timed out.".to_string()),
+                            Err(_) => {
+                                cancel_requested.store(true, Ordering::SeqCst);
+                                Err("Workspace file read timed out.".to_string())
+                            }
                         };
                         let path_display = path.display();
                         let is_safetensors = Path::new(&path_display)
@@ -31006,7 +31479,13 @@ pub fn run() {
                                 read_metadata_header(&local_path, &header_path)
                             });
                             let Some(header) =
-                                until_workspace_change(&cancellation, task).await
+                                until_workspace_change(
+                                    &cancellation,
+                                    &retired_jobs,
+                                    "safetensors-header",
+                                    task,
+                                )
+                                .await
                             else {
                                 log::debug!(
                                     "native Safetensors header read canceled workspace={workspace_id} path={path_display}"
@@ -31085,7 +31564,14 @@ pub fn run() {
                                 folder_count,
                             })
                         });
-                        let Some(result) = until_workspace_change(&cancellation, task).await else {
+                        let Some(result) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "folder-preview",
+                            task,
+                        )
+                        .await
+                        else {
                             log::debug!(
                                 "native folder preview canceled workspace={workspace_id} path={}",
                                 completion_path.display()
@@ -31147,7 +31633,7 @@ pub fn run() {
                             };
                             Some(result.and_then(FileRead::into_bytes))
                         };
-                        let mut task = tokio::task::spawn_blocking(move || {
+                        let task = tokio::task::spawn_blocking(move || {
                             let (db_path, materialized) = match (local_path, bytes) {
                                 (Some(local_path), _) => (local_path, None),
                                 (None, Some(Ok(bytes))) => {
@@ -31172,17 +31658,26 @@ pub fn run() {
                                 tables,
                             })
                         });
-                        let result = tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => {
-                                let _ = task.await;
+                        let result = match wait_workspace_job(
+                            &cancellation,
+                            &retired_jobs,
+                            "sqlite-schema",
+                            task,
+                            None,
+                        )
+                        .await
+                        {
+                            NativeJobWait::WorkspaceChanged => {
                                 log::debug!(
                                     "native SQLite schema load canceled workspace={workspace_id} path={}",
                                     completion_path.display()
                                 );
                                 continue;
                             }
-                            joined = &mut task => joined.unwrap_or_else(|error| {
+                            NativeJobWait::TimedOut => {
+                                Err("SQLite schema task timed out.".to_string())
+                            }
+                            NativeJobWait::Completed(joined) => joined.unwrap_or_else(|error| {
                                 Err(format!("SQLite schema task failed: {error}"))
                             }),
                         };
@@ -31212,7 +31707,7 @@ pub fn run() {
                         generation,
                         cancellation,
                     } => {
-                        let mut task = tokio::task::spawn_blocking(move || {
+                        let task = tokio::task::spawn_blocking(move || {
                             sqlite_preview::load_page(
                                 &db_path,
                                 table,
@@ -31222,17 +31717,26 @@ pub fn run() {
                                 sort,
                             )
                         });
-                        let result = tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => {
-                                let _ = task.await;
+                        let result = match wait_workspace_job(
+                            &cancellation,
+                            &retired_jobs,
+                            "sqlite-page",
+                            task,
+                            None,
+                        )
+                        .await
+                        {
+                            NativeJobWait::WorkspaceChanged => {
                                 log::debug!(
                                     "native SQLite page load canceled workspace={workspace_id} path={}",
                                     path.display()
                                 );
                                 continue;
                             }
-                            joined = &mut task => joined.unwrap_or_else(|error| {
+                            NativeJobWait::TimedOut => {
+                                Err("SQLite page task timed out.".to_string())
+                            }
+                            NativeJobWait::Completed(joined) => joined.unwrap_or_else(|error| {
                                 Err(format!("SQLite page task failed: {error}"))
                             }),
                         };
@@ -31338,7 +31842,7 @@ pub fn run() {
                                 destination,
                             } => {
                                 let worker_cancel = cancel_requested.clone();
-                                let mut worker = tokio::task::spawn_blocking(move || {
+                                let worker = tokio::task::spawn_blocking(move || {
                                     let source_access = craic_system::workspace::file_access_for_configured_workspace(
                                         &source_workspace,
                                     )?;
@@ -31358,14 +31862,20 @@ pub fn run() {
                                     )
                                     .map(Some)
                                 });
-                                tokio::select! {
-                                    biased;
-                                    _ = cancellation.cancelled() => {
-                                        cancel_requested.store(true, Ordering::Relaxed);
-                                        let _ = worker.await;
-                                        None
-                                    }
-                                    joined = &mut worker => Some(joined.unwrap_or_else(|error| {
+                                match wait_workspace_job(
+                                    &cancellation,
+                                    &retired_jobs,
+                                    "cross-provider-transfer",
+                                    worker,
+                                    Some(&cancel_requested),
+                                )
+                                .await
+                                {
+                                    NativeJobWait::WorkspaceChanged => None,
+                                    NativeJobWait::TimedOut => Some(Err(
+                                        "Cross-provider transfer timed out.".to_string(),
+                                    )),
+                                    NativeJobWait::Completed(joined) => Some(joined.unwrap_or_else(|error| {
                                         Err(format!("Cross-provider transfer task failed: {error}"))
                                     })),
                                 }
@@ -31375,7 +31885,7 @@ pub fn run() {
                                 destination_parent,
                             } => {
                                 let worker_cancel = cancel_requested.clone();
-                                let mut worker = tokio::task::spawn_blocking(move || {
+                                let worker = tokio::task::spawn_blocking(move || {
                                     upload_local_paths_to_workspace(
                                         access,
                                         sources,
@@ -31384,14 +31894,20 @@ pub fn run() {
                                     )
                                     .map(|paths| paths.into_iter().next())
                                 });
-                                tokio::select! {
-                                    biased;
-                                    _ = cancellation.cancelled() => {
-                                        cancel_requested.store(true, Ordering::Relaxed);
-                                        let _ = worker.await;
-                                        None
+                                match wait_workspace_job(
+                                    &cancellation,
+                                    &retired_jobs,
+                                    "workspace-upload",
+                                    worker,
+                                    Some(&cancel_requested),
+                                )
+                                .await
+                                {
+                                    NativeJobWait::WorkspaceChanged => None,
+                                    NativeJobWait::TimedOut => {
+                                        Some(Err("Upload task timed out.".to_string()))
                                     }
-                                    joined = &mut worker => Some(joined.unwrap_or_else(|error| {
+                                    NativeJobWait::Completed(joined) => Some(joined.unwrap_or_else(|error| {
                                         Err(format!("Upload task failed: {error}"))
                                     })),
                                 }
@@ -31442,21 +31958,27 @@ pub fn run() {
                         let completion_destination = destination.clone();
                         let cancel_requested = Arc::new(AtomicBool::new(false));
                         let worker_cancel = cancel_requested.clone();
-                        let mut worker = tokio::task::spawn_blocking(move || {
+                        let worker = tokio::task::spawn_blocking(move || {
                             access.download_to_local(FileDownloadRequest {
                                 sources: vec![source],
                                 destination,
                                 cancel_requested: Some(worker_cancel),
                             })
                         });
-                        let result = tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => {
-                                cancel_requested.store(true, Ordering::Relaxed);
-                                let _ = worker.await;
-                                None
+                        let result = match wait_workspace_job(
+                            &cancellation,
+                            &retired_jobs,
+                            "workspace-download",
+                            worker,
+                            Some(&cancel_requested),
+                        )
+                        .await
+                        {
+                            NativeJobWait::WorkspaceChanged => None,
+                            NativeJobWait::TimedOut => {
+                                Some(Err("Download task timed out.".to_string()))
                             }
-                            joined = &mut worker => Some(joined.unwrap_or_else(|error| {
+                            NativeJobWait::Completed(joined) => Some(joined.unwrap_or_else(|error| {
                                 Err(format!("Download task failed: {error}"))
                             })),
                         };
@@ -31496,7 +32018,7 @@ pub fn run() {
                         let completion_signature = expected_signature.clone();
                         let cancel_requested = Arc::new(AtomicBool::new(false));
                         let worker_cancel = cancel_requested.clone();
-                        let mut worker = tokio::task::spawn_blocking(move || {
+                        let worker = tokio::task::spawn_blocking(move || {
                             let current = access.info(&path)?;
                             if file_signature_from_info(&current) != expected_signature {
                                 return Err(
@@ -31514,14 +32036,20 @@ pub fn run() {
                             ))?;
                             access.info(&path)
                         });
-                        let result = tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => {
-                                cancel_requested.store(true, Ordering::Relaxed);
-                                let _ = worker.await;
-                                None
+                        let result = match wait_workspace_job(
+                            &cancellation,
+                            &retired_jobs,
+                            "workspace-save",
+                            worker,
+                            Some(&cancel_requested),
+                        )
+                        .await
+                        {
+                            NativeJobWait::WorkspaceChanged => None,
+                            NativeJobWait::TimedOut => {
+                                Some(Err("File save task timed out.".to_string()))
                             }
-                            joined = &mut worker => Some(joined.unwrap_or_else(|error| {
+                            NativeJobWait::Completed(joined) => Some(joined.unwrap_or_else(|error| {
                                 Err(format!("File save task failed: {error}"))
                             })),
                         };
@@ -31658,7 +32186,14 @@ pub fn run() {
                                 csv_table,
                             }
                         });
-                        let Some(result) = until_workspace_change(&cancellation, task).await else {
+                        let Some(result) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "text-analysis",
+                            task,
+                        )
+                        .await
+                        else {
                             log::debug!(
                                 "native Files syntax canceled workspace={workspace_id} path={}",
                                 path.display()
@@ -31832,7 +32367,13 @@ pub fn run() {
                                     decode_agent_image_data_uri(&data_uri)
                                 });
                                 let Some(result) =
-                                    until_workspace_change(&cancellation, task).await
+                                    until_workspace_change(
+                                        &cancellation,
+                                        &retired_jobs,
+                                        "agent-image-decode",
+                                        task,
+                                    )
+                                    .await
                                 else {
                                     log::debug!(
                                         "Codex inline image decode canceled workspace={workspace_id} item_id={item_id}"
@@ -31890,24 +32431,44 @@ pub fn run() {
                         workspace_id,
                         handle,
                         option,
+                        cancellation,
                     } => {
-                        let saved = match tokio::time::timeout(
-                            REPOSITORY_CALLBACK_TIMEOUT,
-                            handle.save_author_identity_async(&option.name, &option.email),
+                        let save_handle = handle.clone();
+                        let Some(saved) = wait_native_result(
+                            &cancellation,
+                            &retired_jobs,
+                            "save-commit-author",
+                            "Author update timed out.",
+                            async move {
+                                save_handle
+                                    .save_author_identity_async(&option.name, &option.email)
+                                    .await
+                            },
                         )
                         .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => Err("Author update timed out.".to_string()),
+                        else {
+                            continue;
                         };
                         let result = match saved {
                             Ok(()) => {
                                 let reload_handle = handle.clone();
-                                tokio::task::spawn_blocking(move || {
+                                let task = tokio::task::spawn_blocking(move || {
                                     reload_handle.load_workspace_snapshot()
-                                })
+                                });
+                                let Some(result) = until_workspace_change(
+                                    &cancellation,
+                                    &retired_jobs,
+                                    "commit-author-refresh",
+                                    task,
+                                )
                                 .await
-                                .unwrap_or_else(|error| {
+                                else {
+                                    log::debug!(
+                                        "commit author refresh canceled workspace={workspace_id}"
+                                    );
+                                    continue;
+                                };
+                                result.unwrap_or_else(|error| {
                                     Err(format!("Repository refresh task failed: {error}"))
                                 })
                             }
@@ -31917,6 +32478,7 @@ pub fn run() {
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::CommitAuthorFinished {
                                     workspace_id,
+                                    cancellation: cancellation.clone(),
                                     handle,
                                     result,
                                 },
@@ -31932,20 +32494,28 @@ pub fn run() {
                         summary,
                         description,
                         files,
+                        cancellation,
                     } => {
                         log::info!(
                             "native commit started workspace={} files={}",
                             workspace_id,
                             files.len()
                         );
-                        let result = match tokio::time::timeout(
-                            REPOSITORY_CALLBACK_TIMEOUT,
-                            handle.commit_paths_async(&summary, &description, &files),
+                        let commit_handle = handle.clone();
+                        let Some(result) = wait_native_result(
+                            &cancellation,
+                            &retired_jobs,
+                            "commit-paths",
+                            "Commit timed out.",
+                            async move {
+                                commit_handle
+                                    .commit_paths_async(&summary, &description, &files)
+                                    .await
+                            },
                         )
                         .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => Err("Commit timed out.".to_string()),
+                        else {
+                            continue;
                         };
                         let succeeded = result.is_ok();
                         log::info!(
@@ -31956,9 +32526,10 @@ pub fn run() {
                         if !succeeded {
                             if repository_completion_tx
                                 .send(FrontendCompletion::Repository(
-                                    RepositoryCompletion::CommitFinished {
-                                        workspace_id,
-                                        handle: None,
+                                        RepositoryCompletion::CommitFinished {
+                                            workspace_id,
+                                            cancellation: cancellation.clone(),
+                                            handle: None,
                                         snapshot: None,
                                         result,
                                     },
@@ -31970,17 +32541,28 @@ pub fn run() {
                             continue;
                         }
                         let reload_handle = handle.clone();
-                        let snapshot = tokio::task::spawn_blocking(move || {
+                        let task = tokio::task::spawn_blocking(move || {
                             reload_handle.load_workspace_snapshot()
-                        })
+                        });
+                        let Some(snapshot) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "commit-refresh",
+                            task,
+                        )
                         .await
-                        .unwrap_or_else(|error| {
+                        else {
+                            log::debug!("commit refresh canceled workspace={workspace_id}");
+                            continue;
+                        };
+                        let snapshot = snapshot.unwrap_or_else(|error| {
                             Err(format!("Repository refresh task failed: {error}"))
                         });
                         if repository_completion_tx
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::CommitFinished {
                                     workspace_id,
+                                    cancellation: cancellation.clone(),
                                     handle: Some(handle),
                                     snapshot: Some(snapshot),
                                     result,
@@ -31997,8 +32579,23 @@ pub fn run() {
                         files,
                         request_id,
                         cancellation,
+                        workspace_cancellation,
                     } => {
-                        let config = tokio::task::spawn_blocking(craic_config::load).await;
+                        let task = tokio::task::spawn_blocking(craic_config::load);
+                        let Some(config) = until_workspace_change(
+                            &workspace_cancellation,
+                            &retired_jobs,
+                            "commit-message-config",
+                            task,
+                        )
+                        .await
+                        else {
+                            cancellation.cancel();
+                            log::debug!(
+                                "commit-message config load canceled workspace={workspace_id}"
+                            );
+                            continue;
+                        };
                         let (provider_id, model) = match config {
                             Ok(config) => {
                                 (config.commit_message_provider, config.commit_message_model)
@@ -32011,6 +32608,7 @@ pub fn run() {
                                     FrontendCompletion::Repository(
                                         RepositoryCompletion::CommitMessageGenerated {
                                             workspace_id,
+                                            cancellation: workspace_cancellation.clone(),
                                             request_id,
                                             provider_label: "configured provider".to_string(),
                                             result,
@@ -32023,36 +32621,61 @@ pub fn run() {
                         let provider_label = find_provider(&provider_id)
                             .map(|provider| provider.label().to_string())
                             .unwrap_or_else(|| provider_id.clone());
-                        let context = match tokio::time::timeout(
-                            REPOSITORY_CALLBACK_TIMEOUT,
-                            handle.commit_message_context_async(&files),
+                        let context_handle = handle.clone();
+                        let Some(context) = wait_native_result(
+                            &workspace_cancellation,
+                            &retired_jobs,
+                            "commit-message-context",
+                            "Commit-message context timed out.",
+                            async move {
+                                context_handle.commit_message_context_async(&files).await
+                            },
                         )
                         .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => Err("Commit-message context timed out.".to_string()),
+                        else {
+                            log::debug!(
+                                "commit-message context canceled workspace={workspace_id}"
+                            );
+                            continue;
                         };
                         let result = match context {
-                            Ok(context) => tokio::task::spawn_blocking(move || {
-                                craic_agent::ai_commit::generate_from_context(
-                                    context,
-                                    &provider_id,
-                                    model.as_deref(),
-                                    &cancellation,
+                            Ok(context) => {
+                                let generation_cancellation = cancellation.clone();
+                                let task = tokio::task::spawn_blocking(move || {
+                                    craic_agent::ai_commit::generate_from_context(
+                                        context,
+                                        &provider_id,
+                                        model.as_deref(),
+                                        &generation_cancellation,
+                                    )
+                                });
+                                let Some(result) = until_workspace_change(
+                                    &workspace_cancellation,
+                                    &retired_jobs,
+                                    "commit-message-generation",
+                                    task,
                                 )
-                            })
-                            .await
-                            .unwrap_or_else(|error| {
-                                Err(format!(
-                                    "Commit-message generation task did not complete: {error}"
-                                ))
-                            }),
+                                .await
+                                else {
+                                    cancellation.cancel();
+                                    log::debug!(
+                                        "commit-message generation canceled workspace={workspace_id}"
+                                    );
+                                    continue;
+                                };
+                                result.unwrap_or_else(|error| {
+                                    Err(format!(
+                                        "Commit-message generation task did not complete: {error}"
+                                    ))
+                                })
+                            }
                             Err(error) => Err(error),
                         };
                         if repository_completion_tx
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::CommitMessageGenerated {
                                     workspace_id,
+                                    cancellation: workspace_cancellation.clone(),
                                     request_id,
                                     provider_label,
                                     result,
@@ -32154,24 +32777,32 @@ pub fn run() {
                         request_id,
                         workspace,
                         handle,
+                        cancellation,
                     } => {
-                        let result = tokio::time::timeout(REPOSITORY_CALLBACK_TIMEOUT, async {
-                            let (settings, github_accounts) = tokio::join!(
-                                handle.settings_async(),
-                                load_native_workspace_github_accounts(workspace)
-                            );
-                            settings.map(|settings| NativeWorkspaceSettings {
-                                settings,
-                                github_accounts,
-                            })
-                        })
+                        let Some(result) = wait_native_result(
+                            &cancellation,
+                            &retired_jobs,
+                            "workspace-settings-load",
+                            "Workspace settings loading timed out.",
+                            async move {
+                                let (settings, github_accounts) = tokio::join!(
+                                    handle.settings_async(),
+                                    load_native_workspace_github_accounts(workspace)
+                                );
+                                settings.map(|settings| NativeWorkspaceSettings {
+                                    settings,
+                                    github_accounts,
+                                })
+                            },
+                        )
                         .await
-                        .unwrap_or_else(|_| {
-                            Err("Workspace settings loading timed out.".to_string())
-                        });
+                        else {
+                            continue;
+                        };
                         let _ = repository_completion_tx.send(FrontendCompletion::Repository(
                             RepositoryCompletion::WorkspaceSettingsLoaded {
                                 workspace_id,
+                                cancellation: cancellation.clone(),
                                 request_id,
                                 result,
                             },
@@ -32182,23 +32813,40 @@ pub fn run() {
                         request_id,
                         handle,
                         settings,
+                        cancellation,
                     } => {
-                        let save_result = tokio::time::timeout(
-                            REPOSITORY_CALLBACK_TIMEOUT,
-                            handle.save_settings_async(&settings),
+                        let save_handle = handle.clone();
+                        let Some(save_result) = wait_native_result(
+                            &cancellation,
+                            &retired_jobs,
+                            "workspace-settings-save",
+                            "Workspace settings save timed out.",
+                            async move { save_handle.save_settings_async(&settings).await },
                         )
                         .await
-                        .unwrap_or_else(|_| {
-                            Err("Workspace settings save timed out.".to_string())
-                        });
+                        else {
+                            continue;
+                        };
                         let result = match save_result {
                             Ok(()) => {
                                 let reload_handle = handle.clone();
-                                tokio::task::spawn_blocking(move || {
+                                let task = tokio::task::spawn_blocking(move || {
                                     reload_handle.load_workspace_snapshot()
-                                })
+                                });
+                                let Some(result) = until_workspace_change(
+                                    &cancellation,
+                                    &retired_jobs,
+                                    "workspace-settings-refresh",
+                                    task,
+                                )
                                 .await
-                                .unwrap_or_else(|error| {
+                                else {
+                                    log::debug!(
+                                        "workspace settings refresh canceled workspace={workspace_id}"
+                                    );
+                                    continue;
+                                };
+                                result.unwrap_or_else(|error| {
                                     Err(format!(
                                         "Workspace reload after settings save did not complete: {error}"
                                     ))
@@ -32209,6 +32857,7 @@ pub fn run() {
                         let _ = repository_completion_tx.send(FrontendCompletion::Repository(
                             RepositoryCompletion::WorkspaceSettingsSaved {
                                 workspace_id,
+                                cancellation: cancellation.clone(),
                                 request_id,
                                 handle,
                                 result,
@@ -32219,6 +32868,7 @@ pub fn run() {
                         workspace_id,
                         handle,
                         paths,
+                        cancellation,
                     } => {
                         log::info!(
                             "native discard started workspace={} files={}",
@@ -32227,29 +32877,36 @@ pub fn run() {
                         );
                         let mut failure = None;
                         for path in paths {
-                            match tokio::time::timeout(
-                                REPOSITORY_CALLBACK_TIMEOUT,
-                                handle.discard_path_async(&path),
+                            let discard_handle = handle.clone();
+                            let timeout_message =
+                                format!("Discard operation timed out for {path}.");
+                            let result = wait_native_result(
+                                &cancellation,
+                                &retired_jobs,
+                                "discard-path",
+                                "Discard operation timed out.",
+                                async move { discard_handle.discard_path_async(&path).await },
                             )
-                            .await
-                            {
-                                Ok(Ok(_)) => {}
-                                Ok(Err(error)) => {
+                            .await;
+                            match result {
+                                Some(Ok(_)) => {}
+                                Some(Err(error)) => {
+                                    let error = if error == "Discard operation timed out." {
+                                        timeout_message
+                                    } else {
+                                        error
+                                    };
                                     failure = Some(error);
                                     break;
                                 }
-                                Err(_) => {
-                                    failure = Some(format!(
-                                        "Discard operation timed out for {path}."
-                                    ));
-                                    break;
-                                }
+                                None => return,
                             }
                         }
                         if let Some(message) = failure {
                             let _ = repository_completion_tx.send(
                                 FrontendCompletion::Repository(
                                     RepositoryCompletion::ChangesFailed {
+                                        cancellation: cancellation.clone(),
                                         title: "Discard Failed",
                                         message,
                                     },
@@ -32258,17 +32915,28 @@ pub fn run() {
                             continue;
                         }
                         let reload_handle = handle.clone();
-                        let snapshot = tokio::task::spawn_blocking(move || {
+                        let task = tokio::task::spawn_blocking(move || {
                             reload_handle.load_workspace_snapshot()
-                        })
+                        });
+                        let Some(snapshot) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "discard-refresh",
+                            task,
+                        )
                         .await
-                        .unwrap_or_else(|error| {
+                        else {
+                            log::debug!("discard refresh canceled workspace={workspace_id}");
+                            continue;
+                        };
+                        let snapshot = snapshot.unwrap_or_else(|error| {
                             Err(format!("Repository refresh task failed: {error}"))
                         });
                         if repository_completion_tx
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
+                                    cancellation: cancellation.clone(),
                                     handle: Some(handle),
                                     core_request: None,
                                     result: snapshot,
@@ -32282,16 +32950,20 @@ pub fn run() {
                     RepositoryRequest::Stash {
                         workspace_id,
                         handle,
+                        cancellation,
                     } => {
                         log::info!("native stash started workspace={workspace_id}");
-                        let result = match tokio::time::timeout(
-                            REPOSITORY_CALLBACK_TIMEOUT,
-                            handle.stash_changes_async(),
+                        let stash_handle = handle.clone();
+                        let Some(result) = wait_native_result(
+                            &cancellation,
+                            &retired_jobs,
+                            "stash-changes",
+                            "Stash operation timed out.",
+                            async move { stash_handle.stash_changes_async().await },
                         )
                         .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => Err("Stash operation timed out.".to_string()),
+                        else {
+                            continue;
                         };
                         match result {
                             Ok(message) => {
@@ -32305,6 +32977,7 @@ pub fn run() {
                                 let _ = repository_completion_tx.send(
                                     FrontendCompletion::Repository(
                                         RepositoryCompletion::ChangesFailed {
+                                            cancellation: cancellation.clone(),
                                             title: "Stash Failed",
                                             message,
                                         },
@@ -32314,17 +32987,28 @@ pub fn run() {
                             }
                         }
                         let reload_handle = handle.clone();
-                        let snapshot = tokio::task::spawn_blocking(move || {
+                        let task = tokio::task::spawn_blocking(move || {
                             reload_handle.load_workspace_snapshot()
-                        })
+                        });
+                        let Some(snapshot) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "stash-refresh",
+                            task,
+                        )
                         .await
-                        .unwrap_or_else(|error| {
+                        else {
+                            log::debug!("stash refresh canceled workspace={workspace_id}");
+                            continue;
+                        };
+                        let snapshot = snapshot.unwrap_or_else(|error| {
                             Err(format!("Repository refresh task failed: {error}"))
                         });
                         if repository_completion_tx
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
+                                    cancellation: cancellation.clone(),
                                     handle: Some(handle),
                                     core_request: None,
                                     result: snapshot,
@@ -32339,20 +33023,24 @@ pub fn run() {
                         workspace_id,
                         handle,
                         pattern,
+                        cancellation,
                     } => {
                         log::info!(
                             "native ignore-pattern started workspace={} pattern={}",
                             workspace_id,
                             pattern
                         );
-                        let result = match tokio::time::timeout(
-                            REPOSITORY_CALLBACK_TIMEOUT,
-                            handle.add_ignore_pattern_async(pattern),
+                        let ignore_handle = handle.clone();
+                        let Some(result) = wait_native_result(
+                            &cancellation,
+                            &retired_jobs,
+                            "add-ignore-pattern",
+                            "Ignore operation timed out.",
+                            async move { ignore_handle.add_ignore_pattern_async(pattern).await },
                         )
                         .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => Err("Ignore operation timed out.".to_string()),
+                        else {
+                            continue;
                         };
                         match result {
                             Ok(message) => {
@@ -32366,6 +33054,7 @@ pub fn run() {
                                 let _ = repository_completion_tx.send(
                                     FrontendCompletion::Repository(
                                         RepositoryCompletion::ChangesFailed {
+                                            cancellation: cancellation.clone(),
                                             title: "Ignore Failed",
                                             message,
                                         },
@@ -32375,17 +33064,28 @@ pub fn run() {
                             }
                         }
                         let reload_handle = handle.clone();
-                        let snapshot = tokio::task::spawn_blocking(move || {
+                        let task = tokio::task::spawn_blocking(move || {
                             reload_handle.load_workspace_snapshot()
-                        })
+                        });
+                        let Some(snapshot) = until_workspace_change(
+                            &cancellation,
+                            &retired_jobs,
+                            "ignore-refresh",
+                            task,
+                        )
                         .await
-                        .unwrap_or_else(|error| {
+                        else {
+                            log::debug!("ignore refresh canceled workspace={workspace_id}");
+                            continue;
+                        };
+                        let snapshot = snapshot.unwrap_or_else(|error| {
                             Err(format!("Repository refresh task failed: {error}"))
                         });
                         if repository_completion_tx
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
+                                    cancellation: cancellation.clone(),
                                     handle: Some(handle),
                                     core_request: None,
                                     result: snapshot,
