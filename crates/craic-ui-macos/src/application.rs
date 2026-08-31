@@ -1081,6 +1081,7 @@ enum RepositoryRequest {
         handle: Arc<GitRepoHandle>,
         snapshot: RepositorySnapshot,
         action: NativeRemoteAction,
+        stash_before: bool,
     },
     LoadQuickActions {
         workspace_id: String,
@@ -1435,7 +1436,15 @@ enum RepositoryCompletion {
     },
     ActionFailed {
         workspace_id: String,
+        title: &'static str,
         message: String,
+    },
+    ActionNeedsStash {
+        workspace_id: String,
+        handle: Arc<GitRepoHandle>,
+        snapshot: RepositorySnapshot,
+        action: NativeRemoteAction,
+        files: Vec<String>,
     },
     ActionFinished {
         workspace_id: String,
@@ -5847,9 +5856,11 @@ impl AppDelegate {
             handle,
             snapshot,
             action,
+            stash_before: false,
         }) {
             self.repository_action_failed(
                 &workspace_id,
+                "Git Operation Failed",
                 &format!("The Git operation could not be queued: {error}"),
             );
         }
@@ -5944,7 +5955,11 @@ impl AppDelegate {
             handle,
             cancellation,
         }) {
-            self.repository_action_failed(&workspace_id, &error.to_string());
+            self.repository_action_failed(
+                &workspace_id,
+                "Git Operation Failed",
+                &error.to_string(),
+            );
             self.changes_operation_failed(
                 "Refresh Failed",
                 &format!("Refresh request could not be queued: {error}"),
@@ -21554,7 +21569,7 @@ impl AppDelegate {
         }
     }
 
-    fn repository_action_failed(&self, workspace_id: &str, message: &str) {
+    fn repository_action_failed(&self, workspace_id: &str, title: &str, message: &str) {
         if self.ivars().active_workspace_id.borrow().as_deref() != Some(workspace_id) {
             return;
         }
@@ -21564,8 +21579,65 @@ impl AppDelegate {
         if let Some(fetch) = self.ivars().fetch_button.get() {
             fetch.setToolTip(Some(&NSString::from_str(message)));
         }
-        self.present_path_action_error("Git Operation Failed", message);
+        self.present_path_action_error(title, message);
         log::warn!("native git action failed workspace={workspace_id}: {message}");
+    }
+
+    fn show_local_changes_overwritten_dialog(
+        &self,
+        workspace_id: String,
+        handle: Arc<GitRepoHandle>,
+        snapshot: RepositorySnapshot,
+        action: NativeRemoteAction,
+        files: Vec<String>,
+    ) {
+        if self.ivars().active_workspace_id.borrow().as_deref() != Some(&workspace_id) {
+            return;
+        }
+        self.configure_repository_controls(&snapshot, false);
+        let Some(window) = self.ivars().window.get() else {
+            return;
+        };
+        let alert = NSAlert::new(self.mtm());
+        alert.setMessageText(&NSString::from_str("Local Changes Would Be Overwritten"));
+        alert.setInformativeText(&NSString::from_str(&local_changes_overwritten_body(
+            action, &snapshot, &files,
+        )));
+        alert.addButtonWithTitle(&NSString::from_str("Stash Changes and Continue"));
+        alert.addButtonWithTitle(&NSString::from_str("Close"));
+        alert.setAlertStyle(NSAlertStyle::Warning);
+        let delegate = self.retain();
+        let completion = RcBlock::new(move |response| {
+            if response != NSAlertFirstButtonReturn
+                || delegate.ivars().active_workspace_id.borrow().as_deref()
+                    != Some(workspace_id.as_str())
+            {
+                return;
+            }
+            let Some(requests) = delegate.ivars().repository_requests.get() else {
+                delegate.repository_action_failed(
+                    &workspace_id,
+                    "Stash Failed",
+                    "The repository service is unavailable.",
+                );
+                return;
+            };
+            delegate.set_repository_action_progress(&workspace_id, "Stashing changes…");
+            if let Err(error) = requests.try_send(RepositoryRequest::RunGitAction {
+                workspace_id: workspace_id.clone(),
+                handle: handle.clone(),
+                snapshot: snapshot.clone(),
+                action,
+                stash_before: true,
+            }) {
+                delegate.repository_action_failed(
+                    &workspace_id,
+                    "Stash Failed",
+                    &format!("The stash request could not be queued: {error}"),
+                );
+            }
+        });
+        alert.beginSheetModalForWindow_completionHandler(window, Some(&completion));
     }
 
     fn set_branch_action_progress(&self, workspace_id: &str, label: &str) {
@@ -21677,8 +21749,22 @@ impl AppDelegate {
             } => self.set_repository_action_progress(&workspace_id, &message),
             RepositoryCompletion::ActionFailed {
                 workspace_id,
+                title,
                 message,
-            } => self.repository_action_failed(&workspace_id, &message),
+            } => self.repository_action_failed(&workspace_id, title, &message),
+            RepositoryCompletion::ActionNeedsStash {
+                workspace_id,
+                handle,
+                snapshot,
+                action,
+                files,
+            } => self.show_local_changes_overwritten_dialog(
+                workspace_id,
+                handle,
+                snapshot,
+                action,
+                files,
+            ),
             RepositoryCompletion::ActionFinished {
                 workspace_id,
                 handle,
@@ -26405,6 +26491,91 @@ fn docker_access_for_workspace(
     }
 }
 
+fn native_remote_action_pulls(action: NativeRemoteAction, snapshot: &RepositorySnapshot) -> bool {
+    match action {
+        NativeRemoteAction::Pull => true,
+        NativeRemoteAction::Push => false,
+        NativeRemoteAction::Contextual => snapshot.has_upstream && snapshot.behind > 0,
+    }
+}
+
+fn local_changes_overwritten_body(
+    action: NativeRemoteAction,
+    snapshot: &RepositorySnapshot,
+    files: &[String],
+) -> String {
+    let action_name = if matches!(action, NativeRemoteAction::Contextual)
+        && snapshot.has_upstream
+        && snapshot.behind > 0
+        && snapshot.ahead > 0
+    {
+        "pull remote changes before pushing"
+    } else {
+        "pull"
+    };
+    let mut body = format!("Unable to {action_name} when changes are present on your branch.");
+    if !files.is_empty() {
+        body.push_str(" The following files would be overwritten:");
+        for file in files.iter().take(12) {
+            body.push_str("\n  ");
+            body.push_str(file);
+        }
+        if files.len() > 12 {
+            body.push_str(&format!("\n  ... and {} more", files.len() - 12));
+        }
+    }
+    body.push_str("\n\nYou can stash your changes now and recover them afterwards.");
+    body
+}
+
+fn is_local_changes_overwritten_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let would_overwrite = lower.contains("would be overwritten")
+        && (lower.contains("local changes")
+            || lower.contains("untracked working tree files")
+            || lower.contains("files would be overwritten"));
+    let rebase_dirty = lower.contains("cannot pull with rebase")
+        && (lower.contains("unstaged changes")
+            || lower.contains("uncommitted changes")
+            || lower.contains("please commit or stash"));
+    let merge_dirty = lower.contains("commit your changes or stash them")
+        && (lower.contains("merge") || lower.contains("pull"));
+
+    would_overwrite || rebase_dirty || merge_dirty
+}
+
+fn parse_files_to_be_overwritten(message: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut in_files_list = false;
+    for line in message.lines() {
+        if in_files_list {
+            if line.starts_with('\t') || line.starts_with("    ") {
+                let file = line.trim();
+                if !file.is_empty() {
+                    files.push(file.to_string());
+                }
+                continue;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            break;
+        }
+
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("error:")
+            && lower.contains("would be overwritten")
+            && lower.trim_end().ends_with(':')
+        {
+            in_files_list = true;
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
 fn git_action_events(
     handle: &GitRepoHandle,
     snapshot: &RepositorySnapshot,
@@ -28013,7 +28184,46 @@ pub fn run() {
                         handle,
                         snapshot,
                         action,
+                        stash_before,
                     } => {
+                        if stash_before {
+                            let _ = repository_completion_tx.send(
+                                FrontendCompletion::Repository(
+                                    RepositoryCompletion::ActionProgress {
+                                        workspace_id: workspace_id.clone(),
+                                        message: "Stashing changes…".to_string(),
+                                    },
+                                ),
+                            );
+                            let stash_result = match tokio::time::timeout(
+                                REPOSITORY_CALLBACK_TIMEOUT,
+                                handle.stash_changes_async(),
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err("Stash operation timed out.".to_string()),
+                            };
+                            match stash_result {
+                                Ok(message) => log::info!(
+                                    "native stash before retry finished workspace={} message={}",
+                                    workspace_id,
+                                    message.trim()
+                                ),
+                                Err(message) => {
+                                    let _ = repository_completion_tx.send(
+                                        FrontendCompletion::Repository(
+                                            RepositoryCompletion::ActionFailed {
+                                                workspace_id: workspace_id.clone(),
+                                                title: "Stash Failed",
+                                                message,
+                                            },
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         let _ = repository_completion_tx.send(FrontendCompletion::Repository(
                             RepositoryCompletion::ActionProgress {
                                 workspace_id: workspace_id.clone(),
@@ -28028,6 +28238,7 @@ pub fn run() {
                                     FrontendCompletion::Repository(
                                         RepositoryCompletion::ActionFailed {
                                             workspace_id: workspace_id.clone(),
+                                            title: "Git Operation Failed",
                                             message,
                                         },
                                     ),
@@ -28066,14 +28277,32 @@ pub fn run() {
                                 }
                                 GitCommandEvent::Failed { message } => {
                                     failure_reported = true;
-                                    let _ = repository_completion_tx.send(
-                                        FrontendCompletion::Repository(
-                                            RepositoryCompletion::ActionFailed {
-                                                workspace_id: workspace_id.clone(),
-                                                message,
-                                            },
-                                        ),
-                                    );
+                                    let completion = if !stash_before
+                                        && native_remote_action_pulls(action, &snapshot)
+                                        && is_local_changes_overwritten_error(&message)
+                                    {
+                                        let files = parse_files_to_be_overwritten(&message);
+                                        log::info!(
+                                            "native pull blocked by local changes workspace={} overwritten_files={}",
+                                            workspace_id,
+                                            files.len()
+                                        );
+                                        RepositoryCompletion::ActionNeedsStash {
+                                            workspace_id: workspace_id.clone(),
+                                            handle: handle.clone(),
+                                            snapshot: snapshot.clone(),
+                                            action,
+                                            files,
+                                        }
+                                    } else {
+                                        RepositoryCompletion::ActionFailed {
+                                            workspace_id: workspace_id.clone(),
+                                            title: "Git Operation Failed",
+                                            message,
+                                        }
+                                    };
+                                    let _ = repository_completion_tx
+                                        .send(FrontendCompletion::Repository(completion));
                                     break;
                                 }
                             }
@@ -28086,6 +28315,7 @@ pub fn run() {
                                     FrontendCompletion::Repository(
                                         RepositoryCompletion::ActionFailed {
                                             workspace_id: workspace_id.clone(),
+                                            title: "Git Operation Failed",
                                             message,
                                         },
                                     ),
