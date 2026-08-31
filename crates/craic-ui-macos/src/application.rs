@@ -960,11 +960,27 @@ pub(crate) struct AppDelegateIvars {
     workspace_popover: OnceCell<Retained<NSPopover>>,
     workspace_search: OnceCell<Retained<NSSearchField>>,
     workspace_table: OnceCell<Retained<NSTableView>>,
+    workspace_add_button: OnceCell<Retained<NSButton>>,
     workspace_results: RefCell<Vec<usize>>,
     workspaces: RefCell<Vec<WorkspaceEntry>>,
     workspace_discovery_loading: Cell<bool>,
     workspace_discovery_generation: Cell<u64>,
     workspace_discovery_requests: OnceCell<tokio::sync::mpsc::Sender<WorkspaceDiscoveryRequest>>,
+    workspace_create_request_id: Cell<u64>,
+    workspace_create_in_progress: Cell<bool>,
+    workspace_create_name: RefCell<Option<Retained<NSTextField>>>,
+    workspace_create_remote: RefCell<Option<Retained<NSTextField>>>,
+    workspace_create_root: RefCell<Option<Retained<NSPopUpButton>>>,
+    workspace_create_roots: RefCell<Vec<PathBuf>>,
+    workspace_create_button: RefCell<Option<Retained<NSButton>>>,
+    workspace_create_cancel_button: RefCell<Option<Retained<NSButton>>>,
+    workspace_create_has_root: Cell<bool>,
+    workspace_create_auto_name: Cell<bool>,
+    workspace_create_updating_name: Cell<bool>,
+    workspace_create_form: RefCell<Option<Retained<NSAlert>>>,
+    workspace_create_spinner: RefCell<Option<Retained<NSProgressIndicator>>>,
+    workspace_create_status: RefCell<Option<Retained<NSTextField>>>,
+    workspace_create_pending_success: RefCell<Option<(PathBuf, String)>>,
     workspace_metadata: RefCell<HashMap<String, NativeWorkspaceMetadata>>,
     workspace_metadata_pending: RefCell<HashSet<String>>,
     workspace_metadata_generation: Cell<u64>,
@@ -1444,6 +1460,10 @@ enum FrontendCompletion {
         generation: u64,
         message: String,
     },
+    WorkspaceCreated {
+        request_id: u64,
+        result: Result<(PathBuf, String), String>,
+    },
     WorkspaceMetadata {
         workspace_id: String,
         generation: u64,
@@ -1464,6 +1484,10 @@ enum FrontendCompletion {
 
 enum FrontendRequest {
     OpenWorkspace,
+    CreateWorkspace {
+        request_id: u64,
+        request: NativeCreateWorkspaceRequest,
+    },
     ConfirmDiscard {
         paths: Vec<String>,
         heading: String,
@@ -1476,6 +1500,12 @@ struct WorkspaceDiscoveryRequest {
     generation: u64,
     preferred: Option<craic_config::ConfiguredWorkspace>,
     select_workspace: bool,
+}
+
+struct NativeCreateWorkspaceRequest {
+    root: PathBuf,
+    name: String,
+    remote: Option<String>,
 }
 
 enum RepositoryCompletion {
@@ -1896,7 +1926,29 @@ define_class!(
     // SAFETY: AppDelegate is main-thread-only and satisfies the delegate's NSObject contract.
     unsafe impl NSControlTextEditingDelegate for AppDelegate {
         #[unsafe(method(controlTextDidChange:))]
-        fn control_text_did_change(&self, _notification: &NSNotification) {
+        fn control_text_did_change(&self, notification: &NSNotification) {
+            if let Some(object) = notification.object() {
+                let name = self.ivars().workspace_create_name.borrow().clone();
+                if let Some(name) = name.as_ref()
+                    && std::ptr::eq(
+                        &*object,
+                        (&**name as *const NSTextField).cast::<AnyObject>(),
+                    )
+                {
+                    self.workspace_create_name_did_change(name);
+                    return;
+                }
+                let remote = self.ivars().workspace_create_remote.borrow().clone();
+                if let Some(remote) = remote.as_ref()
+                    && std::ptr::eq(
+                        &*object,
+                        (&**remote as *const NSTextField).cast::<AnyObject>(),
+                    )
+                {
+                    self.workspace_create_remote_did_change(remote);
+                    return;
+                }
+            }
             if let Some(composer) = self.ivars().commit_composer.get() {
                 composer.clear_completion();
                 composer.refresh_action_state();
@@ -4831,7 +4883,22 @@ define_class!(
             if let Some(popover) = self.ivars().workspace_popover.get() {
                 popover.close();
             }
-            self.show_open_workspace_panel();
+            self.show_create_workspace_dialog();
+        }
+
+        #[unsafe(method(workspaceCreateNameChanged:))]
+        fn workspace_create_name_changed(&self, sender: &NSTextField) {
+            self.workspace_create_name_did_change(sender);
+        }
+
+        #[unsafe(method(workspaceCreateRemoteChanged:))]
+        fn workspace_create_remote_changed(&self, sender: &NSTextField) {
+            self.workspace_create_remote_did_change(sender);
+        }
+
+        #[unsafe(method(submitWorkspaceCreation:))]
+        fn submit_workspace_creation_action(&self, _sender: &NSButton) {
+            self.submit_workspace_creation();
         }
 
         #[unsafe(method(openWorkspace:))]
@@ -8653,6 +8720,13 @@ impl AppDelegate {
         }
         log::info!("native AppKit shutdown preparation started");
         self.cancel_commit_message_generation();
+        self.ivars().workspace_create_request_id.set(
+            self.ivars()
+                .workspace_create_request_id
+                .get()
+                .wrapping_add(1),
+        );
+        self.ivars().workspace_create_in_progress.set(false);
         if let Some(timer) = self.ivars().toast_timer.borrow_mut().take() {
             timer.invalidate();
         }
@@ -13297,6 +13371,10 @@ impl AppDelegate {
             log::warn!("workspace selection index out of range index={index}");
             return;
         };
+        self.prompt_workspace_open(workspace, None);
+    }
+
+    fn prompt_workspace_open(&self, workspace: WorkspaceEntry, message: Option<String>) {
         if let Some(popover) = self.ivars().workspace_popover.get() {
             popover.close();
         }
@@ -13317,6 +13395,13 @@ impl AppDelegate {
         let completion = RcBlock::new(move |response| {
             if response == NSAlertFirstButtonReturn {
                 delegate.activate_workspace_here(workspace.clone());
+                if let Some(message) = message
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    delegate.show_native_toast(message);
+                }
             } else if response == NSAlertSecondButtonReturn {
                 delegate.open_workspace_in_new_window(&workspace.workspace);
             }
@@ -13431,7 +13516,7 @@ impl AppDelegate {
             NSButton::buttonWithImage_target_action(
                 &NSImage::imageWithSystemSymbolName_accessibilityDescription(
                     &NSString::from_str("plus"),
-                    Some(&NSString::from_str("Open workspace")),
+                    Some(&NSString::from_str("Create workspace")),
                 )
                 .expect("macOS 14 provides the plus SF Symbol"),
                 Some(self),
@@ -13448,11 +13533,15 @@ impl AppDelegate {
         ));
         add.setBezelStyle(NSBezelStyle::Circular);
         add.setControlSize(NSControlSize::Regular);
-        add.setToolTip(Some(&NSString::from_str("Open workspace")));
+        add.setToolTip(Some(&NSString::from_str("Create workspace")));
         add.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
         );
         root.addSubview(&add);
+        self.ivars()
+            .workspace_add_button
+            .set(add)
+            .expect("workspace add button is initialized once");
 
         let table = NSTableView::initWithFrame(
             NSTableView::alloc(mtm),
@@ -22026,6 +22115,451 @@ impl AppDelegate {
         }
     }
 
+    fn workspace_create_name_did_change(&self, sender: &NSTextField) {
+        if !self.ivars().workspace_create_updating_name.get() {
+            self.ivars()
+                .workspace_create_auto_name
+                .set(sender.stringValue().to_string().trim().is_empty());
+        }
+        self.update_workspace_create_button();
+    }
+
+    fn workspace_create_remote_did_change(&self, sender: &NSTextField) {
+        let Some(name) = self.ivars().workspace_create_name.borrow().clone() else {
+            return;
+        };
+        if self.ivars().workspace_create_auto_name.get()
+            || name.stringValue().to_string().trim().is_empty()
+        {
+            let derived = native_workspace_name_from_remote(&sender.stringValue().to_string())
+                .unwrap_or_default();
+            self.ivars().workspace_create_updating_name.set(true);
+            name.setStringValue(&NSString::from_str(&derived));
+            self.ivars().workspace_create_updating_name.set(false);
+            self.ivars().workspace_create_auto_name.set(true);
+        }
+        self.update_workspace_create_button();
+    }
+
+    fn update_workspace_create_button(&self) {
+        let Some(button) = self.ivars().workspace_create_button.borrow().clone() else {
+            return;
+        };
+        let has_explicit_name = self
+            .ivars()
+            .workspace_create_name
+            .borrow()
+            .as_ref()
+            .is_some_and(|field| !field.stringValue().to_string().trim().is_empty());
+        let has_derived_name = self
+            .ivars()
+            .workspace_create_remote
+            .borrow()
+            .as_ref()
+            .and_then(|field| native_workspace_name_from_remote(&field.stringValue().to_string()))
+            .is_some();
+        button.setEnabled(
+            !self.ivars().workspace_create_in_progress.get()
+                && self.ivars().workspace_create_has_root.get()
+                && (has_explicit_name || has_derived_name),
+        );
+    }
+
+    fn show_create_workspace_dialog(&self) {
+        if self.ivars().workspace_create_form.borrow().is_some() {
+            return;
+        }
+        let Some(window) = self.ivars().window.get() else {
+            return;
+        };
+        let roots = craic_config::load()
+            .workspace_roots
+            .into_iter()
+            .filter_map(|root| {
+                root.provider.is_local().then(|| {
+                    craic_config::expand_config_path_for_ui(&root.path)
+                        .map(|path| path.canonicalize().unwrap_or(path))
+                })?
+            })
+            .collect::<Vec<_>>();
+
+        let alert = NSAlert::new(self.mtm());
+        alert.setMessageText(&NSString::from_str("Create Workspace"));
+        alert.setInformativeText(&NSString::from_str(
+            "Create an empty workspace or clone a Git repository into a configured local root.",
+        ));
+        let create = alert.addButtonWithTitle(&NSString::from_str("Create"));
+        let cancel = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        unsafe {
+            create.setTarget(Some(self));
+            create.setAction(Some(sel!(submitWorkspaceCreation:)));
+        }
+
+        let accessory = NSView::initWithFrame(
+            NSView::alloc(self.mtm()),
+            NSRect::new(NSPoint::ZERO, NSSize::new(440.0, 172.0)),
+        );
+        let root_label =
+            NSTextField::labelWithString(&NSString::from_str("Workspace Root"), self.mtm());
+        root_label.setFrame(NSRect::new(
+            NSPoint::new(0.0, 148.0),
+            NSSize::new(130.0, 18.0),
+        ));
+        accessory.addSubview(&root_label);
+        let root = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(self.mtm()),
+            NSRect::new(NSPoint::new(138.0, 142.0), NSSize::new(302.0, 28.0)),
+            false,
+        );
+        if roots.is_empty() {
+            root.addItemWithTitle(&NSString::from_str("No configured local roots"));
+            root.setEnabled(false);
+        } else {
+            for path in &roots {
+                root.addItemWithTitle(&NSString::from_str(&path.display().to_string()));
+            }
+        }
+        root.setToolTip(Some(&NSString::from_str("Configured local workspace root")));
+        accessory.addSubview(&root);
+
+        let name_label =
+            NSTextField::labelWithString(&NSString::from_str("Repository Name"), self.mtm());
+        name_label.setFrame(NSRect::new(
+            NSPoint::new(0.0, 106.0),
+            NSSize::new(130.0, 18.0),
+        ));
+        accessory.addSubview(&name_label);
+        let name = NSTextField::initWithFrame(
+            NSTextField::alloc(self.mtm()),
+            NSRect::new(NSPoint::new(138.0, 100.0), NSSize::new(302.0, 26.0)),
+        );
+        name.setPlaceholderString(Some(&NSString::from_str("Repository name")));
+        unsafe {
+            name.setTarget(Some(self));
+            name.setAction(Some(sel!(workspaceCreateNameChanged:)));
+            name.setDelegate(Some(ProtocolObject::from_ref(self)));
+        }
+        accessory.addSubview(&name);
+
+        let remote_label =
+            NSTextField::labelWithString(&NSString::from_str("Remote Git Source"), self.mtm());
+        remote_label.setFrame(NSRect::new(
+            NSPoint::new(0.0, 64.0),
+            NSSize::new(130.0, 18.0),
+        ));
+        accessory.addSubview(&remote_label);
+        let remote = NSTextField::initWithFrame(
+            NSTextField::alloc(self.mtm()),
+            NSRect::new(NSPoint::new(138.0, 58.0), NSSize::new(302.0, 26.0)),
+        );
+        remote.setPlaceholderString(Some(&NSString::from_str("Optional Git URL")));
+        remote.setToolTip(Some(&NSString::from_str(
+            "Optional remote repository to clone",
+        )));
+        unsafe {
+            remote.setTarget(Some(self));
+            remote.setAction(Some(sel!(workspaceCreateRemoteChanged:)));
+            remote.setDelegate(Some(ProtocolObject::from_ref(self)));
+        }
+        accessory.addSubview(&remote);
+        let spinner = NSProgressIndicator::initWithFrame(
+            NSProgressIndicator::alloc(self.mtm()),
+            NSRect::new(NSPoint::new(138.0, 12.0), NSSize::new(16.0, 16.0)),
+        );
+        spinner.setStyle(NSProgressIndicatorStyle::Spinning);
+        spinner.setControlSize(NSControlSize::Small);
+        spinner.setIndeterminate(true);
+        spinner.setDisplayedWhenStopped(false);
+        spinner.setHidden(true);
+        accessory.addSubview(&spinner);
+        let status = NSTextField::labelWithString(&NSString::new(), self.mtm());
+        status.setFrame(NSRect::new(
+            NSPoint::new(162.0, 10.0),
+            NSSize::new(278.0, 20.0),
+        ));
+        status.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        status.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        status.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        accessory.addSubview(&status);
+        alert.setAccessoryView(Some(&accessory));
+
+        self.ivars().workspace_create_auto_name.set(true);
+        self.ivars().workspace_create_updating_name.set(false);
+        self.ivars()
+            .workspace_create_has_root
+            .set(!roots.is_empty());
+        self.ivars()
+            .workspace_create_name
+            .replace(Some(name.clone()));
+        self.ivars()
+            .workspace_create_remote
+            .replace(Some(remote.clone()));
+        self.ivars().workspace_create_root.replace(Some(root));
+        self.ivars().workspace_create_roots.replace(roots);
+        self.ivars()
+            .workspace_create_button
+            .replace(Some(create.clone()));
+        self.ivars()
+            .workspace_create_cancel_button
+            .replace(Some(cancel));
+        self.ivars().workspace_create_spinner.replace(Some(spinner));
+        self.ivars().workspace_create_status.replace(Some(status));
+        self.ivars()
+            .workspace_create_pending_success
+            .borrow_mut()
+            .take();
+        self.ivars()
+            .workspace_create_form
+            .replace(Some(alert.clone()));
+        create.setEnabled(false);
+        let delegate = self.retain();
+        let completion = RcBlock::new(move |response| {
+            let success = delegate
+                .ivars()
+                .workspace_create_pending_success
+                .borrow_mut()
+                .take();
+            delegate.ivars().workspace_create_in_progress.set(false);
+            if let Some(add) = delegate.ivars().workspace_add_button.get() {
+                add.setEnabled(true);
+            }
+            delegate.ivars().workspace_create_name.borrow_mut().take();
+            delegate.ivars().workspace_create_remote.borrow_mut().take();
+            delegate.ivars().workspace_create_root.borrow_mut().take();
+            delegate.ivars().workspace_create_roots.borrow_mut().clear();
+            delegate.ivars().workspace_create_button.borrow_mut().take();
+            delegate
+                .ivars()
+                .workspace_create_cancel_button
+                .borrow_mut()
+                .take();
+            delegate
+                .ivars()
+                .workspace_create_spinner
+                .borrow_mut()
+                .take();
+            delegate.ivars().workspace_create_status.borrow_mut().take();
+            delegate.ivars().workspace_create_form.borrow_mut().take();
+            if response == NSAlertFirstButtonReturn
+                && let Some((path, message)) = success
+            {
+                delegate.apply_workspace_creation_success(path, message);
+            }
+        });
+        alert.beginSheetModalForWindow_completionHandler(window, Some(&completion));
+        window.makeFirstResponder(Some(&name));
+    }
+
+    fn submit_workspace_creation(&self) {
+        if self.ivars().workspace_create_in_progress.get() {
+            return;
+        }
+        let (Some(root), Some(name), Some(remote)) = (
+            self.ivars().workspace_create_root.borrow().clone(),
+            self.ivars().workspace_create_name.borrow().clone(),
+            self.ivars().workspace_create_remote.borrow().clone(),
+        ) else {
+            return;
+        };
+        let Ok(root_index) = usize::try_from(root.indexOfSelectedItem()) else {
+            self.set_workspace_create_status("Choose a workspace root.", true);
+            return;
+        };
+        let Some(root) = self
+            .ivars()
+            .workspace_create_roots
+            .borrow()
+            .get(root_index)
+            .cloned()
+        else {
+            self.set_workspace_create_status("Choose a configured local workspace root.", true);
+            return;
+        };
+        match native_create_workspace_request(
+            root,
+            &name.stringValue().to_string(),
+            &remote.stringValue().to_string(),
+        ) {
+            Ok(request) => self.start_workspace_creation(request),
+            Err(error) => self.set_workspace_create_status(&error, true),
+        }
+    }
+
+    fn set_workspace_create_status(&self, message: &str, is_error: bool) {
+        let Some(status) = self.ivars().workspace_create_status.borrow().clone() else {
+            return;
+        };
+        status.setStringValue(&NSString::from_str(message));
+        let color = if is_error {
+            NSColor::systemRedColor()
+        } else {
+            NSColor::secondaryLabelColor()
+        };
+        status.setTextColor(Some(&color));
+        status.setToolTip(
+            (!message.is_empty())
+                .then(|| NSString::from_str(message))
+                .as_deref(),
+        );
+    }
+
+    fn start_workspace_creation(&self, request: NativeCreateWorkspaceRequest) {
+        if self.ivars().workspace_create_in_progress.replace(true) {
+            return;
+        }
+        let request_id = self
+            .ivars()
+            .workspace_create_request_id
+            .get()
+            .wrapping_add(1);
+        self.ivars().workspace_create_request_id.set(request_id);
+        if let Some(add) = self.ivars().workspace_add_button.get() {
+            add.setEnabled(false);
+        }
+        if let Some(root) = self.ivars().workspace_create_root.borrow().as_ref() {
+            root.setEnabled(false);
+        }
+        if let Some(name) = self.ivars().workspace_create_name.borrow().as_ref() {
+            name.setEnabled(false);
+        }
+        if let Some(remote) = self.ivars().workspace_create_remote.borrow().as_ref() {
+            remote.setEnabled(false);
+        }
+        if let Some(create) = self.ivars().workspace_create_button.borrow().as_ref() {
+            create.setTitle(&NSString::from_str("Creating…"));
+            create.setEnabled(false);
+        }
+        if let Some(cancel) = self
+            .ivars()
+            .workspace_create_cancel_button
+            .borrow()
+            .as_ref()
+        {
+            cancel.setEnabled(false);
+        }
+        if let Some(spinner) = self.ivars().workspace_create_spinner.borrow().as_ref() {
+            spinner.setHidden(false);
+            unsafe { spinner.startAnimation(None) };
+        }
+        self.set_workspace_create_status("Creating workspace…", false);
+        let Some(requests) = self.ivars().frontend_requests.get() else {
+            self.finish_workspace_creation(
+                request_id,
+                Err("The workspace creation service is unavailable.".to_string()),
+            );
+            return;
+        };
+        if let Err(error) = requests.try_send(FrontendRequest::CreateWorkspace {
+            request_id,
+            request,
+        }) {
+            self.finish_workspace_creation(
+                request_id,
+                Err(format!("Workspace creation could not be queued: {error}")),
+            );
+        }
+    }
+
+    fn finish_workspace_creation(
+        &self,
+        request_id: u64,
+        result: Result<(PathBuf, String), String>,
+    ) {
+        if self.ivars().workspace_create_request_id.get() != request_id
+            || !self.ivars().workspace_create_in_progress.replace(false)
+        {
+            return;
+        }
+        let (path, message) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(add) = self.ivars().workspace_add_button.get() {
+                    add.setEnabled(true);
+                }
+                if let Some(root) = self.ivars().workspace_create_root.borrow().as_ref() {
+                    root.setEnabled(true);
+                }
+                if let Some(name) = self.ivars().workspace_create_name.borrow().as_ref() {
+                    name.setEnabled(true);
+                }
+                if let Some(remote) = self.ivars().workspace_create_remote.borrow().as_ref() {
+                    remote.setEnabled(true);
+                }
+                if let Some(cancel) = self
+                    .ivars()
+                    .workspace_create_cancel_button
+                    .borrow()
+                    .as_ref()
+                {
+                    cancel.setEnabled(true);
+                }
+                if let Some(create) = self.ivars().workspace_create_button.borrow().as_ref() {
+                    create.setTitle(&NSString::from_str("Create"));
+                }
+                if let Some(spinner) = self.ivars().workspace_create_spinner.borrow().as_ref() {
+                    unsafe { spinner.stopAnimation(None) };
+                    spinner.setHidden(true);
+                }
+                self.set_workspace_create_status(&error, true);
+                self.update_workspace_create_button();
+                return;
+            }
+        };
+        self.ivars()
+            .workspace_create_pending_success
+            .replace(Some((path, message)));
+        let Some(alert) = self.ivars().workspace_create_form.borrow().clone() else {
+            return;
+        };
+        if let Some(window) = self.ivars().window.get() {
+            window.endSheet_returnCode(&alert.window(), NSAlertFirstButtonReturn);
+        }
+    }
+
+    fn apply_workspace_creation_success(&self, path: PathBuf, message: String) {
+        let workspace = craic_config::ConfiguredWorkspace::local(path.to_string_lossy());
+        let entry = WorkspaceEntry {
+            label: workspace.label(),
+            workspace,
+        };
+        if !self
+            .ivars()
+            .workspaces
+            .borrow()
+            .iter()
+            .any(|candidate| candidate.selection_id() == entry.selection_id())
+        {
+            self.ivars().workspaces.borrow_mut().push(entry.clone());
+            self.ivars()
+                .workspaces
+                .borrow_mut()
+                .sort_by_key(|candidate| candidate.label.to_lowercase());
+            self.queue_workspace_metadata(vec![entry.clone()]);
+        }
+        let preferred = self
+            .ivars()
+            .active_workspace_id
+            .borrow()
+            .as_deref()
+            .and_then(|workspace_id| {
+                self.ivars()
+                    .workspaces
+                    .borrow()
+                    .iter()
+                    .find(|candidate| candidate.selection_id() == workspace_id)
+                    .map(|candidate| candidate.workspace.clone())
+            });
+        let filter = self
+            .ivars()
+            .workspace_search
+            .get()
+            .map(|search| search.stringValue().to_string())
+            .unwrap_or_default();
+        self.refresh_workspace_results(&filter);
+        self.prompt_workspace_open(entry, Some(message));
+        self.request_workspace_discovery(preferred, false);
+    }
+
     fn show_open_workspace_panel(&self) {
         let Some(requests) = self.ivars().frontend_requests.get() else {
             log::warn!("workspace picker ignored because the UI effect bridge is unavailable");
@@ -22416,6 +22950,9 @@ impl AppDelegate {
                 if let Some(window) = self.ivars().window.get() {
                     alert.beginSheetModalForWindow_completionHandler(window, None);
                 }
+            }
+            FrontendCompletion::WorkspaceCreated { request_id, result } => {
+                self.finish_workspace_creation(request_id, result)
             }
             FrontendCompletion::WorkspaceMetadata {
                 workspace_id,
@@ -26647,6 +27184,109 @@ impl AppDelegate {
     }
 }
 
+fn native_create_workspace_request(
+    root: PathBuf,
+    name: &str,
+    remote: &str,
+) -> Result<NativeCreateWorkspaceRequest, String> {
+    let remote = remote.trim();
+    let remote = (!remote.is_empty()).then(|| remote.to_string());
+    let name = if name.trim().is_empty() {
+        remote
+            .as_deref()
+            .and_then(native_workspace_name_from_remote)
+            .unwrap_or_default()
+    } else {
+        name.trim().to_string()
+    };
+    let name = native_validated_workspace_name(&name)?;
+    Ok(NativeCreateWorkspaceRequest { root, name, remote })
+}
+
+fn native_workspace_name_from_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches('/');
+    if remote.is_empty() {
+        return None;
+    }
+    let remote = remote.strip_suffix(".git").unwrap_or(remote);
+    let name = remote.rsplit(['/', ':']).next().unwrap_or(remote);
+    native_validated_workspace_name(name).ok()
+}
+
+fn native_validated_workspace_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Repository name is required.".to_string());
+    }
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err("Repository name must be a single folder name.".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn create_native_workspace(
+    request: NativeCreateWorkspaceRequest,
+) -> Result<(PathBuf, String), String> {
+    if !request.root.is_dir() {
+        return Err(format!(
+            "Workspace root is not a directory: {}",
+            request.root.display()
+        ));
+    }
+    let destination = request.root.join(&request.name);
+    if destination.exists() {
+        if !destination.is_dir() {
+            return Err(format!(
+                "Destination already exists and is not a folder: {}",
+                destination.display()
+            ));
+        }
+        let mut entries = std::fs::read_dir(&destination).map_err(|error| {
+            format!(
+                "Could not inspect destination folder {}: {error}",
+                destination.display()
+            )
+        })?;
+        if entries.next().is_some() {
+            return Err(format!(
+                "Destination folder is not empty: {}",
+                destination.display()
+            ));
+        }
+    }
+
+    if let Some(remote) = request.remote {
+        let provider = LocalProvider::new();
+        let workspace = LocalProvider::workspace_for_path(&request.root);
+        let shell = provider
+            .shell(&workspace)
+            .ok_or_else(|| "Local shell access is unavailable.".to_string())?;
+        let message = craic_vcs::git::clone_repository_with_shell(
+            shell,
+            workspace.root,
+            &remote,
+            &request.name,
+        )?;
+        return Ok((destination, message));
+    }
+
+    log::info!(
+        "native workspace folder create start path={}",
+        destination.display()
+    );
+    std::fs::create_dir_all(&destination).map_err(|error| {
+        format!(
+            "Could not create workspace folder {}: {error}",
+            destination.display()
+        )
+    })?;
+    log::info!(
+        "native workspace folder create complete path={}",
+        destination.display()
+    );
+    Ok((destination, "Workspace created.".to_string()))
+}
+
 fn load_workspace_snapshot(
     workspace: &craic_config::ConfiguredWorkspace,
 ) -> Result<(Arc<GitRepoHandle>, WorkspaceSnapshot), String> {
@@ -28443,6 +29083,22 @@ pub fn run() {
                         };
                         if frontend_task_completion_tx
                             .send(FrontendCompletion::OpenWorkspace(result))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    FrontendRequest::CreateWorkspace {
+                        request_id,
+                        request,
+                    } => {
+                        let creation =
+                            tokio::task::spawn_blocking(move || create_native_workspace(request));
+                        let result = creation.await.unwrap_or_else(|error| {
+                            Err(format!("Workspace creation did not complete: {error}"))
+                        });
+                        if frontend_task_completion_tx
+                            .send(FrontendCompletion::WorkspaceCreated { request_id, result })
                             .is_err()
                         {
                             break;
