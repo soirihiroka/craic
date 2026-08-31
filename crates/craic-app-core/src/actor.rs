@@ -465,31 +465,53 @@ pub(crate) async fn run(
                 }
                 false
             }
-            AppCommand::RoutePageCommand(command) => {
-                let target = command.page.clone().or_else(|| state.active_page.clone());
-                if let Some(page) = target {
-                    if pages.is_refreshing(&page) {
-                        log::debug!(
-                            "coalesced routed page command page={} action={}",
-                            page.as_str(),
-                            command.action.as_str()
+            AppCommand::RoutePageCommand(command) => match command.action.as_str() {
+                "refresh" => {
+                    let target = command.page.clone().or_else(|| state.active_page.clone());
+                    if let Some(page) = target {
+                        if pages.is_refreshing(&page) {
+                            log::debug!(
+                                "coalesced routed page command page={} action={}",
+                                page.as_str(),
+                                command.action.as_str()
+                            );
+                            false
+                        } else {
+                            let request =
+                                pages.begin(command, page.clone(), state.workspace_generation);
+                            set_page_refreshing(&mut state, &page, true);
+                            page_events.push(pages.event(&page));
+                            page_events.push(UiEvent::PageServiceRequest(request));
+                            true
+                        }
+                    } else {
+                        log::warn!(
+                            "page command ignored because it has no explicit target and no page is active"
+                        );
+                        false
+                    }
+                }
+                "open-file-location" => {
+                    let files = PageId::new("files");
+                    if command.page.as_ref() != Some(&files) {
+                        log::warn!(
+                            "open-file-location page command ignored because target is not Files target={}",
+                            command.page.as_ref().map(PageId::as_str).unwrap_or("none")
                         );
                         false
                     } else {
-                        let request =
-                            pages.begin(command, page.clone(), state.workspace_generation);
-                        set_page_refreshing(&mut state, &page, true);
-                        page_events.push(pages.event(&page));
-                        page_events.push(UiEvent::PageServiceRequest(request));
+                        let mut command = command;
+                        command.page = Some(files.clone());
+                        state.active_page = Some(files);
+                        page_events.push(UiEvent::PageCommand(command));
                         true
                     }
-                } else {
-                    log::warn!(
-                        "page command ignored because it has no explicit target and no page is active"
-                    );
+                }
+                action => {
+                    log::warn!("unknown routed page command ignored action={action}");
                     false
                 }
-            }
+            },
             AppCommand::ShutdownRequested => {
                 state.shutting_down = true;
                 root_cancellation.cancel();

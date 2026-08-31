@@ -25,4 +25,5 @@ moka.workspace = true
 pango.workspace = true
 pangocairo.workspace = true
 rusqlite.workspace = true
+serde_json.workspace = true
 tokio.workspace = true

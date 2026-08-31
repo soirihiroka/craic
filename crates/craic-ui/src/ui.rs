@@ -317,7 +317,14 @@ pub fn build_ui(
             let state_slot = state_slot.clone();
             move |command| {
                 if let Some(state) = state_slot.borrow().upgrade() {
-                    dispatch_page_command(&state, command);
+                    match command {
+                        PageCommand::OpenFileLocation { path, line, column } => {
+                            route_open_file_location(&state, path, line, column);
+                        }
+                        command => {
+                            dispatch_page_command(&state, command);
+                        }
+                    }
                 }
             }
         }),
@@ -421,14 +428,8 @@ pub fn build_ui(
     startup.mark("apply-workspace-color");
 
     if let Some(location) = startup_open_location {
-        let result = dispatch_page_command(
-            &state,
-            PageCommand::OpenFileLocation {
-                path: location.path,
-                line: location.line,
-                column: location.column,
-            },
-        );
+        let result =
+            route_open_file_location(&state, location.path, location.line, location.column);
         if result == PageCommandResult::Ignored {
             log::warn!("startup file location was not handled");
             activate_page(&state, 0);
@@ -1161,7 +1162,12 @@ impl content::RepositoryActionContext for Rc<AppState> {
     }
 
     fn dispatch_command(&self, command: PageCommand) -> PageCommandResult {
-        dispatch_page_command(self, command)
+        match command {
+            PageCommand::OpenFileLocation { path, line, column } => {
+                route_open_file_location(self, path, line, column)
+            }
+            command => dispatch_page_command(self, command),
+        }
     }
 }
 
@@ -1722,6 +1728,7 @@ fn apply_app_core_event(state: &Rc<AppState>, event: UiEvent) {
             revision,
             state: page_state,
         } => apply_app_core_page_state(state, &page, revision, &page_state),
+        UiEvent::PageCommand(command) => apply_app_core_page_command(state, command),
         UiEvent::PageServiceRequest(request) => route_app_core_page_service(state, request),
         UiEvent::WorkspaceRefreshRequest(request) => execute_workspace_refresh(state, request),
         UiEvent::Effect(request) => {
@@ -1731,6 +1738,68 @@ fn apply_app_core_event(state: &Rc<AppState>, event: UiEvent) {
             );
         }
         UiEvent::ShutdownReady => log::debug!("GTK app-core shutdown ready"),
+    }
+}
+
+fn apply_app_core_page_command(state: &Rc<AppState>, command: CorePageCommand) {
+    if command.page.as_ref().map(CorePageId::as_str) != Some("files")
+        || command.action.as_str() != "open-file-location"
+    {
+        log::warn!(
+            "GTK ignored unsupported app-core page command page={} action={}",
+            command
+                .page
+                .as_ref()
+                .map(CorePageId::as_str)
+                .unwrap_or("none"),
+            command.action.as_str()
+        );
+        return;
+    }
+    let Some(payload) = command.payload.as_object() else {
+        log::warn!("GTK ignored malformed open-file-location payload: expected object");
+        return;
+    };
+    let Some(path) = payload.get("path").and_then(serde_json::Value::as_str) else {
+        log::warn!("GTK ignored malformed open-file-location payload: invalid path");
+        return;
+    };
+    let line = match checked_optional_usize(payload.get("line")) {
+        Ok(line) => line,
+        Err(()) => {
+            log::warn!("GTK ignored malformed open-file-location payload: invalid line");
+            return;
+        }
+    };
+    let column = match checked_optional_usize(payload.get("column")) {
+        Ok(column) => column,
+        Err(()) => {
+            log::warn!("GTK ignored malformed open-file-location payload: invalid column");
+            return;
+        }
+    };
+    if dispatch_page_command(
+        state,
+        PageCommand::OpenFileLocation {
+            path: path.to_string(),
+            line,
+            column,
+        },
+    ) == PageCommandResult::Ignored
+    {
+        log::warn!("GTK Files page ignored app-core open-file-location command");
+    }
+}
+
+fn checked_optional_usize(value: Option<&serde_json::Value>) -> Result<Option<usize>, ()> {
+    match value {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .map(Some)
+            .ok_or(()),
+        None => Err(()),
     }
 }
 
@@ -1849,6 +1918,29 @@ fn refresh_active_page(state: &Rc<AppState>) {
         }))
     {
         log::warn!("GTK active page refresh queue rejected command={command:?}");
+    }
+}
+
+fn route_open_file_location(
+    state: &AppState,
+    path: String,
+    line: Option<usize>,
+    column: Option<usize>,
+) -> PageCommandResult {
+    let command = AppCommand::RoutePageCommand(CorePageCommand {
+        page: Some(CorePageId::new("files")),
+        action: ActionId::new("open-file-location"),
+        payload: serde_json::json!({
+            "path": path,
+            "line": line,
+            "column": column,
+        }),
+    });
+    if let Err(command) = state.app_handle.try_send(command) {
+        log::warn!("GTK open-file-location queue rejected command={command:?}");
+        PageCommandResult::Ignored
+    } else {
+        PageCommandResult::HandledAndActivate
     }
 }
 

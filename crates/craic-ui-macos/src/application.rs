@@ -42,10 +42,10 @@ use craic_agent::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsage
 use craic_agent::ai_commit::CommitMessageDraft;
 use craic_agent::remote_media::{self, RemoteMedia, RemoteMediaKind};
 use craic_app_core::{
-    AppCommand, AppHandle, ApplicationRuntime, ApplicationViewState, Badge, PAGE_DESCRIPTORS,
-    PageId, PageServiceRequest, PageViewState, RefreshScope, RuntimeConfig, ServiceCompletion,
-    UiEvent, WorkspaceId, WorkspaceRefreshCompletion, WorkspaceRefreshIdentity,
-    WorkspaceRefreshRequest, WorkspaceSelection, page_descriptor,
+    ActionId, AppCommand, AppHandle, ApplicationRuntime, ApplicationViewState, Badge,
+    PAGE_DESCRIPTORS, PageCommand, PageId, PageServiceRequest, PageViewState, RefreshScope,
+    RuntimeConfig, ServiceCompletion, UiEvent, WorkspaceId, WorkspaceRefreshCompletion,
+    WorkspaceRefreshIdentity, WorkspaceRefreshRequest, WorkspaceSelection, page_descriptor,
 };
 use craic_file_support::{FileProbe, FileRole, resolve as resolve_file_support};
 use craic_language::markdown_lint::MarkdownLintIssue;
@@ -5412,7 +5412,7 @@ define_class!(
             let Some(path) = self.changed_file_path_for_tag(sender.tag()) else {
                 return;
             };
-            self.open_workspace_file_location(path, None, None);
+            self.enqueue_workspace_file_location(path, None, None);
         }
 
         #[unsafe(method(addChangedIgnorePattern:))]
@@ -9094,7 +9094,7 @@ impl AppDelegate {
                 log::info!(
                     "native Codex file link opening workspace path={relative} line={line:?} column={column:?}"
                 );
-                self.open_workspace_file_location(relative, line, column);
+                self.enqueue_workspace_file_location(relative, line, column);
             }
             Ok(TerminalLinkTarget::External(path)) => {
                 self.confirm_open_external_agent_file(&path.absolute, line, column);
@@ -9106,7 +9106,32 @@ impl AppDelegate {
         }
     }
 
-    fn open_workspace_file_location(
+    fn enqueue_workspace_file_location(
+        &self,
+        path: String,
+        line: Option<usize>,
+        column: Option<usize>,
+    ) {
+        let Some(handle) = self.ivars().app_handle.get() else {
+            log::warn!(
+                "native open-file-location ignored because application actor is unavailable"
+            );
+            return;
+        };
+        if let Err(command) = handle.try_send(AppCommand::RoutePageCommand(PageCommand {
+            page: Some(PageId::new("files")),
+            action: ActionId::new("open-file-location"),
+            payload: serde_json::json!({
+                "path": path,
+                "line": line,
+                "column": column,
+            }),
+        })) {
+            log::warn!("native open-file-location queue rejected command={command:?}");
+        }
+    }
+
+    fn apply_workspace_file_location(
         &self,
         path: String,
         line: Option<usize>,
@@ -9131,12 +9156,7 @@ impl AppDelegate {
             }
             files.dirty.set(true);
         }
-        let Some(handle) = self.ivars().app_handle.get() else {
-            return;
-        };
-        if let Err(command) = handle.try_send(AppCommand::ActivatePage(PageId::new("files"))) {
-            log::warn!("show-in-Files page activation rejected command={command:?}");
-        } else if let Some(index) = PAGE_DESCRIPTORS
+        if let Some(index) = PAGE_DESCRIPTORS
             .iter()
             .position(|descriptor| descriptor.id == "files")
         {
@@ -26978,6 +26998,7 @@ impl AppDelegate {
                 revision,
                 state,
             } => self.apply_page_state(&page, revision, &state),
+            UiEvent::PageCommand(command) => self.apply_page_command(command),
             UiEvent::PageServiceRequest(request) => self.apply_page_service_request(request),
             UiEvent::WorkspaceRefreshRequest(request) => self.request_workspace_refresh(request),
             UiEvent::Effect(request) => {
@@ -26997,6 +27018,42 @@ impl AppDelegate {
                 log::info!("native UI received application shutdown readiness");
             }
         }
+    }
+
+    fn apply_page_command(&self, command: PageCommand) {
+        if command.page.as_ref().map(PageId::as_str) != Some("files")
+            || command.action.as_str() != "open-file-location"
+        {
+            log::warn!(
+                "native ignored unsupported app-core page command page={} action={}",
+                command.page.as_ref().map(PageId::as_str).unwrap_or("none"),
+                command.action.as_str()
+            );
+            return;
+        }
+        let Some(payload) = command.payload.as_object() else {
+            log::warn!("native ignored malformed open-file-location payload: expected object");
+            return;
+        };
+        let Some(path) = payload.get("path").and_then(serde_json::Value::as_str) else {
+            log::warn!("native ignored malformed open-file-location payload: invalid path");
+            return;
+        };
+        let line = match checked_optional_usize(payload.get("line")) {
+            Ok(line) => line,
+            Err(()) => {
+                log::warn!("native ignored malformed open-file-location payload: invalid line");
+                return;
+            }
+        };
+        let column = match checked_optional_usize(payload.get("column")) {
+            Ok(column) => column,
+            Err(()) => {
+                log::warn!("native ignored malformed open-file-location payload: invalid column");
+                return;
+            }
+        };
+        self.apply_workspace_file_location(path.to_string(), line, column);
     }
 
     fn apply_page_state(&self, page: &PageId, revision: u64, state: &PageViewState) {
@@ -27761,6 +27818,18 @@ impl AppDelegate {
             self.begin_workspace_transition(&workspace_id);
             self.request_repository_load(selected.workspace);
         }
+    }
+}
+
+fn checked_optional_usize(value: Option<&serde_json::Value>) -> Result<Option<usize>, ()> {
+    match value {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .map(Some)
+            .ok_or(()),
+        None => Err(()),
     }
 }
 

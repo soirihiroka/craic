@@ -845,6 +845,7 @@ dependencies = [
  "pango",
  "pangocairo",
  "rusqlite",
+ "serde_json",
  "tokio",
 ]
 

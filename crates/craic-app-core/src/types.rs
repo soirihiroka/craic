@@ -254,6 +254,7 @@ pub enum UiEvent {
         revision: u64,
         state: Arc<PageViewState>,
     },
+    PageCommand(PageCommand),
     PageServiceRequest(PageServiceRequest),
     WorkspaceRefreshRequest(WorkspaceRefreshRequest),
     Effect(UiEffectRequest),
