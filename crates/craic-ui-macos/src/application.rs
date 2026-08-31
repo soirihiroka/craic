@@ -924,12 +924,15 @@ pub(crate) struct AppDelegateIvars {
     frontend_requests: OnceCell<tokio::sync::mpsc::Sender<FrontendRequest>>,
     startup_error: RefCell<Option<String>>,
     workspace_button: OnceCell<Retained<NSButton>>,
+    workspace_button_spinner: OnceCell<Retained<NSProgressIndicator>>,
     workspace_popover: OnceCell<Retained<NSPopover>>,
     workspace_search: OnceCell<Retained<NSSearchField>>,
     workspace_table: OnceCell<Retained<NSTableView>>,
     workspace_results: RefCell<Vec<usize>>,
     workspaces: RefCell<Vec<WorkspaceEntry>>,
+    workspace_discovery_loading: Cell<bool>,
     workspace_metadata: RefCell<HashMap<String, NativeWorkspaceMetadata>>,
+    workspace_metadata_pending: RefCell<HashSet<String>>,
     workspace_metadata_generation: Cell<u64>,
     workspace_metadata_requests:
         OnceCell<tokio::sync::mpsc::Sender<NativeWorkspaceMetadataRequest>>,
@@ -1395,6 +1398,7 @@ enum FrontendCompletion {
         entries: Vec<WorkspaceEntry>,
         preferred: Option<craic_config::ConfiguredWorkspace>,
     },
+    WorkspaceDiscoveryFailed(String),
     WorkspaceMetadata {
         workspace_id: String,
         generation: u64,
@@ -13247,8 +13251,13 @@ impl AppDelegate {
                     NSSize::new(width, WORKSPACE_ROW_HEIGHT),
                 ),
             );
+            let loading = self.ivars().workspace_discovery_loading.get();
             let empty = NSTextField::labelWithString(
-                &NSString::from_str("No workspaces found"),
+                &NSString::from_str(if loading {
+                    "Loading workspaces…"
+                } else {
+                    "No workspaces found"
+                }),
                 self.mtm(),
             );
             empty.setFrame(NSRect::new(
@@ -13259,6 +13268,21 @@ impl AppDelegate {
             empty.setFont(Some(&NSFont::systemFontOfSize(12.0)));
             empty.setTextColor(Some(&NSColor::secondaryLabelColor()));
             cell.addSubview(&empty);
+            if loading {
+                let spinner = NSProgressIndicator::initWithFrame(
+                    NSProgressIndicator::alloc(self.mtm()),
+                    NSRect::new(
+                        NSPoint::new((width - 170.0).max(8.0) / 2.0, 15.0),
+                        NSSize::new(16.0, 16.0),
+                    ),
+                );
+                spinner.setStyle(NSProgressIndicatorStyle::Spinning);
+                spinner.setControlSize(NSControlSize::Small);
+                spinner.setIndeterminate(true);
+                spinner.setDisplayedWhenStopped(false);
+                unsafe { spinner.startAnimation(None) };
+                cell.addSubview(&spinner);
+            }
             return Some(cell);
         };
 
@@ -13280,31 +13304,49 @@ impl AppDelegate {
             .borrow()
             .get(&workspace.selection_id())
             .cloned();
-        let symbol = metadata
-            .as_ref()
-            .map(|metadata| native_workspace_metadata_symbol(metadata.kind))
-            .unwrap_or("folder");
-        if let Some(folder) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str(symbol),
-            Some(&NSString::from_str(
-                metadata
-                    .as_ref()
-                    .map(|metadata| native_workspace_metadata_description(metadata.kind))
-                    .unwrap_or("Workspace"),
-            )),
-        ) {
-            let icon = NSImageView::imageViewWithImage(&folder, self.mtm());
-            let icon_size = 18.0;
-            icon.setFrame(NSRect::new(
-                NSPoint::new(10.0, 14.0),
-                NSSize::new(icon_size, icon_size),
-            ));
-            icon.setContentTintColor(Some(
-                workspace_color
-                    .as_deref()
-                    .unwrap_or(&NSColor::secondaryLabelColor()),
-            ));
-            cell.addSubview(&icon);
+        let metadata_loading = self
+            .ivars()
+            .workspace_metadata_pending
+            .borrow()
+            .contains(&workspace.selection_id());
+        if metadata_loading {
+            let spinner = NSProgressIndicator::initWithFrame(
+                NSProgressIndicator::alloc(self.mtm()),
+                NSRect::new(NSPoint::new(11.0, 15.0), NSSize::new(16.0, 16.0)),
+            );
+            spinner.setStyle(NSProgressIndicatorStyle::Spinning);
+            spinner.setControlSize(NSControlSize::Small);
+            spinner.setIndeterminate(true);
+            spinner.setDisplayedWhenStopped(false);
+            unsafe { spinner.startAnimation(None) };
+            cell.addSubview(&spinner);
+        } else {
+            let symbol = metadata
+                .as_ref()
+                .map(|metadata| native_workspace_metadata_symbol(metadata.kind))
+                .unwrap_or("folder");
+            if let Some(folder) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str(symbol),
+                Some(&NSString::from_str(
+                    metadata
+                        .as_ref()
+                        .map(|metadata| native_workspace_metadata_description(metadata.kind))
+                        .unwrap_or("Workspace"),
+                )),
+            ) {
+                let icon = NSImageView::imageViewWithImage(&folder, self.mtm());
+                let icon_size = 18.0;
+                icon.setFrame(NSRect::new(
+                    NSPoint::new(10.0, 14.0),
+                    NSSize::new(icon_size, icon_size),
+                ));
+                icon.setContentTintColor(Some(
+                    workspace_color
+                        .as_deref()
+                        .unwrap_or(&NSColor::secondaryLabelColor()),
+                ));
+                cell.addSubview(&icon);
+            }
         }
 
         if let Some(workspace_color) = workspace_color.as_deref() {
@@ -13400,9 +13442,24 @@ impl AppDelegate {
         if entries.is_empty() {
             return;
         }
+        let workspace_ids = entries
+            .iter()
+            .map(WorkspaceEntry::selection_id)
+            .collect::<Vec<_>>();
+        self.ivars()
+            .workspace_metadata_pending
+            .borrow_mut()
+            .extend(workspace_ids.iter().cloned());
+        self.refresh_workspace_loading_indicators();
         let generation = self.ivars().workspace_metadata_generation.get();
         let Some(requests) = self.ivars().workspace_metadata_requests.get() else {
             log::warn!("workspace metadata was not queued because its service is unavailable");
+            let mut pending = self.ivars().workspace_metadata_pending.borrow_mut();
+            for workspace_id in &workspace_ids {
+                pending.remove(workspace_id);
+            }
+            drop(pending);
+            self.refresh_workspace_loading_indicators();
             return;
         };
         if let Err(error) = requests.try_send(NativeWorkspaceMetadataRequest {
@@ -13412,6 +13469,12 @@ impl AppDelegate {
             log::warn!(
                 "workspace metadata batch queue rejected generation={generation} error={error}"
             );
+            let mut pending = self.ivars().workspace_metadata_pending.borrow_mut();
+            for workspace_id in &workspace_ids {
+                pending.remove(workspace_id);
+            }
+            drop(pending);
+            self.refresh_workspace_loading_indicators();
         }
     }
 
@@ -13434,6 +13497,10 @@ impl AppDelegate {
             );
             return;
         }
+        self.ivars()
+            .workspace_metadata_pending
+            .borrow_mut()
+            .remove(workspace_id);
         match result {
             Ok(metadata) => {
                 log::debug!(
@@ -13467,6 +13534,7 @@ impl AppDelegate {
         {
             self.apply_workspace_button_appearance(workspace);
         }
+        self.refresh_workspace_loading_indicators();
     }
 
     fn filtered_file_tree_rows(&self) -> Vec<NativeFileRow> {
@@ -21840,6 +21908,18 @@ impl AppDelegate {
             FrontendCompletion::WorkspaceEntries { entries, preferred } => {
                 self.apply_workspace_entries(entries, preferred)
             }
+            FrontendCompletion::WorkspaceDiscoveryFailed(message) => {
+                self.ivars().workspace_discovery_loading.set(false);
+                self.refresh_workspace_results("");
+                self.refresh_workspace_loading_indicators();
+                let alert = NSAlert::new(self.mtm());
+                alert.setMessageText(&NSString::from_str("Unable to Load Workspaces"));
+                alert.setInformativeText(&NSString::from_str(&message));
+                alert.addButtonWithTitle(&NSString::from_str("OK"));
+                if let Some(window) = self.ivars().window.get() {
+                    alert.beginSheetModalForWindow_completionHandler(window, None);
+                }
+            }
             FrontendCompletion::WorkspaceMetadata {
                 workspace_id,
                 generation,
@@ -21907,16 +21987,21 @@ impl AppDelegate {
         };
         let selection_id = entry.selection_id();
         let mut workspaces = self.ivars().workspaces.borrow_mut();
-        if !workspaces
+        let inserted = if !workspaces
             .iter()
             .any(|candidate| candidate.selection_id() == selection_id)
         {
             workspaces.push(entry.clone());
             workspaces.sort_by_key(|candidate| candidate.label.to_lowercase());
+            true
+        } else {
+            false
+        };
+        drop(workspaces);
+        if inserted {
             self.queue_workspace_metadata(vec![entry.clone()]);
         }
         self.apply_workspace_button_appearance(&entry);
-        drop(workspaces);
         self.refresh_workspace_results("");
 
         let Some(handle) = self.ivars().app_handle.get() else {
@@ -21933,6 +22018,59 @@ impl AppDelegate {
         self.begin_workspace_transition(&entry.selection_id());
         self.request_repository_load(entry.workspace.clone());
         self.queue_save_last_workspace(entry.workspace);
+    }
+
+    fn set_workspace_button_loading(&self, loading: bool) {
+        let Some(spinner) = self.ivars().workspace_button_spinner.get() else {
+            return;
+        };
+        if loading {
+            if let Some(button) = self.ivars().workspace_button.get() {
+                button.setImage(None);
+                button.setToolTip(Some(&NSString::from_str("Loading workspace metadata…")));
+            }
+            unsafe { spinner.startAnimation(None) };
+        } else {
+            unsafe { spinner.stopAnimation(None) };
+        }
+    }
+
+    fn refresh_workspace_loading_indicators(&self) {
+        let active = self
+            .ivars()
+            .active_workspace_id
+            .borrow()
+            .as_deref()
+            .and_then(|workspace_id| {
+                self.ivars()
+                    .workspaces
+                    .borrow()
+                    .iter()
+                    .find(|workspace| workspace.selection_id() == workspace_id)
+                    .cloned()
+            });
+        if let Some(workspace) = active.as_ref() {
+            self.apply_workspace_button_appearance(workspace);
+        } else {
+            let loading = self.ivars().workspace_discovery_loading.get();
+            if let Some(button) = self.ivars().workspace_button.get() {
+                button.setTitle(&NSString::from_str("Workspace"));
+                button.setContentTintColor(None);
+                button.setToolTip(Some(&NSString::from_str("Choose workspace")));
+                if !loading
+                    && let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                        &NSString::from_str("folder"),
+                        Some(&NSString::from_str("Workspace")),
+                    )
+                {
+                    button.setImage(Some(&image));
+                }
+            }
+            self.set_workspace_button_loading(loading);
+        }
+        if let Some(table) = self.ivars().workspace_table.get() {
+            table.reloadData();
+        }
     }
 
     fn apply_workspace_button_appearance(&self, workspace: &WorkspaceEntry) {
@@ -21976,6 +22114,13 @@ impl AppDelegate {
             "Choose workspace — {description}: {}",
             workspace.workspace.path
         ))));
+        let loading = self.ivars().workspace_discovery_loading.get()
+            || self
+                .ivars()
+                .workspace_metadata_pending
+                .borrow()
+                .contains(&workspace.selection_id());
+        self.set_workspace_button_loading(loading);
     }
 
     fn set_page_badge(&self, page_id: &str, badge: NativePageBadge) {
@@ -22148,12 +22293,40 @@ impl AppDelegate {
                         .and_then(|color| ns_color_from_hex(&color.background))
                         .as_deref(),
                 );
+                let spinner = NSProgressIndicator::initWithFrame(
+                    NSProgressIndicator::alloc(mtm),
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(16.0, 16.0)),
+                );
+                spinner.setStyle(NSProgressIndicatorStyle::Spinning);
+                spinner.setControlSize(NSControlSize::Small);
+                spinner.setIndeterminate(true);
+                spinner.setDisplayedWhenStopped(false);
+                spinner.setTranslatesAutoresizingMaskIntoConstraints(false);
+                workspace.addSubview(&spinner);
+                spinner
+                    .centerYAnchor()
+                    .constraintEqualToAnchor(&workspace.centerYAnchor())
+                    .setActive(true);
+                spinner
+                    .leadingAnchor()
+                    .constraintEqualToAnchor_constant(&workspace.leadingAnchor(), 10.0)
+                    .setActive(true);
+                spinner
+                    .widthAnchor()
+                    .constraintEqualToConstant(16.0)
+                    .setActive(true);
+                spinner
+                    .heightAnchor()
+                    .constraintEqualToConstant(16.0)
+                    .setActive(true);
                 item.setLabel(&NSString::from_str("Workspace"));
                 item.setPaletteLabel(&NSString::from_str("Workspace"));
                 item.setVisibilityPriority(NSToolbarItemVisibilityPriorityHigh);
                 item.setView(Some(&workspace));
                 if will_be_inserted && self.ivars().workspace_button.get().is_none() {
                     let _ = self.ivars().workspace_button.set(workspace);
+                    let _ = self.ivars().workspace_button_spinner.set(spinner);
+                    self.refresh_workspace_loading_indicators();
                 }
             }
             TOOLBAR_BRANCH => {
@@ -25891,6 +26064,7 @@ impl AppDelegate {
         entries: Vec<WorkspaceEntry>,
         preferred: Option<craic_config::ConfiguredWorkspace>,
     ) {
+        self.ivars().workspace_discovery_loading.set(false);
         let selected = preferred
             .as_ref()
             .and_then(|preferred| {
@@ -25902,6 +26076,7 @@ impl AppDelegate {
             .cloned();
 
         self.ivars().workspace_metadata.borrow_mut().clear();
+        self.ivars().workspace_metadata_pending.borrow_mut().clear();
         self.ivars().workspace_metadata_generation.set(
             self.ivars()
                 .workspace_metadata_generation
@@ -25910,13 +26085,14 @@ impl AppDelegate {
         );
         self.ivars().workspaces.replace(entries.clone());
         self.queue_workspace_metadata(entries);
+        self.refresh_workspace_results("");
+        self.refresh_workspace_loading_indicators();
         if let Some(selected) = selected.as_ref() {
             self.apply_workspace_button_appearance(selected);
         } else if let Some(button) = self.ivars().workspace_button.get() {
             button.setTitle(&NSString::from_str("Workspace"));
             button.setContentTintColor(None);
         }
-        self.refresh_workspace_results("");
 
         if let Some(selected) = selected
             && let Some(handle) = self.ivars().app_handle.get()
@@ -27405,6 +27581,7 @@ pub fn run() {
     let mtm = MainThreadMarker::new().expect("Craic must start on the macOS main thread");
     let application = NSApplication::sharedApplication(mtm);
     let delegate = AppDelegate::new(mtm);
+    delegate.ivars().workspace_discovery_loading.set(true);
     delegate.ivars().startup_error.replace(startup_error);
     delegate
         .ivars()
@@ -29912,9 +30089,17 @@ pub fn run() {
                 (entries, preferred)
             })
             .await;
-            let Ok((entries, preferred)) = discovered else {
-                log::error!("native workspace discovery task failed");
-                return;
+            let (entries, preferred) = match discovered {
+                Ok(result) => result,
+                Err(error) => {
+                    let message = error.to_string();
+                    log::error!("native workspace discovery task failed error={message}");
+                    let _ =
+                        discovery_completion_tx.send(FrontendCompletion::WorkspaceDiscoveryFailed(
+                            format!("Workspace discovery did not complete: {message}"),
+                        ));
+                    return;
+                }
             };
             if discovery_completion_tx
                 .send(FrontendCompletion::WorkspaceEntries { entries, preferred })
