@@ -1179,9 +1179,17 @@ pub(crate) struct AppDelegateIvars {
     agents_search_visible: Cell<bool>,
     changes_filter_query: RefCell<String>,
     content_empty: OnceCell<Retained<NSTextField>>,
+    content_home_root: OnceCell<Retained<NSView>>,
     content_home_title: OnceCell<Retained<NSTextField>>,
     content_home_subtitle: OnceCell<Retained<NSTextField>>,
+    content_home_cards: OnceCell<Vec<Retained<NSBox>>>,
+    content_home_git_title: OnceCell<Retained<NSTextField>>,
+    content_home_git_subtitle: OnceCell<Retained<NSTextField>>,
     content_home_action: OnceCell<Retained<NSButton>>,
+    content_home_editor: OnceCell<Retained<NSButton>>,
+    content_home_terminal: OnceCell<Retained<NSButton>>,
+    content_home_files: OnceCell<Retained<NSButton>>,
+    content_home_remote: OnceCell<Retained<NSButton>>,
     changes_list: OnceCell<Retained<NSView>>,
     changes_scroll: OnceCell<Retained<NSScrollView>>,
     selected_change_path: RefCell<Option<String>>,
@@ -5876,6 +5884,26 @@ define_class!(
             self.request_remote_action(NativeRemoteAction::Contextual);
         }
 
+        #[unsafe(method(openRepositorySuggestionInEditor:))]
+        fn open_repository_suggestion_in_editor(&self, _sender: &NSButton) {
+            self.open_active_repository_in_editor();
+        }
+
+        #[unsafe(method(openRepositorySuggestionInGhostty:))]
+        fn open_repository_suggestion_in_ghostty(&self, _sender: &NSButton) {
+            self.open_active_repository_in_ghostty();
+        }
+
+        #[unsafe(method(showRepositorySuggestionInFinder:))]
+        fn show_repository_suggestion_in_finder(&self, _sender: &NSButton) {
+            self.show_active_repository_in_finder();
+        }
+
+        #[unsafe(method(openRepositorySuggestionRemote:))]
+        fn open_repository_suggestion_remote(&self, _sender: &NSButton) {
+            self.open_active_repository_remote();
+        }
+
         #[unsafe(method(toggleTerminal:))]
         fn toggle_terminal(&self, sender: &NSToolbarItem) {
             let visible = !self.ivars().terminal_visible.get();
@@ -7041,6 +7069,113 @@ impl AppDelegate {
         let path = craic_config::expand_config_path_for_ui(&workspace.workspace.path)
             .unwrap_or_else(|| PathBuf::from(&workspace.workspace.path));
         Ok((workspace_id, path))
+    }
+
+    fn open_active_repository_in_editor(&self) {
+        let (_, path) = match self.active_local_workspace_path() {
+            Ok(workspace) => workspace,
+            Err(message) => {
+                self.present_path_action_error("Unable to Open Repository", &message);
+                return;
+            }
+        };
+        let workspace = NSWorkspace::sharedWorkspace();
+        let Some(application_url) = workspace
+            .URLForApplicationWithBundleIdentifier(&NSString::from_str("com.microsoft.VSCode"))
+        else {
+            self.present_path_action_error(
+                "Unable to Open Repository",
+                "Visual Studio Code is not installed or is not registered with macOS.",
+            );
+            return;
+        };
+        let repository_url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let configuration = NSWorkspaceOpenConfiguration::new();
+        configuration.setActivates(true);
+        workspace.openURLs_withApplicationAtURL_configuration_completionHandler(
+            &NSArray::from_slice(&[&*repository_url]),
+            &application_url,
+            &configuration,
+            None,
+        );
+    }
+
+    fn open_active_repository_in_ghostty(&self) {
+        let (_, path) = match self.active_local_workspace_path() {
+            Ok(workspace) => workspace,
+            Err(message) => {
+                self.present_path_action_error("Unable to Open Ghostty", &message);
+                return;
+            }
+        };
+        let workspace = NSWorkspace::sharedWorkspace();
+        let Some(application_url) = workspace
+            .URLForApplicationWithBundleIdentifier(&NSString::from_str("com.mitchellh.ghostty"))
+        else {
+            self.present_path_action_error(
+                "Unable to Open Ghostty",
+                "Ghostty is not installed or is not registered with macOS.",
+            );
+            return;
+        };
+        let working_directory = NSString::from_str("--working-directory");
+        let path = NSString::from_str(&path.to_string_lossy());
+        let arguments = NSArray::from_slice(&[&*working_directory, &*path]);
+        let configuration = NSWorkspaceOpenConfiguration::new();
+        configuration.setActivates(true);
+        configuration.setArguments(&arguments);
+        workspace.openApplicationAtURL_configuration_completionHandler(
+            &application_url,
+            &configuration,
+            None,
+        );
+    }
+
+    fn show_active_repository_in_finder(&self) {
+        let (_, path) = match self.active_local_workspace_path() {
+            Ok(workspace) => workspace,
+            Err(message) => {
+                self.present_path_action_error("Unable to Open Finder", &message);
+                return;
+            }
+        };
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        if !NSWorkspace::sharedWorkspace().openURL(&url) {
+            self.present_path_action_error(
+                "Unable to Open Finder",
+                &format!("Finder could not open {}.", path.display()),
+            );
+        }
+    }
+
+    fn open_active_repository_remote(&self) {
+        let Some(remote_url) = self
+            .ivars()
+            .repository_snapshot
+            .borrow()
+            .as_ref()
+            .and_then(|snapshot| snapshot.remote_url.clone())
+        else {
+            self.present_path_action_error(
+                "No Remote Repository",
+                "The active repository does not have a remote URL.",
+            );
+            return;
+        };
+        let web_url = craic_vcs::git::remote_web_url(&remote_url);
+        let Some(url) = NSURL::URLWithString(&NSString::from_str(&web_url)) else {
+            self.present_path_action_error(
+                "Unable to Open Remote",
+                "The repository remote URL is invalid.",
+            );
+            return;
+        };
+        if !NSWorkspace::sharedWorkspace().openURL(&url) {
+            self.present_path_action_error(
+                "Unable to Open Remote",
+                "The repository remote URL could not be opened.",
+            );
+        }
     }
 
     fn request_native_quick_actions(&self) {
@@ -12049,24 +12184,35 @@ impl AppDelegate {
             NSPoint::new(0.0, safe.bottom + usable_height / 2.0 - 20.0),
             NSSize::new(bounds.size.width.max(1.0), 40.0),
         ));
-        if let (Some(title), Some(subtitle), Some(action)) = (
+        if let (Some(root), Some(title), Some(subtitle), Some(cards)) = (
+            self.ivars().content_home_root.get(),
             self.ivars().content_home_title.get(),
             self.ivars().content_home_subtitle.get(),
-            self.ivars().content_home_action.get(),
+            self.ivars().content_home_cards.get(),
         ) {
-            let center_y = safe.bottom + usable_height / 2.0;
+            root.setFrame(NSRect::new(
+                NSPoint::new(0.0, safe.bottom),
+                NSSize::new(bounds.size.width.max(1.0), usable_height),
+            ));
+            let card_width = 640.0_f64.min((bounds.size.width - 64.0).max(240.0));
+            let card_x = ((bounds.size.width - card_width) / 2.0).max(0.0);
+            let top = usable_height - 24.0;
             title.setFrame(NSRect::new(
-                NSPoint::new(24.0, center_y + 12.0),
+                NSPoint::new(24.0, top - 32.0),
                 NSSize::new((bounds.size.width - 48.0).max(1.0), 32.0),
             ));
             subtitle.setFrame(NSRect::new(
-                NSPoint::new(24.0, center_y - 14.0),
+                NSPoint::new(24.0, top - 58.0),
                 NSSize::new((bounds.size.width - 48.0).max(1.0), 20.0),
             ));
-            action.setFrame(NSRect::new(
-                NSPoint::new((bounds.size.width - 196.0).max(0.0) / 2.0, center_y - 60.0),
-                NSSize::new(196.0_f64.min(bounds.size.width.max(1.0)), 32.0),
-            ));
+            let mut card_top = top - 86.0;
+            for card in cards.iter().filter(|card| !card.isHidden()) {
+                card.setFrame(NSRect::new(
+                    NSPoint::new(card_x, card_top - 72.0),
+                    NSSize::new(card_width, 72.0),
+                ));
+                card_top -= 82.0;
+            }
         }
         if let Some(history) = self.ivars().history.get() {
             history.content_root.setFrame(NSRect::new(
@@ -20294,11 +20440,24 @@ impl AppDelegate {
     }
 
     fn update_repository_home(&self, snapshot: &RepositorySnapshot, running: bool) {
-        let (Some(title), Some(subtitle), Some(action)) = (
+        let (
+            Some(root),
+            Some(title),
+            Some(subtitle),
+            Some(cards),
+            Some(git_title),
+            Some(git_subtitle),
+            Some(action),
+        ) = (
+            self.ivars().content_home_root.get(),
             self.ivars().content_home_title.get(),
             self.ivars().content_home_subtitle.get(),
+            self.ivars().content_home_cards.get(),
+            self.ivars().content_home_git_title.get(),
+            self.ivars().content_home_git_subtitle.get(),
             self.ivars().content_home_action.get(),
-        ) else {
+        )
+        else {
             return;
         };
         title.setStringValue(&NSString::from_str(&match snapshot.changed_files.len() {
@@ -20317,41 +20476,76 @@ impl AppDelegate {
         )));
         let remote_action = snapshot.remote_name.as_deref().and_then(|remote| {
             if !snapshot.has_upstream {
-                Some("Publish branch".to_string())
-            } else if snapshot.behind > 0 && snapshot.ahead > 0 {
-                Some(format!("Pull & Push {remote}"))
+                Some((
+                    "Publish your branch".to_string(),
+                    format!(
+                        "Publish the local branch '{}' to the remote '{}' to share your commits.",
+                        snapshot.branch, remote
+                    ),
+                    "Publish branch".to_string(),
+                ))
             } else if snapshot.behind > 0 {
-                Some(format!("Pull {remote}"))
+                Some((
+                    if snapshot.behind == 1 {
+                        "Pull 1 commit from remote".to_string()
+                    } else {
+                        format!("Pull {} commits from remote", snapshot.behind)
+                    },
+                    format!(
+                        "The current branch '{}' has commits on the remote that do not exist locally.",
+                        snapshot.branch
+                    ),
+                    format!("Pull {remote}"),
+                ))
             } else if snapshot.ahead > 0 {
-                Some(format!("Push {remote}"))
+                Some((
+                    if snapshot.ahead == 1 {
+                        "Push 1 commit to remote".to_string()
+                    } else {
+                        format!("Push {} commits to remote", snapshot.ahead)
+                    },
+                    "You have local commits that haven't been pushed to the remote.".to_string(),
+                    format!("Push {remote}"),
+                ))
             } else {
                 None
             }
         });
-        if let Some(label) = remote_action {
+        let git_card = &cards[0];
+        if let Some((heading, detail, label)) = remote_action {
+            git_title.setStringValue(&NSString::from_str(&heading));
+            git_subtitle.setStringValue(&NSString::from_str(&detail));
             action.setTitle(&NSString::from_str(&label));
             action.setToolTip(Some(&NSString::from_str(&label)));
             action.setEnabled(!running);
-            action.setHidden(false);
+            git_card.setHidden(false);
         } else {
-            action.setHidden(true);
+            git_card.setHidden(true);
         }
-        title.setHidden(false);
-        subtitle.setHidden(false);
+        let local_workspace = self.active_local_workspace_path().is_ok();
+        for button in [
+            self.ivars().content_home_editor.get(),
+            self.ivars().content_home_terminal.get(),
+            self.ivars().content_home_files.get(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            button.setEnabled(local_workspace);
+        }
+        if let Some(remote) = self.ivars().content_home_remote.get() {
+            remote.setEnabled(true);
+        }
+        root.setHidden(false);
         if let Some(empty) = self.ivars().content_empty.get() {
             empty.setHidden(true);
         }
+        self.layout_content();
     }
 
     fn hide_repository_home(&self) {
-        if let Some(title) = self.ivars().content_home_title.get() {
-            title.setHidden(true);
-        }
-        if let Some(subtitle) = self.ivars().content_home_subtitle.get() {
-            subtitle.setHidden(true);
-        }
-        if let Some(action) = self.ivars().content_home_action.get() {
-            action.setHidden(true);
+        if let Some(root) = self.ivars().content_home_root.get() {
+            root.setHidden(true);
         }
     }
 
@@ -26665,30 +26859,120 @@ impl AppDelegate {
         );
         content.addSubview(&empty_state);
 
+        let content_home_root = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(
+                NSPoint::ZERO,
+                NSSize::new(bounds.size.width - SIDEBAR_WIDTH, bounds.size.height),
+            ),
+        );
+        content_home_root.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        content_home_root.setHidden(true);
+        content.addSubview(&content_home_root);
+
         let content_home_title =
             NSTextField::labelWithString(&NSString::from_str("No local changes"), mtm);
         content_home_title.setAlignment(NSTextAlignment::Center);
         content_home_title.setFont(Some(&NSFont::boldSystemFontOfSize(24.0)));
-        content_home_title.setHidden(true);
-        content.addSubview(&content_home_title);
+        content_home_root.addSubview(&content_home_title);
         let content_home_subtitle = NSTextField::labelWithString(&NSString::new(), mtm);
         content_home_subtitle.setAlignment(NSTextAlignment::Center);
         content_home_subtitle.setFont(Some(&NSFont::systemFontOfSize(13.0)));
         content_home_subtitle.setTextColor(Some(&NSColor::secondaryLabelColor()));
-        content_home_subtitle.setHidden(true);
-        content.addSubview(&content_home_subtitle);
-        let content_home_action = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("Fetch remote"),
-                Some(self),
-                Some(sel!(fetchRemote:)),
-                mtm,
-            )
+        content_home_root.addSubview(&content_home_subtitle);
+
+        let suggestion_card = |title: &str, subtitle: &str, button_title: &str, action: Sel| {
+            let card = NSBox::initWithFrame(
+                NSBox::alloc(mtm),
+                NSRect::new(NSPoint::ZERO, NSSize::new(640.0, 72.0)),
+            );
+            card.setBoxType(NSBoxType::Custom);
+            card.setBorderWidth(1.0);
+            card.setBorderColor(&NSColor::separatorColor());
+            card.setFillColor(&NSColor::controlBackgroundColor());
+            card.setCornerRadius(10.0);
+            let title = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+            title.setFrame(NSRect::new(
+                NSPoint::new(18.0, 37.0),
+                NSSize::new(480.0, 20.0),
+            ));
+            title.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+            title.setFont(Some(&NSFont::boldSystemFontOfSize(13.5)));
+            title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            card.addSubview(&title);
+            let subtitle = NSTextField::labelWithString(&NSString::from_str(subtitle), mtm);
+            subtitle.setFrame(NSRect::new(
+                NSPoint::new(18.0, 15.0),
+                NSSize::new(480.0, 18.0),
+            ));
+            subtitle.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+            subtitle.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+            subtitle.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            subtitle.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            card.addSubview(&subtitle);
+            let button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str(button_title),
+                    Some(self),
+                    Some(action),
+                    mtm,
+                )
+            };
+            button.setFrame(NSRect::new(
+                NSPoint::new(520.0, 20.0),
+                NSSize::new(102.0, 32.0),
+            ));
+            button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+            button.setBezelStyle(NSBezelStyle::Push);
+            button.setControlSize(NSControlSize::Regular);
+            card.addSubview(&button);
+            (card, title, subtitle, button)
         };
-        content_home_action.setBezelStyle(NSBezelStyle::Push);
-        content_home_action.setControlSize(NSControlSize::Regular);
-        content_home_action.setHidden(true);
-        content.addSubview(&content_home_action);
+
+        let (git_card, git_title, git_subtitle, content_home_action) = suggestion_card(
+            "Repository action",
+            "Synchronize this branch with its remote.",
+            "Fetch",
+            sel!(fetchRemote:),
+        );
+        git_card.setHidden(true);
+        let (editor_card, _, _, content_home_editor) = suggestion_card(
+            "Open in editor",
+            "Jump into the project files.",
+            "Open",
+            sel!(openRepositorySuggestionInEditor:),
+        );
+        let (terminal_card, _, _, content_home_terminal) = suggestion_card(
+            "Open in Ghostty",
+            "Open the repository in an external Ghostty window.",
+            "Open",
+            sel!(openRepositorySuggestionInGhostty:),
+        );
+        let (files_card, _, _, content_home_files) = suggestion_card(
+            "Open in Files",
+            "Open the repository folder in Finder.",
+            "Show",
+            sel!(showRepositorySuggestionInFinder:),
+        );
+        let (remote_card, _, _, content_home_remote) = suggestion_card(
+            "View on GitHub",
+            "Open the remote repository.",
+            "View",
+            sel!(openRepositorySuggestionRemote:),
+        );
+        let content_home_cards = vec![
+            git_card,
+            editor_card,
+            terminal_card,
+            files_card,
+            remote_card,
+        ];
+        for card in &content_home_cards {
+            content_home_root.addSubview(card);
+        }
 
         let history = self.make_history_ui(sidebar.bounds(), content.bounds());
         let files = self.make_files_ui(sidebar.bounds(), content.bounds());
@@ -27154,6 +27438,10 @@ impl AppDelegate {
             .set(empty_state)
             .expect("content empty state is initialized once");
         self.ivars()
+            .content_home_root
+            .set(content_home_root)
+            .expect("content home root is initialized once");
+        self.ivars()
             .content_home_title
             .set(content_home_title)
             .expect("content home title is initialized once");
@@ -27162,9 +27450,37 @@ impl AppDelegate {
             .set(content_home_subtitle)
             .expect("content home subtitle is initialized once");
         self.ivars()
+            .content_home_cards
+            .set(content_home_cards)
+            .expect("content home cards are initialized once");
+        self.ivars()
+            .content_home_git_title
+            .set(git_title)
+            .expect("content home Git title is initialized once");
+        self.ivars()
+            .content_home_git_subtitle
+            .set(git_subtitle)
+            .expect("content home Git subtitle is initialized once");
+        self.ivars()
             .content_home_action
             .set(content_home_action)
             .expect("content home action is initialized once");
+        self.ivars()
+            .content_home_editor
+            .set(content_home_editor)
+            .expect("content home editor action is initialized once");
+        self.ivars()
+            .content_home_terminal
+            .set(content_home_terminal)
+            .expect("content home terminal action is initialized once");
+        self.ivars()
+            .content_home_files
+            .set(content_home_files)
+            .expect("content home Files action is initialized once");
+        self.ivars()
+            .content_home_remote
+            .set(content_home_remote)
+            .expect("content home remote action is initialized once");
         self.ivars()
             .changes_list
             .set(changes_list)
