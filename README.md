@@ -8,12 +8,16 @@ A development environment made by me for me :D
 
 Any usage outside of my computer is out of scope and unsupported x3
 
-<img width="1227" height="811" alt="Screenshot From 2026-07-22 00-18-14" src="https://github.com/user-attachments/assets/0ce02b73-d09d-4262-83d3-ceaaefad4bc3" />
+<img width="1227" height="811" alt="image" src="https://github.com/user-attachments/assets/0ce02b73-d09d-4262-83d3-ceaaefad4bc3" />
+
+<img width="2184" height="1464" alt="image" src="https://github.com/user-attachments/assets/574b0da3-3b9d-4935-8a0f-fb052e0ed589" />
+
 
 ---
 
 ## Features
 
+- GTK/AppKit frontend.
 - Vibe coding sessions with Codex, AGY, and OpenCode, plus Ollama-backed smart
   features.
 - Git and GitHub workflows, generated commit messages, and Docker integration.
