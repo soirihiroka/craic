@@ -40,6 +40,7 @@ use craic_agent::agent_provider::{
 };
 use craic_agent::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsageTracker};
 use craic_agent::ai_commit::CommitMessageDraft;
+use craic_agent::remote_media::{self, RemoteMedia, RemoteMediaKind};
 use craic_app_core::{
     AppCommand, AppHandle, ApplicationRuntime, ApplicationViewState, PAGE_DESCRIPTORS, PageId,
     RuntimeConfig, UiEvent, WorkspaceId, WorkspaceSelection, page_descriptor,
@@ -70,7 +71,9 @@ use craic_system::system::capabilities::files::{
     FileWatchReceiver, FileWatchRequest, FileWatchSubscription, FileWriteMode, FileWritePayload,
     FileWriteRequest,
 };
-use craic_system::system::capabilities::shell::{ShellCommandActivity, ShellCommandSpec};
+use craic_system::system::capabilities::shell::{
+    ShellAccess, ShellCommandActivity, ShellCommandSpec,
+};
 use craic_system::system::capabilities::terminal_link::TerminalLinkTarget;
 use craic_system::system::materialize::{MaterializedFile, materialize_bytes_for_view};
 use craic_system::system::providers::local::LocalProvider;
@@ -900,6 +903,33 @@ struct NativeTerminalSession {
     activity: ShellCommandActivity,
     reported_task_active: bool,
     auto_close_timer: Option<Retained<NSTimer>>,
+    remote_media: Option<NativeTerminalRemoteMedia>,
+}
+
+#[derive(Clone)]
+struct NativeTerminalRemoteMedia {
+    workspace_id: String,
+    shell: Arc<dyn ShellAccess>,
+    working_dir: WorkspacePath,
+    cancellation: WorkspaceCancellationToken,
+}
+
+enum NativeTerminalMediaCommand {
+    Upload {
+        session_id: isize,
+        context: NativeTerminalRemoteMedia,
+        sources: Vec<PathBuf>,
+    },
+    Close {
+        session_id: isize,
+    },
+    Shutdown,
+}
+
+struct NativeTerminalMediaWorkerSession {
+    shell: Arc<dyn ShellAccess>,
+    working_dir: WorkspacePath,
+    uploaded: Vec<RemoteMedia>,
 }
 
 impl NativeTerminalSession {
@@ -1001,6 +1031,7 @@ pub(crate) struct AppDelegateIvars {
     terminal_search_visible: Cell<bool>,
     terminal_search_placement: Cell<Option<NativeTerminalPlacement>>,
     terminal_sessions: RefCell<Vec<NativeTerminalSession>>,
+    terminal_media_commands: OnceCell<std::sync::mpsc::Sender<NativeTerminalMediaCommand>>,
     agent_terminal_usage_timer: RefCell<Option<Retained<NSTimer>>>,
     agent_terminal_usage_tracker: RefCell<Option<ProcessUsageTracker>>,
     agent_terminal_usage: RefCell<HashMap<isize, AgentResourceUsage>>,
@@ -1410,6 +1441,11 @@ enum FrontendCompletion {
     ConfirmDiscard {
         paths: Vec<String>,
         result: UiEffectResult,
+    },
+    TerminalRemoteImages {
+        workspace_id: String,
+        session_id: isize,
+        result: Result<Vec<String>, String>,
     },
     Shutdown,
 }
@@ -7113,6 +7149,18 @@ impl AppDelegate {
         let files = handle.workspace_files();
         let root = files.root();
         let working_directory = files.copy_path(&root);
+        let local_working_directory = files.local_path(&root);
+        let remote_media = if program == "codex" {
+            match self.native_terminal_remote_media_context() {
+                Ok(context) => context,
+                Err(error) => {
+                    self.present_path_action_error("Unable to Start Agent", &error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let mut arguments = if program == "codex" {
             vec![
                 "--no-alt-screen".to_string(),
@@ -7141,8 +7189,9 @@ impl AppDelegate {
             command,
             title.to_string(),
             working_directory,
-            files.local_path(&root),
+            local_working_directory,
             NativeTerminalPlacement::Agent,
+            remote_media,
         ) {
             self.present_path_action_error("Unable to Start Agent", &error);
             return;
@@ -7150,6 +7199,43 @@ impl AppDelegate {
         log::info!(
             "native terminal agent started provider={program} title={title} placement=agents-detail"
         );
+    }
+
+    fn native_terminal_remote_media_context(
+        &self,
+    ) -> Result<Option<NativeTerminalRemoteMedia>, String> {
+        let workspace_id = self
+            .ivars()
+            .active_workspace_id
+            .borrow()
+            .clone()
+            .ok_or_else(|| "Open a workspace before starting an agent session.".to_string())?;
+        let workspace = self
+            .ivars()
+            .workspaces
+            .borrow()
+            .iter()
+            .find(|entry| entry.selection_id() == workspace_id)
+            .map(|entry| entry.workspace.clone())
+            .ok_or_else(|| "The active workspace configuration is unavailable.".to_string())?;
+        let craic_config::WorkspaceProvider::Ssh { host } = workspace.provider else {
+            return Ok(None);
+        };
+        let provider = SshProvider::new(SshProviderConfig::new(host));
+        let workspace_ref = provider.workspace_for_remote_path(workspace.path);
+        let shell = provider
+            .shell(&workspace_ref)
+            .ok_or_else(|| "Shell access is unavailable for this SSH workspace.".to_string())?;
+        let cancellation = self
+            .workspace_cancellation_token()
+            .ok_or_else(|| "Workspace cancellation is unavailable.".to_string())?
+            .child_token();
+        Ok(Some(NativeTerminalRemoteMedia {
+            workspace_id,
+            shell,
+            working_dir: workspace_ref.root,
+            cancellation,
+        }))
     }
 
     fn spawn_native_terminal_command(
@@ -7174,6 +7260,7 @@ impl AppDelegate {
             working_directory_label,
             local_working_directory,
             NativeTerminalPlacement::General,
+            None,
         )
     }
 
@@ -7184,6 +7271,7 @@ impl AppDelegate {
         working_directory_label: String,
         local_working_directory: Option<PathBuf>,
         placement: NativeTerminalPlacement,
+        remote_media: Option<NativeTerminalRemoteMedia>,
     ) -> Result<(), String> {
         let mut activity = command.activity;
         let mut program = command.program.into_string().map_err(|program| {
@@ -7372,6 +7460,7 @@ impl AppDelegate {
                 activity,
                 reported_task_active: false,
                 auto_close_timer: None,
+                remote_media,
             });
         self.layout_native_terminal_tabs();
         if placement == NativeTerminalPlacement::Agent {
@@ -7771,6 +7860,108 @@ impl AppDelegate {
             _ => return,
         };
         self.adjust_native_active_font_size(delta);
+    }
+
+    pub(crate) fn native_terminal_files_dropped(
+        &self,
+        session_id: isize,
+        paths: Vec<PathBuf>,
+    ) -> bool {
+        let context = self
+            .ivars()
+            .terminal_sessions
+            .borrow()
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.remote_media.clone());
+        let Some(context) = context else {
+            return false;
+        };
+        if paths
+            .iter()
+            .any(|path| !remote_media::supported_path(path, RemoteMediaKind::Image))
+        {
+            self.present_path_action_error(
+                "Remote Image Upload Failed",
+                "Remote Codex CLI drops currently accept PNG, JPEG, GIF, WebP, and BMP images.",
+            );
+            return true;
+        }
+        let session_active = self
+            .ivars()
+            .terminal_sessions
+            .borrow()
+            .iter()
+            .find(|session| session.id == session_id)
+            .is_some_and(|session| session.view.is_active());
+        if !session_active || context.cancellation.is_cancelled() {
+            log::debug!("remote Codex CLI image drop ignored for inactive session id={session_id}");
+            return true;
+        }
+        let Some(commands) = self.ivars().terminal_media_commands.get() else {
+            self.present_path_action_error(
+                "Remote Image Upload Failed",
+                "The remote image upload service is unavailable.",
+            );
+            return true;
+        };
+        let count = paths.len();
+        if let Err(error) = commands.send(NativeTerminalMediaCommand::Upload {
+            session_id,
+            context,
+            sources: paths,
+        }) {
+            self.present_path_action_error(
+                "Remote Image Upload Failed",
+                &format!("The remote image upload could not be queued: {error}"),
+            );
+        } else {
+            log::info!(
+                "remote Codex CLI image upload queued session={} count={}",
+                session_id,
+                count
+            );
+        }
+        true
+    }
+
+    fn apply_terminal_remote_images(
+        &self,
+        workspace_id: &str,
+        session_id: isize,
+        result: Result<Vec<String>, String>,
+    ) {
+        if self.ivars().active_workspace_id.borrow().as_deref() != Some(workspace_id) {
+            return;
+        }
+        let terminal = self
+            .ivars()
+            .terminal_sessions
+            .borrow()
+            .iter()
+            .find(|session| session.id == session_id)
+            .filter(|session| {
+                session.view.is_active()
+                    && session.remote_media.as_ref().is_some_and(|context| {
+                        context.workspace_id == workspace_id && !context.cancellation.is_cancelled()
+                    })
+            })
+            .map(|session| session.view.clone());
+        let Some(terminal) = terminal else {
+            return;
+        };
+        match result {
+            Ok(paths) => {
+                let paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+                terminal.paste_file_paths(&paths);
+                log::info!(
+                    "remote Codex CLI image paths pasted session={} count={}",
+                    session_id,
+                    paths.len()
+                );
+            }
+            Err(error) => self.present_path_action_error("Remote Image Upload Failed", &error),
+        }
     }
 
     pub(crate) fn native_terminal_session_exited(&self, id: isize, exit_code: Option<i32>) {
@@ -8308,6 +8499,15 @@ impl AppDelegate {
         log::debug!("native terminal session reordered id={id} from={index} to={target}");
     }
 
+    fn close_native_terminal_remote_media(&self, id: isize, context: NativeTerminalRemoteMedia) {
+        context.cancellation.cancel();
+        if let Some(commands) = self.ivars().terminal_media_commands.get()
+            && let Err(error) = commands.send(NativeTerminalMediaCommand::Close { session_id: id })
+        {
+            log::warn!("remote terminal media close request failed session={id}: {error}");
+        }
+    }
+
     fn finish_native_terminal_close(&self, id: isize) {
         let (mut entry, replacement, was_active) = {
             let mut sessions = self.ivars().terminal_sessions.borrow_mut();
@@ -8334,6 +8534,9 @@ impl AppDelegate {
         let placement = entry.placement;
         if let Some(timer) = entry.auto_close_timer.take() {
             timer.invalidate();
+        }
+        if let Some(context) = entry.remote_media.take() {
+            self.close_native_terminal_remote_media(id, context);
         }
         if let Err(error) = entry.view.shutdown() {
             log::warn!("native terminal close failed id={id}: {error}");
@@ -8393,6 +8596,9 @@ impl AppDelegate {
         for mut session in sessions {
             if let Some(timer) = session.auto_close_timer.take() {
                 timer.invalidate();
+            }
+            if let Some(context) = session.remote_media.take() {
+                self.close_native_terminal_remote_media(session.id, context);
             }
             if let Err(error) = session.view.shutdown() {
                 log::warn!("native terminal shutdown failed id={}: {error}", session.id);
@@ -22131,6 +22337,11 @@ impl AppDelegate {
             FrontendCompletion::ConfirmDiscard { result, .. } => {
                 log::warn!("discard confirmation returned unexpected result={result:?}");
             }
+            FrontendCompletion::TerminalRemoteImages {
+                workspace_id,
+                session_id,
+                result,
+            } => self.apply_terminal_remote_images(&workspace_id, session_id, result),
             FrontendCompletion::Shutdown => {}
         }
     }
@@ -27687,6 +27898,49 @@ fn resolve_local_workspace_arg(path: &Path) -> Result<PathBuf, String> {
     Ok(workspace.canonicalize().unwrap_or(workspace))
 }
 
+fn upload_native_terminal_remote_images(
+    context: &NativeTerminalRemoteMedia,
+    sources: Vec<PathBuf>,
+) -> Result<Vec<RemoteMedia>, String> {
+    let mut uploaded = Vec::with_capacity(sources.len());
+    for source in sources {
+        if context.cancellation.is_cancelled() {
+            remote_media::remove_bounded(
+                context.shell.clone(),
+                context.working_dir.clone(),
+                uploaded,
+            );
+            return Err("Remote image upload was cancelled.".to_string());
+        }
+        match remote_media::materialize_cancellable(
+            context.shell.clone(),
+            context.working_dir.clone(),
+            source,
+            RemoteMediaKind::Image,
+            || context.cancellation.is_cancelled(),
+        ) {
+            Ok(media) => uploaded.push(media),
+            Err(error) => {
+                remote_media::remove_bounded(
+                    context.shell.clone(),
+                    context.working_dir.clone(),
+                    uploaded,
+                );
+                return Err(error);
+            }
+        }
+        if context.cancellation.is_cancelled() {
+            remote_media::remove_bounded(
+                context.shell.clone(),
+                context.working_dir.clone(),
+                uploaded,
+            );
+            return Err("Remote image upload was cancelled.".to_string());
+        }
+    }
+    Ok(uploaded)
+}
+
 #[derive(Default)]
 struct NativeStartupOptions {
     workspace: Option<craic_config::ConfiguredWorkspace>,
@@ -27878,6 +28132,83 @@ pub fn run() {
             log::info!("native frontend completion bridge stopped");
         })
         .expect("failed to start native frontend completion bridge");
+    let (terminal_media_tx, terminal_media_rx) = std::sync::mpsc::channel();
+    assert!(
+        delegate
+            .ivars()
+            .terminal_media_commands
+            .set(terminal_media_tx)
+            .is_ok(),
+        "native terminal media command sender is initialized once"
+    );
+    let terminal_media_completion_tx = frontend_completion_tx.clone();
+    let terminal_media_worker = std::thread::Builder::new()
+        .name("craic-terminal-media".to_string())
+        .spawn(move || {
+            let mut sessions = HashMap::<isize, NativeTerminalMediaWorkerSession>::new();
+            while let Ok(command) = terminal_media_rx.recv() {
+                match command {
+                    NativeTerminalMediaCommand::Upload {
+                        session_id,
+                        context,
+                        sources,
+                    } => {
+                        let workspace_id = context.workspace_id.clone();
+                        let result = upload_native_terminal_remote_images(&context, sources).map(
+                            |uploaded| {
+                                let paths = uploaded
+                                    .iter()
+                                    .map(|media| media.path.clone())
+                                    .collect::<Vec<_>>();
+                                sessions
+                                    .entry(session_id)
+                                    .or_insert_with(|| NativeTerminalMediaWorkerSession {
+                                        shell: context.shell.clone(),
+                                        working_dir: context.working_dir.clone(),
+                                        uploaded: Vec::new(),
+                                    })
+                                    .uploaded
+                                    .extend(uploaded);
+                                paths
+                            },
+                        );
+                        if terminal_media_completion_tx
+                            .send(FrontendCompletion::TerminalRemoteImages {
+                                workspace_id,
+                                session_id,
+                                result,
+                            })
+                            .is_err()
+                        {
+                            log::warn!(
+                                "remote terminal image completion dropped during shutdown session={session_id}"
+                            );
+                        }
+                    }
+                    NativeTerminalMediaCommand::Close { session_id } => {
+                        if let Some(session) = sessions.remove(&session_id) {
+                            remote_media::remove_bounded(
+                                session.shell,
+                                session.working_dir,
+                                session.uploaded,
+                            );
+                        }
+                    }
+                    NativeTerminalMediaCommand::Shutdown => {
+                        for (_, session) in sessions.drain() {
+                            remote_media::remove_bounded(
+                                session.shell,
+                                session.working_dir,
+                                session.uploaded,
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+            log::info!("native terminal media worker stopped");
+        })
+        .expect("failed to start native terminal media worker");
     let (agent_command_tx, agent_command_rx) = tokio::sync::mpsc::channel(64);
     assert!(
         delegate
@@ -30436,6 +30767,14 @@ pub fn run() {
     }
     application.run();
     delegate.prepare_for_native_shutdown();
+    if let Some(commands) = delegate.ivars().terminal_media_commands.get()
+        && let Err(error) = commands.send(NativeTerminalMediaCommand::Shutdown)
+    {
+        log::debug!("native terminal media worker was already stopped: {error}");
+    }
+    if terminal_media_worker.join().is_err() {
+        log::error!("native terminal media worker panicked during shutdown");
+    }
 
     let (agent_shutdown_tx, agent_shutdown_rx) = std::sync::mpsc::sync_channel(1);
     match agent_command_tx.try_send(NativeAgentCommand::Shutdown {

@@ -696,18 +696,25 @@ define_class!(
             }) else {
                 return false.into();
             };
-            let text = objects
+            let paths = objects
                 .iter()
                 .filter_map(|object| object.downcast::<NSURL>().ok())
                 .filter(|url| url.isFileURL())
                 .filter_map(|url| url.path())
-                .map(|path| format!("'{}'", path.to_string().replace('\'', "'\"'\"'")))
-                .collect::<Vec<_>>()
-                .join(" ");
-            if text.is_empty() {
+                .map(|path| PathBuf::from(path.to_string()))
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
                 return false.into();
             }
-            self.send_input(text.into_bytes());
+            if let Some(delegate) = self.ivars().activation_delegate.borrow().load()
+                && delegate.native_terminal_files_dropped(
+                    self.ivars().session_id.get(),
+                    paths.clone(),
+                )
+            {
+                return true.into();
+            }
+            self.paste_file_paths(&paths);
             log::info!("native terminal file drop pasted shell-quoted paths");
             true.into()
         }
@@ -871,6 +878,17 @@ impl TerminalMetalView {
         }
         self.update_snapshot();
         self.render_frame();
+    }
+
+    pub(crate) fn paste_file_paths(&self, paths: &[PathBuf]) {
+        let text = paths
+            .iter()
+            .map(|path| format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !text.is_empty() {
+            self.send_input(text.into_bytes());
+        }
     }
 
     pub fn shutdown(&self) -> Result<(), String> {
