@@ -98,27 +98,27 @@ use objc2::{
     AnyThread, ClassType, DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSAccessibility, NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSAppearance,
-    NSAppearanceNameDarkAqua, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSApplicationTerminateReply, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle,
-    NSBorderType, NSBox, NSBoxType, NSButton, NSButtonType, NSCellImagePosition, NSColor,
-    NSControlSize, NSControlStateValueMixed, NSControlStateValueOff, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSDragOperation, NSDraggingInfo, NSEvent, NSEventModifierFlags,
-    NSEventType, NSFindPanelAction, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
-    NSGlassEffectView, NSGlassEffectViewStyle, NSImage, NSImageScaling, NSImageView, NSItemBadge,
-    NSLayoutConstraint, NSLayoutConstraintOrientation, NSLayoutPriorityDefaultHigh,
-    NSLayoutPriorityDefaultLow, NSLineBreakMode, NSLinkAttributeName, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSMenuItemValidation, NSMenuToolbarItem, NSModalResponseOK, NSOpenPanel,
-    NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypeString, NSPopUpButton, NSPopover,
-    NSPopoverBehavior, NSProgressIndicator, NSProgressIndicatorStyle, NSSavePanel, NSScrollView,
-    NSSearchField, NSSecureTextField, NSSplitView, NSSplitViewController, NSSplitViewDelegate,
-    NSSplitViewDividerStyle, NSSplitViewItem, NSTabViewController, NSTabViewControllerTabStyle,
-    NSTabViewItem, NSTableColumn, NSTableHeaderView, NSTableRowView, NSTableView,
-    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewDropOperation, NSTableViewStyle, NSTextAlignment, NSTextDelegate, NSTextField,
-    NSTextFieldDelegate, NSTextView, NSTextViewDelegate, NSTitlePosition, NSTokenField,
-    NSTokenStyle, NSToolbar, NSToolbarDelegate, NSToolbarDisplayMode,
-    NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemGroup,
+    NSAccessibility, NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle,
+    NSAppearance, NSAppearanceNameDarkAqua, NSApplication, NSApplicationActivationPolicy,
+    NSApplicationDelegate, NSApplicationTerminateReply, NSAutoresizingMaskOptions,
+    NSBackingStoreType, NSBezelStyle, NSBorderType, NSBox, NSBoxType, NSButton, NSButtonType,
+    NSCellImagePosition, NSColor, NSControlSize, NSControlStateValueMixed, NSControlStateValueOff,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSDragOperation, NSDraggingInfo, NSEvent,
+    NSEventModifierFlags, NSEventType, NSFindPanelAction, NSFont, NSFontAttributeName,
+    NSForegroundColorAttributeName, NSGlassEffectView, NSGlassEffectViewStyle, NSImage,
+    NSImageScaling, NSImageView, NSItemBadge, NSLayoutConstraint, NSLayoutConstraintOrientation,
+    NSLayoutPriorityDefaultHigh, NSLayoutPriorityDefaultLow, NSLineBreakMode, NSLinkAttributeName,
+    NSMenu, NSMenuDelegate, NSMenuItem, NSMenuItemValidation, NSMenuToolbarItem, NSModalResponseOK,
+    NSOpenPanel, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypeString, NSPopUpButton,
+    NSPopover, NSPopoverBehavior, NSProgressIndicator, NSProgressIndicatorStyle,
+    NSRunningApplication, NSSavePanel, NSScrollView, NSSearchField, NSSecureTextField, NSSplitView,
+    NSSplitViewController, NSSplitViewDelegate, NSSplitViewDividerStyle, NSSplitViewItem,
+    NSTabViewController, NSTabViewControllerTabStyle, NSTabViewItem, NSTableColumn,
+    NSTableHeaderView, NSTableRowView, NSTableView, NSTableViewColumnAutoresizingStyle,
+    NSTableViewDataSource, NSTableViewDelegate, NSTableViewDropOperation, NSTableViewStyle,
+    NSTextAlignment, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
+    NSTextViewDelegate, NSTitlePosition, NSTokenField, NSTokenStyle, NSToolbar, NSToolbarDelegate,
+    NSToolbarDisplayMode, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemGroup,
     NSToolbarItemGroupControlRepresentation, NSToolbarItemGroupSelectionMode,
     NSToolbarItemIdentifier, NSToolbarItemVisibilityPriorityHigh,
     NSToolbarItemVisibilityPriorityLow, NSToolbarItemVisibilityPriorityUser,
@@ -135,9 +135,9 @@ use objc2_core_text::{
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSBundle, NSData, NSDate, NSDateFormatter, NSDateFormatterStyle,
-    NSEdgeInsets, NSIndexSet, NSMutableAttributedString, NSNotification, NSNotificationCenter,
-    NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSRectEdge, NSSize, NSString, NSTimer,
-    NSURL, NSUserDefaults,
+    NSEdgeInsets, NSError, NSIndexSet, NSMutableAttributedString, NSNotification,
+    NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSRectEdge, NSSize,
+    NSString, NSTimer, NSURL, NSUserDefaults,
 };
 use objc2_pdf_kit::{PDFDisplayDirection, PDFDisplayMode, PDFDocument, PDFView};
 use objc2_uniform_type_identifiers::{UTType, UTTypeAudio, UTTypeImage};
@@ -13001,6 +13001,34 @@ impl AppDelegate {
             log::warn!("workspace selection index out of range index={index}");
             return;
         };
+        if let Some(popover) = self.ivars().workspace_popover.get() {
+            popover.close();
+        }
+        let Some(window) = self.ivars().window.get() else {
+            return;
+        };
+        let alert = NSAlert::new(self.mtm());
+        alert.setMessageText(&NSString::from_str("Open Workspace"));
+        alert.setInformativeText(&NSString::from_str(&format!(
+            "Open {} in this window or a new window?",
+            workspace.label
+        )));
+        alert.addButtonWithTitle(&NSString::from_str("Open Here"));
+        alert.addButtonWithTitle(&NSString::from_str("Open in New Window"));
+        let cancel = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        cancel.setKeyEquivalent(&NSString::from_str("\u{1b}"));
+        let delegate = self.retain();
+        let completion = RcBlock::new(move |response| {
+            if response == NSAlertFirstButtonReturn {
+                delegate.activate_workspace_here(workspace.clone());
+            } else if response == NSAlertSecondButtonReturn {
+                delegate.open_workspace_in_new_window(&workspace.workspace);
+            }
+        });
+        alert.beginSheetModalForWindow_completionHandler(window, Some(&completion));
+    }
+
+    fn activate_workspace_here(&self, workspace: WorkspaceEntry) {
         let selection = WorkspaceSelection {
             id: WorkspaceId::new(workspace.selection_id()),
         };
@@ -13016,9 +13044,44 @@ impl AppDelegate {
         self.begin_workspace_transition(&workspace.selection_id());
         self.request_repository_load(workspace.workspace.clone());
         self.queue_save_last_workspace(workspace.workspace);
-        if let Some(popover) = self.ivars().workspace_popover.get() {
-            popover.close();
-        }
+    }
+
+    fn open_workspace_in_new_window(&self, workspace: &craic_config::ConfiguredWorkspace) {
+        let provider_flag = NSString::from_str("--workspace-provider");
+        let provider = NSString::from_str(&workspace.provider_id());
+        let path_flag = NSString::from_str("--workspace-path");
+        let path = NSString::from_str(&workspace.path);
+        let argument_refs: [&NSString; 4] = [&provider_flag, &provider, &path_flag, &path];
+        let arguments = NSArray::from_slice(&argument_refs);
+        let configuration = NSWorkspaceOpenConfiguration::configuration();
+        configuration.setCreatesNewApplicationInstance(true);
+        configuration.setArguments(&arguments);
+        let label = workspace.label();
+        let delegate = Arc::new(MainThreadBound::new(self.retain(), self.mtm()));
+        let completion = RcBlock::new(
+            move |_application: *mut NSRunningApplication, error: *mut NSError| {
+                let Some(error) = (unsafe { error.as_ref() }) else {
+                    log::info!("workspace opened in new window label={label}");
+                    return;
+                };
+                let message = error.localizedDescription().to_string();
+                log::warn!("workspace new-window launch failed label={label} error={message}");
+                let delegate = delegate.clone();
+                DispatchQueue::main().exec_async(move || {
+                    let Some(mtm) = MainThreadMarker::new() else {
+                        return;
+                    };
+                    delegate
+                        .get(mtm)
+                        .present_path_action_error("Open Workspace Failed", &message);
+                });
+            },
+        );
+        NSWorkspace::sharedWorkspace().openApplicationAtURL_configuration_completionHandler(
+            &NSBundle::mainBundle().bundleURL(),
+            &configuration,
+            Some(&completion),
+        );
     }
 
     fn queue_save_last_workspace(&self, workspace: craic_config::ConfiguredWorkspace) {
