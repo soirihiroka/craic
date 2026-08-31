@@ -28,7 +28,8 @@ use branch_actions::connect_branch_actions;
 use craic_app_core::{
     ActionId, AppCommand, AppHandle, ApplicationRuntime, Badge, Generation,
     PageCommand as CorePageCommand, PageId as CorePageId, PageServiceRequest, PageViewState,
-    RuntimeConfig, ServiceCompletion, UiEvent, WorkspaceId, WorkspaceSelection,
+    RuntimeConfig, ServiceCompletion, UiEvent, WorkspaceId, WorkspaceRefreshCompletion,
+    WorkspaceRefreshIdentity, WorkspaceRefreshOptions, WorkspaceRefreshRequest, WorkspaceSelection,
 };
 use craic_ui_core::ui::command_mailbox;
 use dialogs::show_error_dialog;
@@ -398,9 +399,8 @@ pub fn build_ui(
         last_error: RefCell::new(None),
         last_snapshot: RefCell::new(initial_snapshot.clone()),
         last_snapshot_repo: RefCell::new(initial_snapshot.as_ref().map(|_| repo_path.clone())),
-        snapshot_sequence: Cell::new(0),
-        snapshot_refresh_running: Cell::new(false),
-        queued_workspace_refresh: RefCell::new(None),
+        workspace_generation: Cell::new(Generation::INITIAL),
+        workspace_refresh_request: RefCell::new(None),
         repository_monitor: RepositoryMonitor::default(),
         workspace_color_provider,
     });
@@ -895,9 +895,8 @@ struct AppState {
     last_error: RefCell<Option<String>>,
     last_snapshot: RefCell<Option<git::WorkspaceSnapshot>>,
     last_snapshot_repo: RefCell<Option<PathBuf>>,
-    snapshot_sequence: Cell<u64>,
-    snapshot_refresh_running: Cell<bool>,
-    queued_workspace_refresh: RefCell<Option<QueuedWorkspaceRefresh>>,
+    workspace_generation: Cell<Generation>,
+    workspace_refresh_request: RefCell<Option<WorkspaceRefreshRequest>>,
     repository_monitor: RepositoryMonitor,
     workspace_color_provider: gtk::CssProvider,
 }
@@ -1030,13 +1029,6 @@ fn relative_luminance(value: u8) -> f64 {
     } else {
         ((value + 0.055) / 1.055).powf(2.4)
     }
-}
-
-#[derive(Clone, Debug)]
-struct QueuedWorkspaceRefresh {
-    message: Option<String>,
-    show_toast: bool,
-    force_update: bool,
 }
 
 #[derive(Default)]
@@ -1408,11 +1400,11 @@ fn start_repository_monitor(state: &Rc<AppState>) {
 }
 
 fn refresh(state: &Rc<AppState>, message: Option<String>) {
-    refresh_workspace(state, message, true, true);
+    request_workspace_refresh(state, message, true, true);
 }
 
 fn refresh_with_toast(state: &Rc<AppState>, message: Option<String>, show_toast: bool) {
-    refresh_workspace(state, message, show_toast, true);
+    request_workspace_refresh(state, message, show_toast, true);
 }
 
 fn refresh_active_repo_metadata(state: &Rc<AppState>, item_id: Option<String>) {
@@ -1446,25 +1438,38 @@ fn refresh_active_repo_metadata(state: &Rc<AppState>, item_id: Option<String>) {
 }
 
 fn refresh_from_monitor(state: &Rc<AppState>) {
-    refresh_workspace(state, None, false, false);
+    request_workspace_refresh(state, None, false, false);
 }
 
-fn refresh_workspace(
+fn request_workspace_refresh(
     state: &Rc<AppState>,
     message: Option<String>,
     show_toast: bool,
     force_update: bool,
 ) {
-    let request = QueuedWorkspaceRefresh {
+    let command = AppCommand::RefreshWorkspace(WorkspaceRefreshOptions {
         message,
         show_toast,
         force_update,
-    };
-    if state.snapshot_refresh_running.get() {
-        queue_workspace_refresh(state, request);
+    });
+    if let Err(command) = state.app_handle.try_send(command) {
+        log::warn!("GTK workspace refresh queue rejected command={command:?}");
+    }
+}
+
+fn execute_workspace_refresh(state: &Rc<AppState>, request: WorkspaceRefreshRequest) {
+    if request.identity.workspace_generation != state.workspace_generation.get() {
+        log::debug!(
+            "ignored stale GTK workspace refresh request={} generation={}",
+            request.identity.request_id,
+            request.identity.workspace_generation.get()
+        );
+        complete_workspace_refresh(state, request.identity, None, true);
         return;
     }
-    state.snapshot_refresh_running.set(true);
+    state
+        .workspace_refresh_request
+        .replace(Some(request.clone()));
 
     let repo_path = state.repo_path.borrow().clone();
     state.repository_monitor.ensure_for_workspace(state);
@@ -1473,11 +1478,9 @@ fn refresh_workspace(
     } else {
         state.content.clear_run_targets();
     }
-    let sequence = state.snapshot_sequence.get().wrapping_add(1);
-    state.snapshot_sequence.set(sequence);
-    let message = request.message.clone();
-    let show_toast = request.show_toast;
-    let force_update = request.force_update;
+    let message = request.options.message.clone();
+    let show_toast = request.options.show_toast;
+    let force_update = request.options.force_update;
 
     let workspace_key = state.workspace_ref.borrow().id.to_string();
     let system_id = state.system_ref.borrow().id.clone();
@@ -1510,8 +1513,9 @@ fn refresh_workspace(
                 .replace(Some(state.repo_path.borrow().clone()));
             state.last_error.borrow_mut().take();
             let completion_state = state.clone();
+            let identity = request.identity;
             refresh_pages(&state.pages, &snapshot, move || {
-                complete_snapshot_refresh(&completion_state);
+                complete_workspace_refresh(&completion_state, identity, None, false);
             });
             return;
         } else if let Some(message) = message.as_deref()
@@ -1520,25 +1524,29 @@ fn refresh_workspace(
             state.show_toast(message);
         }
 
-        complete_snapshot_refresh(state);
+        complete_workspace_refresh(state, request.identity, None, false);
         return;
     };
 
     request_provider_workspace_snapshot(workspace_key.clone(), git_handle, {
         let state = state.clone();
         move |response_workspace_key, result| {
-            if response_workspace_key != workspace_key {
-                log::warn!(
+            if !workspace_refresh_request_is_current(&state, request.identity, &workspace_key) {
+                log::debug!(
+                    "discarding stale GTK workspace refresh request={} workspace={}",
+                    request.identity.request_id,
+                    workspace_key
+                );
+                complete_workspace_refresh(&state, request.identity, None, true);
+                return;
+            } else if response_workspace_key != workspace_key {
+                let message = format!(
                     "discarding stale snapshot response for {} (current workspace {})",
-                    response_workspace_key,
-                    workspace_key,
+                    response_workspace_key, workspace_key,
                 );
-            } else if state.snapshot_sequence.get() != sequence {
-                log::trace!(
-                    "discarding outdated snapshot result for {} (sequence {})",
-                    repo_path.display(),
-                    sequence,
-                );
+                log::warn!("{message}");
+                complete_workspace_refresh(&state, request.identity, Some(message), false);
+                return;
             } else {
                 match result {
                     Ok(snapshot) => {
@@ -1555,7 +1563,7 @@ fn refresh_workspace(
                                 "skipping workspace refresh for {} due no changes",
                                 repo_path.display(),
                             );
-                            complete_snapshot_refresh(&state);
+                            complete_workspace_refresh(&state, request.identity, None, false);
                             return;
                         }
 
@@ -1578,8 +1586,14 @@ fn refresh_workspace(
                                 state.show_toast(message);
                             }
                             let completion_state = state.clone();
+                            let identity = request.identity;
                             refresh_pages(&state.pages, &snapshot, move || {
-                                complete_snapshot_refresh(&completion_state);
+                                complete_workspace_refresh(
+                                    &completion_state,
+                                    identity,
+                                    None,
+                                    false,
+                                );
                             });
                             return;
                         } else if let Some(message) = message.as_deref()
@@ -1601,47 +1615,56 @@ fn refresh_workspace(
                             *state.last_error.borrow_mut() = Some(err.clone());
                             show_error_dialog(&state.window, "Repository Error", &err);
                         }
+                        complete_workspace_refresh(&state, request.identity, Some(err), false);
+                        return;
                     }
                 }
             }
-            complete_snapshot_refresh(&state);
+            complete_workspace_refresh(&state, request.identity, None, false);
         }
     })
 }
 
-fn queue_workspace_refresh(state: &Rc<AppState>, request: QueuedWorkspaceRefresh) {
-    let mut queued = state.queued_workspace_refresh.borrow_mut();
-    let already_queued = queued.is_some();
-    match queued.as_mut() {
-        Some(existing) => {
-            if request.message.is_some() {
-                existing.message = request.message;
-            }
-            existing.show_toast |= request.show_toast;
-            existing.force_update |= request.force_update;
-        }
-        None => {
-            *queued = Some(request);
-        }
-    }
-    if already_queued {
-        log::trace!("coalesced workspace refresh while snapshot is running");
-    } else {
-        log::debug!("queued workspace refresh while snapshot is running");
-    }
+fn workspace_refresh_request_is_current(
+    state: &AppState,
+    identity: WorkspaceRefreshIdentity,
+    workspace_key: &str,
+) -> bool {
+    state.workspace_generation.get() == identity.workspace_generation
+        && state.workspace_ref.borrow().id.to_string() == workspace_key
+        && state
+            .workspace_refresh_request
+            .borrow()
+            .as_ref()
+            .is_some_and(|request| request.identity == identity)
 }
 
-fn complete_snapshot_refresh(state: &Rc<AppState>) {
-    state.snapshot_refresh_running.set(false);
-    let queued = state.queued_workspace_refresh.borrow_mut().take();
-    if let Some(queued) = queued {
-        log::debug!("running queued workspace refresh after snapshot completion");
-        refresh_workspace(
-            state,
-            queued.message,
-            queued.show_toast,
-            queued.force_update,
-        );
+fn complete_workspace_refresh(
+    state: &AppState,
+    identity: WorkspaceRefreshIdentity,
+    error: Option<String>,
+    cancelled: bool,
+) {
+    let is_current = state
+        .workspace_refresh_request
+        .borrow()
+        .as_ref()
+        .is_some_and(|request| request.identity == identity);
+    if is_current {
+        state.workspace_refresh_request.borrow_mut().take();
+    }
+    let completion = if cancelled {
+        WorkspaceRefreshCompletion::Cancelled(identity)
+    } else if let Some(message) = error {
+        WorkspaceRefreshCompletion::Failed { identity, message }
+    } else {
+        WorkspaceRefreshCompletion::Succeeded(identity)
+    };
+    if let Err(command) = state
+        .app_handle
+        .try_send(AppCommand::WorkspaceRefreshCompleted(completion))
+    {
+        log::warn!("GTK workspace refresh completion queue rejected command={command:?}");
     }
 }
 
@@ -1679,6 +1702,12 @@ where
 fn apply_app_core_event(state: &Rc<AppState>, event: UiEvent) {
     match event {
         UiEvent::ApplicationState(view_state) => {
+            if state.workspace_generation.get() != view_state.workspace_generation {
+                state
+                    .workspace_generation
+                    .set(view_state.workspace_generation);
+                state.workspace_refresh_request.borrow_mut().take();
+            }
             if let Some(page) = view_state.active_page.as_ref()
                 && let Some(index) = state
                     .pages
@@ -1694,6 +1723,7 @@ fn apply_app_core_event(state: &Rc<AppState>, event: UiEvent) {
             state: page_state,
         } => apply_app_core_page_state(state, &page, revision, &page_state),
         UiEvent::PageServiceRequest(request) => route_app_core_page_service(state, request),
+        UiEvent::WorkspaceRefreshRequest(request) => execute_workspace_refresh(state, request),
         UiEvent::Effect(request) => {
             log::warn!(
                 "GTK received an unsupported app-core UI effect id={:?}",

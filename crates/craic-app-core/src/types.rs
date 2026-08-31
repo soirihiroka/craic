@@ -116,6 +116,54 @@ pub struct WorkspaceSelection {
     pub id: WorkspaceId,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRefreshOptions {
+    pub message: Option<String>,
+    pub show_toast: bool,
+    pub force_update: bool,
+}
+
+impl WorkspaceRefreshOptions {
+    pub fn merge(&mut self, newer: Self) {
+        if newer.message.is_some() {
+            self.message = newer.message;
+        }
+        self.show_toast |= newer.show_toast;
+        self.force_update |= newer.force_update;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRefreshIdentity {
+    pub request_id: uuid::Uuid,
+    pub workspace_generation: Generation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRefreshRequest {
+    pub identity: WorkspaceRefreshIdentity,
+    pub options: WorkspaceRefreshOptions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceRefreshCompletion {
+    Succeeded(WorkspaceRefreshIdentity),
+    Failed {
+        identity: WorkspaceRefreshIdentity,
+        message: String,
+    },
+    Cancelled(WorkspaceRefreshIdentity),
+}
+
+impl WorkspaceRefreshCompletion {
+    pub fn identity(&self) -> WorkspaceRefreshIdentity {
+        match self {
+            Self::Succeeded(identity) | Self::Cancelled(identity) => *identity,
+            Self::Failed { identity, .. } => *identity,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefreshScope {
     Application,
@@ -165,9 +213,11 @@ pub enum AppCommand {
     RoutePageCommand(PageCommand),
     SelectWorkspace(WorkspaceSelection),
     Refresh(RefreshScope),
+    RefreshWorkspace(WorkspaceRefreshOptions),
     SetPageBadge { page: PageId, badge: Option<Badge> },
     CompleteUiEffect(UiEffectCompletion),
     ServiceCompleted(ServiceCompletion),
+    WorkspaceRefreshCompleted(WorkspaceRefreshCompletion),
     ShutdownRequested,
 }
 
@@ -184,6 +234,7 @@ pub struct ApplicationViewState {
     pub workspace_generation: Generation,
     pub badges: BTreeMap<PageId, Badge>,
     pub refreshing: Vec<RefreshScope>,
+    pub workspace_refresh_error: Option<String>,
     pub shutting_down: bool,
 }
 
@@ -204,6 +255,7 @@ pub enum UiEvent {
         state: Arc<PageViewState>,
     },
     PageServiceRequest(PageServiceRequest),
+    WorkspaceRefreshRequest(WorkspaceRefreshRequest),
     Effect(UiEffectRequest),
     ShutdownReady,
 }

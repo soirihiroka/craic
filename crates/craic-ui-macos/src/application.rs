@@ -44,7 +44,8 @@ use craic_agent::remote_media::{self, RemoteMedia, RemoteMediaKind};
 use craic_app_core::{
     AppCommand, AppHandle, ApplicationRuntime, ApplicationViewState, Badge, PAGE_DESCRIPTORS,
     PageId, PageServiceRequest, PageViewState, RefreshScope, RuntimeConfig, ServiceCompletion,
-    UiEvent, WorkspaceId, WorkspaceSelection, page_descriptor,
+    UiEvent, WorkspaceId, WorkspaceRefreshCompletion, WorkspaceRefreshIdentity,
+    WorkspaceRefreshRequest, WorkspaceSelection, page_descriptor,
 };
 use craic_file_support::{FileProbe, FileRole, resolve as resolve_file_support};
 use craic_language::markdown_lint::MarkdownLintIssue;
@@ -988,6 +989,8 @@ pub(crate) struct AppDelegateIvars {
     workspace_metadata_requests:
         OnceCell<tokio::sync::mpsc::Sender<NativeWorkspaceMetadataRequest>>,
     active_workspace_id: RefCell<Option<String>>,
+    workspace_generation: Cell<craic_app_core::Generation>,
+    workspace_refresh_loading: Cell<bool>,
     repository_requests: OnceCell<tokio::sync::mpsc::Sender<RepositoryRequest>>,
     agent_commands: OnceCell<tokio::sync::mpsc::Sender<NativeAgentCommand>>,
     agent_request_alerts: RefCell<HashMap<String, Retained<NSAlert>>>,
@@ -1130,7 +1133,7 @@ enum RepositoryRequest {
     Refresh {
         workspace_id: String,
         handle: Arc<GitRepoHandle>,
-        page_request_id: Option<String>,
+        core_request: Option<RepositoryCoreRefreshRequest>,
         cancellation: WorkspaceCancellationToken,
     },
     RunGitAction {
@@ -1402,6 +1405,12 @@ enum RepositoryRequest {
     },
 }
 
+#[derive(Clone)]
+enum RepositoryCoreRefreshRequest {
+    Page(String),
+    Workspace(WorkspaceRefreshRequest),
+}
+
 struct NativeQuickActions {
     targets: Vec<RunItem>,
     configs: Vec<QuickActionConfig>,
@@ -1520,7 +1529,7 @@ enum RepositoryCompletion {
     Snapshot {
         workspace_id: String,
         handle: Option<Arc<GitRepoHandle>>,
-        page_request_id: Option<String>,
+        core_request: Option<RepositoryCoreRefreshRequest>,
         result: Result<WorkspaceSnapshot, String>,
     },
     ActionProgress {
@@ -4936,9 +4945,7 @@ define_class!(
             let Some(handle) = self.ivars().app_handle.get() else {
                 return;
             };
-            if let Err(command) = handle.try_send(AppCommand::Refresh(RefreshScope::Page(
-                PageId::new("changes"),
-            ))) {
+            if let Err(command) = handle.try_send(AppCommand::Refresh(RefreshScope::Workspace)) {
                 log::warn!("native workspace refresh queue rejected command={command:?}");
             }
         }
@@ -6121,7 +6128,7 @@ impl AppDelegate {
         }
     }
 
-    fn request_workspace_refresh(&self, page_request_id: String) {
+    fn request_changes_refresh(&self, page_request_id: String) {
         let Some(workspace_id) = self.ivars().active_workspace_id.borrow().clone() else {
             self.complete_pending_page_service(
                 "changes",
@@ -6159,7 +6166,7 @@ impl AppDelegate {
         if let Err(error) = requests.try_send(RepositoryRequest::Refresh {
             workspace_id: workspace_id.clone(),
             handle,
-            page_request_id: Some(page_request_id),
+            core_request: Some(RepositoryCoreRefreshRequest::Page(page_request_id)),
             cancellation,
         }) {
             self.repository_action_failed(
@@ -6173,6 +6180,44 @@ impl AppDelegate {
             );
             self.restore_changes_page_badge();
             self.complete_pending_page_service("changes", Err(error.to_string()));
+        }
+    }
+
+    fn request_workspace_refresh(&self, request: WorkspaceRefreshRequest) {
+        let Some(workspace_id) = self.ivars().active_workspace_id.borrow().clone() else {
+            self.complete_workspace_refresh(request.identity, Err("No workspace is active".into()));
+            return;
+        };
+        let Some(handle) = self.ivars().workspace_handle.borrow().clone() else {
+            self.complete_workspace_refresh(
+                request.identity,
+                Err("The workspace is not loaded".into()),
+            );
+            return;
+        };
+        let Some(cancellation) = self.workspace_cancellation_token() else {
+            self.complete_workspace_refresh(
+                request.identity,
+                Err("The workspace is shutting down".into()),
+            );
+            return;
+        };
+        let Some(requests) = self.ivars().repository_requests.get() else {
+            self.complete_workspace_refresh(
+                request.identity,
+                Err("The repository service is unavailable".into()),
+            );
+            return;
+        };
+        self.set_repository_action_progress(&workspace_id, "Refreshing…");
+        if let Err(error) = requests.try_send(RepositoryRequest::Refresh {
+            workspace_id: workspace_id.clone(),
+            handle,
+            core_request: Some(RepositoryCoreRefreshRequest::Workspace(request.clone())),
+            cancellation,
+        }) {
+            self.repository_action_failed(&workspace_id, "Refresh Failed", &error.to_string());
+            self.complete_workspace_refresh(request.identity, Err(error.to_string()));
         }
     }
 
@@ -21549,9 +21594,6 @@ impl AppDelegate {
             self.shutdown_all_native_terminals();
         }
         self.cancel_commit_message_generation();
-        for page_id in ["changes", "history", "files", "containers", "agents"] {
-            self.set_page_badge(page_id, NativePageBadge::Indicator);
-        }
         self.ivars()
             .active_workspace_id
             .replace(Some(workspace_id.to_string()));
@@ -21742,13 +21784,28 @@ impl AppDelegate {
         &self,
         workspace_id: &str,
         handle: Option<Arc<GitRepoHandle>>,
-        page_request_id: Option<String>,
+        core_request: Option<RepositoryCoreRefreshRequest>,
         result: Result<WorkspaceSnapshot, String>,
     ) {
         if self.ivars().active_workspace_id.borrow().as_deref() != Some(workspace_id) {
             log::debug!("discarding stale repository snapshot workspace={workspace_id}");
             return;
         }
+        if let Some(RepositoryCoreRefreshRequest::Workspace(request)) = core_request.as_ref()
+            && request.identity.workspace_generation != self.ivars().workspace_generation.get()
+        {
+            log::debug!(
+                "discarding stale native workspace refresh request={} generation={}",
+                request.identity.request_id,
+                request.identity.workspace_generation.get()
+            );
+            self.complete_workspace_refresh_cancelled(request.identity);
+            return;
+        }
+        let completes_workspace_refresh = matches!(
+            core_request.as_ref(),
+            Some(RepositoryCoreRefreshRequest::Workspace(_))
+        );
         let page_service_result = result
             .as_ref()
             .map(|_| serde_json::Value::Null)
@@ -21784,7 +21841,7 @@ impl AppDelegate {
                             if let Err(error) = requests.try_send(RepositoryRequest::Refresh {
                                 workspace_id: monitored_workspace.clone(),
                                 handle: monitored_handle.clone(),
-                                page_request_id: None,
+                                core_request: None,
                                 cancellation: cancellation.clone(),
                             }) {
                                 log::debug!(
@@ -21813,7 +21870,10 @@ impl AppDelegate {
                     .repository_snapshot
                     .replace(Some(snapshot.clone()));
                 self.restore_changes_page_badge();
-                self.configure_repository_controls(&snapshot, false);
+                self.configure_repository_controls(
+                    &snapshot,
+                    self.ivars().workspace_refresh_loading.get(),
+                );
                 self.refresh_changed_file_results();
                 self.update_commit_composer_state();
                 if let Some(path) = self.ivars().selected_change_path.borrow().clone() {
@@ -21919,6 +21979,9 @@ impl AppDelegate {
                 log::warn!("native repository snapshot failed workspace={workspace_id}: {error}");
             }
         }
+        if self.ivars().workspace_refresh_loading.get() && !completes_workspace_refresh {
+            self.set_repository_action_progress(workspace_id, "Refreshing…");
+        }
         if first_workspace_snapshot
             && self
                 .ivars()
@@ -21928,8 +21991,13 @@ impl AppDelegate {
         {
             self.request_workspace_settings_load();
         }
-        if let Some(page_request_id) = page_request_id {
-            self.complete_pending_page_service_id("changes", page_request_id, page_service_result);
+        match core_request {
+            Some(RepositoryCoreRefreshRequest::Page(page_request_id)) => self
+                .complete_pending_page_service_id("changes", page_request_id, page_service_result),
+            Some(RepositoryCoreRefreshRequest::Workspace(request)) => {
+                self.complete_workspace_refresh(request.identity, page_service_result.map(|_| ()))
+            }
+            None => {}
         }
     }
 
@@ -22903,9 +22971,9 @@ impl AppDelegate {
             RepositoryCompletion::Snapshot {
                 workspace_id,
                 handle,
-                page_request_id,
+                core_request,
                 result,
-            } => self.apply_repository_snapshot(&workspace_id, handle, page_request_id, result),
+            } => self.apply_repository_snapshot(&workspace_id, handle, core_request, result),
             RepositoryCompletion::ActionProgress {
                 workspace_id,
                 message,
@@ -23490,7 +23558,6 @@ impl AppDelegate {
                 attention: true,
             }),
         };
-        self.render_page_badge(page_id, badge);
         if let Some(handle) = self.ivars().app_handle.get()
             && let Err(command) = handle.try_send(AppCommand::SetPageBadge {
                 page: PageId::new(page_id),
@@ -26912,6 +26979,7 @@ impl AppDelegate {
                 state,
             } => self.apply_page_state(&page, revision, &state),
             UiEvent::PageServiceRequest(request) => self.apply_page_service_request(request),
+            UiEvent::WorkspaceRefreshRequest(request) => self.request_workspace_refresh(request),
             UiEvent::Effect(request) => {
                 if self.ivars().ui_context.get() == Some(&request.context) {
                     self.apply_ui_effect(request.id, request.effect);
@@ -26991,7 +27059,7 @@ impl AppDelegate {
             .borrow_mut()
             .insert(page.clone(), request);
         match page.as_str() {
-            "changes" => self.request_workspace_refresh(page_request_id),
+            "changes" => self.request_changes_refresh(page_request_id),
             "history" => self.request_history_page(true),
             "files" => self.request_files_tree(),
             "containers" => self.request_containers(),
@@ -27059,6 +27127,34 @@ impl AppDelegate {
         };
         if let Err(command) = handle.try_send(AppCommand::ServiceCompleted(completion)) {
             log::warn!("native page service completion queue rejected command={command:?}");
+        }
+    }
+
+    fn complete_workspace_refresh(
+        &self,
+        identity: WorkspaceRefreshIdentity,
+        result: Result<(), String>,
+    ) {
+        let completion = match result {
+            Ok(()) => WorkspaceRefreshCompletion::Succeeded(identity),
+            Err(message) => WorkspaceRefreshCompletion::Failed { identity, message },
+        };
+        let Some(handle) = self.ivars().app_handle.get() else {
+            return;
+        };
+        if let Err(command) = handle.try_send(AppCommand::WorkspaceRefreshCompleted(completion)) {
+            log::warn!("native workspace refresh completion queue rejected command={command:?}");
+        }
+    }
+
+    fn complete_workspace_refresh_cancelled(&self, identity: WorkspaceRefreshIdentity) {
+        let Some(handle) = self.ivars().app_handle.get() else {
+            return;
+        };
+        if let Err(command) = handle.try_send(AppCommand::WorkspaceRefreshCompleted(
+            WorkspaceRefreshCompletion::Cancelled(identity),
+        )) {
+            log::warn!("native workspace refresh cancellation queue rejected command={command:?}");
         }
     }
 
@@ -27247,6 +27343,27 @@ impl AppDelegate {
     }
 
     fn apply_application_state(&self, state: &ApplicationViewState) {
+        self.ivars()
+            .workspace_generation
+            .set(state.workspace_generation);
+        let refresh_loading = state
+            .refreshing
+            .iter()
+            .any(|scope| matches!(scope, RefreshScope::Workspace));
+        if self
+            .ivars()
+            .workspace_refresh_loading
+            .replace(refresh_loading)
+            != refresh_loading
+        {
+            if refresh_loading {
+                if let Some(workspace_id) = self.ivars().active_workspace_id.borrow().clone() {
+                    self.set_repository_action_progress(&workspace_id, "Refreshing…");
+                }
+            } else if let Some(snapshot) = self.ivars().repository_snapshot.borrow().clone() {
+                self.configure_repository_controls(&snapshot, false);
+            }
+        }
         if let Some(selection) = state.workspace.as_ref()
             && let Some(workspace) = self
                 .ivars()
@@ -29701,7 +29818,7 @@ pub fn run() {
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
                                     handle,
-                                    page_request_id: None,
+                                    core_request: None,
                                     result,
                                 },
                             ))
@@ -29713,7 +29830,7 @@ pub fn run() {
                     RepositoryRequest::Refresh {
                         workspace_id,
                         handle,
-                        page_request_id,
+                        core_request,
                         cancellation,
                     } => {
                         let refresh_handle = handle.clone();
@@ -29732,7 +29849,7 @@ pub fn run() {
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
                                     handle: Some(handle),
-                                    page_request_id,
+                                    core_request,
                                     result,
                                 },
                             ))
@@ -32084,7 +32201,7 @@ pub fn run() {
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
                                     handle: Some(handle),
-                                    page_request_id: None,
+                                    core_request: None,
                                     result: snapshot,
                                 },
                             ))
@@ -32140,7 +32257,7 @@ pub fn run() {
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
                                     handle: Some(handle),
-                                    page_request_id: None,
+                                    core_request: None,
                                     result: snapshot,
                                 },
                             ))
@@ -32201,7 +32318,7 @@ pub fn run() {
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
                                     handle: Some(handle),
-                                    page_request_id: None,
+                                    core_request: None,
                                     result: snapshot,
                                 },
                             ))

@@ -1,7 +1,8 @@
 use crate::{
     ActionId, AppCommand, ApplicationViewState, Badge, Generation, PAGE_DESCRIPTORS, PageCommand,
     PageId, PageRefreshCoordinator, PageServiceRequest, PageViewState, RefreshScope,
-    ServiceCompletion, UiEvent,
+    ServiceCompletion, UiEvent, WorkspaceRefreshCompletion, WorkspaceRefreshIdentity,
+    WorkspaceRefreshOptions, WorkspaceRefreshRequest,
 };
 use craic_platform::{UiEffectId, UiEffectResult};
 use serde_json::{Value, json};
@@ -27,6 +28,74 @@ struct PageStateOwner {
     states: BTreeMap<PageId, PageViewState>,
     revisions: BTreeMap<PageId, u64>,
     pending: HashMap<uuid::Uuid, PendingPageRequest>,
+}
+
+#[derive(Default)]
+struct WorkspaceRefreshOwner {
+    in_flight: Option<WorkspaceRefreshIdentity>,
+    trailing: Option<WorkspaceRefreshOptions>,
+}
+
+impl WorkspaceRefreshOwner {
+    fn request(
+        &mut self,
+        options: WorkspaceRefreshOptions,
+        workspace_generation: Generation,
+    ) -> Option<WorkspaceRefreshRequest> {
+        if self.in_flight.is_some() {
+            match self.trailing.as_mut() {
+                Some(trailing) => trailing.merge(options),
+                None => self.trailing = Some(options),
+            }
+            return None;
+        }
+
+        let identity = WorkspaceRefreshIdentity {
+            request_id: uuid::Uuid::new_v4(),
+            workspace_generation,
+        };
+        self.in_flight = Some(identity);
+        Some(WorkspaceRefreshRequest { identity, options })
+    }
+
+    fn complete(
+        &mut self,
+        completion: WorkspaceRefreshCompletion,
+        workspace_generation: Generation,
+    ) -> Option<(Option<String>, Option<WorkspaceRefreshRequest>)> {
+        let identity = completion.identity();
+        if identity.workspace_generation != workspace_generation || self.in_flight != Some(identity)
+        {
+            log::debug!(
+                "ignored stale workspace refresh completion request={} generation={}",
+                identity.request_id,
+                identity.workspace_generation.get()
+            );
+            return None;
+        }
+
+        self.in_flight = None;
+        let error = match completion {
+            WorkspaceRefreshCompletion::Failed { message, .. } => Some(message),
+            WorkspaceRefreshCompletion::Succeeded(_) | WorkspaceRefreshCompletion::Cancelled(_) => {
+                None
+            }
+        };
+        let trailing = self
+            .trailing
+            .take()
+            .and_then(|options| self.request(options, workspace_generation));
+        Some((error, trailing))
+    }
+
+    fn invalidate_workspace(&mut self) {
+        self.in_flight = None;
+        self.trailing = None;
+    }
+
+    fn is_refreshing(&self) -> bool {
+        self.in_flight.is_some()
+    }
 }
 
 impl PageStateOwner {
@@ -255,6 +324,7 @@ pub(crate) async fn run(
 ) {
     let mut state = ApplicationViewState::default();
     let mut pages = PageStateOwner::new();
+    let mut workspace_refresh = WorkspaceRefreshOwner::default();
     if events
         .send(UiEvent::ApplicationState(Arc::new(state.clone())))
         .await
@@ -291,47 +361,87 @@ pub(crate) async fn run(
                 );
                 state.workspace = Some(selection);
                 state.refreshing.clear();
+                state.workspace_refresh_error = None;
                 state.badges.clear();
+                workspace_refresh.invalidate_workspace();
                 for page in pages.invalidate_workspace() {
                     page_events.push(pages.event(&page));
                 }
                 true
             }
             AppCommand::Refresh(scope) => {
-                let targets = match &scope {
-                    RefreshScope::Page(page) => vec![page.clone()],
-                    RefreshScope::Application | RefreshScope::Workspace => PAGE_DESCRIPTORS
-                        .into_iter()
-                        .map(|descriptor| descriptor.page_id())
-                        .collect(),
-                };
-                let mut requested = false;
-                for page in targets {
-                    if pages.is_refreshing(&page) {
-                        log::debug!("coalesced page refresh page={}", page.as_str());
-                        continue;
-                    }
-                    let request = pages.begin(
-                        PageCommand {
-                            page: Some(page.clone()),
-                            action: ActionId::new("refresh"),
-                            payload: Value::Null,
-                        },
-                        page.clone(),
+                if matches!(scope, RefreshScope::Application | RefreshScope::Workspace) {
+                    let request = workspace_refresh.request(
+                        WorkspaceRefreshOptions::default(),
                         state.workspace_generation,
                     );
-                    set_page_refreshing(&mut state, &page, true);
-                    page_events.push(pages.event(&page));
-                    page_events.push(UiEvent::PageServiceRequest(request));
-                    requested = true;
+                    set_workspace_refreshing(&mut state, workspace_refresh.is_refreshing());
+                    if let Some(request) = request {
+                        state.workspace_refresh_error = None;
+                        page_events.push(UiEvent::WorkspaceRefreshRequest(request));
+                    } else {
+                        log::debug!("coalesced workspace refresh");
+                    }
+                    true
+                } else {
+                    let RefreshScope::Page(page) = scope else {
+                        unreachable!("workspace refresh scopes handled above")
+                    };
+                    let targets = [page];
+                    let mut requested = false;
+                    for page in targets {
+                        if pages.is_refreshing(&page) {
+                            log::debug!("coalesced page refresh page={}", page.as_str());
+                            continue;
+                        }
+                        let request = pages.begin(
+                            PageCommand {
+                                page: Some(page.clone()),
+                                action: ActionId::new("refresh"),
+                                payload: Value::Null,
+                            },
+                            page.clone(),
+                            state.workspace_generation,
+                        );
+                        set_page_refreshing(&mut state, &page, true);
+                        page_events.push(pages.event(&page));
+                        page_events.push(UiEvent::PageServiceRequest(request));
+                        requested = true;
+                    }
+                    requested
                 }
-                requested
+            }
+            AppCommand::RefreshWorkspace(options) => {
+                let request = workspace_refresh.request(options, state.workspace_generation);
+                set_workspace_refreshing(&mut state, workspace_refresh.is_refreshing());
+                if let Some(request) = request {
+                    state.workspace_refresh_error = None;
+                    page_events.push(UiEvent::WorkspaceRefreshRequest(request));
+                } else {
+                    log::debug!("coalesced workspace refresh");
+                }
+                true
             }
             AppCommand::ServiceCompleted(completion) => {
                 if let Some(page) = pages.complete(completion, state.workspace_generation) {
                     set_page_refreshing(&mut state, &page, false);
                     sync_page_badge(&mut state, &pages, &page);
                     page_events.push(pages.event(&page));
+                    true
+                } else {
+                    false
+                }
+            }
+            AppCommand::WorkspaceRefreshCompleted(completion) => {
+                if let Some((error, trailing)) =
+                    workspace_refresh.complete(completion, state.workspace_generation)
+                {
+                    state.workspace_refresh_error = error;
+                    set_workspace_refreshing(&mut state, workspace_refresh.is_refreshing());
+                    if let Some(request) = trailing {
+                        state.workspace_refresh_error = None;
+                        page_events.push(UiEvent::WorkspaceRefreshRequest(request));
+                    }
                     true
                 } else {
                     false
@@ -433,6 +543,15 @@ fn set_page_refreshing(state: &mut ApplicationViewState, page: &PageId, refreshi
     state.refreshing.retain(|candidate| candidate != &scope);
     if refreshing {
         state.refreshing.push(scope);
+    }
+}
+
+fn set_workspace_refreshing(state: &mut ApplicationViewState, refreshing: bool) {
+    state
+        .refreshing
+        .retain(|candidate| !matches!(candidate, RefreshScope::Workspace));
+    if refreshing {
+        state.refreshing.push(RefreshScope::Workspace);
     }
 }
 
