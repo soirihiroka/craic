@@ -94,12 +94,6 @@ impl ModeSwitcher {
         }
     }
 
-    pub(in crate::ui) fn update_badges(&self, pages: &[PageRef]) {
-        for (index, page) in pages.iter().enumerate() {
-            self.set_badge(index, page.badge());
-        }
-    }
-
     pub(super) fn set_badge(&self, index: usize, badge: Option<PageBadge>) {
         let Some(label) = self.badges.get(index) else {
             return;

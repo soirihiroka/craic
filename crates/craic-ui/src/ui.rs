@@ -25,7 +25,11 @@ use crate::system::{SystemProviderRegistry, SystemRef, WorkspacePath, WorkspaceR
 use adw::prelude::*;
 use app_menu::{app_menu, install_actions, launch_workspace_location_in_new_instance};
 use branch_actions::connect_branch_actions;
-use craic_app_core::{Generation, PageRefreshCoordinator};
+use craic_app_core::{
+    ActionId, AppCommand, AppHandle, ApplicationRuntime, Badge, Generation,
+    PageCommand as CorePageCommand, PageId as CorePageId, PageServiceRequest, PageViewState,
+    RuntimeConfig, ServiceCompletion, UiEvent, WorkspaceId, WorkspaceSelection,
+};
 use craic_ui_core::ui::command_mailbox;
 use dialogs::show_error_dialog;
 use dialogs::show_startup_crash_dialog;
@@ -34,6 +38,7 @@ use pages::{PageCommand, PageCommandResult, PageRefreshRequest};
 use pango::prelude::FontMapExt;
 use shell_actions::connect_shell_actions;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, OnceLock, mpsc};
@@ -292,7 +297,18 @@ pub fn build_ui(
             let state_slot = state_slot.clone();
             move || {
                 if let Some(state) = state_slot.borrow().upgrade() {
-                    state.sidebar.update_page_badges(&state.pages);
+                    for page in &state.pages {
+                        let badge = page.badge().map(|badge| Badge {
+                            text: badge.text().to_string(),
+                            attention: false,
+                        });
+                        if let Err(command) = state.app_handle.try_send(AppCommand::SetPageBadge {
+                            page: page.id(),
+                            badge,
+                        }) {
+                            log::warn!("GTK page badge queue rejected command={command:?}");
+                        }
+                    }
                 }
             }
         }),
@@ -331,7 +347,13 @@ pub fn build_ui(
     startup.mark("build-content");
 
     let page_host = pages::PageHost::new(&sidebar.page_slot(), &content.page_slot());
-    let page_refreshes = PageRefreshCoordinator::new(pages.iter().map(|page| page.id()));
+    let (app_runtime, app_channels) = ApplicationRuntime::start(RuntimeConfig {
+        thread_name: "craic-gtk-app".to_string(),
+        ..RuntimeConfig::default()
+    })
+    .expect("failed to start GTK application state runtime");
+    let app_handle = app_channels.handle;
+    let mut app_events = app_channels.events;
     startup.mark("build-page-host");
 
     let main_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
@@ -368,7 +390,10 @@ pub fn build_ui(
         pages,
         page_host,
         active_page: RefCell::new(None),
-        page_refreshes: RefCell::new(page_refreshes),
+        app_runtime: RefCell::new(Some(app_runtime)),
+        app_handle,
+        page_state_revisions: RefCell::new(HashMap::new()),
+        page_service_requests: RefCell::new(HashMap::new()),
         git_action_running,
         last_error: RefCell::new(None),
         last_snapshot: RefCell::new(initial_snapshot.clone()),
@@ -381,6 +406,16 @@ pub fn build_ui(
     });
     *state_slot.borrow_mut() = Rc::downgrade(&state);
     startup.mark("build-app-state");
+
+    if let Err(command) =
+        state
+            .app_handle
+            .try_send(AppCommand::SelectWorkspace(WorkspaceSelection {
+                id: WorkspaceId::new(initial_workspace_key.clone()),
+            }))
+    {
+        log::warn!("initial GTK app-core workspace selection rejected command={command:?}");
+    }
 
     apply_workspace_color(&state);
     startup.mark("apply-workspace-color");
@@ -411,6 +446,16 @@ pub fn build_ui(
 
     window.present();
     startup.mark("present-window");
+
+    let state_weak = Rc::downgrade(&state);
+    gtk::glib::spawn_future_local(async move {
+        while let Some(event) = app_events.recv().await {
+            let Some(state) = state_weak.upgrade() else {
+                break;
+            };
+            apply_app_core_event(&state, event);
+        }
+    });
 
     let state_weak = Rc::downgrade(&state);
     window.add_tick_callback(move |_, _| {
@@ -842,7 +887,10 @@ struct AppState {
     pages: Vec<pages::PageRef>,
     page_host: pages::PageHost,
     active_page: RefCell<Option<pages::PageId>>,
-    page_refreshes: RefCell<PageRefreshCoordinator>,
+    app_runtime: RefCell<Option<ApplicationRuntime>>,
+    app_handle: AppHandle,
+    page_state_revisions: RefCell<HashMap<CorePageId, u64>>,
+    page_service_requests: RefCell<HashMap<CorePageId, PageServiceRequest>>,
     git_action_running: Rc<Cell<bool>>,
     last_error: RefCell<Option<String>>,
     last_snapshot: RefCell<Option<git::WorkspaceSnapshot>>,
@@ -857,6 +905,14 @@ struct AppState {
 impl AppState {
     fn show_toast(&self, message: &str) {
         self.toast_overlay.add_toast(adw::Toast::new(message));
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.app_runtime.get_mut().take() {
+            runtime.shutdown(std::time::Duration::from_secs(2));
+        }
     }
 }
 
@@ -1620,21 +1676,159 @@ where
     }
 }
 
+fn apply_app_core_event(state: &Rc<AppState>, event: UiEvent) {
+    match event {
+        UiEvent::ApplicationState(view_state) => {
+            if let Some(page) = view_state.active_page.as_ref()
+                && let Some(index) = state
+                    .pages
+                    .iter()
+                    .position(|candidate| candidate.id() == *page)
+            {
+                activate_page(state, index);
+            }
+        }
+        UiEvent::PageState {
+            page,
+            revision,
+            state: page_state,
+        } => apply_app_core_page_state(state, &page, revision, &page_state),
+        UiEvent::PageServiceRequest(request) => route_app_core_page_service(state, request),
+        UiEvent::Effect(request) => {
+            log::warn!(
+                "GTK received an unsupported app-core UI effect id={:?}",
+                request.id
+            );
+        }
+        UiEvent::ShutdownReady => log::debug!("GTK app-core shutdown ready"),
+    }
+}
+
+fn apply_app_core_page_state(
+    state: &AppState,
+    page: &CorePageId,
+    revision: u64,
+    page_state: &PageViewState,
+) {
+    let mut revisions = state.page_state_revisions.borrow_mut();
+    let current = revisions.entry(page.clone()).or_default();
+    if revision <= *current {
+        return;
+    }
+    *current = revision;
+    drop(revisions);
+    let Some(index) = state
+        .pages
+        .iter()
+        .position(|candidate| candidate.id() == *page)
+    else {
+        log::warn!(
+            "GTK app-core page state targets unknown page={}",
+            page.as_str()
+        );
+        return;
+    };
+    state
+        .sidebar
+        .set_page_refreshing(index, page_state.refreshing);
+    state.sidebar.set_page_badge(
+        index,
+        page_state
+            .badge
+            .as_ref()
+            .filter(|badge| !badge.text.is_empty())
+            .map(|badge| pages::PageBadge::new(badge.text.clone())),
+    );
+}
+
+fn route_app_core_page_service(state: &Rc<AppState>, request: PageServiceRequest) {
+    let Some(page) = request.command.page.clone() else {
+        complete_app_core_page_service(
+            state,
+            &request,
+            Some("The routed page command has no target".to_string()),
+        );
+        return;
+    };
+    if request.command.action.as_str() != "refresh" {
+        complete_app_core_page_service(
+            state,
+            &request,
+            Some(format!(
+                "Unsupported GTK page command: {}",
+                request.command.action.as_str()
+            )),
+        );
+        return;
+    }
+    let Some(index) = state
+        .pages
+        .iter()
+        .position(|candidate| candidate.id() == page)
+    else {
+        complete_app_core_page_service(
+            state,
+            &request,
+            Some(format!("Unknown GTK page: {}", page.as_str())),
+        );
+        return;
+    };
+    state
+        .page_service_requests
+        .borrow_mut()
+        .insert(page.clone(), request.clone());
+    execute_page_refresh(state, page, index, request.page_generation);
+}
+
+fn complete_app_core_page_service(
+    state: &AppState,
+    request: &PageServiceRequest,
+    error: Option<String>,
+) {
+    let completion = match error {
+        None => ServiceCompletion::Succeeded {
+            request_id: request.request_id,
+            generation: request.page_generation,
+            payload: request.command.payload.clone(),
+        },
+        Some(message) => ServiceCompletion::Failed {
+            request_id: request.request_id,
+            generation: request.page_generation,
+            message,
+        },
+    };
+    if let Err(command) = state
+        .app_handle
+        .try_send(AppCommand::ServiceCompleted(completion))
+    {
+        log::warn!("GTK page service completion queue rejected command={command:?}");
+    }
+}
+
 fn refresh_active_page(state: &Rc<AppState>) {
     let Some(page_id) = state.active_page.borrow().clone() else {
         log::warn!("active page refresh ignored because no page is active");
         return;
     };
-    let Some(index) = state.pages.iter().position(|page| page.id() == page_id) else {
-        log::warn!(
-            "active page refresh ignored unknown page={}",
-            page_id.as_str()
-        );
-        return;
-    };
+    if let Err(command) = state
+        .app_handle
+        .try_send(AppCommand::RoutePageCommand(CorePageCommand {
+            page: Some(page_id),
+            action: ActionId::new("refresh"),
+            payload: Default::default(),
+        }))
+    {
+        log::warn!("GTK active page refresh queue rejected command={command:?}");
+    }
+}
+
+fn execute_page_refresh(
+    state: &Rc<AppState>,
+    page_id: pages::PageId,
+    index: usize,
+    generation: Generation,
+) {
     let page = state.pages[index].clone();
-    let generation = state.page_refreshes.borrow_mut().begin(&page_id);
-    state.sidebar.set_page_refreshing(index, true);
 
     let label = page.label();
     log::info!(
@@ -1737,7 +1931,13 @@ fn refresh_workspace_page(
                     response_workspace_key,
                     workspace_key,
                 );
-                complete_page_refresh(&state, &page_id, index, generation);
+                complete_page_refresh_result(
+                    &state,
+                    &page_id,
+                    index,
+                    generation,
+                    Some("The workspace refresh response did not match its request".to_string()),
+                );
                 return;
             }
 
@@ -1746,7 +1946,13 @@ fn refresh_workspace_page(
                     "discarding page refresh for inactive workspace {}",
                     workspace_key
                 );
-                complete_page_refresh(&state, &page_id, index, generation);
+                complete_page_refresh_result(
+                    &state,
+                    &page_id,
+                    index,
+                    generation,
+                    Some("The page refresh completed for an inactive workspace".to_string()),
+                );
                 return;
             }
 
@@ -1774,10 +1980,9 @@ fn refresh_workspace_page(
                     log::warn!("page refresh failed index={index} label={label}: {err}");
                     page.set_error(&err);
                     show_error_dialog(&state.window, "Refresh Failed", &err);
+                    complete_page_refresh_result(&state, &page_id, index, generation, Some(err));
                 }
             }
-
-            complete_page_refresh(&state, &page_id, index, generation);
         }
     });
 }
@@ -1788,23 +1993,37 @@ fn complete_page_refresh(
     index: usize,
     generation: Generation,
 ) {
-    if !state
-        .page_refreshes
-        .borrow_mut()
-        .finish(page_id, generation)
-    {
+    complete_page_refresh_result(state, page_id, index, generation, None);
+}
+
+fn complete_page_refresh_result(
+    state: &Rc<AppState>,
+    page_id: &pages::PageId,
+    index: usize,
+    generation: Generation,
+    error: Option<String>,
+) {
+    let request = state
+        .page_service_requests
+        .borrow()
+        .get(page_id)
+        .filter(|request| request.page_generation == generation)
+        .cloned();
+    let Some(request) = request else {
         log::trace!(
             "ignored stale page refresh completion page={} generation={}",
             page_id.as_str(),
             generation.get()
         );
         return;
-    }
+    };
 
-    state.sidebar.set_page_refreshing(index, false);
+    state.page_service_requests.borrow_mut().remove(page_id);
+    complete_app_core_page_service(state, &request, error);
     log::debug!(
-        "page refresh indicator cleared page={} generation={}",
+        "page refresh completion submitted page={} index={} generation={}",
         page_id.as_str(),
+        index,
         generation.get()
     );
 }
@@ -1815,9 +2034,10 @@ fn page_refresh_generation_is_current(
     generation: Generation,
 ) -> bool {
     state
-        .page_refreshes
+        .page_service_requests
         .borrow()
-        .is_current(page_id, generation)
+        .get(page_id)
+        .is_some_and(|request| request.page_generation == generation)
 }
 
 fn activate_page(state: &Rc<AppState>, index: usize) {
@@ -1827,11 +2047,14 @@ fn activate_page(state: &Rc<AppState>, index: usize) {
 
     let page_id = state.pages[index].id();
     if state.active_page.borrow().as_ref() != Some(&page_id) {
-        state.active_page.replace(Some(page_id));
+        state.active_page.replace(Some(page_id.clone()));
         state.page_host.show(&state.pages, index);
         let page = state.pages[index].clone();
         let activate_page = page.clone();
         page.initialize(Box::new(move |_, _| activate_page.activate()));
+        if let Err(command) = state.app_handle.try_send(AppCommand::ActivatePage(page_id)) {
+            log::warn!("GTK page activation queue rejected command={command:?}");
+        }
     }
 
     if let Some(button) = state.sidebar.mode_switcher.buttons.get(index) {

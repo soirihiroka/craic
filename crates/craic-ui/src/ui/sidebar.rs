@@ -154,12 +154,12 @@ impl SidebarPane {
         }
     }
 
-    pub fn update_page_badges(&self, pages: &[PageRef]) {
-        self.mode_switcher.update_badges(pages);
-    }
-
     pub fn set_page_refreshing(&self, index: usize, refreshing: bool) {
         self.mode_switcher.set_refreshing(index, refreshing);
+    }
+
+    pub fn set_page_badge(&self, index: usize, badge: Option<super::pages::PageBadge>) {
+        self.mode_switcher.set_badge(index, badge);
     }
 
     pub fn set_error(&self, message: &str, workspace_name: &str) {

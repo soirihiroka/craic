@@ -104,6 +104,14 @@ pub struct PageCommand {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageServiceRequest {
+    pub request_id: uuid::Uuid,
+    pub workspace_generation: Generation,
+    pub page_generation: Generation,
+    pub command: PageCommand,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceSelection {
     pub id: WorkspaceId,
 }
@@ -134,6 +142,14 @@ pub enum ServiceCompletion {
 }
 
 impl ServiceCompletion {
+    pub fn request_id(&self) -> uuid::Uuid {
+        match self {
+            Self::Succeeded { request_id, .. }
+            | Self::Failed { request_id, .. }
+            | Self::Cancelled { request_id, .. } => *request_id,
+        }
+    }
+
     pub fn generation(&self) -> Generation {
         match self {
             Self::Succeeded { generation, .. }
@@ -149,6 +165,7 @@ pub enum AppCommand {
     RoutePageCommand(PageCommand),
     SelectWorkspace(WorkspaceSelection),
     Refresh(RefreshScope),
+    SetPageBadge { page: PageId, badge: Option<Badge> },
     CompleteUiEffect(UiEffectCompletion),
     ServiceCompleted(ServiceCompletion),
     ShutdownRequested,
@@ -186,6 +203,7 @@ pub enum UiEvent {
         revision: u64,
         state: Arc<PageViewState>,
     },
+    PageServiceRequest(PageServiceRequest),
     Effect(UiEffectRequest),
     ShutdownReady,
 }

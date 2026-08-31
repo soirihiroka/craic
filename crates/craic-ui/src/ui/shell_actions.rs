@@ -12,6 +12,7 @@ use crate::git;
 use crate::system::SystemProviderRegistry;
 use crate::system::providers::local::LocalProvider;
 use adw::prelude::*;
+use craic_app_core::{AppCommand, WorkspaceId, WorkspaceSelection};
 use craic_ui_agent::{AGENT_SESSION_NOTIFICATION_ACTION, agent_session_notification_id};
 use gtk::{gdk, gio};
 use std::cell::{Cell, RefCell};
@@ -205,6 +206,18 @@ fn connect_sidebar_mode_buttons(state: &Rc<AppState>) {
 fn set_active_workspace(state: &Rc<AppState>, workspace: ConfiguredWorkspace) {
     let active = active_workspace_from_config(&state.providers, &workspace);
     let item_id = workspace.selection_id();
+    if let Err(command) =
+        state
+            .app_handle
+            .try_send(AppCommand::SelectWorkspace(WorkspaceSelection {
+                id: WorkspaceId::new(item_id.clone()),
+            }))
+    {
+        log::warn!("GTK app-core workspace selection rejected command={command:?}");
+        state.show_toast("The workspace change could not be queued.");
+        return;
+    }
+    state.page_service_requests.borrow_mut().clear();
     *state.repo_path.borrow_mut() = active.repo_path.clone();
     state.system_ref.replace(active.system_ref);
     state.workspace_ref.replace(active.workspace_ref);

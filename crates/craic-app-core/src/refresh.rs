@@ -34,6 +34,10 @@ impl PageRefreshCoordinator {
         self.generations.get(page).copied() == Some(generation) && self.refreshing.contains(page)
     }
 
+    pub(crate) fn is_refreshing(&self, page: &PageId) -> bool {
+        self.refreshing.contains(page)
+    }
+
     pub fn finish(&mut self, page: &PageId, generation: Generation) -> bool {
         if !self.is_current(page, generation) {
             return false;

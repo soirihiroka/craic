@@ -42,8 +42,9 @@ use craic_agent::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsage
 use craic_agent::ai_commit::CommitMessageDraft;
 use craic_agent::remote_media::{self, RemoteMedia, RemoteMediaKind};
 use craic_app_core::{
-    AppCommand, AppHandle, ApplicationRuntime, ApplicationViewState, PAGE_DESCRIPTORS, PageId,
-    RuntimeConfig, UiEvent, WorkspaceId, WorkspaceSelection, page_descriptor,
+    AppCommand, AppHandle, ApplicationRuntime, ApplicationViewState, Badge, PAGE_DESCRIPTORS,
+    PageId, PageServiceRequest, PageViewState, RefreshScope, RuntimeConfig, ServiceCompletion,
+    UiEvent, WorkspaceId, WorkspaceSelection, page_descriptor,
 };
 use craic_file_support::{FileProbe, FileRole, resolve as resolve_file_support};
 use craic_language::markdown_lint::MarkdownLintIssue;
@@ -1069,6 +1070,8 @@ pub(crate) struct AppDelegateIvars {
     changes_top_cover: OnceCell<Retained<NSGlassEffectView>>,
     changes_search_popup: OnceCell<Retained<NSGlassEffectView>>,
     active_page_id: RefCell<Option<String>>,
+    page_state_revisions: RefCell<HashMap<String, u64>>,
+    page_service_requests: RefCell<HashMap<String, PageServiceRequest>>,
     history: OnceCell<HistoryUi>,
     files: OnceCell<FilesUi>,
     containers: OnceCell<ContainersUi>,
@@ -1127,6 +1130,7 @@ enum RepositoryRequest {
     Refresh {
         workspace_id: String,
         handle: Arc<GitRepoHandle>,
+        page_request_id: Option<String>,
         cancellation: WorkspaceCancellationToken,
     },
     RunGitAction {
@@ -1516,6 +1520,7 @@ enum RepositoryCompletion {
     Snapshot {
         workspace_id: String,
         handle: Option<Arc<GitRepoHandle>>,
+        page_request_id: Option<String>,
         result: Result<WorkspaceSnapshot, String>,
     },
     ActionProgress {
@@ -4928,19 +4933,28 @@ define_class!(
 
         #[unsafe(method(refreshWorkspace:))]
         fn refresh_workspace(&self, _sender: &NSMenuItem) {
-            self.request_workspace_refresh();
+            let Some(handle) = self.ivars().app_handle.get() else {
+                return;
+            };
+            if let Err(command) = handle.try_send(AppCommand::Refresh(RefreshScope::Page(
+                PageId::new("changes"),
+            ))) {
+                log::warn!("native workspace refresh queue rejected command={command:?}");
+            }
         }
 
         #[unsafe(method(refreshPage:))]
         fn refresh_page(&self, _sender: &NSMenuItem) {
-            if self.is_active_page("changes") {
-                self.request_workspace_refresh();
-            } else if self.is_active_page("history") {
-                self.request_history_page(true);
-            } else if self.is_active_page("files") {
-                self.request_files_tree();
-            } else if self.is_active_page("containers") {
-                self.request_containers();
+            let Some(page) = self.ivars().active_page_id.borrow().clone() else {
+                return;
+            };
+            let Some(handle) = self.ivars().app_handle.get() else {
+                return;
+            };
+            if let Err(command) =
+                handle.try_send(AppCommand::Refresh(RefreshScope::Page(PageId::new(page))))
+            {
+                log::warn!("native page refresh queue rejected command={command:?}");
             }
         }
 
@@ -6107,20 +6121,36 @@ impl AppDelegate {
         }
     }
 
-    fn request_workspace_refresh(&self) {
+    fn request_workspace_refresh(&self, page_request_id: String) {
         let Some(workspace_id) = self.ivars().active_workspace_id.borrow().clone() else {
+            self.complete_pending_page_service(
+                "changes",
+                Err("No workspace is active".to_string()),
+            );
             return;
         };
         let Some(handle) = self.ivars().workspace_handle.borrow().clone() else {
+            self.complete_pending_page_service(
+                "changes",
+                Err("The workspace is not loaded".to_string()),
+            );
             return;
         };
         let Some(cancellation) = self.workspace_cancellation_token() else {
+            self.complete_pending_page_service(
+                "changes",
+                Err("The workspace is shutting down".to_string()),
+            );
             return;
         };
         let Some(requests) = self.ivars().repository_requests.get() else {
             self.changes_operation_failed(
                 "Refresh Failed",
                 "The repository service is unavailable.",
+            );
+            self.complete_pending_page_service(
+                "changes",
+                Err("The repository service is unavailable".to_string()),
             );
             return;
         };
@@ -6129,6 +6159,7 @@ impl AppDelegate {
         if let Err(error) = requests.try_send(RepositoryRequest::Refresh {
             workspace_id: workspace_id.clone(),
             handle,
+            page_request_id: Some(page_request_id),
             cancellation,
         }) {
             self.repository_action_failed(
@@ -6141,6 +6172,7 @@ impl AppDelegate {
                 &format!("Refresh request could not be queued: {error}"),
             );
             self.restore_changes_page_badge();
+            self.complete_pending_page_service("changes", Err(error.to_string()));
         }
     }
 
@@ -13069,7 +13101,7 @@ impl AppDelegate {
         unsafe { ui.workspace_spinner.stopAnimation(None) };
         match result {
             Ok(snapshot) => {
-                self.apply_repository_snapshot(workspace_id, Some(handle), Ok(snapshot));
+                self.apply_repository_snapshot(workspace_id, Some(handle), None, Ok(snapshot));
                 ui.workspace_status
                     .setStringValue(&NSString::from_str("Workspace Git settings saved."));
                 self.request_workspace_settings_load();
@@ -15208,9 +15240,17 @@ impl AppDelegate {
 
     fn request_containers(&self) {
         let Some(containers) = self.ivars().containers.get() else {
+            self.complete_pending_page_service(
+                "containers",
+                Err("The Containers page is unavailable".to_string()),
+            );
             return;
         };
         let Some(workspace_id) = self.ivars().active_workspace_id.borrow().clone() else {
+            self.complete_pending_page_service(
+                "containers",
+                Err("No workspace is active".to_string()),
+            );
             return;
         };
         let Some(workspace) = self
@@ -15221,16 +15261,25 @@ impl AppDelegate {
             .find(|entry| entry.selection_id() == workspace_id)
             .map(|entry| entry.workspace.clone())
         else {
+            self.complete_pending_page_service(
+                "containers",
+                Err("The active workspace is unavailable".to_string()),
+            );
             return;
         };
         let access = match docker_access_for_workspace(&workspace) {
             Ok(access) => access,
             Err(error) => {
                 self.show_containers_error(&error);
+                self.complete_pending_page_service("containers", Err(error));
                 return;
             }
         };
         let Some(cancellation) = self.workspace_cancellation_token() else {
+            self.complete_pending_page_service(
+                "containers",
+                Err("The workspace is shutting down".to_string()),
+            );
             return;
         };
         let generation = containers.generation.get().wrapping_add(1);
@@ -15252,6 +15301,10 @@ impl AppDelegate {
             containers.spinner.setHidden(true);
             self.set_page_badge("containers", NativePageBadge::None);
             self.show_containers_error("The repository service is unavailable.");
+            self.complete_pending_page_service(
+                "containers",
+                Err("The repository service is unavailable".to_string()),
+            );
             return;
         };
         if let Err(error) = requests.try_send(RepositoryRequest::LoadContainers {
@@ -15270,6 +15323,7 @@ impl AppDelegate {
                 )));
             self.set_page_badge("containers", NativePageBadge::None);
             self.show_containers_error(&format!("Unable to queue container loading: {error}"));
+            self.complete_pending_page_service("containers", Err(error.to_string()));
         }
     }
 
@@ -15289,6 +15343,10 @@ impl AppDelegate {
             log::debug!("discarding stale container inventory workspace={workspace_id}");
             return;
         }
+        let page_service_result = result
+            .as_ref()
+            .map(|inventory| serde_json::json!({ "containers": inventory.container_count() }))
+            .map_err(Clone::clone);
         containers.loading.set(false);
         unsafe { containers.spinner.stopAnimation(None) };
         containers.spinner.setHidden(true);
@@ -15424,6 +15482,7 @@ impl AppDelegate {
                 log::warn!("native container inventory failed workspace={workspace_id}: {error}");
             }
         }
+        self.complete_pending_page_service("containers", page_service_result);
     }
 
     fn show_containers_error(&self, error: &str) {
@@ -18731,15 +18790,28 @@ impl AppDelegate {
 
     fn request_files_tree(&self) {
         let Some(files) = self.ivars().files.get() else {
+            self.complete_pending_page_service(
+                "files",
+                Err("The Files page is unavailable".to_string()),
+            );
             return;
         };
         let Some(workspace_id) = self.ivars().active_workspace_id.borrow().clone() else {
+            self.complete_pending_page_service("files", Err("No workspace is active".to_string()));
             return;
         };
         let Some(handle) = self.ivars().workspace_handle.borrow().clone() else {
+            self.complete_pending_page_service(
+                "files",
+                Err("The workspace is not loaded".to_string()),
+            );
             return;
         };
         let Some(cancellation) = self.workspace_cancellation_token() else {
+            self.complete_pending_page_service(
+                "files",
+                Err("The workspace is shutting down".to_string()),
+            );
             return;
         };
         if files.rows.borrow().is_empty()
@@ -18769,6 +18841,10 @@ impl AppDelegate {
         files.spinner.setHidden(false);
         unsafe { files.spinner.startAnimation(None) };
         let Some(requests) = self.ivars().repository_requests.get() else {
+            self.complete_pending_page_service(
+                "files",
+                Err("The repository service is unavailable".to_string()),
+            );
             return;
         };
         if let Err(error) = requests.try_send(RepositoryRequest::LoadFilesTree {
@@ -18785,6 +18861,7 @@ impl AppDelegate {
                 "Unable to queue file loading: {error}"
             )));
             self.set_page_badge("files", NativePageBadge::None);
+            self.complete_pending_page_service("files", Err(error.to_string()));
         }
     }
 
@@ -18856,6 +18933,10 @@ impl AppDelegate {
         if files.generation.get() != generation {
             return;
         }
+        let page_service_result = result
+            .as_ref()
+            .map(|rows| serde_json::json!({ "rows": rows.len() }))
+            .map_err(Clone::clone);
         files.loading.set(false);
         self.set_page_badge("files", NativePageBadge::None);
         unsafe { files.spinner.stopAnimation(None) };
@@ -18900,6 +18981,7 @@ impl AppDelegate {
         if files.dirty.get() && !files.loading.get() {
             self.request_files_tree();
         }
+        self.complete_pending_page_service("files", page_service_result);
     }
 
     fn show_commit_author_picker(&self, sender: &NSButton) {
@@ -19263,7 +19345,7 @@ impl AppDelegate {
                 if let Some(popover) = self.ivars().author_popover.get() {
                     popover.close();
                 }
-                self.apply_repository_snapshot(workspace_id, Some(handle), Ok(snapshot));
+                self.apply_repository_snapshot(workspace_id, Some(handle), None, Ok(snapshot));
                 log::info!("native commit author updated workspace={workspace_id}");
             }
             Err(error) => {
@@ -20774,9 +20856,17 @@ impl AppDelegate {
 
     fn request_history_page(&self, reset: bool) {
         let Some(history) = self.ivars().history.get() else {
+            self.complete_pending_page_service(
+                "history",
+                Err("The History page is unavailable".to_string()),
+            );
             return;
         };
         if history.loading.get() {
+            self.complete_pending_page_service(
+                "history",
+                Err("History is already refreshing".to_string()),
+            );
             return;
         }
         if reset {
@@ -20805,21 +20895,37 @@ impl AppDelegate {
             history
                 .status
                 .setStringValue(&NSString::from_str("No workspace"));
+            self.complete_pending_page_service(
+                "history",
+                Err("No workspace is active".to_string()),
+            );
             return;
         };
         let Some(handle) = self.ivars().git_handle.borrow().clone() else {
             history
                 .status
                 .setStringValue(&NSString::from_str("No Git repository"));
+            self.complete_pending_page_service(
+                "history",
+                Err("The workspace is not a Git repository".to_string()),
+            );
             return;
         };
         let Some(cancellation) = self.workspace_cancellation_token() else {
+            self.complete_pending_page_service(
+                "history",
+                Err("The workspace is shutting down".to_string()),
+            );
             return;
         };
         let Some(requests) = self.ivars().repository_requests.get() else {
             history
                 .status
                 .setStringValue(&NSString::from_str("History service unavailable"));
+            self.complete_pending_page_service(
+                "history",
+                Err("The history service is unavailable".to_string()),
+            );
             return;
         };
         history.loading.set(true);
@@ -20871,6 +20977,7 @@ impl AppDelegate {
             self.layout_sidebar();
             self.set_page_badge("history", NativePageBadge::None);
             log::warn!("history page queue rejected request error={error}");
+            self.complete_pending_page_service("history", Err(error.to_string()));
         }
     }
 
@@ -20889,6 +20996,10 @@ impl AppDelegate {
             log::debug!("discarding stale history page workspace={workspace_id}");
             return;
         }
+        let page_service_result = result
+            .as_ref()
+            .map(|page| serde_json::json!({ "commits": page.commits.len() }))
+            .map_err(Clone::clone);
         history.loading.set(false);
         self.set_page_badge("history", NativePageBadge::None);
         // SAFETY: The retained spinner is driven on AppKit's main thread.
@@ -20957,6 +21068,7 @@ impl AppDelegate {
             }
         }
         self.layout_sidebar();
+        self.complete_pending_page_service("history", page_service_result);
     }
 
     fn select_history_commit(&self, index: usize) {
@@ -21431,6 +21543,7 @@ impl AppDelegate {
 
     fn begin_workspace_transition(&self, workspace_id: &str) {
         log::info!("native workspace transition started workspace={workspace_id}");
+        self.ivars().page_service_requests.borrow_mut().clear();
         if !self.ivars().terminal_sessions.borrow().is_empty() {
             log::info!("stopping workspace-scoped native terminal before workspace transition");
             self.shutdown_all_native_terminals();
@@ -21612,7 +21725,7 @@ impl AppDelegate {
         let Some(requests) = self.ivars().repository_requests.get() else {
             let message = "Repository service is unavailable.".to_string();
             log::warn!("repository load ignored because repository service is unavailable");
-            self.apply_repository_snapshot(&workspace_id, None, Err(message));
+            self.apply_repository_snapshot(&workspace_id, None, None, Err(message));
             return;
         };
         if let Err(error) = requests.try_send(RepositoryRequest::Load {
@@ -21621,7 +21734,7 @@ impl AppDelegate {
         }) {
             let message = format!("Unable to queue workspace load: {error}");
             log::warn!("repository load queue rejected request error={error}");
-            self.apply_repository_snapshot(&workspace_id, None, Err(message));
+            self.apply_repository_snapshot(&workspace_id, None, None, Err(message));
         }
     }
 
@@ -21629,12 +21742,17 @@ impl AppDelegate {
         &self,
         workspace_id: &str,
         handle: Option<Arc<GitRepoHandle>>,
+        page_request_id: Option<String>,
         result: Result<WorkspaceSnapshot, String>,
     ) {
         if self.ivars().active_workspace_id.borrow().as_deref() != Some(workspace_id) {
             log::debug!("discarding stale repository snapshot workspace={workspace_id}");
             return;
         }
+        let page_service_result = result
+            .as_ref()
+            .map(|_| serde_json::Value::Null)
+            .map_err(Clone::clone);
         let first_workspace_snapshot = self.ivars().workspace_handle.borrow().is_none();
         self.ivars().repository_loading.set(false);
         if result.is_ok() {
@@ -21659,32 +21777,36 @@ impl AppDelegate {
                     && let (Some(handle), Some(requests)) =
                         (handle, self.ivars().repository_requests.get().cloned())
                 {
-                    let Some(cancellation) = self.workspace_cancellation_token() else {
-                        return;
-                    };
-                    let monitored_workspace = workspace_id.to_string();
-                    let monitored_handle = handle.clone();
-                    let listener: ChangeListener = Arc::new(move || {
-                        if let Err(error) = requests.try_send(RepositoryRequest::Refresh {
-                            workspace_id: monitored_workspace.clone(),
-                            handle: monitored_handle.clone(),
-                            cancellation: cancellation.clone(),
-                        }) {
-                            log::debug!(
-                                "native repository monitor coalesced refresh workspace={} error={error}",
-                                monitored_workspace
-                            );
-                        }
-                    });
-                    self.ivars()
-                        .repository_monitor
-                        .replace(Some(handle.add_on_change_listener(listener.clone())));
-                    self.ivars()
-                        .repository_background_pull
-                        .replace(Some(handle.schedule_background_pull_loop(Some(listener))));
-                    log::info!(
-                        "native repository monitor and background pull subscribed workspace={workspace_id}"
-                    );
+                    if let Some(cancellation) = self.workspace_cancellation_token() {
+                        let monitored_workspace = workspace_id.to_string();
+                        let monitored_handle = handle.clone();
+                        let listener: ChangeListener = Arc::new(move || {
+                            if let Err(error) = requests.try_send(RepositoryRequest::Refresh {
+                                workspace_id: monitored_workspace.clone(),
+                                handle: monitored_handle.clone(),
+                                page_request_id: None,
+                                cancellation: cancellation.clone(),
+                            }) {
+                                log::debug!(
+                                    "native repository monitor coalesced refresh workspace={} error={error}",
+                                    monitored_workspace
+                                );
+                            }
+                        });
+                        self.ivars()
+                            .repository_monitor
+                            .replace(Some(handle.add_on_change_listener(listener.clone())));
+                        self.ivars()
+                            .repository_background_pull
+                            .replace(Some(handle.schedule_background_pull_loop(Some(listener))));
+                        log::info!(
+                            "native repository monitor and background pull subscribed workspace={workspace_id}"
+                        );
+                    } else {
+                        log::debug!(
+                            "native repository monitor skipped during workspace cancellation workspace={workspace_id}"
+                        );
+                    }
                 }
                 self.update_changed_files_snapshot(&snapshot);
                 self.ivars()
@@ -21805,6 +21927,9 @@ impl AppDelegate {
                 .is_some_and(|settings| settings.window.isVisible())
         {
             self.request_workspace_settings_load();
+        }
+        if let Some(page_request_id) = page_request_id {
+            self.complete_pending_page_service_id("changes", page_request_id, page_service_result);
         }
     }
 
@@ -22778,8 +22903,9 @@ impl AppDelegate {
             RepositoryCompletion::Snapshot {
                 workspace_id,
                 handle,
+                page_request_id,
                 result,
-            } => self.apply_repository_snapshot(&workspace_id, handle, result),
+            } => self.apply_repository_snapshot(&workspace_id, handle, page_request_id, result),
             RepositoryCompletion::ActionProgress {
                 workspace_id,
                 message,
@@ -22811,7 +22937,7 @@ impl AppDelegate {
                 let current_workspace = self.ivars().active_workspace_id.borrow().as_deref()
                     == Some(workspace_id.as_str());
                 let succeeded = result.is_ok();
-                self.apply_repository_snapshot(&workspace_id, Some(handle), result);
+                self.apply_repository_snapshot(&workspace_id, Some(handle), None, result);
                 if current_workspace && succeeded {
                     self.show_native_toast(
                         message
@@ -22857,7 +22983,7 @@ impl AppDelegate {
                 let current_workspace = self.ivars().active_workspace_id.borrow().as_deref()
                     == Some(workspace_id.as_str());
                 let succeeded = result.is_ok();
-                self.apply_repository_snapshot(&workspace_id, Some(handle), result);
+                self.apply_repository_snapshot(&workspace_id, Some(handle), None, result);
                 if current_workspace && succeeded {
                     self.show_native_toast(message.trim());
                 }
@@ -23047,7 +23173,7 @@ impl AppDelegate {
                 result,
             } => {
                 if let Some(snapshot) = snapshot {
-                    self.apply_repository_snapshot(&workspace_id, handle, snapshot);
+                    self.apply_repository_snapshot(&workspace_id, handle, None, snapshot);
                 }
                 self.finish_commit(&workspace_id, &result);
             }
@@ -23353,6 +23479,29 @@ impl AppDelegate {
     }
 
     fn set_page_badge(&self, page_id: &str, badge: NativePageBadge) {
+        let core_badge = match &badge {
+            NativePageBadge::None => None,
+            NativePageBadge::Count(count) => Some(Badge {
+                text: count.to_string(),
+                attention: false,
+            }),
+            NativePageBadge::Indicator => Some(Badge {
+                text: String::new(),
+                attention: true,
+            }),
+        };
+        self.render_page_badge(page_id, badge);
+        if let Some(handle) = self.ivars().app_handle.get()
+            && let Err(command) = handle.try_send(AppCommand::SetPageBadge {
+                page: PageId::new(page_id),
+                badge: core_badge,
+            })
+        {
+            log::warn!("native page badge queue rejected command={command:?}");
+        }
+    }
+
+    fn render_page_badge(&self, page_id: &str, badge: NativePageBadge) {
         let Some(group) = self.ivars().page_switcher.get() else {
             return;
         };
@@ -26757,12 +26906,12 @@ impl AppDelegate {
     fn apply_event(&self, event: UiEvent) {
         match event {
             UiEvent::ApplicationState(state) => self.apply_application_state(&state),
-            UiEvent::PageState { page, revision, .. } => {
-                log::debug!(
-                    "native page state received page={} revision={revision}",
-                    page.as_str()
-                );
-            }
+            UiEvent::PageState {
+                page,
+                revision,
+                state,
+            } => self.apply_page_state(&page, revision, &state),
+            UiEvent::PageServiceRequest(request) => self.apply_page_service_request(request),
             UiEvent::Effect(request) => {
                 if self.ivars().ui_context.get() == Some(&request.context) {
                     self.apply_ui_effect(request.id, request.effect);
@@ -26779,6 +26928,137 @@ impl AppDelegate {
             UiEvent::ShutdownReady => {
                 log::info!("native UI received application shutdown readiness");
             }
+        }
+    }
+
+    fn apply_page_state(&self, page: &PageId, revision: u64, state: &PageViewState) {
+        let mut revisions = self.ivars().page_state_revisions.borrow_mut();
+        let current = revisions.entry(page.as_str().to_string()).or_default();
+        if revision <= *current {
+            log::debug!(
+                "ignored stale native page state page={} revision={} current_revision={}",
+                page.as_str(),
+                revision,
+                *current
+            );
+            return;
+        }
+        *current = revision;
+        drop(revisions);
+
+        let badge = if state.refreshing {
+            NativePageBadge::Indicator
+        } else if let Some(badge) = state.badge.as_ref() {
+            badge
+                .text
+                .parse::<usize>()
+                .ok()
+                .map(NativePageBadge::Count)
+                .unwrap_or(NativePageBadge::Indicator)
+        } else {
+            NativePageBadge::None
+        };
+        self.render_page_badge(page.as_str(), badge);
+        log::debug!(
+            "native page state applied page={} revision={} refreshing={}",
+            page.as_str(),
+            revision,
+            state.refreshing
+        );
+    }
+
+    fn apply_page_service_request(&self, request: PageServiceRequest) {
+        let page = request
+            .command
+            .page
+            .as_ref()
+            .map(PageId::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if request.command.action.as_str() != "refresh" {
+            self.complete_page_service_request(
+                &request,
+                Err(format!(
+                    "Unsupported native page command: {}",
+                    request.command.action.as_str()
+                )),
+            );
+            return;
+        }
+        let page_request_id = request.request_id.to_string();
+        self.ivars()
+            .page_service_requests
+            .borrow_mut()
+            .insert(page.clone(), request);
+        match page.as_str() {
+            "changes" => self.request_workspace_refresh(page_request_id),
+            "history" => self.request_history_page(true),
+            "files" => self.request_files_tree(),
+            "containers" => self.request_containers(),
+            "agents" => self.complete_pending_page_service("agents", Ok(serde_json::Value::Null)),
+            _ => {
+                self.complete_pending_page_service(
+                    &page,
+                    Err(format!("Unknown native page: {page}")),
+                );
+            }
+        }
+    }
+
+    fn complete_pending_page_service(&self, page: &str, result: Result<serde_json::Value, String>) {
+        let request = self.ivars().page_service_requests.borrow_mut().remove(page);
+        if let Some(request) = request {
+            self.complete_page_service_request(&request, result);
+        }
+    }
+
+    fn complete_pending_page_service_id(
+        &self,
+        page: &str,
+        request_id: String,
+        result: Result<serde_json::Value, String>,
+    ) {
+        let request = self
+            .ivars()
+            .page_service_requests
+            .borrow()
+            .get(page)
+            .filter(|request| request.request_id.to_string() == request_id.as_str())
+            .cloned();
+        if let Some(request) = request {
+            self.ivars().page_service_requests.borrow_mut().remove(page);
+            self.complete_page_service_request(&request, result);
+        } else {
+            log::debug!(
+                "ignored stale native page service completion page={} request={}",
+                page,
+                request_id
+            );
+        }
+    }
+
+    fn complete_page_service_request(
+        &self,
+        request: &PageServiceRequest,
+        result: Result<serde_json::Value, String>,
+    ) {
+        let completion = match result {
+            Ok(payload) => ServiceCompletion::Succeeded {
+                request_id: request.request_id,
+                generation: request.page_generation,
+                payload,
+            },
+            Err(message) => ServiceCompletion::Failed {
+                request_id: request.request_id,
+                generation: request.page_generation,
+                message,
+            },
+        };
+        let Some(handle) = self.ivars().app_handle.get() else {
+            return;
+        };
+        if let Err(command) = handle.try_send(AppCommand::ServiceCompleted(completion)) {
+            log::warn!("native page service completion queue rejected command={command:?}");
         }
     }
 
@@ -29421,6 +29701,7 @@ pub fn run() {
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
                                     handle,
+                                    page_request_id: None,
                                     result,
                                 },
                             ))
@@ -29432,6 +29713,7 @@ pub fn run() {
                     RepositoryRequest::Refresh {
                         workspace_id,
                         handle,
+                        page_request_id,
                         cancellation,
                     } => {
                         let refresh_handle = handle.clone();
@@ -29450,6 +29732,7 @@ pub fn run() {
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
                                     handle: Some(handle),
+                                    page_request_id,
                                     result,
                                 },
                             ))
@@ -31801,6 +32084,7 @@ pub fn run() {
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
                                     handle: Some(handle),
+                                    page_request_id: None,
                                     result: snapshot,
                                 },
                             ))
@@ -31856,6 +32140,7 @@ pub fn run() {
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
                                     handle: Some(handle),
+                                    page_request_id: None,
                                     result: snapshot,
                                 },
                             ))
@@ -31916,6 +32201,7 @@ pub fn run() {
                                 RepositoryCompletion::Snapshot {
                                     workspace_id,
                                     handle: Some(handle),
+                                    page_request_id: None,
                                     result: snapshot,
                                 },
                             ))
