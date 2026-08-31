@@ -1036,6 +1036,12 @@ impl AppChatSessionInner {
                     model: extra
                         .remove("model")
                         .and_then(|value| value.as_str().map(str::to_owned)),
+                    personality: extra
+                        .remove("personality")
+                        .and_then(|value| value.as_str().map(str::to_owned)),
+                    service_tier: extra
+                        .remove("serviceTier")
+                        .map(|value| value.as_str().map(str::to_owned)),
                     extra,
                 })
             }
@@ -1482,7 +1488,7 @@ impl AppChatSessionInner {
         };
         if !mention
             && matches!(
-                kind,
+                &kind,
                 ComposerAttachmentKind::Image | ComposerAttachmentKind::Audio
             )
             && self.ctx.system_ref().provider_kind != ProviderKind::Local
@@ -1601,7 +1607,7 @@ impl AppChatSessionInner {
                         session.view.add_attachment(ComposerAttachment {
                             id: attachment_id.clone(),
                             label: label.clone(),
-                            kind,
+                            kind: kind.clone(),
                             reference: image.path,
                         });
                     }

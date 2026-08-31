@@ -863,7 +863,7 @@ fn start_worktree_preview_watch(
 }
 
 fn spawn_worktree_preview_bridge<T>(
-    mut receiver: git::FileDiffReceiver<T>,
+    receiver: git::FileDiffReceiver<T>,
     signature: WorktreePreviewSignature,
     sender: command_mailbox::UiCommandSender<WorktreePreviewWorkerResult>,
     wrap: fn(T) -> WorktreePreview,
@@ -874,10 +874,7 @@ where
     thread::spawn(move || {
         let mut start = Instant::now();
         let mut cacheable = true;
-        while receiver.blocking_changed().is_ok() {
-            let Some(result) = receiver.borrow_and_update().clone() else {
-                continue;
-            };
+        while let Ok(result) = receiver.recv() {
             let result = match result.map(wrap) {
                 Ok(preview) => Ok(preview),
                 Err(err) if is_preview_limit_message(&err) => {

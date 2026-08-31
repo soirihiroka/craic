@@ -284,7 +284,11 @@ fn parse_process_stat(
     stat_text: &str,
     page_size: u64,
 ) -> Option<ProcessStat> {
-    let pid = stat_text.split_whitespace().next()?.parse().ok()?;
+    let pid = stat_text
+        .split_whitespace()
+        .next()?
+        .parse::<libc::pid_t>()
+        .ok()?;
     if pid != expected_pid {
         return None;
     }

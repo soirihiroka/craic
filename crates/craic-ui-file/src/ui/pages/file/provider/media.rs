@@ -272,7 +272,7 @@ fn show_media(request: PreviewRequest<'_>, kind: MediaKind) {
         return;
     }
     if let Some(path) = local_path {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::channel::<Result<MediaPreviewLoad, String>>();
         let _ = sender.send(Ok(MediaPreviewLoad {
             kind,
             file_path,
@@ -311,7 +311,7 @@ fn show_media(request: PreviewRequest<'_>, kind: MediaKind) {
             Ok(materialized) => {
                 let load = MediaPreviewLoad {
                     kind,
-                    file_path,
+                    file_path: file_path.clone(),
                     full_path: materialized.path().to_path_buf(),
                     materialized: Some(materialized),
                     disk_signature,

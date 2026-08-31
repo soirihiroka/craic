@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
-use super::canvas_painter::CanvasPainter;
+use super::canvas_painter::{CairoPainter, CanvasPainter};
 
 const MIDDLE_AUTOSCROLL_FRAME_MS: u64 = 16;
 const MIDDLE_AUTOSCROLL_DEAD_ZONE: f64 = 12.0;
@@ -564,8 +564,9 @@ pub fn install_middle_autoscroll_marker(
 ) {
     let autoscroll = Rc::clone(autoscroll);
     marker.set_draw_func(move |_, context, width, height| {
+        let context = CairoPainter::new(context);
         draw_middle_autoscroll_marker(
-            context,
+            &context,
             width,
             height,
             autoscroll.state(),

@@ -202,7 +202,6 @@ impl ChangedFileItem {
         }
         let path = self.imp().path.borrow();
         path.to_lowercase().contains(query)
-            || file_name(&path).to_lowercase().contains(query)
             || self.imp().status.borrow().to_lowercase().contains(query)
     }
 

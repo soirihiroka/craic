@@ -24,7 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc as tokio_mpsc, oneshot, watch};
+use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 const GIT_CHANGE_LISTENER_INTERVAL: Duration = Duration::from_secs(2);
 const GIT_BACKGROUND_PULL_INTERVAL: Duration = Duration::from_secs(60);
@@ -47,7 +47,7 @@ fn successful_fetch_times() -> &'static Mutex<HashMap<String, SystemTime>> {
 
 pub type ChangeListener = Arc<dyn Fn() + Send + Sync + 'static>;
 pub type GitOperationReceiver<T> = oneshot::Receiver<Result<T, String>>;
-pub type FileDiffReceiver<T> = watch::Receiver<Option<Result<T, String>>>;
+pub type FileDiffReceiver<T> = mpsc::Receiver<Result<T, String>>;
 
 #[derive(Debug)]
 pub enum GitCommandEvent {
@@ -230,11 +230,16 @@ impl FileDiffSubscription {
     {
         let label = label.into();
         let (stop_sender, stop_receiver) = mpsc::channel();
-        let (sender, receiver) = watch::channel(None);
+        let (sender, receiver) = mpsc::channel();
         let thread_label = label.clone();
         let thread = thread::spawn(move || {
             log::info!("git file diff watcher started label={thread_label} path={file_path}");
-            sender.send_replace(Some(load(&git, &file_path)));
+            if sender.send(load(&git, &file_path)).is_err() {
+                log::info!(
+                    "git file diff watcher stopped before initial delivery label={thread_label}"
+                );
+                return;
+            }
 
             loop {
                 if stop_receiver.try_recv().is_ok() {
@@ -247,7 +252,9 @@ impl FileDiffSubscription {
                         if stop_receiver.try_recv().is_ok() {
                             break;
                         }
-                        sender.send_replace(Some(load(&git, &file_path)));
+                        if sender.send(load(&git, &file_path)).is_err() {
+                            break;
+                        }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,

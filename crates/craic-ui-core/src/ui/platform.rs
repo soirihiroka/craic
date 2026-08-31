@@ -91,6 +91,7 @@ fn reveal_path(path: &Path, parent: Option<&impl IsA<gtk::Window>>) {
     let fd_list = gio::UnixFDList::from_array([file]);
     let options = glib::VariantDict::default();
     if let Some(parent) = parent {
+        let parent: &gtk::Window = parent.as_ref();
         let context = parent.display().app_launch_context();
         context.set_timestamp(gtk::gdk::CURRENT_TIME);
         let files = [gio::File::for_path(&path)];
