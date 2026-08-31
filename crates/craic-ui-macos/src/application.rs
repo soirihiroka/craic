@@ -4928,10 +4928,30 @@ define_class!(
         fn new_window(&self, _sender: &NSMenuItem) {
             let configuration = NSWorkspaceOpenConfiguration::configuration();
             configuration.setCreatesNewApplicationInstance(true);
+            let delegate = Arc::new(MainThreadBound::new(self.retain(), self.mtm()));
+            let completion = RcBlock::new(
+                move |_application: *mut NSRunningApplication, error: *mut NSError| {
+                    let Some(error) = (unsafe { error.as_ref() }) else {
+                        log::info!("new native window opened");
+                        return;
+                    };
+                    let message = error.localizedDescription().to_string();
+                    log::warn!("new native window launch failed error={message}");
+                    let delegate = delegate.clone();
+                    DispatchQueue::main().exec_async(move || {
+                        let Some(mtm) = MainThreadMarker::new() else {
+                            return;
+                        };
+                        delegate
+                            .get(mtm)
+                            .present_path_action_error("Failed to Open New Window", &message);
+                    });
+                },
+            );
             NSWorkspace::sharedWorkspace().openApplicationAtURL_configuration_completionHandler(
                 &NSBundle::mainBundle().bundleURL(),
                 &configuration,
-                None,
+                Some(&completion),
             );
         }
 
