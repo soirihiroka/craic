@@ -20,6 +20,217 @@ impl EditorSelection {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditorLineCommentEdit {
+    pub range_start: usize,
+    pub range_end: usize,
+    pub replacement: String,
+    pub uncomment: bool,
+    prefix_edits: Vec<EditorLinePrefixEdit>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EditorLinePrefixEdit {
+    start: usize,
+    removed: usize,
+    inserted: usize,
+}
+
+impl EditorLineCommentEdit {
+    pub fn map_offset(&self, offset: usize) -> usize {
+        let mut adjustment = 0isize;
+        for edit in &self.prefix_edits {
+            if offset < edit.start {
+                break;
+            }
+            let adjusted_start = edit.start.saturating_add_signed(adjustment);
+            let removed_end = edit.start.saturating_add(edit.removed);
+            if offset <= removed_end {
+                return adjusted_start.saturating_add(edit.inserted);
+            }
+            adjustment += edit.inserted as isize - edit.removed as isize;
+        }
+        offset.saturating_add_signed(adjustment)
+    }
+
+    pub fn map_selection(&self, selection: EditorSelection) -> EditorSelection {
+        EditorSelection {
+            anchor: self.map_offset(selection.anchor),
+            focus: self.map_offset(selection.focus),
+        }
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.prefix_edits.len()
+    }
+}
+
+pub fn toggle_editor_line_comment(
+    text: &str,
+    selection: EditorSelection,
+    prefix: &str,
+) -> Option<EditorLineCommentEdit> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let selection = EditorSelection {
+        anchor: clamp_editor_offset(text, selection.anchor),
+        focus: clamp_editor_offset(text, selection.focus),
+    };
+    let (start, end) = selection.normalized();
+    let first_line_start = editor_line_start(text, start);
+    let last_offset = if end > start {
+        previous_editor_char_boundary(text, end)
+    } else {
+        start
+    };
+    let last_line_start = editor_line_start(text, last_offset);
+    let range_start = first_line_start;
+    let range_end = editor_line_end(text, last_line_start);
+    let line_starts = editor_line_starts(text, first_line_start, last_line_start);
+    let uncomment = should_uncomment_editor_lines(text, &line_starts, prefix);
+    let mut replacement = String::with_capacity(
+        range_end
+            .saturating_sub(range_start)
+            .saturating_add(line_starts.len() * (prefix.len() + 1)),
+    );
+    let mut prefix_edits = Vec::new();
+    let mut copied_until = range_start;
+
+    for line_start in line_starts {
+        let line_end = editor_line_end(text, line_start);
+        let line = &text[line_start..line_end];
+        let indent_len = editor_leading_whitespace(line).len();
+        let edit_start = line_start + indent_len;
+        replacement.push_str(&text[copied_until..edit_start]);
+        if uncomment {
+            if let Some(removed) = editor_line_comment_remove_len(&line[indent_len..], prefix) {
+                prefix_edits.push(EditorLinePrefixEdit {
+                    start: edit_start,
+                    removed,
+                    inserted: 0,
+                });
+                copied_until = edit_start + removed;
+            } else {
+                copied_until = edit_start;
+            }
+        } else {
+            replacement.push_str(prefix);
+            replacement.push(' ');
+            prefix_edits.push(EditorLinePrefixEdit {
+                start: edit_start,
+                removed: 0,
+                inserted: prefix.len() + 1,
+            });
+            copied_until = edit_start;
+        }
+    }
+    if prefix_edits.is_empty() {
+        return None;
+    }
+    replacement.push_str(&text[copied_until..range_end]);
+    Some(EditorLineCommentEdit {
+        range_start,
+        range_end,
+        replacement,
+        uncomment,
+        prefix_edits,
+    })
+}
+
+fn should_uncomment_editor_lines(text: &str, line_starts: &[usize], prefix: &str) -> bool {
+    let mut has_nonblank_line = false;
+    for &line_start in line_starts {
+        let line_end = editor_line_end(text, line_start);
+        let line = &text[line_start..line_end];
+        if line.trim().is_empty() {
+            continue;
+        }
+        has_nonblank_line = true;
+        let indent_len = editor_leading_whitespace(line).len();
+        if editor_line_comment_remove_len(&line[indent_len..], prefix).is_none() {
+            return false;
+        }
+    }
+    has_nonblank_line
+}
+
+fn editor_line_comment_remove_len(line_after_indent: &str, prefix: &str) -> Option<usize> {
+    let rest = line_after_indent.strip_prefix(prefix)?;
+    if prefix == "#" && rest.starts_with('!') {
+        return None;
+    }
+    Some(
+        prefix.len()
+            + rest
+                .chars()
+                .next()
+                .filter(|character| matches!(character, ' ' | '\t'))
+                .map(char::len_utf8)
+                .unwrap_or(0),
+    )
+}
+
+fn editor_line_starts(text: &str, first: usize, last: usize) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut line_start = first.min(text.len());
+    loop {
+        starts.push(line_start);
+        if line_start >= last {
+            break;
+        }
+        let line_end = editor_line_end(text, line_start);
+        if line_end >= text.len() {
+            break;
+        }
+        line_start = line_end + 1;
+    }
+    starts
+}
+
+fn editor_line_start(text: &str, offset: usize) -> usize {
+    let offset = clamp_editor_offset(text, offset);
+    text[..offset]
+        .rfind('\n')
+        .map(|newline| newline + 1)
+        .unwrap_or(0)
+}
+
+fn editor_line_end(text: &str, offset: usize) -> usize {
+    let offset = clamp_editor_offset(text, offset);
+    text[offset..]
+        .find('\n')
+        .map(|newline| offset + newline)
+        .unwrap_or(text.len())
+}
+
+fn previous_editor_char_boundary(text: &str, offset: usize) -> usize {
+    let offset = clamp_editor_offset(text, offset);
+    text[..offset]
+        .char_indices()
+        .next_back()
+        .map(|(byte, _)| byte)
+        .unwrap_or(0)
+}
+
+fn clamp_editor_offset(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn editor_leading_whitespace(line: &str) -> &str {
+    let end = line
+        .char_indices()
+        .take_while(|(_, character)| matches!(character, ' ' | '\t'))
+        .map(|(offset, character)| offset + character.len_utf8())
+        .last()
+        .unwrap_or(0);
+    &line[..end]
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct EditorMetrics {
     pub font_size: f32,

@@ -1,10 +1,11 @@
 use crate::application::AppDelegate;
+use craic_language::{language_id_from_path, language_support_for_id};
 use craic_render_skia::{
     DragSelection, EditorDocument, EditorFoldRange, EditorMetrics, EditorPaintRequest,
     EditorSearchMatch, EditorSelection, EditorViewport, SelectionMode, TextDiagnosticSpan,
     TextSyntaxSpan, drag_for_mode, editor_search_index_after, find_editor_search_matches,
     next_word_boundary, paint_editor, previous_word_boundary, selected_editor_text,
-    selection_for_drag, word_bounds_at,
+    selection_for_drag, toggle_editor_line_comment, word_bounds_at,
 };
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
@@ -496,6 +497,9 @@ define_class!(
                     "v" => self.paste_clipboard(),
                     "z" if modifiers.contains(NSEventModifierFlags::Shift) => self.redo(),
                     "z" => self.undo(),
+                    "/" if !modifiers.contains(NSEventModifierFlags::Shift) => {
+                        self.toggle_line_comment()
+                    }
                     _ => unsafe { let _: () = msg_send![super(self), keyDown: event]; },
                 }
                 return;
@@ -1134,6 +1138,62 @@ impl CodeMetalView {
         state.clamp_scroll(self.bounds().size);
         drop(state);
         log::debug!("native Skia editor expanded all folds");
+        self.notify_scroll_changed();
+        self.update_accessibility();
+        self.render_frame();
+    }
+
+    fn toggle_line_comment(&self) {
+        let mut state = self.ivars().state.borrow_mut();
+        if !state.editable {
+            return;
+        }
+        let language = language_support_for_id(language_id_from_path(&state.path));
+        let Some(prefix) = language.line_comment else {
+            log::debug!(
+                "native Skia editor line comment skipped unsupported language={:?}",
+                language.id
+            );
+            return;
+        };
+        let Some(edit) = toggle_editor_line_comment(state.document.text(), state.selection, prefix)
+        else {
+            log::debug!("native Skia editor line comment skipped no applicable lines");
+            return;
+        };
+        let snapshot = EditorSnapshot {
+            text: state.document.text().to_string(),
+            selection: state.selection,
+        };
+        state.undo.push(snapshot);
+        if state.undo.len() > 100 {
+            state.undo.remove(0);
+        }
+        state.redo.clear();
+        let mut text = state.document.text().to_string();
+        text.replace_range(edit.range_start..edit.range_end, &edit.replacement);
+        state.document = EditorDocument::new(text, Vec::new());
+        state.diagnostics.clear();
+        state.manual_folds.clear();
+        clear_completion_state(&mut state);
+        state.selection = edit.map_selection(state.selection);
+        rebuild_search_state(&mut state);
+        state.reveal_selection(self.bounds().size);
+        let text = state.document.text().to_string();
+        let selection = selection_utf16(&state.document, state.selection);
+        let action = if edit.uncomment {
+            "uncomment"
+        } else {
+            "comment"
+        };
+        log::debug!(
+            "native Skia editor line comment action={action} range={}..{} lines={}",
+            edit.range_start,
+            edit.range_end,
+            edit.line_count()
+        );
+        drop(state);
+        self.notify_text_changed(text, selection);
         self.notify_scroll_changed();
         self.update_accessibility();
         self.render_frame();

@@ -16,6 +16,7 @@ use crate::ui::components::context_menu::{
 };
 use crate::ui::{canvas_scroll, canvas_scrollbar};
 use adw::prelude::*;
+use craic_render_skia::{EditorSelection as SharedEditorSelection, toggle_editor_line_comment};
 use gtk::gdk;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -2298,143 +2299,52 @@ fn toggle_line_comment(area: &gtk::GLArea, state: &Rc<EditorState>) {
     };
 
     let text = state.text.borrow();
-    let (first_line_start, last_line_start) = indentation_line_range(&text, state);
-    let range_start = first_line_start;
-    let range_end = current_line_end(&text, last_line_start);
-    let line_starts = line_starts_between(&text, first_line_start, last_line_start);
-    let uncomment = should_uncomment_line_comment(&text, &line_starts, prefix);
-    let (replacement, edits) = line_comment_edit(
-        &text,
-        range_start,
-        range_end,
-        &line_starts,
-        prefix,
-        uncomment,
-    );
     let before_cursor = state.cursor.get().min(text.len());
     let before_selection = *state.selection.borrow();
+    let selection = before_selection.map_or(
+        SharedEditorSelection {
+            anchor: before_cursor,
+            focus: before_cursor,
+        },
+        |selection| SharedEditorSelection {
+            anchor: selection.anchor,
+            focus: selection.focus,
+        },
+    );
+    let Some(edit) = toggle_editor_line_comment(&text, selection, prefix) else {
+        log::debug!("code_editor line_comment skipped no applicable lines");
+        return;
+    };
     drop(text);
 
-    if edits.is_empty() {
-        log::debug!(
-            "code_editor line_comment skipped action={}",
-            if uncomment { "uncomment" } else { "comment" }
-        );
-        return;
-    }
-
-    let cursor = map_offset_through_prefix_edits(before_cursor, &edits);
+    let cursor = edit.map_offset(before_cursor);
     let restored_selection = before_selection.map(|selection| Selection {
-        anchor: map_offset_through_prefix_edits(selection.anchor, &edits),
-        focus: map_offset_through_prefix_edits(selection.focus, &edits),
-        visual_anchor: map_offset_through_prefix_edits(selection.visual_anchor, &edits),
-        visual_focus: map_offset_through_prefix_edits(selection.visual_focus, &edits),
+        anchor: edit.map_offset(selection.anchor),
+        focus: edit.map_offset(selection.focus),
+        visual_anchor: edit.map_offset(selection.visual_anchor),
+        visual_focus: edit.map_offset(selection.visual_focus),
     });
     log::debug!(
         "code_editor line_comment action={} range={}..{} lines={}",
-        if uncomment { "uncomment" } else { "comment" },
-        range_start,
-        range_end,
-        edits.len()
+        if edit.uncomment {
+            "uncomment"
+        } else {
+            "comment"
+        },
+        edit.range_start,
+        edit.range_end,
+        edit.line_count()
     );
     commit_edit(
         area,
         state,
-        range_start,
-        range_end,
-        &replacement,
+        edit.range_start,
+        edit.range_end,
+        &edit.replacement,
         cursor,
         restored_selection,
         true,
     );
-}
-
-fn should_uncomment_line_comment(text: &str, line_starts: &[usize], prefix: &str) -> bool {
-    let mut has_nonblank_line = false;
-
-    for &line_start in line_starts {
-        let line_end = current_line_end(text, line_start);
-        let line = &text[line_start..line_end];
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        has_nonblank_line = true;
-        let indent_len = leading_whitespace(line).len();
-        if line_comment_remove_len(&line[indent_len..], prefix).is_none() {
-            return false;
-        }
-    }
-
-    has_nonblank_line
-}
-
-fn line_comment_edit(
-    text: &str,
-    range_start: usize,
-    range_end: usize,
-    line_starts: &[usize],
-    prefix: &str,
-    uncomment: bool,
-) -> (String, Vec<LinePrefixEdit>) {
-    let mut replacement = String::with_capacity(
-        range_end
-            .saturating_sub(range_start)
-            .saturating_add(line_starts.len() * (prefix.len() + 1)),
-    );
-    let mut edits = Vec::new();
-    let mut copied_until = range_start;
-
-    for &line_start in line_starts {
-        let line_end = current_line_end(text, line_start);
-        let line = &text[line_start..line_end];
-        let indent_len = leading_whitespace(line).len();
-        let edit_start = line_start + indent_len;
-        replacement.push_str(&text[copied_until..edit_start]);
-
-        if uncomment {
-            if let Some(removed) = line_comment_remove_len(&line[indent_len..], prefix) {
-                edits.push(LinePrefixEdit {
-                    start: edit_start,
-                    removed,
-                    inserted: 0,
-                });
-                copied_until = edit_start + removed;
-            } else {
-                copied_until = edit_start;
-            }
-            continue;
-        }
-
-        replacement.push_str(prefix);
-        replacement.push(' ');
-        edits.push(LinePrefixEdit {
-            start: edit_start,
-            removed: 0,
-            inserted: prefix.len() + 1,
-        });
-        copied_until = edit_start;
-    }
-
-    replacement.push_str(&text[copied_until..range_end]);
-    (replacement, edits)
-}
-
-fn line_comment_remove_len(line_after_indent: &str, prefix: &str) -> Option<usize> {
-    let rest = line_after_indent.strip_prefix(prefix)?;
-    if prefix == "#" && rest.starts_with('!') {
-        return None;
-    }
-
-    Some(
-        prefix.len()
-            + rest
-                .chars()
-                .next()
-                .filter(|ch| matches!(ch, ' ' | '\t'))
-                .map(char::len_utf8)
-                .unwrap_or(0),
-    )
 }
 
 fn indentation_line_range(text: &str, state: &Rc<EditorState>) -> (usize, usize) {

@@ -27,8 +27,8 @@ pub use diff_layout::{
 };
 pub use diff_painter::{DiffPaintRequest, paint_diff};
 pub use editor::{
-    EditorDocument, EditorFoldRange, EditorLine, EditorMetrics, EditorSelection, EditorViewport,
-    selected_editor_text,
+    EditorDocument, EditorFoldRange, EditorLine, EditorLineCommentEdit, EditorMetrics,
+    EditorSelection, EditorViewport, selected_editor_text, toggle_editor_line_comment,
 };
 pub use editor_buffer::{
     EditorTextBuffer, byte_offset_for_line_column, clamp_to_char_boundary, next_char_boundary,
