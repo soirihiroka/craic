@@ -4,12 +4,12 @@ use std::sync::mpsc::{SyncSender, TrySendError as StdTrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde::Serialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
 use tokio::time::{Instant, sleep_until};
+use tokio_util::sync::CancellationToken;
 
 use crate::lifecycle::{AppServerError, AppServerEvent, ConnectionState};
 use crate::protocol::{
@@ -17,11 +17,38 @@ use crate::protocol::{
 };
 
 pub(crate) const INITIALIZE_REQUEST_ID: i64 = 1;
+const MAX_JSONL_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
+enum FrameRead {
+    Frame(Vec<u8>),
+    Oversized,
+    Cancelled,
+    Eof,
+}
+
+enum ParsedMessage {
+    ServerRequest(Request),
+    Notification(Notification),
+    Response {
+        response: Response,
+        initialize: Option<Result<InitializeResult, String>>,
+    },
+    ErrorResponse(ErrorResponse),
+    ProtocolError(String),
+}
 
 pub(crate) enum WriterCommand {
-    Value(Value),
+    Message(OutboundMessage),
     InitializeAck(InitializeResult),
     Shutdown,
+}
+
+pub(crate) enum OutboundMessage {
+    Request(Request),
+    Notification(Notification),
+    Response(Response),
+    ErrorResponse(ErrorResponse),
+    Initialized,
 }
 
 pub(crate) enum ProcessCommand {
@@ -29,17 +56,14 @@ pub(crate) enum ProcessCommand {
     Terminate,
 }
 
-pub(crate) fn enqueue_value<T: Serialize>(
+pub(crate) fn enqueue_command(
     sender: &Sender<WriterCommand>,
-    message: T,
+    command: WriterCommand,
 ) -> Result<(), AppServerError> {
-    let value = serde_json::to_value(message).map_err(AppServerError::Serialize)?;
-    sender
-        .try_send(WriterCommand::Value(value))
-        .map_err(|error| match error {
-            TrySendError::Full(_) => AppServerError::CommandQueueFull,
-            TrySendError::Closed(_) => AppServerError::Disconnected,
-        })
+    sender.try_send(command).map_err(|error| match error {
+        TrySendError::Full(_) => AppServerError::CommandQueueFull,
+        TrySendError::Closed(_) => AppServerError::Disconnected,
+    })
 }
 
 pub(crate) async fn run_writer(
@@ -49,22 +73,52 @@ pub(crate) async fn run_writer(
     events: SyncSender<AppServerEvent>,
     saturated: Arc<AtomicBool>,
     process: Sender<ProcessCommand>,
+    cancellation: CancellationToken,
 ) {
-    while let Some(command) = commands.recv().await {
+    loop {
+        let command = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => break,
+            command = commands.recv() => match command {
+                Some(command) => command,
+                None => break,
+            },
+        };
         match command {
-            WriterCommand::Value(value) => {
-                if let Err(error) = write_json_line(&mut stdin, &value).await {
-                    transport_failed(&state, &events, &saturated, &process, error);
-                    break;
+            WriterCommand::Message(message) => {
+                match write_json_line(&mut stdin, message, &cancellation).await {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        transport_failed(&state, &events, &saturated, &process, error);
+                        break;
+                    }
                 }
             }
             WriterCommand::InitializeAck(initialize) => {
-                let initialized = serde_json::json!({ "method": "initialized" });
-                if let Err(error) = write_json_line(&mut stdin, &initialized).await {
-                    transport_failed(&state, &events, &saturated, &process, error);
+                match write_json_line(&mut stdin, OutboundMessage::Initialized, &cancellation).await
+                {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        transport_failed(&state, &events, &saturated, &process, error);
+                        break;
+                    }
+                }
+                if cancellation.is_cancelled() {
                     break;
                 }
-                set_state(&state, &events, &saturated, ConnectionState::Ready);
+                let mut current = lock(&state);
+                if cancellation.is_cancelled() || *current != ConnectionState::Initializing {
+                    break;
+                }
+                log::info!("Codex App Server lifecycle: {:?} -> Ready", *current);
+                *current = ConnectionState::Ready;
+                emit_event(
+                    &events,
+                    &saturated,
+                    AppServerEvent::StateChanged(ConnectionState::Ready),
+                );
                 emit_event(&events, &saturated, AppServerEvent::Ready(initialize));
             }
             WriterCommand::Shutdown => break,
@@ -74,12 +128,94 @@ pub(crate) async fn run_writer(
 
 async fn write_json_line(
     writer: &mut (impl AsyncWrite + Unpin),
-    value: &Value,
-) -> Result<(), std::io::Error> {
-    let mut bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
-    bytes.push(b'\n');
-    writer.write_all(&bytes).await?;
-    writer.flush().await
+    message: OutboundMessage,
+    cancellation: &CancellationToken,
+) -> Result<bool, std::io::Error> {
+    // Large request parameters can make serialization expensive. Keep that owned work off the I/O
+    // workers and await it here so writes remain ordered and shutdown joins the work.
+    let serialized = tokio::task::spawn_blocking(move || {
+        let mut bytes = match message {
+            OutboundMessage::Request(message) => serde_json::to_vec(&message),
+            OutboundMessage::Notification(message) => serde_json::to_vec(&message),
+            OutboundMessage::Response(message) => serde_json::to_vec(&message),
+            OutboundMessage::ErrorResponse(message) => serde_json::to_vec(&message),
+            OutboundMessage::Initialized => {
+                serde_json::to_vec(&serde_json::json!({ "method": "initialized" }))
+            }
+        }
+        .map_err(std::io::Error::other)?;
+        if bytes.len() > MAX_JSONL_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "serialized App Server JSONL message exceeds the {} byte limit",
+                    MAX_JSONL_FRAME_BYTES
+                ),
+            ));
+        }
+        bytes.push(b'\n');
+        Ok(bytes)
+    })
+    .await;
+    if cancellation.is_cancelled() {
+        return Ok(false);
+    }
+    let bytes = serialized.map_err(|error| {
+        std::io::Error::other(format!("JSONL serializer task failed: {error}"))
+    })??;
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Ok(false),
+        result = async {
+            writer.write_all(&bytes).await?;
+            writer.flush().await
+        } => result.map(|()| true),
+    }
+}
+
+async fn read_jsonl_frame(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    buffer: &mut Vec<u8>,
+    cancellation: &CancellationToken,
+) -> Result<FrameRead, std::io::Error> {
+    buffer.clear();
+    let mut oversized = false;
+    loop {
+        let available = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(FrameRead::Cancelled),
+            result = reader.fill_buf() => result?,
+        };
+        if available.is_empty() {
+            return Ok(if oversized {
+                FrameRead::Oversized
+            } else if buffer.is_empty() {
+                FrameRead::Eof
+            } else {
+                FrameRead::Frame(std::mem::take(buffer))
+            });
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        if !oversized {
+            if buffer.len().saturating_add(content_len) > MAX_JSONL_FRAME_BYTES {
+                oversized = true;
+                buffer.clear();
+            } else {
+                buffer.extend_from_slice(&available[..content_len]);
+            }
+        }
+        let consumed = content_len + usize::from(newline.is_some());
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(if oversized {
+                FrameRead::Oversized
+            } else {
+                FrameRead::Frame(std::mem::take(buffer))
+            });
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -91,14 +227,25 @@ pub(crate) async fn run_stdout_reader(
     pending: Arc<Mutex<HashMap<RequestId, String>>>,
     events: SyncSender<AppServerEvent>,
     saturated: Arc<AtomicBool>,
+    cancellation: CancellationToken,
 ) {
     let mut reader = BufReader::new(stdout);
-    let mut buffer = Vec::new();
+    let mut buffer = Vec::with_capacity(8 * 1024);
     loop {
-        buffer.clear();
-        match reader.read_until(b'\n', &mut buffer).await {
-            Ok(0) => break,
-            Ok(_) => {}
+        let mut frame = match read_jsonl_frame(&mut reader, &mut buffer, &cancellation).await {
+            Ok(FrameRead::Cancelled | FrameRead::Eof) => break,
+            Ok(FrameRead::Frame(frame)) => frame,
+            Ok(FrameRead::Oversized) => {
+                emit_event(
+                    &events,
+                    &saturated,
+                    AppServerEvent::ProtocolError(format!(
+                        "App Server JSONL message exceeds the {} byte limit",
+                        MAX_JSONL_FRAME_BYTES
+                    )),
+                );
+                continue;
+            }
             Err(error) => {
                 emit_event(
                     &events,
@@ -109,139 +256,185 @@ pub(crate) async fn run_stdout_reader(
                 );
                 break;
             }
+        };
+        while matches!(frame.last(), Some(b'\r')) {
+            frame.pop();
         }
-        while matches!(buffer.last(), Some(b'\n' | b'\r')) {
-            buffer.pop();
-        }
-        if buffer.is_empty() {
+        if frame.is_empty() {
             continue;
         }
-        let value = match serde_json::from_slice::<Value>(&buffer) {
-            Ok(value) => value,
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let parsed = tokio::task::spawn_blocking(move || parse_message(frame)).await;
+        // Never abandon an in-flight blocking parser. Once it is joined, cancellation wins before
+        // the decoded message can mutate pending-request or connection state.
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let parsed = match parsed {
+            Ok(parsed) => parsed,
             Err(error) => {
                 emit_event(
                     &events,
                     &saturated,
                     AppServerEvent::ProtocolError(format!(
-                        "malformed App Server JSONL message: {error}"
+                        "App Server JSONL parser task failed: {error}"
                     )),
                 );
-                continue;
+                let _ = process.try_send(ProcessCommand::Terminate);
+                break;
             }
         };
         route_message(
-            value, &commands, &process, &state, &pending, &events, &saturated,
+            parsed,
+            &commands,
+            &process,
+            &state,
+            &pending,
+            &events,
+            &saturated,
+            &cancellation,
         );
+    }
+}
+
+fn parse_message(frame: Vec<u8>) -> ParsedMessage {
+    let value = match serde_json::from_slice::<Value>(&frame) {
+        Ok(value) => value,
+        Err(error) => {
+            return ParsedMessage::ProtocolError(format!(
+                "malformed App Server JSONL message: {error}"
+            ));
+        }
+    };
+    let has_method = value.get("method").is_some();
+    let has_id = value.get("id").is_some();
+    if has_method && has_id {
+        match serde_json::from_value::<Request>(value) {
+            Ok(request) => ParsedMessage::ServerRequest(request),
+            Err(error) => ParsedMessage::ProtocolError(format!("invalid server request: {error}")),
+        }
+    } else if has_method {
+        match serde_json::from_value::<Notification>(value) {
+            Ok(notification) => ParsedMessage::Notification(notification),
+            Err(error) => ParsedMessage::ProtocolError(format!("invalid notification: {error}")),
+        }
+    } else if value.get("result").is_some() && has_id {
+        match serde_json::from_value::<Response>(value) {
+            Ok(response) => {
+                let initialize =
+                    (response.id == RequestId::Integer(INITIALIZE_REQUEST_ID)).then(|| {
+                        serde_json::from_value::<InitializeResult>(response.result.clone())
+                            .map_err(|error| format!("invalid initialize response: {error}"))
+                    });
+                ParsedMessage::Response {
+                    response,
+                    initialize,
+                }
+            }
+            Err(error) => ParsedMessage::ProtocolError(format!("invalid response: {error}")),
+        }
+    } else if value.get("error").is_some() && has_id {
+        match serde_json::from_value::<ErrorResponse>(value) {
+            Ok(response) => ParsedMessage::ErrorResponse(response),
+            Err(error) => ParsedMessage::ProtocolError(format!("invalid error response: {error}")),
+        }
+    } else {
+        ParsedMessage::ProtocolError("unrecognized App Server envelope".to_owned())
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn route_message(
-    value: Value,
+    message: ParsedMessage,
     commands: &Sender<WriterCommand>,
     process: &Sender<ProcessCommand>,
     state: &Arc<Mutex<ConnectionState>>,
     pending: &Arc<Mutex<HashMap<RequestId, String>>>,
     events: &SyncSender<AppServerEvent>,
     saturated: &Arc<AtomicBool>,
+    cancellation: &CancellationToken,
 ) {
-    let has_method = value.get("method").is_some();
-    let has_id = value.get("id").is_some();
-    if has_method && has_id {
-        match serde_json::from_value::<Request>(value) {
-            Ok(request) => emit_event(events, saturated, AppServerEvent::ServerRequest(request)),
-            Err(error) => emit_event(
-                events,
-                saturated,
-                AppServerEvent::ProtocolError(format!("invalid server request: {error}")),
-            ),
+    let mut current = lock(state);
+    if cancellation.is_cancelled()
+        || matches!(
+            *current,
+            ConnectionState::Stopped | ConnectionState::Crashed
+        )
+    {
+        return;
+    }
+    match message {
+        ParsedMessage::ServerRequest(request) => {
+            emit_event(events, saturated, AppServerEvent::ServerRequest(request));
         }
-    } else if has_method {
-        match serde_json::from_value::<Notification>(value) {
-            Ok(notification) => emit_event(
+        ParsedMessage::Notification(notification) => {
+            emit_event(
                 events,
                 saturated,
                 AppServerEvent::Notification(notification),
-            ),
-            Err(error) => emit_event(
-                events,
-                saturated,
-                AppServerEvent::ProtocolError(format!("invalid notification: {error}")),
-            ),
+            );
         }
-    } else if value.get("result").is_some() && has_id {
-        match serde_json::from_value::<Response>(value) {
-            Ok(response) => {
-                let method = lock(pending).remove(&response.id);
-                if response.id == RequestId::Integer(INITIALIZE_REQUEST_ID) {
-                    match serde_json::from_value::<InitializeResult>(response.result.clone()) {
-                        Ok(initialize) => {
-                            if let Err(error) =
-                                commands.try_send(WriterCommand::InitializeAck(initialize))
-                            {
-                                let message = match error {
-                                    TrySendError::Full(_) => {
-                                        "writer queue full before initialized acknowledgement"
-                                    }
-                                    TrySendError::Closed(_) => {
-                                        "writer disconnected before initialized acknowledgement"
-                                    }
-                                };
-                                initialization_failed(state, events, saturated, process, message);
-                            }
+        ParsedMessage::Response {
+            response,
+            initialize,
+        } => {
+            let method = lock(pending).remove(&response.id);
+            if let Some(initialize) = initialize {
+                match initialize {
+                    Ok(initialize) => {
+                        if let Err(error) =
+                            commands.try_send(WriterCommand::InitializeAck(initialize))
+                        {
+                            let message = match error {
+                                TrySendError::Full(_) => {
+                                    "writer queue full before initialized acknowledgement"
+                                }
+                                TrySendError::Closed(_) => {
+                                    "writer disconnected before initialized acknowledgement"
+                                }
+                            };
+                            initialization_failed(
+                                &mut current,
+                                events,
+                                saturated,
+                                process,
+                                message,
+                            );
                         }
-                        Err(error) => initialization_failed(
-                            state,
-                            events,
-                            saturated,
-                            process,
-                            &format!("invalid initialize response: {error}"),
-                        ),
+                    }
+                    Err(error) => {
+                        initialization_failed(&mut current, events, saturated, process, &error)
                     }
                 }
-                emit_event(
-                    events,
-                    saturated,
-                    AppServerEvent::Response { response, method },
-                );
             }
-            Err(error) => emit_event(
+            emit_event(
                 events,
                 saturated,
-                AppServerEvent::ProtocolError(format!("invalid response: {error}")),
-            ),
+                AppServerEvent::Response { response, method },
+            );
         }
-    } else if value.get("error").is_some() && has_id {
-        match serde_json::from_value::<ErrorResponse>(value) {
-            Ok(response) => {
-                let method = lock(pending).remove(&response.id);
-                if response.id == RequestId::Integer(INITIALIZE_REQUEST_ID) {
-                    initialization_failed(
-                        state,
-                        events,
-                        saturated,
-                        process,
-                        &format!("initialize failed: {}", response.error.message),
-                    );
-                }
-                emit_event(
+        ParsedMessage::ErrorResponse(response) => {
+            let method = lock(pending).remove(&response.id);
+            if response.id == RequestId::Integer(INITIALIZE_REQUEST_ID) {
+                initialization_failed(
+                    &mut current,
                     events,
                     saturated,
-                    AppServerEvent::ErrorResponse { response, method },
+                    process,
+                    &format!("initialize failed: {}", response.error.message),
                 );
             }
-            Err(error) => emit_event(
+            emit_event(
                 events,
                 saturated,
-                AppServerEvent::ProtocolError(format!("invalid error response: {error}")),
-            ),
+                AppServerEvent::ErrorResponse { response, method },
+            );
         }
-    } else {
-        emit_event(
-            events,
-            saturated,
-            AppServerEvent::ProtocolError("unrecognized App Server envelope".to_owned()),
-        );
+        ParsedMessage::ProtocolError(error) => {
+            emit_event(events, saturated, AppServerEvent::ProtocolError(error));
+        }
     }
 }
 
@@ -249,12 +442,21 @@ pub(crate) async fn run_stderr_reader(
     stderr: ChildStderr,
     events: SyncSender<AppServerEvent>,
     saturated: Arc<AtomicBool>,
+    cancellation: CancellationToken,
 ) {
     let mut reader = BufReader::new(stderr);
     let mut buffer = Vec::new();
     loop {
         buffer.clear();
-        match reader.read_until(b'\n', &mut buffer).await {
+        let read = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => break,
+            result = reader.read_until(b'\n', &mut buffer) => result,
+        };
+        if cancellation.is_cancelled() {
+            break;
+        }
+        match read {
             Ok(0) => break,
             Ok(_) => {
                 let diagnostic = String::from_utf8_lossy(&buffer)
@@ -397,13 +599,21 @@ fn transport_failed(
 }
 
 fn initialization_failed(
-    state: &Arc<Mutex<ConnectionState>>,
+    state: &mut ConnectionState,
     events: &SyncSender<AppServerEvent>,
     saturated: &Arc<AtomicBool>,
     process: &Sender<ProcessCommand>,
     message: &str,
 ) {
-    set_state(state, events, saturated, ConnectionState::Crashed);
+    if *state != ConnectionState::Crashed {
+        log::info!("Codex App Server lifecycle: {:?} -> Crashed", *state);
+        *state = ConnectionState::Crashed;
+        emit_event(
+            events,
+            saturated,
+            AppServerEvent::StateChanged(ConnectionState::Crashed),
+        );
+    }
     emit_event(
         events,
         saturated,

@@ -10,15 +10,15 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::{
     NSAccessibility, NSAccessibilityTextAreaRole, NSAutoresizingMaskOptions, NSBorderType,
-    NSCursor, NSEvent, NSEventModifierFlags, NSEventTrackingRunLoopMode, NSMenu, NSMenuItem,
-    NSPasteboard, NSPasteboardTypeString, NSScrollElasticity, NSScrollView, NSSearchField,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSViewBoundsDidChangeNotification,
-    NSWindowOcclusionState,
+    NSControlSize, NSCursor, NSEvent, NSEventModifierFlags, NSEventTrackingRunLoopMode, NSMenu,
+    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSScrollElasticity, NSScrollView, NSSearchField, NSTrackingArea,
+    NSTrackingAreaOptions, NSView, NSViewBoundsDidChangeNotification, NSWindowOcclusionState,
 };
 use objc2_core_foundation::CGSize;
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSNotificationCenter, NSObjectProtocol, NSPoint, NSRect,
-    NSRunLoop, NSRunLoopCommonModes, NSSize, NSString,
+    NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
 };
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable,
@@ -31,6 +31,8 @@ use objc2_quartz_core::{
 use skia_safe::gpu::{self, DirectContext, SurfaceOrigin, backend_render_targets, mtl};
 use skia_safe::{Color4f, ColorType, Paint, Rect};
 use std::cell::{Cell, RefCell};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 
 const BASE_FONT_SIZE: f64 = 13.0;
 const BASE_LINE_HEIGHT: f64 = 22.0;
@@ -62,6 +64,105 @@ impl Drop for MetalState {
 }
 
 #[derive(Default)]
+struct DiffLayoutWorkerState {
+    pending: Option<DiffLayoutRequest>,
+    shutdown: bool,
+}
+
+struct DiffLayoutWorker {
+    state: Arc<(Mutex<DiffLayoutWorkerState>, Condvar)>,
+    result: Arc<Mutex<Option<DiffLayoutCache>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl DiffLayoutWorker {
+    fn new() -> Self {
+        let state = Arc::new((Mutex::new(DiffLayoutWorkerState::default()), Condvar::new()));
+        let worker_state = state.clone();
+        let result = Arc::new(Mutex::new(None));
+        let worker_result = result.clone();
+        let thread = thread::Builder::new()
+            .name("craic-diff-layout".to_string())
+            .spawn(move || {
+                loop {
+                    let request = {
+                        let (lock, ready) = &*worker_state;
+                        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+                        while state.pending.is_none() && !state.shutdown {
+                            state = ready.wait(state).unwrap_or_else(|error| error.into_inner());
+                        }
+                        if state.shutdown {
+                            break;
+                        }
+                        state.pending.take()
+                    };
+                    let Some(request) = request else {
+                        continue;
+                    };
+                    *worker_result
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) =
+                        Some(build_diff_layout(request));
+                }
+            })
+            .expect("native diff layout worker should start");
+        Self {
+            state,
+            result,
+            thread: Some(thread),
+        }
+    }
+
+    fn submit(&self, request: DiffLayoutRequest) {
+        let (lock, ready) = &*self.state;
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        state.pending = Some(request);
+        ready.notify_one();
+    }
+
+    fn clear_pending(&self) {
+        let (lock, _) = &*self.state;
+        lock.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending = None;
+    }
+
+    fn take_result(&self) -> Option<DiffLayoutCache> {
+        self.result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_none_or(|thread| thread.is_finished())
+    }
+
+    fn shutdown(&mut self) {
+        let (lock, ready) = &*self.state;
+        {
+            let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+            state.pending = None;
+            state.shutdown = true;
+            ready.notify_one();
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            log::warn!("native diff layout worker panicked during shutdown");
+        }
+    }
+}
+
+impl Drop for DiffLayoutWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[derive(Default)]
 struct DiffState {
     path: String,
     fingerprint: u64,
@@ -70,7 +171,6 @@ struct DiffState {
     rows: Vec<DiffRow>,
     layout: Option<DiffLayoutCache>,
     generation: u64,
-    layout_width: i32,
     scroll_y: f64,
     elastic_scrolling: bool,
     selection: Option<DiffTextSelection>,
@@ -270,7 +370,6 @@ impl DiffState {
         self.syntax = syntax;
         self.generation = self.generation.wrapping_add(1).max(1);
         self.layout = None;
-        self.layout_width = 0;
         if !preserve {
             self.scroll_y = 0.0;
             self.elastic_scrolling = false;
@@ -293,18 +392,15 @@ impl DiffState {
         };
     }
 
-    fn ensure_layout(&mut self, width: f64, height: f64) {
+    fn layout_signature(&self, width: f64) -> Option<DiffLayoutSignature> {
+        if self.rows.is_empty() {
+            return None;
+        }
         let content_width = (width - SCROLLBAR_WIDTH).max(1.0);
         let layout_width = content_width.round() as i32;
-        if self.layout.is_some() && self.layout_width == layout_width {
-            if !self.elastic_scrolling {
-                self.clamp_scroll(height);
-            }
-            return;
-        }
         let half_width = content_width / 2.0;
         let text_width = (half_width - GUTTER_WIDTH - CELL_PADDING * 2.0).max(40.0);
-        let signature = DiffLayoutSignature::new(
+        Some(DiffLayoutSignature::new(
             self.generation,
             layout_width,
             GUTTER_WIDTH,
@@ -312,18 +408,33 @@ impl DiffState {
             text_width,
             self.char_width,
             self.rows.len(),
-        );
-        self.layout = Some(build_diff_layout(DiffLayoutRequest {
+        ))
+    }
+
+    fn layout_request(
+        &self,
+        width: f64,
+        pending: Option<&DiffLayoutSignature>,
+    ) -> Option<DiffLayoutRequest> {
+        let signature = self.layout_signature(width)?;
+        if self
+            .layout
+            .as_ref()
+            .is_some_and(|layout| layout.signature == signature)
+            || pending == Some(&signature)
+        {
+            return None;
+        }
+        let content_width = (width - SCROLLBAR_WIDTH).max(1.0);
+        let half_width = content_width / 2.0;
+        let text_width = (half_width - GUTTER_WIDTH - CELL_PADDING * 2.0).max(40.0);
+        Some(DiffLayoutRequest {
             signature,
             rows: self.rows.clone(),
             text_width,
             line_height: self.line_height,
             char_width: self.char_width,
-        }));
-        self.layout_width = layout_width;
-        if !self.elastic_scrolling {
-            self.clamp_scroll(height);
-        }
+        })
     }
 
     fn maximum_scroll(&self, viewport_height: f64) -> f64 {
@@ -334,11 +445,14 @@ impl DiffState {
     }
 
     fn clamp_scroll(&mut self, viewport_height: f64) {
+        if self.layout.is_none() {
+            return;
+        }
         let maximum = self.maximum_scroll(viewport_height);
         self.scroll_y = self.scroll_y.clamp(0.0, maximum);
     }
 
-    fn toggle_fold(&mut self, fold_index: usize, width: f64, height: f64) -> bool {
+    fn toggle_fold(&mut self, fold_index: usize) -> bool {
         let Some(fold) = self.folds.get_mut(fold_index) else {
             return false;
         };
@@ -347,7 +461,6 @@ impl DiffState {
         self.generation = self.generation.wrapping_add(1).max(1);
         self.layout = None;
         self.rebuild_search_matches();
-        self.ensure_layout(width, height);
         true
     }
 
@@ -444,6 +557,10 @@ pub(crate) struct DiffMetalViewIvars {
     last_frame_timestamp: Cell<f64>,
     native_scroll: RefCell<Option<Retained<NSScrollView>>>,
     native_scroll_document: RefCell<Option<Retained<NativeScrollDocument>>>,
+    layout_worker: RefCell<Option<DiffLayoutWorker>>,
+    layout_pending_signature: RefCell<Option<DiffLayoutSignature>>,
+    layout_timer: RefCell<Option<Retained<NSTimer>>>,
+    layout_spinner: Retained<NSProgressIndicator>,
 }
 
 define_class!(
@@ -591,6 +708,11 @@ define_class!(
             self.apply_native_scroll_position();
         }
 
+        #[unsafe(method(pollDiffLayout:))]
+        fn poll_diff_layout(&self, _timer: &NSTimer) {
+            self.poll_diff_layout_results();
+        }
+
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
@@ -609,8 +731,8 @@ define_class!(
             }
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             let bounds = self.bounds();
+            self.ensure_layout(bounds.size.width, bounds.size.height);
             let mut state = self.ivars().state.borrow_mut();
-            state.ensure_layout(bounds.size.width, bounds.size.height);
             state.elastic_scrolling = false;
             if self.point_in_scrollbar_lane(point) {
                 if let Some(scroll_y) = scrollbar_scroll_for_press(
@@ -636,11 +758,12 @@ define_class!(
                     if row.left_kind == DiffRowKind::Fold || row.right_kind == DiffRowKind::Fold {
                         let fold_index = row.left_number.or(row.right_number);
                         if let Some(fold_index) = fold_index {
-                            if state.toggle_fold(fold_index, bounds.size.width, bounds.size.height) {
+                            if state.toggle_fold(fold_index) {
                                 log::debug!("native diff fold toggled index={fold_index}");
                             }
                         }
                         drop(state);
+                        self.ensure_layout(bounds.size.width, bounds.size.height);
                         self.update_native_scroll_geometry();
                         self.sync_native_scroll_to_state();
                         self.update_accessibility_selection();
@@ -674,8 +797,8 @@ define_class!(
             if self.ivars().scrollbar_active.get() {
                 let point = self.convertPoint_fromView(event.locationInWindow(), None);
                 let bounds = self.bounds();
+                self.ensure_layout(bounds.size.width, bounds.size.height);
                 let mut state = self.ivars().state.borrow_mut();
-                state.ensure_layout(bounds.size.width, bounds.size.height);
                 let total_height = state.layout.as_ref().map_or(0.0, |layout| layout.content_height);
                 if let Some((_, thumb_height)) = scrollbar_thumb_geometry(
                     bounds.size.height,
@@ -700,8 +823,8 @@ define_class!(
             }
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             let bounds = self.bounds();
+            self.ensure_layout(bounds.size.width, bounds.size.height);
             let mut state = self.ivars().state.borrow_mut();
-            state.ensure_layout(bounds.size.width, bounds.size.height);
             let Some(anchor) = state.selection_anchor else { return };
             if point.y < 0.0 {
                 state.scroll_y = (state.scroll_y - state.line_height).max(0.0);
@@ -769,8 +892,8 @@ define_class!(
                 }
             }
             let bounds = self.bounds();
+            self.ensure_layout(bounds.size.width, bounds.size.height);
             let mut state = self.ivars().state.borrow_mut();
-            state.ensure_layout(bounds.size.width, bounds.size.height);
             match event.keyCode() {
                 123 => state.scroll_y = (state.scroll_y - state.char_width * 4.0).max(0.0),
                 124 => state.scroll_y += state.char_width * 4.0,
@@ -816,6 +939,27 @@ define_class!(
 impl DiffMetalView {
     pub fn new(frame: NSRect, font_size: f64, mtm: MainThreadMarker) -> Retained<Self> {
         let (font_size, line_height, char_width) = diff_metrics(font_size);
+        let layout_spinner = NSProgressIndicator::initWithFrame(
+            NSProgressIndicator::alloc(mtm),
+            NSRect::new(
+                NSPoint::new(
+                    (frame.size.width - 24.0) / 2.0,
+                    (frame.size.height - 24.0) / 2.0,
+                ),
+                NSSize::new(24.0, 24.0),
+            ),
+        );
+        layout_spinner.setStyle(NSProgressIndicatorStyle::Spinning);
+        layout_spinner.setControlSize(NSControlSize::Regular);
+        layout_spinner.setIndeterminate(true);
+        layout_spinner.setDisplayedWhenStopped(false);
+        layout_spinner.setHidden(true);
+        layout_spinner.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinXMargin
+                | NSAutoresizingMaskOptions::ViewMaxXMargin
+                | NSAutoresizingMaskOptions::ViewMinYMargin
+                | NSAutoresizingMaskOptions::ViewMaxYMargin,
+        );
         let this = Self::alloc(mtm).set_ivars(DiffMetalViewIvars {
             metal: RefCell::new(None),
             state: RefCell::new(DiffState {
@@ -838,12 +982,17 @@ impl DiffMetalView {
             last_frame_timestamp: Cell::new(0.0),
             native_scroll: RefCell::new(None),
             native_scroll_document: RefCell::new(None),
+            layout_worker: RefCell::new(Some(DiffLayoutWorker::new())),
+            layout_pending_signature: RefCell::new(None),
+            layout_timer: RefCell::new(None),
+            layout_spinner,
         });
         // SAFETY: NSView's designated frame initializer is valid for this subclass.
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         view.initialize_metal();
         view.initialize_tracking();
         view.initialize_native_scroll();
+        view.addSubview(&view.ivars().layout_spinner);
         view.setAccessibilityRole(Some(unsafe { NSAccessibilityTextAreaRole }));
         view.setAccessibilityLabel(Some(&NSString::from_str("File diff")));
         view.update_accessibility_content();
@@ -861,9 +1010,8 @@ impl DiffMetalView {
         state.line_height = line_height;
         state.char_width = char_width;
         state.layout = None;
-        state.layout_width = 0;
-        state.ensure_layout(bounds.size.width, bounds.size.height);
         drop(state);
+        self.ensure_layout(bounds.size.width, bounds.size.height);
         self.update_native_scroll_geometry();
         self.sync_native_scroll_to_state();
         self.render_frame();
@@ -882,7 +1030,6 @@ impl DiffMetalView {
         let bounds = self.bounds();
         let mut state = self.ivars().state.borrow_mut();
         state.set_document(path, fingerprint, document, syntax);
-        state.ensure_layout(bounds.size.width, bounds.size.height);
         log::info!(
             "native Skia Metal diff updated path={} rows={} folds={} fingerprint={:016x}",
             path,
@@ -891,6 +1038,7 @@ impl DiffMetalView {
             fingerprint
         );
         drop(state);
+        self.ensure_layout(bounds.size.width, bounds.size.height);
         self.update_native_scroll_geometry();
         self.sync_native_scroll_to_state();
         self.update_accessibility_content();
@@ -898,6 +1046,7 @@ impl DiffMetalView {
     }
 
     pub fn clear(&self) {
+        self.clear_pending_layout();
         self.ivars().state.borrow_mut().clear();
         self.update_native_scroll_geometry();
         self.sync_native_scroll_to_state();
@@ -908,6 +1057,156 @@ impl DiffMetalView {
     pub fn attach_search_panel(&self, panel: &NSView, field: &NSSearchField) {
         self.ivars().search_panel.replace(Some(panel.retain()));
         self.ivars().search_field.replace(Some(field.retain()));
+    }
+
+    fn ensure_layout(&self, width: f64, height: f64) {
+        self.drain_layout_results(width, height);
+        let (request, needs_layout) = {
+            let pending = self.ivars().layout_pending_signature.borrow();
+            let mut state = self.ivars().state.borrow_mut();
+            let Some(current_signature) = state.layout_signature(width) else {
+                state.layout = None;
+                drop(state);
+                drop(pending);
+                self.clear_pending_layout();
+                return;
+            };
+            let layout_is_current = state
+                .layout
+                .as_ref()
+                .is_some_and(|layout| layout.signature == current_signature);
+            if !layout_is_current {
+                state.layout = None;
+            }
+            (
+                state.layout_request(width, pending.as_ref()),
+                !layout_is_current,
+            )
+        };
+        if let Some(request) = request {
+            let signature = request.signature.clone();
+            if self.ivars().layout_worker.borrow().is_none() {
+                self.ivars()
+                    .layout_worker
+                    .replace(Some(DiffLayoutWorker::new()));
+            }
+            if let Some(worker) = self.ivars().layout_worker.borrow().as_ref() {
+                worker.submit(request);
+                self.ivars()
+                    .layout_pending_signature
+                    .replace(Some(signature));
+                self.start_layout_timer();
+            }
+        }
+        if needs_layout {
+            self.ivars().layout_spinner.setHidden(false);
+            // SAFETY: Layout requests and spinner animation are owned by AppKit's main thread.
+            unsafe { self.ivars().layout_spinner.startAnimation(None) };
+            self.start_layout_timer();
+        }
+        let mut state = self.ivars().state.borrow_mut();
+        if !state.elastic_scrolling {
+            state.clamp_scroll(height);
+        }
+    }
+
+    fn drain_layout_results(&self, width: f64, height: f64) -> bool {
+        let mut applied = false;
+        let (result, disconnected) = self
+            .ivars()
+            .layout_worker
+            .borrow()
+            .as_ref()
+            .map_or((None, false), |worker| {
+                (worker.take_result(), worker.is_finished())
+            });
+        if let Some(layout) = result {
+            let current_signature = self.ivars().state.borrow().layout_signature(width);
+            let pending_matches =
+                self.ivars().layout_pending_signature.borrow().as_ref() == Some(&layout.signature);
+            if pending_matches && current_signature.as_ref() == Some(&layout.signature) {
+                let mut state = self.ivars().state.borrow_mut();
+                state.layout = Some(layout);
+                if state.active_search_match.is_some() {
+                    state.select_search_match(0, height);
+                }
+                if !state.elastic_scrolling {
+                    state.clamp_scroll(height);
+                }
+                drop(state);
+                self.ivars().layout_pending_signature.borrow_mut().take();
+                unsafe { self.ivars().layout_spinner.stopAnimation(None) };
+                self.ivars().layout_spinner.setHidden(true);
+                applied = true;
+            } else {
+                log::debug!(
+                    "discarding stale native diff layout pending_match={} current_match={}",
+                    pending_matches,
+                    current_signature.as_ref() == Some(&layout.signature)
+                );
+            }
+        }
+        if disconnected {
+            self.ivars().layout_pending_signature.borrow_mut().take();
+            self.ivars().layout_worker.borrow_mut().take();
+            unsafe { self.ivars().layout_spinner.stopAnimation(None) };
+            self.ivars().layout_spinner.setHidden(true);
+            log::warn!("native diff layout worker disconnected");
+        }
+        applied
+    }
+
+    fn start_layout_timer(&self) {
+        if self.ivars().layout_timer.borrow().is_some() {
+            return;
+        }
+        // SAFETY: The timer runs on AppKit's main run loop, targets this retained view, and is
+        // invalidated as soon as the latest layout resolves or during renderer teardown.
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                1.0 / 60.0,
+                self.as_ref(),
+                objc2::sel!(pollDiffLayout:),
+                None,
+                true,
+            )
+        };
+        let main_run_loop = NSRunLoop::mainRunLoop();
+        unsafe {
+            main_run_loop.addTimer_forMode(&timer, NSRunLoopCommonModes);
+            main_run_loop.addTimer_forMode(&timer, NSEventTrackingRunLoopMode);
+        }
+        self.ivars().layout_timer.replace(Some(timer));
+    }
+
+    fn stop_layout_timer(&self) {
+        if let Some(timer) = self.ivars().layout_timer.borrow_mut().take() {
+            timer.invalidate();
+        }
+    }
+
+    fn clear_pending_layout(&self) {
+        self.ivars().layout_pending_signature.borrow_mut().take();
+        if let Some(worker) = self.ivars().layout_worker.borrow().as_ref() {
+            worker.clear_pending();
+        }
+        self.stop_layout_timer();
+        unsafe { self.ivars().layout_spinner.stopAnimation(None) };
+        self.ivars().layout_spinner.setHidden(true);
+    }
+
+    fn poll_diff_layout_results(&self) {
+        let bounds = self.bounds();
+        let applied = self.drain_layout_results(bounds.size.width, bounds.size.height);
+        if self.ivars().layout_pending_signature.borrow().is_none() {
+            self.stop_layout_timer();
+        }
+        if applied {
+            self.update_native_scroll_geometry();
+            self.sync_native_scroll_to_state();
+            self.update_accessibility_selection();
+            self.render_frame();
+        }
     }
 
     pub fn set_search_query(&self, query: &str) {
@@ -1001,6 +1300,10 @@ impl DiffMetalView {
     }
 
     pub fn teardown_renderer(&self) {
+        self.clear_pending_layout();
+        if let Some(mut worker) = self.ivars().layout_worker.borrow_mut().take() {
+            worker.shutdown();
+        }
         if let Some(display_link) = self.ivars().display_link.borrow_mut().take() {
             display_link.setPaused(true);
             display_link.setDelegate(None);
@@ -1098,14 +1401,13 @@ impl DiffMetalView {
         if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
             return;
         }
+        self.ensure_layout(bounds.size.width, bounds.size.height);
         let content_height = {
-            let mut state = self.ivars().state.borrow_mut();
-            state.ensure_layout(bounds.size.width, bounds.size.height);
+            let state = self.ivars().state.borrow();
             state
                 .layout
                 .as_ref()
-                .map_or(bounds.size.height, |layout| layout.content_height)
-                .max(bounds.size.height)
+                .map(|layout| layout.content_height.max(bounds.size.height))
         };
         if let Some(scroll) = self.ivars().native_scroll.borrow().as_ref() {
             scroll.setFrame(NSRect::new(
@@ -1113,6 +1415,9 @@ impl DiffMetalView {
                 NSSize::new(1.0, bounds.size.height),
             ));
         }
+        let Some(content_height) = content_height else {
+            return;
+        };
         if let Some(document) = self.ivars().native_scroll_document.borrow().as_ref() {
             let frame = document.frame();
             if (frame.size.width - 1.0).abs() > 0.5
@@ -1130,6 +1435,9 @@ impl DiffMetalView {
         let bounds = self.bounds();
         let scroll_y = scroll.contentView().bounds().origin.y;
         let mut state = self.ivars().state.borrow_mut();
+        if state.layout.is_none() {
+            return;
+        }
         let maximum = state.maximum_scroll(bounds.size.height);
         state.scroll_y = scroll_y;
         state.elastic_scrolling = scroll_y < 0.0 || scroll_y > maximum;
@@ -1145,6 +1453,9 @@ impl DiffMetalView {
         let bounds = self.bounds();
         let scroll_y = {
             let state = self.ivars().state.borrow();
+            if state.layout.is_none() {
+                return;
+            }
             state
                 .scroll_y
                 .clamp(0.0, state.maximum_scroll(bounds.size.height))
@@ -1319,8 +1630,8 @@ impl DiffMetalView {
         };
         let canvas = surface.canvas();
         canvas.scale((scale_x, scale_y));
-        let mut state = self.ivars().state.borrow_mut();
-        state.ensure_layout(bounds.size.width, bounds.size.height);
+        self.ensure_layout(bounds.size.width, bounds.size.height);
+        let state = self.ivars().state.borrow();
         if let Some(layout) = state.layout.as_ref() {
             paint_diff(
                 canvas,

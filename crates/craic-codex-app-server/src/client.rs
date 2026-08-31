@@ -18,6 +18,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
+use tokio_util::sync::CancellationToken;
 
 use crate::lifecycle::{AppServerConfig, AppServerError, AppServerEvent, ConnectionState};
 use crate::protocol::ApprovalResponse;
@@ -104,8 +105,9 @@ use crate::protocol::{
     WindowsSandboxSetupStartParams,
 };
 use crate::transport::{
-    INITIALIZE_REQUEST_ID, ProcessCommand, WriterCommand, emit_event, enqueue_value, lock,
-    run_process_waiter, run_stderr_reader, run_stdout_reader, run_writer, set_state,
+    INITIALIZE_REQUEST_ID, OutboundMessage, ProcessCommand, WriterCommand, emit_event,
+    enqueue_command, lock, run_process_waiter, run_stderr_reader, run_stdout_reader, run_writer,
+    set_state,
 };
 use crate::version::check_codex_version;
 
@@ -241,6 +243,7 @@ impl AppServer {
                         ConnectionState::Initializing,
                     );
 
+                    let transport_cancellation = CancellationToken::new();
                     let writer = tokio::spawn(run_writer(
                         stdin,
                         command_rx,
@@ -248,27 +251,37 @@ impl AppServer {
                         runtime_events.clone(),
                         Arc::clone(&runtime_saturated),
                         runtime_process.clone(),
+                        transport_cancellation.clone(),
                     ));
+                    let reader_commands = runtime_commands.clone();
                     let reader = tokio::spawn(run_stdout_reader(
                         stdout,
-                        runtime_commands,
+                        reader_commands,
                         runtime_process,
                         Arc::clone(&runtime_state),
                         runtime_pending,
                         runtime_events.clone(),
                         Arc::clone(&runtime_saturated),
+                        transport_cancellation.clone(),
                     ));
                     let stderr_reader = tokio::spawn(run_stderr_reader(
                         stderr,
                         runtime_events.clone(),
                         Arc::clone(&runtime_saturated),
+                        transport_cancellation.clone(),
                     ));
                     if startup_tx.send(Ok(())).is_err() {
-                        writer.abort();
-                        reader.abort();
-                        stderr_reader.abort();
+                        // Serialize startup cancellation with stdout message acceptance so a
+                        // decoded frame cannot route after cancellation has won.
+                        let current = lock(&runtime_state);
+                        transport_cancellation.cancel();
+                        drop(current);
                         let _ = child.start_kill();
                         let _ = child.wait().await;
+                        drop(runtime_commands);
+                        let _ = writer.await;
+                        let _ = reader.await;
+                        let _ = stderr_reader.await;
                         return;
                     }
                     run_process_waiter(
@@ -280,9 +293,8 @@ impl AppServer {
                         process_group_id,
                     )
                     .await;
-                    writer.abort();
-                    reader.abort();
-                    stderr_reader.abort();
+                    transport_cancellation.cancel();
+                    drop(runtime_commands);
                     let _ = writer.await;
                     let _ = reader.await;
                     let _ = stderr_reader.await;
@@ -303,7 +315,10 @@ impl AppServer {
             }
         }
         lock(&pending).insert(initialize.id.clone(), initialize.method.clone());
-        if let Err(error) = enqueue_value(&command_tx, initialize) {
+        if let Err(error) = enqueue_command(
+            &command_tx,
+            WriterCommand::Message(OutboundMessage::Request(initialize)),
+        ) {
             let _ = process_tx.try_send(ProcessCommand::Terminate);
             drop(events_rx);
             let _ = supervisor.join();
@@ -382,7 +397,7 @@ impl AppServer {
             trace: None,
         };
         lock(&self.pending).insert(id.clone(), method);
-        if let Err(error) = self.enqueue(request) {
+        if let Err(error) = self.enqueue(OutboundMessage::Request(request)) {
             lock(&self.pending).remove(&id);
             return Err(error);
         }
@@ -395,21 +410,21 @@ impl AppServer {
         params: P,
     ) -> Result<(), AppServerError> {
         self.ensure_ready()?;
-        self.enqueue(Notification {
+        self.enqueue(OutboundMessage::Notification(Notification {
             method: method.into(),
             params: Some(serde_json::to_value(params).map_err(AppServerError::Serialize)?),
             emitted_at_ms: None,
-        })
+        }))
     }
 
     pub fn respond(&self, id: RequestId, result: Value) -> Result<(), AppServerError> {
         self.ensure_ready()?;
-        self.enqueue(Response { id, result })
+        self.enqueue(OutboundMessage::Response(Response { id, result }))
     }
 
     pub fn respond_error(&self, id: RequestId, error: RpcError) -> Result<(), AppServerError> {
         self.ensure_ready()?;
-        self.enqueue(ErrorResponse { id, error })
+        self.enqueue(OutboundMessage::ErrorResponse(ErrorResponse { id, error }))
     }
 
     pub fn respond_approval(&self, id: RequestId, decision: Value) -> Result<(), AppServerError> {
@@ -1253,12 +1268,12 @@ impl AppServer {
             .map_err(|_| AppServerError::RequestIdExhausted)
     }
 
-    fn enqueue<T: Serialize>(&self, message: T) -> Result<(), AppServerError> {
+    fn enqueue(&self, message: OutboundMessage) -> Result<(), AppServerError> {
         let command_tx = self
             .command_tx
             .as_ref()
             .ok_or(AppServerError::Disconnected)?;
-        enqueue_value(command_tx, message)
+        enqueue_command(command_tx, WriterCommand::Message(message))
     }
 }
 
