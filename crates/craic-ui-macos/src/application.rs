@@ -963,6 +963,8 @@ pub(crate) struct AppDelegateIvars {
     workspace_results: RefCell<Vec<usize>>,
     workspaces: RefCell<Vec<WorkspaceEntry>>,
     workspace_discovery_loading: Cell<bool>,
+    workspace_discovery_generation: Cell<u64>,
+    workspace_discovery_requests: OnceCell<tokio::sync::mpsc::Sender<WorkspaceDiscoveryRequest>>,
     workspace_metadata: RefCell<HashMap<String, NativeWorkspaceMetadata>>,
     workspace_metadata_pending: RefCell<HashSet<String>>,
     workspace_metadata_generation: Cell<u64>,
@@ -1433,10 +1435,15 @@ enum FrontendCompletion {
     Repository(RepositoryCompletion),
     Agent(NativeAgentEvent),
     WorkspaceEntries {
+        generation: u64,
         entries: Vec<WorkspaceEntry>,
         preferred: Option<craic_config::ConfiguredWorkspace>,
+        select_workspace: bool,
     },
-    WorkspaceDiscoveryFailed(String),
+    WorkspaceDiscoveryFailed {
+        generation: u64,
+        message: String,
+    },
     WorkspaceMetadata {
         workspace_id: String,
         generation: u64,
@@ -1463,6 +1470,12 @@ enum FrontendRequest {
         message: String,
     },
     SaveLastWorkspace(craic_config::ConfiguredWorkspace),
+}
+
+struct WorkspaceDiscoveryRequest {
+    generation: u64,
+    preferred: Option<craic_config::ConfiguredWorkspace>,
+    select_workspace: bool,
 }
 
 enum RepositoryCompletion {
@@ -13222,6 +13235,20 @@ impl AppDelegate {
             popover.close();
             return;
         }
+        let preferred = self
+            .ivars()
+            .active_workspace_id
+            .borrow()
+            .as_deref()
+            .and_then(|workspace_id| {
+                self.ivars()
+                    .workspaces
+                    .borrow()
+                    .iter()
+                    .find(|entry| entry.selection_id() == workspace_id)
+                    .map(|entry| entry.workspace.clone())
+            });
+        self.request_workspace_discovery(preferred, false);
         if let Some(search) = self.ivars().workspace_search.get() {
             search.setStringValue(&NSString::new());
         }
@@ -13231,6 +13258,37 @@ impl AppDelegate {
             && let Some(window) = search.window()
         {
             window.makeFirstResponder(Some(search));
+        }
+    }
+
+    fn request_workspace_discovery(
+        &self,
+        preferred: Option<craic_config::ConfiguredWorkspace>,
+        select_workspace: bool,
+    ) {
+        if self.ivars().workspace_discovery_loading.get() {
+            return;
+        }
+        let Some(requests) = self.ivars().workspace_discovery_requests.get() else {
+            log::warn!("workspace discovery ignored because the discovery service is unavailable");
+            return;
+        };
+        let generation = self
+            .ivars()
+            .workspace_discovery_generation
+            .get()
+            .wrapping_add(1);
+        self.ivars().workspace_discovery_generation.set(generation);
+        self.ivars().workspace_discovery_loading.set(true);
+        self.refresh_workspace_loading_indicators();
+        if let Err(error) = requests.try_send(WorkspaceDiscoveryRequest {
+            generation,
+            preferred,
+            select_workspace,
+        }) {
+            self.ivars().workspace_discovery_loading.set(false);
+            self.refresh_workspace_loading_indicators();
+            log::warn!("workspace discovery queue rejected generation={generation} error={error}");
         }
     }
 
@@ -13267,6 +13325,14 @@ impl AppDelegate {
     }
 
     fn activate_workspace_here(&self, workspace: WorkspaceEntry) {
+        self.ivars().workspace_discovery_generation.set(
+            self.ivars()
+                .workspace_discovery_generation
+                .get()
+                .wrapping_add(1),
+        );
+        self.ivars().workspace_discovery_loading.set(false);
+        self.refresh_workspace_loading_indicators();
         let selection = WorkspaceSelection {
             id: WorkspaceId::new(workspace.selection_id()),
         };
@@ -22316,12 +22382,32 @@ impl AppDelegate {
                 self.apply_repository_completion(completion)
             }
             FrontendCompletion::Agent(event) => self.apply_native_agent_event(event),
-            FrontendCompletion::WorkspaceEntries { entries, preferred } => {
-                self.apply_workspace_entries(entries, preferred)
-            }
-            FrontendCompletion::WorkspaceDiscoveryFailed(message) => {
+            FrontendCompletion::WorkspaceEntries {
+                generation,
+                entries,
+                preferred,
+                select_workspace,
+            } => self.apply_workspace_entries(generation, entries, preferred, select_workspace),
+            FrontendCompletion::WorkspaceDiscoveryFailed {
+                generation,
+                message,
+            } => {
+                if self.ivars().workspace_discovery_generation.get() != generation {
+                    log::debug!(
+                        "stale workspace discovery failure ignored generation={} current_generation={}",
+                        generation,
+                        self.ivars().workspace_discovery_generation.get()
+                    );
+                    return;
+                }
                 self.ivars().workspace_discovery_loading.set(false);
-                self.refresh_workspace_results("");
+                let filter = self
+                    .ivars()
+                    .workspace_search
+                    .get()
+                    .map(|search| search.stringValue().to_string())
+                    .unwrap_or_default();
+                self.refresh_workspace_results(&filter);
                 self.refresh_workspace_loading_indicators();
                 let alert = NSAlert::new(self.mtm());
                 alert.setMessageText(&NSString::from_str("Unable to Load Workspaces"));
@@ -22396,6 +22482,13 @@ impl AppDelegate {
     }
 
     fn activate_local_workspace(&self, path: String) {
+        self.ivars().workspace_discovery_generation.set(
+            self.ivars()
+                .workspace_discovery_generation
+                .get()
+                .wrapping_add(1),
+        );
+        self.ivars().workspace_discovery_loading.set(false);
         let workspace = craic_config::ConfiguredWorkspace::local(path);
         let entry = WorkspaceEntry {
             label: workspace.label(),
@@ -26477,19 +26570,39 @@ impl AppDelegate {
 
     fn apply_workspace_entries(
         &self,
+        generation: u64,
         entries: Vec<WorkspaceEntry>,
         preferred: Option<craic_config::ConfiguredWorkspace>,
+        select_workspace: bool,
     ) {
+        if self.ivars().workspace_discovery_generation.get() != generation {
+            log::debug!(
+                "stale workspace discovery ignored generation={} current_generation={}",
+                generation,
+                self.ivars().workspace_discovery_generation.get()
+            );
+            return;
+        }
         self.ivars().workspace_discovery_loading.set(false);
-        let selected = preferred
-            .as_ref()
-            .and_then(|preferred| {
+        let active_workspace_id = self.ivars().active_workspace_id.borrow().clone();
+        let selected = if select_workspace {
+            preferred
+                .as_ref()
+                .and_then(|preferred| {
+                    entries
+                        .iter()
+                        .find(|entry| entry.selection_id() == preferred.selection_id())
+                })
+                .or_else(|| entries.first())
+                .cloned()
+        } else {
+            active_workspace_id.as_deref().and_then(|workspace_id| {
                 entries
                     .iter()
-                    .find(|entry| entry.selection_id() == preferred.selection_id())
+                    .find(|entry| entry.selection_id() == workspace_id)
+                    .cloned()
             })
-            .or_else(|| entries.first())
-            .cloned();
+        };
 
         self.ivars().workspace_metadata.borrow_mut().clear();
         self.ivars().workspace_metadata_pending.borrow_mut().clear();
@@ -26501,7 +26614,13 @@ impl AppDelegate {
         );
         self.ivars().workspaces.replace(entries.clone());
         self.queue_workspace_metadata(entries);
-        self.refresh_workspace_results("");
+        let filter = self
+            .ivars()
+            .workspace_search
+            .get()
+            .map(|search| search.stringValue().to_string())
+            .unwrap_or_default();
+        self.refresh_workspace_results(&filter);
         self.refresh_workspace_loading_indicators();
         if let Some(selected) = selected.as_ref() {
             self.apply_workspace_button_appearance(selected);
@@ -26510,7 +26629,8 @@ impl AppDelegate {
             button.setContentTintColor(None);
         }
 
-        if let Some(selected) = selected
+        if select_workspace
+            && let Some(selected) = selected
             && let Some(handle) = self.ivars().app_handle.get()
         {
             let workspace_id = selected.selection_id();
@@ -28125,7 +28245,6 @@ pub fn run() {
     let mtm = MainThreadMarker::new().expect("Craic must start on the macOS main thread");
     let application = NSApplication::sharedApplication(mtm);
     let delegate = AppDelegate::new(mtm);
-    delegate.ivars().workspace_discovery_loading.set(true);
     delegate.ivars().startup_error.replace(startup_error);
     delegate
         .ivars()
@@ -30765,12 +30884,32 @@ pub fn run() {
         })
         .expect("failed to start the native UI event bridge");
 
+    let (workspace_discovery_tx, mut workspace_discovery_rx) = tokio::sync::mpsc::channel(1);
+    assert!(
+        delegate
+            .ivars()
+            .workspace_discovery_requests
+            .set(workspace_discovery_tx)
+            .is_ok(),
+        "workspace discovery sender is initialized once"
+    );
     let discovery_completion_tx = frontend_completion_tx.clone();
+    let discovery_cancellation = runtime.cancellation_token();
     runtime
         .spawn(async move {
-            let discovered = tokio::task::spawn_blocking(move || {
+            loop {
+                let request = tokio::select! {
+                    _ = discovery_cancellation.cancelled() => break,
+                    request = workspace_discovery_rx.recv() => request,
+                };
+                let Some(request) = request else {
+                    break;
+                };
+                let generation = request.generation;
+                let select_workspace = request.select_workspace;
+                let discovered = tokio::task::spawn_blocking(move || {
                 let mut entries = craic_system::workspace::discover_configured_workspaces();
-                let preferred = startup_workspace.or_else(craic_config::last_workspace);
+                let preferred = request.preferred;
                 if let Some(workspace) = preferred.as_ref()
                     && !entries
                         .iter()
@@ -30785,26 +30924,47 @@ pub fn run() {
                 (entries, preferred)
             })
             .await;
-            let (entries, preferred) = match discovered {
-                Ok(result) => result,
-                Err(error) => {
-                    let message = error.to_string();
-                    log::error!("native workspace discovery task failed error={message}");
-                    let _ =
-                        discovery_completion_tx.send(FrontendCompletion::WorkspaceDiscoveryFailed(
-                            format!("Workspace discovery did not complete: {message}"),
-                        ));
-                    return;
+                let (entries, preferred) = match discovered {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let message = error.to_string();
+                        log::error!(
+                            "native workspace discovery task failed generation={generation} error={message}"
+                        );
+                        if discovery_completion_tx
+                            .send(FrontendCompletion::WorkspaceDiscoveryFailed {
+                                generation,
+                                message: format!(
+                                    "Workspace discovery did not complete: {message}"
+                                ),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if discovery_completion_tx
+                    .send(FrontendCompletion::WorkspaceEntries {
+                        generation,
+                        entries,
+                        preferred,
+                        select_workspace,
+                    })
+                    .is_err()
+                {
+                    log::warn!("native workspace discovery dropped during shutdown");
+                    break;
                 }
-            };
-            if discovery_completion_tx
-                .send(FrontendCompletion::WorkspaceEntries { entries, preferred })
-                .is_err()
-            {
-                log::warn!("native workspace discovery dropped during shutdown");
             }
+            log::info!("native workspace discovery service stopped");
         })
-        .expect("application runtime must accept initial workspace discovery");
+        .expect("application runtime must accept workspace discovery service");
+    delegate.request_workspace_discovery(
+        startup_workspace.or_else(craic_config::last_workspace),
+        true,
+    );
 
     application.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     let saved_page_index = if startup_files_requested {
