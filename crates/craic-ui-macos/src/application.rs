@@ -1390,6 +1390,7 @@ enum RepositoryRequest {
     },
     RunContainerAction {
         workspace_id: String,
+        workspace_generation: craic_app_core::Generation,
         access: Arc<dyn DockerAccess>,
         container_id: String,
         action: docker::ContainerAction,
@@ -1398,6 +1399,7 @@ enum RepositoryRequest {
     },
     RunComposeAction {
         workspace_id: String,
+        workspace_generation: craic_app_core::Generation,
         access: Arc<dyn DockerAccess>,
         compose: ComposeProject,
         action: docker::ComposeAction,
@@ -1798,6 +1800,7 @@ enum RepositoryCompletion {
     },
     ContainerActionFinished {
         workspace_id: String,
+        workspace_generation: craic_app_core::Generation,
         request_id: u64,
         result: Result<String, String>,
     },
@@ -15373,6 +15376,7 @@ impl AppDelegate {
         let Some(cancellation) = self.workspace_cancellation_token() else {
             return;
         };
+        let workspace_generation = self.ivars().workspace_generation.get();
         let request_id = containers.action_request_id.get().wrapping_add(1);
         containers.action_request_id.set(request_id);
         containers.action_in_progress.set(true);
@@ -15388,6 +15392,7 @@ impl AppDelegate {
         let request = if let Some(container) = container {
             RepositoryRequest::RunContainerAction {
                 workspace_id,
+                workspace_generation,
                 access,
                 container_id: container.id,
                 action,
@@ -15403,6 +15408,7 @@ impl AppDelegate {
             };
             RepositoryRequest::RunComposeAction {
                 workspace_id,
+                workspace_generation,
                 access,
                 compose,
                 action,
@@ -15425,10 +15431,17 @@ impl AppDelegate {
     fn finish_container_action(
         &self,
         workspace_id: &str,
+        workspace_generation: craic_app_core::Generation,
         request_id: u64,
         result: Result<String, String>,
     ) {
-        if self.ivars().active_workspace_id.borrow().as_deref() != Some(workspace_id) {
+        if self.ivars().active_workspace_id.borrow().as_deref() != Some(workspace_id)
+            || self.ivars().workspace_generation.get() != workspace_generation
+        {
+            log::debug!(
+                "discarding container action from stale workspace generation workspace={workspace_id} generation={}",
+                workspace_generation.get()
+            );
             return;
         }
         let Some(containers) = self.ivars().containers.get() else {
@@ -23417,9 +23430,15 @@ impl AppDelegate {
             }
             RepositoryCompletion::ContainerActionFinished {
                 workspace_id,
+                workspace_generation,
                 request_id,
                 result,
-            } => self.finish_container_action(&workspace_id, request_id, result),
+            } => self.finish_container_action(
+                &workspace_id,
+                workspace_generation,
+                request_id,
+                result,
+            ),
             RepositoryCompletion::Avatar { cache_key, result } => {
                 self.apply_avatar(&cache_key, result)
             }
@@ -31330,12 +31349,20 @@ pub fn run() {
                     }
                     RepositoryRequest::RunContainerAction {
                         workspace_id,
+                        workspace_generation,
                         access,
                         container_id,
                         action,
                         request_id,
                         cancellation,
                     } => {
+                        if cancellation.is_cancelled() {
+                            log::debug!(
+                                "skipping canceled container action workspace={workspace_id} generation={} request={request_id}",
+                                workspace_generation.get()
+                            );
+                            continue;
+                        }
                         let task = tokio::task::spawn_blocking(move || {
                             docker::run_container_action(access.as_ref(), &container_id, action)
                         });
@@ -31359,6 +31386,7 @@ pub fn run() {
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::ContainerActionFinished {
                                     workspace_id,
+                                    workspace_generation,
                                     request_id,
                                     result,
                                 },
@@ -31370,12 +31398,20 @@ pub fn run() {
                     }
                     RepositoryRequest::RunComposeAction {
                         workspace_id,
+                        workspace_generation,
                         access,
                         compose,
                         action,
                         request_id,
                         cancellation,
                     } => {
+                        if cancellation.is_cancelled() {
+                            log::debug!(
+                                "skipping canceled Compose action workspace={workspace_id} generation={} request={request_id}",
+                                workspace_generation.get()
+                            );
+                            continue;
+                        }
                         let task = tokio::task::spawn_blocking(move || {
                             docker::run_compose_action(access.as_ref(), &compose, action)
                         });
@@ -31399,6 +31435,7 @@ pub fn run() {
                             .send(FrontendCompletion::Repository(
                                 RepositoryCompletion::ContainerActionFinished {
                                     workspace_id,
+                                    workspace_generation,
                                     request_id,
                                     result,
                                 },
