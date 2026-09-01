@@ -537,7 +537,7 @@ impl AppDelegate {
         content_home_title.setFont(Some(&NSFont::boldSystemFontOfSize(24.0)));
         content_home_root.addSubview(&content_home_title);
         let content_home_subtitle = NSTextField::labelWithString(&NSString::new(), mtm);
-        content_home_subtitle.setAlignment(NSTextAlignment::Center);
+        content_home_subtitle.setAlignment(NSTextAlignment::Left);
         content_home_subtitle.setFont(Some(&NSFont::systemFontOfSize(13.0)));
         content_home_subtitle.setTextColor(Some(&NSColor::secondaryLabelColor()));
         content_home_root.addSubview(&content_home_subtitle);
@@ -552,25 +552,30 @@ impl AppDelegate {
             card.setBorderColor(&NSColor::separatorColor());
             card.setFillColor(&NSColor::controlBackgroundColor());
             card.setCornerRadius(10.0);
+            let text_group = NSView::initWithFrame(
+                NSView::alloc(mtm),
+                NSRect::new(NSPoint::ZERO, NSSize::new(480.0, 36.0)),
+            );
+            text_group.setTranslatesAutoresizingMaskIntoConstraints(false);
             let title = NSTextField::labelWithString(&NSString::from_str(title), mtm);
             title.setFrame(NSRect::new(
-                NSPoint::new(18.0, 37.0),
-                NSSize::new(480.0, 20.0),
+                NSPoint::new(0.0, 19.0),
+                NSSize::new(480.0, 17.0),
             ));
             title.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
             title.setFont(Some(&NSFont::boldSystemFontOfSize(13.5)));
             title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-            card.addSubview(&title);
+            text_group.addSubview(&title);
             let subtitle = NSTextField::labelWithString(&NSString::from_str(subtitle), mtm);
             subtitle.setFrame(NSRect::new(
-                NSPoint::new(18.0, 15.0),
-                NSSize::new(480.0, 18.0),
+                NSPoint::ZERO,
+                NSSize::new(480.0, 15.0),
             ));
             subtitle.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
             subtitle.setFont(Some(&NSFont::systemFontOfSize(12.0)));
             subtitle.setTextColor(Some(&NSColor::secondaryLabelColor()));
             subtitle.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-            card.addSubview(&subtitle);
+            text_group.addSubview(&subtitle);
             let button = unsafe {
                 NSButton::buttonWithTitle_target_action(
                     &NSString::from_str(button_title),
@@ -579,14 +584,43 @@ impl AppDelegate {
                     mtm,
                 )
             };
-            button.setFrame(NSRect::new(
-                NSPoint::new(520.0, 20.0),
-                NSSize::new(102.0, 32.0),
-            ));
-            button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+            button.setTranslatesAutoresizingMaskIntoConstraints(false);
             button.setBezelStyle(NSBezelStyle::Push);
             button.setControlSize(NSControlSize::Regular);
+            card.addSubview(&text_group);
             card.addSubview(&button);
+            text_group
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&card.leadingAnchor(), 18.0)
+                .setActive(true);
+            text_group
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&button.leadingAnchor(), -12.0)
+                .setActive(true);
+            text_group
+                .centerYAnchor()
+                .constraintEqualToAnchor(&card.centerYAnchor())
+                .setActive(true);
+            text_group
+                .heightAnchor()
+                .constraintEqualToConstant(36.0)
+                .setActive(true);
+            button
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&card.trailingAnchor(), -18.0)
+                .setActive(true);
+            button
+                .centerYAnchor()
+                .constraintEqualToAnchor(&card.centerYAnchor())
+                .setActive(true);
+            button
+                .widthAnchor()
+                .constraintEqualToConstant(102.0)
+                .setActive(true);
+            button
+                .heightAnchor()
+                .constraintEqualToConstant(32.0)
+                .setActive(true);
             (card, title, subtitle, button)
         };
 

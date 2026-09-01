@@ -46,19 +46,14 @@ impl AppDelegate {
                 NSSize::new(card_width, 32.0),
             ));
             subtitle.setFrame(NSRect::new(
-                NSPoint::new(24.0, top - 58.0),
-                NSSize::new((bounds.size.width - 48.0).max(1.0), 20.0),
+                NSPoint::new(card_x, top - 58.0),
+                NSSize::new(card_width, 20.0),
             ));
             let visible_cards = cards
                 .iter()
                 .filter(|card| !card.isHidden())
                 .collect::<Vec<_>>();
-            let stack_height = visible_cards.len() as f64 * 72.0
-                + visible_cards.len().saturating_sub(1) as f64 * 10.0;
-            let cards_region_top = top - 72.0;
-            let cards_region_bottom = 24.0;
-            let cards_region_height = (cards_region_top - cards_region_bottom).max(stack_height);
-            let mut card_top = cards_region_bottom + (cards_region_height + stack_height) / 2.0;
+            let mut card_top = top - 80.0;
             for card in visible_cards {
                 card.setFrame(NSRect::new(
                     NSPoint::new(card_x, card_top - 72.0),
