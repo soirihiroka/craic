@@ -527,20 +527,15 @@ impl TerminalSession {
         let event_proxy = TerminalEventProxy {
             sender: event_sender,
         };
-        let mut environment = options.environment;
-        environment
-            .entry("TERM".to_owned())
-            .or_insert_with(|| "xterm-256color".to_owned());
-        environment
-            .entry("COLORTERM".to_owned())
-            .or_insert_with(|| "truecolor".to_owned());
-        environment
-            .entry("TERM_PROGRAM".to_owned())
-            .or_insert_with(|| "Craic".to_owned());
+        let mut environment = craic_platform::terminal_environment();
+        environment.extend(options.environment);
+        let shell = options.shell_program.map(|program| {
+            let mut arguments = vec!["-u".to_owned(), "NO_COLOR".to_owned(), program];
+            arguments.extend(options.shell_arguments);
+            Shell::new("/usr/bin/env".to_owned(), arguments)
+        });
         let pty_options = Options {
-            shell: options
-                .shell_program
-                .map(|program| Shell::new(program, options.shell_arguments)),
+            shell,
             working_directory: options.working_directory,
             drain_on_exit: false,
             env: environment,

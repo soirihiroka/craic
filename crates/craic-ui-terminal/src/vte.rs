@@ -54,19 +54,8 @@ pub struct SpawnSpec {
 }
 
 pub fn terminal_environment() -> HashMap<String, String> {
-    let mut environment = std::env::vars().collect::<HashMap<_, _>>();
-    environment.insert("TERM".to_string(), "xterm-256color".to_string());
-    environment.insert("COLORTERM".to_string(), "truecolor".to_string());
-    environment.insert("TERM_PROGRAM".to_string(), "Craic".to_string());
+    let mut environment = craic_platform::terminal_environment();
     environment.insert("VTE_VERSION".to_string(), VTE_VERSION.to_string());
-    if !["LC_ALL", "LC_CTYPE", "LANG"].into_iter().any(|key| {
-        environment.get(key).is_some_and(|value| {
-            let value = value.to_ascii_lowercase();
-            value.contains("utf-8") || value.contains("utf8")
-        })
-    }) {
-        environment.insert("LC_CTYPE".to_string(), "C.UTF-8".to_string());
-    }
     environment
 }
 

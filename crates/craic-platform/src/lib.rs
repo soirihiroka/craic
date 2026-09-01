@@ -1,6 +1,25 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+
+pub fn terminal_environment() -> HashMap<String, String> {
+    let mut environment = std::env::vars().collect::<HashMap<_, _>>();
+    environment.remove("NO_COLOR");
+    environment.insert("TERM".to_string(), "xterm-256color".to_string());
+    environment.insert("COLORTERM".to_string(), "truecolor".to_string());
+    environment.insert("TERM_PROGRAM".to_string(), "Craic".to_string());
+    environment.insert("CLICOLOR".to_string(), "1".to_string());
+    if !["LC_ALL", "LC_CTYPE", "LANG"].into_iter().any(|key| {
+        environment.get(key).is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("utf-8") || value.contains("utf8")
+        })
+    }) {
+        environment.insert("LC_CTYPE".to_string(), "C.UTF-8".to_string());
+    }
+    environment
+}
 
 pub trait MainThreadDispatcher: Send + Sync {
     /// Enqueues `job` for a later native-main-loop turn. Implementations must not run it inline.

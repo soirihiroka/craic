@@ -10,6 +10,17 @@ export CARGO_TARGET_DIR
 
 UNAME_S := $(shell uname -s)
 
+ifeq ($(UNAME_S),Darwin)
+CARGO_ENV := PATH="$$(dirname "$$(xcrun --find clang)"):$$PATH" \
+	CLANG_PATH="$$(xcrun --find clang)" \
+	CLANGCC="$$(xcrun --find clang)" \
+	CLANGCXX="$$(xcrun --find clang++)" \
+	CC="$$(xcrun --find clang)" \
+	CXX="$$(xcrun --find clang++)" \
+	SDKROOT="$$(xcrun --sdk macosx --show-sdk-path)" \
+	LIBCLANG_PATH="$$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+endif
+
 APP_ID := dev.craic.Craic
 APP_NAME := Craic
 BIN_NAME := craic
@@ -41,22 +52,22 @@ dev: macos-app
 	RUST_LOG=$(RUST_LOG) "$(DEBUG_APP_EXECUTABLE)"
 else
 dev:
-	RUST_LOG=$(RUST_LOG) $(CARGO) run
+	RUST_LOG=$(RUST_LOG) $(CARGO_ENV) $(CARGO) run
 endif
 
 run: dev
 
 build:
-	$(CARGO) build
+	$(CARGO_ENV) $(CARGO) build
 
 release:
-	$(CARGO) build --release
+	$(CARGO_ENV) $(CARGO) build --release
 
 check:
-	$(CARGO) check
+	$(CARGO_ENV) $(CARGO) check
 
 test:
-	$(CARGO) test
+	$(CARGO_ENV) $(CARGO) test
 
 doc:
 	$(UV) run --locked --project "$(DOCS_DIR)" sphinx-build -b html -j auto -W --keep-going "$(DOCS_SOURCE_DIR)" "$(DOCS_BUILD_DIR)"
@@ -66,15 +77,7 @@ resource-watch:
 	./tools/watch-craic-resources.sh "$(PID)" "$(or $(INTERVAL),5)"
 
 macos-app:
-	PATH="$$(dirname "$$(xcrun --find clang)"):$$PATH" \
-	CLANG_PATH="$$(xcrun --find clang)" \
-	CLANGCC="$$(xcrun --find clang)" \
-	CLANGCXX="$$(xcrun --find clang++)" \
-	CC="$$(xcrun --find clang)" \
-	CXX="$$(xcrun --find clang++)" \
-	SDKROOT="$$(xcrun --sdk macosx --show-sdk-path)" \
-	LIBCLANG_PATH="$$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" \
-	$(CARGO) build
+	$(CARGO_ENV) $(CARGO) build
 	$(INSTALL) -d "$(DEBUG_APP_BUNDLE)/Contents/MacOS"
 	$(INSTALL) -d "$(DEBUG_APP_BUNDLE)/Contents/Resources"
 	$(INSTALL) -m 0644 "data/macos/Info.plist" "$(DEBUG_APP_BUNDLE)/Contents/Info.plist"
@@ -84,7 +87,7 @@ run-macos: macos-app
 	open "$(DEBUG_APP_BUNDLE)"
 
 clean:
-	$(CARGO) clean
+	$(CARGO_ENV) $(CARGO) clean
 
 install: release
 	$(INSTALL) -Dm755 target/release/$(BIN_NAME) "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"

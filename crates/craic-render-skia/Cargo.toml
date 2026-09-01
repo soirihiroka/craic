@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 alacritty_terminal.workspace = true
 craic-language.workspace = true
+craic-platform.workspace = true
 craic-text-layout.workspace = true
 libc.workspace = true
 log.workspace = true

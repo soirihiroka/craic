@@ -787,6 +787,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "craic-language",
+ "craic-platform",
  "craic-text-layout",
  "libc",
  "log",
@@ -1039,6 +1040,7 @@ name = "craic-ui-terminal"
 version = "0.1.0"
 dependencies = [
  "craic-config",
+ "craic-platform",
  "craic-system",
  "craic-ui-gtk-core",
  "gtk4",

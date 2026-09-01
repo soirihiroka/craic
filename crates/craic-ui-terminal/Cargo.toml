@@ -7,6 +7,7 @@ license.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 adw.workspace = true
 craic-config.workspace = true
+craic-platform.workspace = true
 craic-system.workspace = true
 craic-ui-core.workspace = true
 gtk.workspace = true

@@ -5,6 +5,8 @@ Focus on your assigned task. There might be other agents working on it at the sa
 
 Static analysis are fine. Run rust check before reporting. You must run cargo fmt.
 
+On macOS, never run Cargo build, check, test, or clean commands directly. Use the matching Make target so rust-skia always receives the repository's Xcode Clang, SDK, and libclang environment.
+
 Avoid custom CSS unless absolutely needed.
 
 Prefer tokio over GIO
