@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use super::super::thread_picker::{ThreadPickerAction, ThreadPickerRow, ThreadPickerSort};
 use super::notifications::timeline_from_item;
-use super::{AppChatSessionInner, AppChatState, title_case};
+use super::{AppChatSessionInner, AppChatState};
 use crate::ui::agent_history::{self, CodexThreadOverlay, CodexThreadOverlayUpsert};
 
 pub(super) struct PickerRequest {
@@ -362,7 +362,7 @@ impl AppChatSessionInner {
             status: thread
                 .pointer("/status/type")
                 .and_then(Value::as_str)
-                .map(title_case),
+                .map(craic_agent::display::title_case),
             tags: overlay
                 .map(|overlay| overlay.tags.clone())
                 .unwrap_or_default(),

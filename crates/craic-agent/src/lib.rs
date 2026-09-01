@@ -8,4 +8,6 @@ pub mod agent_status;
 pub mod agent_usage;
 pub mod ai_commit;
 pub mod app_server;
+pub mod approval;
+pub mod display;
 pub mod remote_media;

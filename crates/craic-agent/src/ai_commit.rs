@@ -1,6 +1,8 @@
 use crate::git::CommitMessageContext;
 use serde::Deserialize;
 
+const MAX_COMMIT_DIFF_CHARS: usize = 48_000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitMessageDraft {
     pub summary: String,
@@ -17,12 +19,13 @@ pub fn generate_from_context(
         return Err("Select at least one file before generating a commit message.".to_string());
     }
 
+    let diff = budget_commit_diff(&context.diff);
     let prompt = commit_prompt(
         &context.repo_name,
         &context.branch,
         &context.files,
         &context.statuses,
-        &context.diff,
+        &diff,
         context.commit_convention,
     );
     crate::agent_provider::generate_structured::<AgentDraft, CommitMessageDraft, _>(
@@ -32,6 +35,34 @@ pub fn generate_from_context(
         "JSON commit message",
         validate_draft,
         cancellation,
+    )
+}
+
+fn budget_commit_diff(diff: &str) -> String {
+    let char_count = diff.chars().count();
+    if char_count <= MAX_COMMIT_DIFF_CHARS {
+        return diff.to_string();
+    }
+
+    let tail_chars = MAX_COMMIT_DIFF_CHARS / 4;
+    let head_chars = MAX_COMMIT_DIFF_CHARS - tail_chars;
+    let head = diff.chars().take(head_chars).collect::<String>();
+    let tail = diff
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    log::info!(
+        "commit-message diff budget applied original_chars={} retained_chars={}",
+        char_count,
+        MAX_COMMIT_DIFF_CHARS
+    );
+    format!(
+        "{head}\n\n[... {} diff characters omitted for commit-message generation ...]\n\n{tail}",
+        char_count - MAX_COMMIT_DIFF_CHARS
     )
 }
 

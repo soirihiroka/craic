@@ -1,11 +1,8 @@
 use crate::{
-    EditorDocument, EditorMetrics, EditorSearchMatch, EditorSelection, TextDiagnosticKind,
-    TextDiagnosticSpan, TextSyntaxSpan,
+    CodeTextPaintCache, EditorDocument, EditorMetrics, EditorSearchMatch, EditorSelection,
+    TextDiagnosticKind, TextDiagnosticSpan, TextSyntaxSpan,
 };
-use skia_safe::textlayout::{
-    FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, TextStyle,
-};
-use skia_safe::{Canvas, Color, Color4f, FontMgr, Paint, PathBuilder, Rect};
+use skia_safe::{Canvas, Color, Color4f, Paint, PathBuilder, Rect};
 
 pub struct EditorPaintRequest<'a> {
     pub document: &'a EditorDocument,
@@ -24,10 +21,13 @@ pub struct EditorPaintRequest<'a> {
     pub metrics: EditorMetrics,
 }
 
-pub fn paint_editor(canvas: &Canvas, request: EditorPaintRequest<'_>) {
+pub fn paint_editor(
+    canvas: &Canvas,
+    request: EditorPaintRequest<'_>,
+    text_cache: &mut CodeTextPaintCache,
+) {
     canvas.clear(Color::from_rgb(30, 30, 30));
     let metrics = request.metrics;
-    let fonts = font_collection();
     let text_x = metrics.gutter_width + metrics.text_inset - request.scroll_x as f32;
     let visible = request.document.visible_line_range(
         request.scroll_y,
@@ -50,35 +50,38 @@ pub fn paint_editor(canvas: &Canvas, request: EditorPaintRequest<'_>) {
     );
     let (selection_start, selection_end) = request.selection.normalized();
     for visual_line in visible {
-        let Some(source_line) = request.document.visual_lines().get(visual_line).copied() else {
+        let Some(display_line) = request.document.visual_lines().get(visual_line) else {
             continue;
         };
+        let source_line = display_line.source_line;
         let Some(line) = request.document.lines().get(source_line) else {
             continue;
         };
         let y =
             metrics.text_inset + visual_line as f32 * metrics.line_height - request.scroll_y as f32;
-        draw_text(
-            canvas,
-            &fonts,
-            &(source_line + 1).to_string(),
-            metrics.gutter_width - metrics.text_inset - 8.0,
-            y + metrics.font_size * 1.27,
-            Color::from_rgb(116, 116, 116),
-            metrics.font_size,
-            true,
-        );
+        if display_line.wrap_index == 0 {
+            draw_text(
+                canvas,
+                text_cache,
+                &(source_line + 1).to_string(),
+                metrics.gutter_width - metrics.text_inset - 8.0,
+                y + metrics.font_size * 1.27,
+                Color::from_rgb(116, 116, 116),
+                metrics.font_size,
+                true,
+            );
+        }
         let first_match = request
             .search_matches
-            .partition_point(|search_match| search_match.end <= line.start);
+            .partition_point(|search_match| search_match.end <= display_line.start);
         for (relative_index, search_match) in
             request.search_matches[first_match..].iter().enumerate()
         {
-            if search_match.start >= line.end {
+            if search_match.start >= display_line.end {
                 break;
             }
-            let start = search_match.start.max(line.start);
-            let end = search_match.end.min(line.end);
+            let start = search_match.start.max(display_line.start);
+            let end = search_match.end.min(display_line.end);
             if start >= end
                 || end > request.document.text().len()
                 || !request.document.text().is_char_boundary(start)
@@ -90,7 +93,7 @@ pub fn paint_editor(canvas: &Canvas, request: EditorPaintRequest<'_>) {
                 canvas,
                 text_x
                     + text_advance(
-                        &request.document.text()[line.start..start],
+                        &request.document.text()[display_line.start..start],
                         metrics.char_width,
                     ),
                 y + 2.0,
@@ -103,13 +106,16 @@ pub fn paint_editor(canvas: &Canvas, request: EditorPaintRequest<'_>) {
                 },
             );
         }
-        let line_selection_start = selection_start.max(line.start).min(line.end);
-        let line_selection_end = selection_end.max(line.start).min(line.end);
-        let newline_selected = line.end_with_newline > line.end
+        let line_selection_start = selection_start
+            .max(display_line.start)
+            .min(display_line.end);
+        let line_selection_end = selection_end.max(display_line.start).min(display_line.end);
+        let newline_selected = display_line.end == line.end
+            && line.end_with_newline > line.end
             && selection_start <= line.end
             && selection_end > line.end;
         if line_selection_start < line_selection_end || newline_selected {
-            let before = &request.document.text()[line.start..line_selection_start];
+            let before = &request.document.text()[display_line.start..line_selection_start];
             let selected = &request.document.text()[line_selection_start..line_selection_end];
             fill_rect(
                 canvas,
@@ -128,21 +134,23 @@ pub fn paint_editor(canvas: &Canvas, request: EditorPaintRequest<'_>) {
         }
         draw_syntax_line(
             canvas,
-            &fonts,
+            text_cache,
             request.document,
-            line.start,
-            line.end,
+            display_line.start,
+            display_line.end,
             text_x,
             y + metrics.font_size * 1.27,
             metrics,
         );
-        if let Some(fold) = request.document.fold_starting_at(source_line) {
+        if display_line.wrap_index == 0
+            && let Some(fold) = request.document.fold_starting_at(source_line)
+        {
             draw_fold_control(canvas, y, metrics, fold.expanded);
             if !fold.expanded {
                 let line_text = request.document.line_text(source_line);
                 draw_text(
                     canvas,
-                    &fonts,
+                    text_cache,
                     &format!(
                         "  … {} lines",
                         fold.end_line.saturating_sub(fold.start_line)
@@ -159,20 +167,20 @@ pub fn paint_editor(canvas: &Canvas, request: EditorPaintRequest<'_>) {
             canvas,
             request.document,
             request.diagnostics,
-            line.start,
-            line.end,
+            display_line.start,
+            display_line.end,
             text_x,
             y + metrics.line_height - 2.0,
             metrics,
         );
     }
     if request.focused && request.selection.is_empty() {
-        let (_, column) = request
-            .document
-            .line_column_for_offset(request.selection.focus);
         let line = request
             .document
             .visual_line_for_offset(request.selection.focus);
+        let column = request
+            .document
+            .visual_column_for_offset(request.selection.focus);
         let x = text_x + column as f32 * metrics.char_width;
         let y = metrics.text_inset + line as f32 * metrics.line_height - request.scroll_y as f32;
         fill_rect(
@@ -195,7 +203,7 @@ pub fn paint_editor(canvas: &Canvas, request: EditorPaintRequest<'_>) {
             );
             draw_text(
                 canvas,
-                &fonts,
+                text_cache,
                 marked_text,
                 x,
                 y + metrics.font_size * 1.27,
@@ -205,25 +213,25 @@ pub fn paint_editor(canvas: &Canvas, request: EditorPaintRequest<'_>) {
             );
         }
     }
-    draw_completion_popup(canvas, &fonts, &request);
+    draw_completion_popup(canvas, text_cache, &request);
     canvas.restore();
 }
 
 fn draw_completion_popup(
     canvas: &Canvas,
-    fonts: &FontCollection,
+    text_cache: &mut CodeTextPaintCache,
     request: &EditorPaintRequest<'_>,
 ) {
     if request.completion_items.is_empty() {
         return;
     }
     let metrics = request.metrics;
-    let (_, column) = request
-        .document
-        .line_column_for_offset(request.selection.focus);
     let visual_line = request
         .document
         .visual_line_for_offset(request.selection.focus);
+    let column = request
+        .document
+        .visual_column_for_offset(request.selection.focus);
     let caret_x = metrics.gutter_width + metrics.text_inset + column as f32 * metrics.char_width
         - request.scroll_x as f32;
     let caret_y =
@@ -280,7 +288,7 @@ fn draw_completion_popup(
         }
         draw_text(
             canvas,
-            fonts,
+            text_cache,
             item,
             x + 12.0,
             row_y + metrics.font_size * 1.27,
@@ -373,7 +381,7 @@ fn draw_wavy_underline(canvas: &Canvas, x: f32, y: f32, width: f32, color: Color
 
 fn draw_syntax_line(
     canvas: &Canvas,
-    fonts: &FontCollection,
+    text_cache: &mut CodeTextPaintCache,
     document: &EditorDocument,
     line_start: usize,
     line_end: usize,
@@ -382,10 +390,10 @@ fn draw_syntax_line(
     metrics: EditorMetrics,
 ) {
     let mut cursor = line_start;
-    for span in document.syntax() {
-        if span.end <= line_start {
-            continue;
-        }
+    let first_span = document
+        .syntax()
+        .partition_point(|span| span.end <= line_start);
+    for span in &document.syntax()[first_span..] {
         if span.start >= line_end {
             break;
         }
@@ -395,7 +403,7 @@ fn draw_syntax_line(
             let plain = &document.text()[cursor..start];
             draw_text(
                 canvas,
-                fonts,
+                text_cache,
                 plain,
                 x,
                 baseline,
@@ -409,7 +417,7 @@ fn draw_syntax_line(
             let segment = &document.text()[start..end];
             draw_text(
                 canvas,
-                fonts,
+                text_cache,
                 segment,
                 x,
                 baseline,
@@ -424,7 +432,7 @@ fn draw_syntax_line(
     if cursor < line_end {
         draw_text(
             canvas,
-            fonts,
+            text_cache,
             &document.text()[cursor..line_end],
             x,
             baseline,
@@ -445,7 +453,7 @@ fn syntax_color(span: &TextSyntaxSpan) -> Color {
 
 fn draw_text(
     canvas: &Canvas,
-    fonts: &FontCollection,
+    text_cache: &mut CodeTextPaintCache,
     text: &str,
     x: f32,
     baseline: f32,
@@ -453,35 +461,7 @@ fn draw_text(
     font_size: f32,
     align_right: bool,
 ) {
-    if text.is_empty() {
-        return;
-    }
-    let mut style = TextStyle::new();
-    style
-        .set_color(color)
-        .set_font_size(font_size)
-        .set_font_families(&["SF Mono", "Menlo", "monospace"]);
-    let mut paragraph_style = ParagraphStyle::new();
-    paragraph_style.set_text_style(&style);
-    let mut builder = ParagraphBuilder::new(&paragraph_style, fonts.clone());
-    builder.push_style(&style);
-    builder.add_text(&text.replace('\t', "    "));
-    builder.pop();
-    let mut paragraph: Paragraph = builder.build();
-    paragraph.layout(1_000_000.0);
-    let x = if align_right {
-        x - paragraph.max_intrinsic_width()
-    } else {
-        x
-    };
-    paragraph.paint(canvas, (x, baseline - paragraph.alphabetic_baseline()));
-}
-
-fn font_collection() -> FontCollection {
-    let mut fonts = FontCollection::new();
-    fonts.set_default_font_manager(FontMgr::new(), Some("SF Mono"));
-    fonts.enable_font_fallback();
-    fonts
+    text_cache.draw(canvas, text, x, baseline, color, font_size, align_right);
 }
 
 fn text_advance(text: &str, char_width: f32) -> f32 {

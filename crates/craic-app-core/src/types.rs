@@ -79,6 +79,17 @@ pub fn page_descriptor(page: &PageId) -> Option<&'static PageDescriptor> {
         .find(|descriptor| descriptor.id == page.as_str())
 }
 
+pub fn optional_usize(value: Option<&Value>) -> Result<Option<usize>, ()> {
+    value
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or(())
+                .and_then(|value| usize::try_from(value).map_err(|_| ()))
+        })
+        .transpose()
+}
+
 #[derive(
     Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
 )]

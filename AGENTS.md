@@ -7,7 +7,7 @@ Static analysis are fine. Run rust check before reporting. You must run cargo fm
 
 Avoid custom CSS unless absolutely needed.
 
-Avoid async Rust.
+Prefer tokio over GIO
 
 Remember to log while dealing with tricky life cycle problem. But avoid logging in a loop or trivial stuff.
 

@@ -11,6 +11,7 @@ mod dispatcher;
 mod image_view;
 mod sqlite_preview;
 mod terminal_view;
+mod text_offsets;
 
 pub use application::run;
 pub use dispatcher::AppKitDispatcher;

@@ -785,9 +785,18 @@ fn tool_result_summary(result: &Value) -> String {
         let lines = object
             .iter()
             .filter_map(|(key, value)| match value {
-                Value::String(value) => Some(format!("{}: {value}", super::title_case(key))),
-                Value::Number(value) => Some(format!("{}: {value}", super::title_case(key))),
-                Value::Bool(value) => Some(format!("{}: {value}", super::title_case(key))),
+                Value::String(value) => Some(format!(
+                    "{}: {value}",
+                    craic_agent::display::title_case(key)
+                )),
+                Value::Number(value) => Some(format!(
+                    "{}: {value}",
+                    craic_agent::display::title_case(key)
+                )),
+                Value::Bool(value) => Some(format!(
+                    "{}: {value}",
+                    craic_agent::display::title_case(key)
+                )),
                 Value::Null => None,
                 _ => None,
             })

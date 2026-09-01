@@ -15,6 +15,43 @@ pub struct WorkspaceEntry {
     pub label: String,
 }
 
+#[derive(Clone)]
+pub struct ConfiguredWorkspaceAccess {
+    pub provider: Arc<dyn SystemProvider>,
+    pub system: crate::system::SystemRef,
+    pub workspace: crate::system::WorkspaceRef,
+    pub display_path: PathBuf,
+}
+
+pub fn configured_workspace_access(workspace: &ConfiguredWorkspace) -> ConfiguredWorkspaceAccess {
+    match &workspace.provider {
+        WorkspaceProvider::Local => {
+            let display_path = crate::config::expand_config_path_for_ui(&workspace.path)
+                .unwrap_or_else(|| PathBuf::from(&workspace.path));
+            let provider = Arc::new(LocalProvider::new());
+            let system = provider.system_ref();
+            let workspace = LocalProvider::workspace_for_path(&display_path);
+            ConfiguredWorkspaceAccess {
+                provider,
+                system,
+                workspace,
+                display_path,
+            }
+        }
+        WorkspaceProvider::Ssh { host } => {
+            let provider = Arc::new(SshProvider::new(SshProviderConfig::new(host.clone())));
+            let system = provider.system_ref();
+            let resolved_workspace = provider.workspace_for_remote_path(workspace.path.clone());
+            ConfiguredWorkspaceAccess {
+                provider,
+                system,
+                workspace: resolved_workspace,
+                display_path: PathBuf::from(&workspace.path),
+            }
+        }
+    }
+}
+
 impl WorkspaceEntry {
     pub fn selection_id(&self) -> String {
         self.workspace.selection_id()
@@ -31,6 +68,17 @@ impl WorkspaceEntry {
             None
         }
     }
+}
+
+pub fn external_workspace_location(absolute: &str) -> (String, String) {
+    let absolute = absolute.trim_end_matches('/');
+    if absolute.is_empty() {
+        return ("/".to_string(), String::new());
+    }
+
+    let (parent, name) = absolute.rsplit_once('/').unwrap_or(("", absolute));
+    let parent = if parent.is_empty() { "/" } else { parent };
+    (parent.to_string(), name.to_string())
 }
 
 pub fn discover_configured_workspaces() -> Vec<WorkspaceEntry> {

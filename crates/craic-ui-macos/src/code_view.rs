@@ -1,19 +1,21 @@
 use crate::application::AppDelegate;
 use craic_language::{language_id_from_path, language_support_for_id};
 use craic_render_skia::{
-    DragSelection, EditorDocument, EditorFoldRange, EditorMetrics, EditorPaintRequest,
-    EditorSearchMatch, EditorSelection, EditorViewport, SelectionMode, TextDiagnosticSpan,
-    TextSyntaxSpan, drag_for_mode, editor_search_index_after, find_editor_search_matches,
-    next_word_boundary, paint_editor, previous_word_boundary, selected_editor_text,
-    selection_for_drag, toggle_editor_line_comment, word_bounds_at,
+    CodeTextPaintCache, DragSelection, EditorDocument, EditorFoldRange, EditorMetrics,
+    EditorPaintRequest, EditorSearchMatch, EditorSelection, EditorViewport, SelectionMode,
+    TextDiagnosticSpan, TextSyntaxSpan, VERTICAL_SCROLLBAR_WIDTH, drag_for_mode,
+    editor_search_index_after, find_editor_search_matches, next_word_boundary, paint_editor,
+    previous_word_boundary, selected_editor_text, selection_for_drag, toggle_editor_line_comment,
+    vertical_scrollbar_layout, vertical_scrollbar_scroll_for_drag,
+    vertical_scrollbar_scroll_for_press, word_bounds_at,
 };
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
-use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAccessibility, NSAccessibilityTextAreaRole, NSAutoresizingMaskOptions, NSCursor, NSEvent,
     NSEventModifierFlags, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
-    NSTextInputClient, NSView,
+    NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView,
 };
 use objc2_core_foundation::CGSize;
 use objc2_foundation::{
@@ -29,7 +31,7 @@ use skia_safe::gpu::{self, DirectContext, SurfaceOrigin, backend_render_targets,
 use skia_safe::{ColorType, Paint, Rect};
 use std::cell::{Cell, RefCell};
 
-const SCROLLBAR_WIDTH: f64 = 12.0;
+const SCROLLBAR_WIDTH: f64 = VERTICAL_SCROLLBAR_WIDTH;
 
 struct MetalState {
     _device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -75,8 +77,9 @@ impl CodeState {
         self.viewport.resize(
             viewport.width,
             viewport.height,
-            &self.document,
+            &mut self.document,
             self.metrics,
+            SCROLLBAR_WIDTH,
         );
     }
 
@@ -84,8 +87,9 @@ impl CodeState {
         self.viewport.resize(
             viewport.width,
             viewport.height,
-            &self.document,
+            &mut self.document,
             self.metrics,
+            SCROLLBAR_WIDTH,
         );
         self.viewport.reveal_offset(
             &self.document,
@@ -98,9 +102,15 @@ impl CodeState {
 
 pub(crate) struct CodeMetalViewIvars {
     metal: RefCell<Option<MetalState>>,
+    text_cache: RefCell<CodeTextPaintCache>,
     state: RefCell<CodeState>,
     delegate: RefCell<Weak<AppDelegate>>,
     dragging_selection: Cell<Option<DragSelection<usize>>>,
+    tracking_area: RefCell<Option<Retained<NSTrackingArea>>>,
+    scrollbar_hovered: Cell<bool>,
+    scrollbar_active: Cell<bool>,
+    scrollbar_drag_start_y: Cell<f64>,
+    scrollbar_drag_start_scroll: Cell<f64>,
 }
 
 define_class!(
@@ -252,10 +262,10 @@ define_class!(
             actual_range: NSRangePointer,
         ) -> Option<Retained<NSAttributedString>> {
             let state = self.ivars().state.borrow();
-            let (start, end) = byte_range_for_utf16(state.document.text(), range);
+            let (start, end) = crate::text_offsets::byte_range(state.document.text(), range);
             if !actual_range.is_null() {
                 unsafe {
-                    *actual_range = utf16_range_for_bytes(state.document.text(), start, end)
+                    *actual_range = crate::text_offsets::range_for_bytes(state.document.text(), start, end)
                 };
             }
             state
@@ -280,13 +290,14 @@ define_class!(
                 unsafe { *actual_range = range };
             }
             let state = self.ivars().state.borrow();
-            let byte = byte_offset_for_utf16(state.document.text(), range.location);
-            let (line, column) = state.document.line_column_for_offset(byte);
+            let byte = crate::text_offsets::byte_offset_clamped(state.document.text(), range.location);
+            let line = state.document.visual_line_for_offset(byte);
+            let column = state.document.visual_column_for_offset(byte);
             let local = NSRect::new(
                 objc2_foundation::NSPoint::new(
                     state.metrics.gutter_width as f64
                         + state.metrics.text_inset as f64
-                        + column as f64 * state.metrics.char_width as f64
+                        + column * state.metrics.char_width as f64
                         - state.viewport.scroll_x(),
                     state.metrics.text_inset as f64
                         + line as f64 * state.metrics.line_height as f64
@@ -320,7 +331,7 @@ define_class!(
                 state.viewport.scroll_y(),
                 state.metrics,
             );
-            utf16_offset_for_byte(state.document.text(), byte)
+            crate::text_offsets::offset_for_byte(state.document.text(), byte)
         }
     }
 
@@ -339,6 +350,14 @@ define_class!(
 
         #[unsafe(method(viewDidChangeBackingProperties))]
         fn view_did_change_backing_properties(&self) { self.render_frame(); }
+
+        #[unsafe(method(viewDidMoveToWindow))]
+        fn view_did_move_to_window(&self) {
+            if let Some(window) = self.window() {
+                window.setAcceptsMouseMovedEvents(true);
+                self.render_frame();
+            }
+        }
 
         #[unsafe(method(setFrameSize:))]
         fn set_frame_size(&self, size: NSSize) {
@@ -386,10 +405,48 @@ define_class!(
             self.render_frame();
         }
 
+        #[unsafe(method(mouseMoved:))]
+        fn mouse_moved(&self, event: &NSEvent) {
+            let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            self.set_scrollbar_hovered(self.point_in_scrollbar_lane(point));
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            self.set_scrollbar_hovered(false);
+        }
+
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             if let Some(window) = self.window() { window.makeFirstResponder(Some(self)); }
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
+            let bounds = self.bounds();
+            if self.point_in_scrollbar_lane(point) {
+                self.set_scrollbar_hovered(true);
+                let mut state = self.ivars().state.borrow_mut();
+                let (_, total_height) = state.document.content_size(state.metrics);
+                if let Some(layout) = vertical_scrollbar_layout(
+                    bounds.size.width,
+                    bounds.size.height,
+                    total_height as f64,
+                    state.viewport.scroll_y(),
+                    1.0,
+                ) {
+                    let scroll_y = vertical_scrollbar_scroll_for_press(layout, point.y);
+                    let current_scroll = state.viewport.scroll_y();
+                    let CodeState { document, viewport, metrics, .. } = &mut *state;
+                    viewport.scroll_by(0.0, scroll_y - current_scroll, document, *metrics);
+                    self.ivars().scrollbar_drag_start_y.set(point.y);
+                    self.ivars().scrollbar_drag_start_scroll.set(scroll_y);
+                    self.ivars().scrollbar_active.set(true);
+                    self.ivars().dragging_selection.set(None);
+                    drop(state);
+                    self.notify_scroll_changed();
+                    self.update_accessibility_viewport();
+                    self.render_frame();
+                    return;
+                }
+            }
             if point.x <= 28.0 && self.toggle_fold_at_y(point.y) {
                 return;
             }
@@ -436,6 +493,33 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
+            if self.ivars().scrollbar_active.get() {
+                let point = self.convertPoint_fromView(event.locationInWindow(), None);
+                let bounds = self.bounds();
+                let mut state = self.ivars().state.borrow_mut();
+                let (_, total_height) = state.document.content_size(state.metrics);
+                if let Some(layout) = vertical_scrollbar_layout(
+                    bounds.size.width,
+                    bounds.size.height,
+                    total_height as f64,
+                    state.viewport.scroll_y(),
+                    1.0,
+                ) {
+                    let scroll_y = vertical_scrollbar_scroll_for_drag(
+                        layout,
+                        self.ivars().scrollbar_drag_start_scroll.get(),
+                        point.y - self.ivars().scrollbar_drag_start_y.get(),
+                    );
+                    let current_scroll = state.viewport.scroll_y();
+                    let CodeState { document, viewport, metrics, .. } = &mut *state;
+                    viewport.scroll_by(0.0, scroll_y - current_scroll, document, *metrics);
+                }
+                drop(state);
+                self.notify_scroll_changed();
+                self.update_accessibility_viewport();
+                self.render_frame();
+                return;
+            }
             let Some(drag) = self.ivars().dragging_selection.get() else {
                 return;
             };
@@ -474,8 +558,13 @@ define_class!(
         }
 
         #[unsafe(method(mouseUp:))]
-        fn mouse_up(&self, _event: &NSEvent) {
+        fn mouse_up(&self, event: &NSEvent) {
             self.ivars().dragging_selection.set(None);
+            if self.ivars().scrollbar_active.replace(false) {
+                let point = self.convertPoint_fromView(event.locationInWindow(), None);
+                self.set_scrollbar_hovered(self.point_in_scrollbar_lane(point));
+                self.render_frame();
+            }
         }
 
         #[unsafe(method(keyDown:))]
@@ -587,6 +676,7 @@ impl CodeMetalView {
     pub fn new(frame: NSRect, font_size: f64, mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(CodeMetalViewIvars {
             metal: RefCell::new(None),
+            text_cache: RefCell::new(CodeTextPaintCache::new(font_size as f32)),
             state: RefCell::new(CodeState {
                 path: String::new(),
                 document: EditorDocument::default(),
@@ -608,6 +698,11 @@ impl CodeMetalView {
             }),
             delegate: RefCell::new(Weak::default()),
             dragging_selection: Cell::new(None),
+            tracking_area: RefCell::new(None),
+            scrollbar_hovered: Cell::new(false),
+            scrollbar_active: Cell::new(false),
+            scrollbar_drag_start_y: Cell::new(0.0),
+            scrollbar_drag_start_scroll: Cell::new(0.0),
         });
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         view.setAutoresizingMask(
@@ -615,6 +710,7 @@ impl CodeMetalView {
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
         view.initialize_metal();
+        view.initialize_tracking();
         view.setAccessibilityElement(true);
         view.setAccessibilityRole(Some(unsafe { NSAccessibilityTextAreaRole }));
         view.setAccessibilityLabel(Some(&NSString::from_str("Code editor")));
@@ -719,7 +815,7 @@ impl CodeMetalView {
 
     pub fn set_completions(&self, items: Vec<String>, replacement_range: NSRange) {
         let mut state = self.ivars().state.borrow_mut();
-        let range = byte_range_for_utf16(state.document.text(), replacement_range);
+        let range = crate::text_offsets::byte_range(state.document.text(), replacement_range);
         if items.is_empty() || range.1 > state.document.text().len() {
             state.completion_items.clear();
             state.completion_range = None;
@@ -846,7 +942,7 @@ impl CodeMetalView {
         else {
             return false;
         };
-        let range = utf16_range_for_bytes(state.document.text(), start, end);
+        let range = crate::text_offsets::range_for_bytes(state.document.text(), start, end);
         drop(state);
         self.replace_text(item, range);
         true
@@ -976,6 +1072,7 @@ impl CodeMetalView {
                 focused,
                 metrics: state.metrics,
             },
+            &mut self.ivars().text_cache.borrow_mut(),
         );
         self.draw_scrollbar(canvas, &state, bounds.size);
         drop(state);
@@ -991,28 +1088,108 @@ impl CodeMetalView {
 
     fn draw_scrollbar(&self, canvas: &skia_safe::Canvas, state: &CodeState, viewport: NSSize) {
         let (_, height) = state.document.content_size(state.metrics);
-        let maximum = (height as f64 - viewport.height).max(0.0);
-        if maximum <= 0.0 {
+        let hover = f64::from(self.ivars().scrollbar_hovered.get());
+        let Some(layout) = vertical_scrollbar_layout(
+            viewport.width,
+            viewport.height,
+            height as f64,
+            state.viewport.scroll_y(),
+            hover,
+        ) else {
             return;
+        };
+        let rounded = |rect: craic_render_skia::Rect, color: skia_safe::Color4f| {
+            let mut paint = Paint::new(color, None);
+            paint.set_anti_alias(true);
+            canvas.draw_round_rect(
+                Rect::from_xywh(
+                    rect.x as f32,
+                    rect.y as f32,
+                    rect.width as f32,
+                    rect.height as f32,
+                ),
+                (rect.width / 2.0) as f32,
+                (rect.width / 2.0) as f32,
+                &paint,
+            );
+        };
+        if hover > f64::EPSILON {
+            rounded(layout.handle, skia_safe::Color4f::new(1.0, 1.0, 1.0, 0.10));
         }
-        let track_height = viewport.height.max(1.0);
-        let thumb_height = (track_height * viewport.height / height as f64)
-            .max(36.0)
-            .min(track_height);
-        let y = state.viewport.scroll_y() / maximum * (track_height - thumb_height);
-        let mut paint = Paint::new(skia_safe::Color4f::new(1.0, 1.0, 1.0, 0.34), None);
-        paint.set_anti_alias(true);
-        canvas.draw_round_rect(
-            Rect::from_xywh(
-                (viewport.width - 7.0) as f32,
-                (y + 3.0) as f32,
-                4.0,
-                (thumb_height - 6.0).max(4.0) as f32,
+        let active = self.ivars().scrollbar_active.get();
+        rounded(
+            craic_render_skia::Rect {
+                x: layout.thumb.x - 1.0,
+                y: layout.thumb.y - 1.0,
+                width: layout.thumb.width + 2.0,
+                height: layout.thumb.height + 2.0,
+            },
+            skia_safe::Color4f::new(
+                0.0,
+                0.0,
+                0.0,
+                if active {
+                    0.57
+                } else {
+                    0.3325 + 0.2375 * hover as f32
+                },
             ),
-            2.0,
-            2.0,
-            &paint,
         );
+        rounded(
+            layout.thumb,
+            skia_safe::Color4f::new(
+                1.0,
+                1.0,
+                1.0,
+                if active {
+                    0.60
+                } else {
+                    0.20 + 0.20 * hover as f32
+                },
+            ),
+        );
+    }
+
+    fn initialize_tracking(&self) {
+        let tracking = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                NSRect::ZERO,
+                NSTrackingAreaOptions::MouseEnteredAndExited
+                    | NSTrackingAreaOptions::MouseMoved
+                    | NSTrackingAreaOptions::ActiveInActiveApp
+                    | NSTrackingAreaOptions::InVisibleRect
+                    | NSTrackingAreaOptions::EnabledDuringMouseDrag,
+                Some(self),
+                None,
+            )
+        };
+        self.addTrackingArea(&tracking);
+        self.ivars().tracking_area.replace(Some(tracking));
+    }
+
+    fn point_in_scrollbar_lane(&self, point: objc2_foundation::NSPoint) -> bool {
+        let bounds = self.bounds();
+        let state = self.ivars().state.borrow();
+        let (_, total_height) = state.document.content_size(state.metrics);
+        point.x >= bounds.size.width - SCROLLBAR_WIDTH
+            && point.x <= bounds.size.width
+            && point.y >= 0.0
+            && point.y <= bounds.size.height
+            && vertical_scrollbar_layout(
+                bounds.size.width,
+                bounds.size.height,
+                total_height as f64,
+                state.viewport.scroll_y(),
+                0.0,
+            )
+            .is_some()
+    }
+
+    fn set_scrollbar_hovered(&self, hovered: bool) {
+        if self.ivars().scrollbar_hovered.replace(hovered) != hovered {
+            self.render_frame();
+        }
     }
 
     fn toggle_fold_at_y(&self, y: f64) -> bool {
@@ -1021,7 +1198,12 @@ impl CodeMetalView {
             .max(0.0)
             / state.metrics.line_height as f64)
             .floor() as usize;
-        let Some(source_line) = state.document.visual_lines().get(visual_line).copied() else {
+        let Some(source_line) = state
+            .document
+            .visual_lines()
+            .get(visual_line)
+            .map(|line| line.source_line)
+        else {
             return false;
         };
         let Some(target) = state.document.fold_starting_at(source_line) else {
@@ -1207,7 +1389,7 @@ impl CodeMetalView {
         let (start, end) = if replacement_range.location == NSNotFound as usize {
             state.selection.normalized()
         } else {
-            byte_range_for_utf16(state.document.text(), replacement_range)
+            crate::text_offsets::byte_range(state.document.text(), replacement_range)
         };
         let mut text = state.document.text().to_string();
         let snapshot = EditorSnapshot {
@@ -1345,13 +1527,18 @@ impl CodeMetalView {
     fn move_vertical(&self, direction: isize, modify: bool) {
         let mut state = self.ivars().state.borrow_mut();
         clear_completion_state(&mut state);
-        let (line, column) = state.document.line_column_for_offset(state.selection.focus);
+        let line = state.document.visual_line_for_offset(state.selection.focus);
+        let column = state
+            .document
+            .visual_column_for_offset(state.selection.focus);
         let target_line = if direction < 0 {
             line.saturating_sub(1)
         } else {
-            (line + 1).min(state.document.lines().len().saturating_sub(1))
+            (line + 1).min(state.document.visual_lines().len().saturating_sub(1))
         };
-        let focus = state.document.offset_for_line_column(target_line, column);
+        let focus = state
+            .document
+            .offset_for_visual_line_column(target_line, column);
         state.selection = EditorSelection {
             anchor: if modify {
                 state.selection.anchor
@@ -1549,7 +1736,7 @@ impl CodeMetalView {
         let visible = state
             .viewport
             .visible_byte_range(&state.document, state.metrics);
-        self.setAccessibilityVisibleCharacterRange(utf16_range_for_bytes(
+        self.setAccessibilityVisibleCharacterRange(crate::text_offsets::range_for_bytes(
             state.document.text(),
             visible.start,
             visible.end,
@@ -1561,7 +1748,7 @@ impl CodeMetalView {
         let visible = state
             .viewport
             .visible_byte_range(&state.document, state.metrics);
-        self.setAccessibilityVisibleCharacterRange(utf16_range_for_bytes(
+        self.setAccessibilityVisibleCharacterRange(crate::text_offsets::range_for_bytes(
             state.document.text(),
             visible.start,
             visible.end,
@@ -1622,42 +1809,9 @@ fn activate_search_match(state: &mut CodeState, viewport: NSSize) {
     state.reveal_selection(viewport);
 }
 
-fn utf16_offset_for_byte(text: &str, byte: usize) -> usize {
-    text.get(..byte.min(text.len()))
-        .unwrap_or_default()
-        .encode_utf16()
-        .count()
-}
-
-fn byte_offset_for_utf16(text: &str, target: usize) -> usize {
-    let mut units = 0;
-    for (byte, character) in text.char_indices() {
-        if units >= target {
-            return byte;
-        }
-        units += character.len_utf16();
-        if units > target {
-            return byte;
-        }
-    }
-    text.len()
-}
-
-fn byte_range_for_utf16(text: &str, range: NSRange) -> (usize, usize) {
-    let start = byte_offset_for_utf16(text, range.location);
-    let end = byte_offset_for_utf16(text, range.location.saturating_add(range.length));
-    (start.min(end), start.max(end))
-}
-
-fn utf16_range_for_bytes(text: &str, start: usize, end: usize) -> NSRange {
-    let start_utf16 = utf16_offset_for_byte(text, start);
-    let end_utf16 = utf16_offset_for_byte(text, end);
-    NSRange::new(start_utf16, end_utf16.saturating_sub(start_utf16))
-}
-
 fn selection_utf16(document: &EditorDocument, selection: EditorSelection) -> NSRange {
     let (start, end) = selection.normalized();
-    utf16_range_for_bytes(document.text(), start, end)
+    crate::text_offsets::range_for_bytes(document.text(), start, end)
 }
 
 fn previous_char_boundary(text: &str, offset: usize) -> usize {

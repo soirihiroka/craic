@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
+use craic_agent::display::permission_profile_label as permission_label;
 use craic_config::{AppAgentSetting, AppAgentSettings};
 use serde_json::{Map, Value, json};
 
 use super::super::codex_chat::{ChatSelector, CodexChatView, SelectorOption};
-use super::{AppChatSessionInner, title_case};
+use super::AppChatSessionInner;
 
 pub(super) const DEFAULT_SERVICE_TIER_ID: &str = "__default__";
 
@@ -53,7 +54,7 @@ impl AppChatSessionInner {
                     let id = effort.get("reasoningEffort")?.as_str()?;
                     Some(SelectorOption {
                         id: id.to_owned(),
-                        label: title_case(id),
+                        label: craic_agent::display::title_case(id),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -179,7 +180,7 @@ impl AppChatSessionInner {
                     .iter()
                     .map(|id| SelectorOption {
                         id: (*id).to_owned(),
-                        label: title_case(id),
+                        label: craic_agent::display::title_case(id),
                     })
                     .collect::<Vec<_>>();
                 self.view
@@ -305,7 +306,7 @@ impl AppChatSessionInner {
                 .iter()
                 .map(|id| SelectorOption {
                     id: (*id).to_owned(),
-                    label: title_case(id),
+                    label: craic_agent::display::title_case(id),
                 })
                 .collect::<Vec<_>>();
             let selected = self.selected_values.borrow().get(&selector).cloned();
@@ -328,7 +329,7 @@ impl AppChatSessionInner {
                     .into_iter()
                     .map(|id| SelectorOption {
                         id: id.to_owned(),
-                        label: title_case(id),
+                        label: craic_agent::display::title_case(id),
                     })
                     .collect()
             });
@@ -393,7 +394,7 @@ impl AppChatSessionInner {
             .into_iter()
             .map(|id| SelectorOption {
                 id: id.to_owned(),
-                label: title_case(id),
+                label: craic_agent::display::title_case(id),
             })
             .collect::<Vec<_>>();
         let selected = self
@@ -584,7 +585,7 @@ pub(super) fn set_initial_selector_options(
             .into_iter()
             .map(|id| SelectorOption {
                 id: id.to_owned(),
-                label: title_case(id),
+                label: craic_agent::display::title_case(id),
             })
             .collect::<Vec<_>>(),
         selected.get(&ChatSelector::Reasoning).map(String::as_str),
@@ -595,7 +596,7 @@ pub(super) fn set_initial_selector_options(
             .into_iter()
             .map(|id| SelectorOption {
                 id: id.to_owned(),
-                label: title_case(id),
+                label: craic_agent::display::title_case(id),
             })
             .collect::<Vec<_>>(),
         selected
@@ -608,7 +609,7 @@ pub(super) fn set_initial_selector_options(
             .into_iter()
             .map(|id| SelectorOption {
                 id: id.to_owned(),
-                label: title_case(id),
+                label: craic_agent::display::title_case(id),
             })
             .collect::<Vec<_>>(),
         selected.get(&ChatSelector::Personality).map(String::as_str),
@@ -632,7 +633,7 @@ pub(super) fn set_initial_selector_options(
             .into_iter()
             .map(|id| SelectorOption {
                 id: id.to_owned(),
-                label: title_case(id),
+                label: craic_agent::display::title_case(id),
             })
             .collect::<Vec<_>>(),
         selected
@@ -640,13 +641,4 @@ pub(super) fn set_initial_selector_options(
             .map(String::as_str)
             .or(Some("user")),
     );
-}
-
-fn permission_label(id: &str) -> String {
-    match id {
-        ":read-only" => "Read only".to_owned(),
-        ":workspace" => "Workspace".to_owned(),
-        ":full-access" | ":danger-full-access" => "Full access".to_owned(),
-        _ => title_case(id.trim_start_matches(':')),
-    }
 }

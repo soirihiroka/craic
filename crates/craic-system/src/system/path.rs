@@ -316,6 +316,10 @@ impl FileNodePath {
         })
     }
 
+    pub fn is_descendant_of(&self, ancestor: &Self) -> bool {
+        self.nodes.len() > ancestor.nodes.len() && self.nodes.starts_with(&ancestor.nodes)
+    }
+
     pub fn contains_archive(&self) -> bool {
         self.nodes
             .iter()

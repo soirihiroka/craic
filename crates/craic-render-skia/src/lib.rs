@@ -1,4 +1,5 @@
 mod canvas;
+mod code_text;
 mod diff;
 mod diff_layout;
 mod diff_painter;
@@ -8,6 +9,7 @@ mod editor_painter;
 mod editor_search;
 mod editor_selection;
 mod geometry;
+mod scrollbar;
 mod sixel;
 mod skia_canvas;
 mod syntax;
@@ -15,6 +17,7 @@ mod terminal;
 mod terminal_painter;
 
 pub use canvas::CanvasPainter;
+pub use code_text::CodeTextPaintCache;
 pub use diff::{
     DiffDocument, DiffFoldRange, DiffRow, DiffRowKind, DiffSearchMatch, DiffSide, DiffTextPoint,
     DiffTextSelection, build_initial_diff_folds, diff_text_for_side, display_diff_rows,
@@ -41,6 +44,12 @@ pub use editor_selection::{
     ordered_bounds, selection_for_drag, selection_for_mode, word_bounds_at,
 };
 pub use geometry::{Point, Rect, ScrollGeometry, SelectionRange};
+pub use scrollbar::{
+    VERTICAL_SCROLLBAR_MIN_THUMB, VERTICAL_SCROLLBAR_VERTICAL_MARGIN, VERTICAL_SCROLLBAR_WIDTH,
+    VerticalScrollbarLayout, vertical_scrollbar_handle_rect, vertical_scrollbar_layout,
+    vertical_scrollbar_scroll_for_delta, vertical_scrollbar_scroll_for_drag,
+    vertical_scrollbar_scroll_for_press, vertical_scrollbar_track_rect,
+};
 pub use skia_canvas::Context;
 pub use syntax::{
     DiffSyntaxSpan, TextDiagnosticKind, TextDiagnosticSpan, TextSyntaxAnalysis, TextSyntaxSpan,

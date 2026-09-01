@@ -1,24 +1,25 @@
 use craic_render_skia::{
-    DiffDocument, DiffFoldRange, DiffLayoutCache, DiffLayoutRequest, DiffLayoutSignature,
-    DiffMarkerKind, DiffPaintRequest, DiffRow, DiffRowKind, DiffSearchMatch, DiffSide,
-    DiffSyntaxSpan, DiffTextPoint, DiffTextSelection, build_diff_layout, build_initial_diff_folds,
-    diff_row_index_at_y, display_diff_rows, find_diff_search_matches, paint_diff,
-    select_all_diff_text, selected_diff_text,
+    CodeTextPaintCache, DiffDocument, DiffFoldRange, DiffLayoutCache, DiffLayoutRequest,
+    DiffLayoutSignature, DiffMarkerKind, DiffPaintRequest, DiffRow, DiffRowKind, DiffSearchMatch,
+    DiffSide, DiffSyntaxSpan, DiffTextPoint, DiffTextSelection, DragSelection, SelectionMode,
+    VERTICAL_SCROLLBAR_WIDTH, build_diff_layout, build_initial_diff_folds, diff_row_index_at_y,
+    diff_text_for_side, display_diff_rows, drag_for_mode, find_diff_search_matches, paint_diff,
+    select_all_diff_text, selected_diff_text, selection_for_drag, vertical_scrollbar_layout,
+    vertical_scrollbar_scroll_for_drag, vertical_scrollbar_scroll_for_press, word_bounds_at,
 };
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::{
-    NSAccessibility, NSAccessibilityTextAreaRole, NSAutoresizingMaskOptions, NSBorderType,
-    NSControlSize, NSCursor, NSEvent, NSEventModifierFlags, NSEventTrackingRunLoopMode, NSMenu,
-    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator,
-    NSProgressIndicatorStyle, NSScrollElasticity, NSScrollView, NSSearchField, NSTrackingArea,
-    NSTrackingAreaOptions, NSView, NSViewBoundsDidChangeNotification, NSWindowOcclusionState,
+    NSAccessibility, NSAccessibilityTextAreaRole, NSAutoresizingMaskOptions, NSControlSize,
+    NSCursor, NSEvent, NSEventModifierFlags, NSEventTrackingRunLoopMode, NSMenu, NSMenuItem,
+    NSPasteboard, NSPasteboardTypeString, NSProgressIndicator, NSProgressIndicatorStyle,
+    NSSearchField, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowOcclusionState,
 };
 use objc2_core_foundation::CGSize;
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSNotificationCenter, NSObjectProtocol, NSPoint, NSRect,
-    NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
+    MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize,
+    NSString, NSTimer,
 };
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable,
@@ -40,12 +41,7 @@ const BASE_CHAR_WIDTH: f64 = 7.83;
 const BASELINE_OFFSET_RATIO: f64 = 16.5 / BASE_FONT_SIZE;
 const GUTTER_WIDTH: f64 = 58.0;
 const CELL_PADDING: f64 = 10.0;
-const SCROLLBAR_WIDTH: f64 = 24.0;
-const SCROLLBAR_IDLE_LANE_WIDTH: f64 = 11.0;
-const SCROLLBAR_IDLE_MARGIN: f64 = 4.0;
-const SCROLLBAR_HOVER_MARGIN: f64 = 8.0;
-const SCROLLBAR_VERTICAL_MARGIN: f64 = 9.0;
-const SCROLLBAR_MIN_THUMB: f64 = 40.0;
+const SCROLLBAR_WIDTH: f64 = VERTICAL_SCROLLBAR_WIDTH;
 const SCROLLBAR_ANIMATION_DURATION_SECONDS: f64 = 0.2;
 const DIFF_ACCESSIBILITY_MAX_BYTES: usize = 256 * 1024;
 
@@ -172,9 +168,7 @@ struct DiffState {
     layout: Option<DiffLayoutCache>,
     generation: u64,
     scroll_y: f64,
-    elastic_scrolling: bool,
     selection: Option<DiffTextSelection>,
-    selection_anchor: Option<DiffTextPoint>,
     active_side: Option<DiffSide>,
     search_query: String,
     search_matches: Vec<DiffSearchMatch>,
@@ -185,46 +179,33 @@ struct DiffState {
     char_width: f64,
 }
 
-fn scrollbar_thumb_geometry(
-    viewport_height: f64,
-    total_height: f64,
-    scroll_y: f64,
-) -> Option<(f64, f64)> {
-    if total_height <= viewport_height + 0.5 {
-        return None;
-    }
-    let track_height = (viewport_height - SCROLLBAR_VERTICAL_MARGIN * 2.0).max(1.0);
-    let thumb_height = (track_height * viewport_height / total_height)
-        .max(SCROLLBAR_MIN_THUMB)
-        .min(track_height);
-    let maximum = (total_height - viewport_height).max(1.0);
-    let travel = (track_height - thumb_height).max(0.0);
-    let y = SCROLLBAR_VERTICAL_MARGIN + scroll_y.clamp(0.0, maximum) / maximum * travel;
-    Some((y, thumb_height))
+fn diff_word_bounds(
+    state: &DiffState,
+    point: DiffTextPoint,
+) -> Option<(DiffTextPoint, DiffTextPoint)> {
+    let text = diff_text_for_side(state.rows.get(point.row)?, point.side)?;
+    let (start, end) = word_bounds_at(text, point.byte)?;
+    Some((
+        DiffTextPoint {
+            byte: start,
+            ..point
+        },
+        DiffTextPoint { byte: end, ..point },
+    ))
 }
 
-fn scrollbar_scroll_for_press(
-    viewport_height: f64,
-    total_height: f64,
-    scroll_y: f64,
-    y: f64,
-) -> Option<f64> {
-    let (thumb_y, thumb_height) =
-        scrollbar_thumb_geometry(viewport_height, total_height, scroll_y)?;
-    if y >= thumb_y && y <= thumb_y + thumb_height {
-        return Some(scroll_y.clamp(0.0, (total_height - viewport_height).max(0.0)));
-    }
-    let track_height = (viewport_height - SCROLLBAR_VERTICAL_MARGIN * 2.0).max(1.0);
-    let travel = (track_height - thumb_height).max(0.0);
-    let maximum = (total_height - viewport_height).max(0.0);
-    if travel <= f64::EPSILON || maximum <= f64::EPSILON {
-        return Some(0.0);
-    }
-    let thumb_y = (y - thumb_height / 2.0).clamp(
-        SCROLLBAR_VERTICAL_MARGIN,
-        SCROLLBAR_VERTICAL_MARGIN + travel,
-    );
-    Some((thumb_y - SCROLLBAR_VERTICAL_MARGIN) / travel * maximum)
+fn diff_line_bounds(
+    state: &DiffState,
+    point: DiffTextPoint,
+) -> Option<(DiffTextPoint, DiffTextPoint)> {
+    let text = diff_text_for_side(state.rows.get(point.row)?, point.side)?;
+    Some((
+        DiffTextPoint { byte: 0, ..point },
+        DiffTextPoint {
+            byte: text.len(),
+            ..point
+        },
+    ))
 }
 
 fn draw_skia_scrollbar(
@@ -236,18 +217,15 @@ fn draw_skia_scrollbar(
     hover: f64,
     active: bool,
 ) {
-    let Some((thumb_y, thumb_height)) =
-        scrollbar_thumb_geometry(height, layout.content_height, scroll_y)
+    let Some(scrollbar) =
+        vertical_scrollbar_layout(width, height, layout.content_height, scroll_y, hover)
     else {
         return;
     };
     let hover = hover.clamp(0.0, 1.0);
-    let lane_width =
-        SCROLLBAR_IDLE_LANE_WIDTH + (SCROLLBAR_WIDTH - SCROLLBAR_IDLE_LANE_WIDTH) * hover;
-    let margin = SCROLLBAR_IDLE_MARGIN + (SCROLLBAR_HOVER_MARGIN - SCROLLBAR_IDLE_MARGIN) * hover;
-    let handle_x = width - lane_width + margin;
-    let handle_width = (lane_width - margin * 2.0).max(1.0);
-    let track_height = (height - SCROLLBAR_VERTICAL_MARGIN * 2.0).max(1.0);
+    let handle_x = scrollbar.handle.x;
+    let handle_width = scrollbar.handle.width;
+    let track_height = scrollbar.track.height;
     let rounded = |x: f64, y: f64, w: f64, h: f64, color: Color4f| {
         let mut paint = Paint::new(color, None);
         paint.set_anti_alias(true);
@@ -262,7 +240,7 @@ fn draw_skia_scrollbar(
     if hover > f64::EPSILON {
         rounded(
             handle_x,
-            SCROLLBAR_VERTICAL_MARGIN,
+            scrollbar.track.y,
             handle_width,
             track_height,
             Color4f::new(1.0, 1.0, 1.0, (0.10 * hover) as f32),
@@ -273,7 +251,7 @@ fn draw_skia_scrollbar(
     canvas.clip_rect(
         Rect::from_xywh(
             handle_x as f32,
-            SCROLLBAR_VERTICAL_MARGIN as f32,
+            scrollbar.track.y as f32,
             handle_width as f32,
             track_height as f32,
         ),
@@ -284,11 +262,10 @@ fn draw_skia_scrollbar(
         let Some(row) = layout.rows.get(marker.row) else {
             continue;
         };
-        let marker_y =
-            SCROLLBAR_VERTICAL_MARGIN + row.y / layout.content_height.max(1.0) * track_height;
+        let marker_y = scrollbar.track.y + row.y / layout.content_height.max(1.0) * track_height;
         let marker_height = (row.height / layout.content_height.max(1.0) * track_height)
             .max(2.0)
-            .min(SCROLLBAR_VERTICAL_MARGIN + track_height - marker_y);
+            .min(scrollbar.track.y + track_height - marker_y);
         let alpha = (0.58 + (0.82 - 0.58) * hover) as f32;
         let marker_rect = |x: f64, marker_width: f64, color: Color4f| {
             let mut paint = Paint::new(color, None);
@@ -333,17 +310,17 @@ fn draw_skia_scrollbar(
     let outline_alpha = if active { 0.60 } else { 0.35 + 0.25 * hover };
     rounded(
         handle_x - 1.0,
-        thumb_y - 1.0,
+        scrollbar.thumb.y - 1.0,
         handle_width + 2.0,
-        thumb_height + 2.0,
+        scrollbar.thumb.height + 2.0,
         Color4f::new(0.0, 0.0, 0.0, (0.95 * outline_alpha) as f32),
     );
     let thumb_alpha = if active { 0.60 } else { 0.20 + 0.20 * hover };
     rounded(
         handle_x,
-        thumb_y,
+        scrollbar.thumb.y,
         handle_width,
-        thumb_height,
+        scrollbar.thumb.height,
         Color4f::new(1.0, 1.0, 1.0, thumb_alpha as f32),
     );
 }
@@ -372,9 +349,7 @@ impl DiffState {
         self.layout = None;
         if !preserve {
             self.scroll_y = 0.0;
-            self.elastic_scrolling = false;
             self.selection = None;
-            self.selection_anchor = None;
         }
         self.rebuild_search_matches();
     }
@@ -516,34 +491,11 @@ impl DiffState {
     }
 }
 
-define_class!(
-    #[unsafe(super = NSView)]
-    #[thread_kind = MainThreadOnly]
-    #[ivars = ()]
-    struct NativeScrollDocument;
-
-    unsafe impl NSObjectProtocol for NativeScrollDocument {}
-
-    impl NativeScrollDocument {
-        #[unsafe(method(isFlipped))]
-        fn is_flipped(&self) -> bool {
-            true
-        }
-    }
-);
-
-impl NativeScrollDocument {
-    fn new(frame: NSRect, mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(());
-        // SAFETY: NSView's designated frame initializer is valid for this private document view.
-        unsafe { msg_send![super(this), initWithFrame: frame] }
-    }
-}
-
 pub(crate) struct DiffMetalViewIvars {
     metal: RefCell<Option<MetalState>>,
+    text_cache: RefCell<CodeTextPaintCache>,
     state: RefCell<DiffState>,
-    dragging_selection: Cell<bool>,
+    dragging_selection: Cell<Option<DragSelection<DiffTextPoint>>>,
     search_field: RefCell<Option<Retained<NSSearchField>>>,
     search_panel: RefCell<Option<Retained<NSView>>>,
     tracking_area: RefCell<Option<Retained<NSTrackingArea>>>,
@@ -555,8 +507,6 @@ pub(crate) struct DiffMetalViewIvars {
     display_link: RefCell<Option<Retained<CAMetalDisplayLink>>>,
     window_occluded: Cell<bool>,
     last_frame_timestamp: Cell<f64>,
-    native_scroll: RefCell<Option<Retained<NSScrollView>>>,
-    native_scroll_document: RefCell<Option<Retained<NativeScrollDocument>>>,
     layout_worker: RefCell<Option<DiffLayoutWorker>>,
     layout_pending_signature: RefCell<Option<DiffLayoutSignature>>,
     layout_timer: RefCell<Option<Retained<NSTimer>>>,
@@ -615,6 +565,7 @@ define_class!(
                         .occlusionState()
                         .contains(NSWindowOcclusionState::Visible),
                 );
+                window.setAcceptsMouseMovedEvents(true);
                 self.initialize_display_link();
                 self.render_frame();
             } else if let Some(display_link) = self.ivars().display_link.borrow_mut().take() {
@@ -635,7 +586,7 @@ define_class!(
             unsafe {
                 let _: () = msg_send![super(self), setFrameSize: size];
             }
-            self.update_native_scroll_geometry();
+            self.refresh_scroll_layout();
             self.render_frame();
         }
 
@@ -697,15 +648,13 @@ define_class!(
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
-            self.update_native_scroll_geometry();
-            if let Some(scroll) = self.ivars().native_scroll.borrow().as_ref() {
-                scroll.scrollWheel(event);
-            }
-        }
-
-        #[unsafe(method(nativeScrollBoundsChanged:))]
-        fn native_scroll_bounds_changed(&self, _notification: &NSNotification) {
-            self.apply_native_scroll_position();
+            let bounds = self.bounds();
+            self.ensure_layout(bounds.size.width, bounds.size.height);
+            let mut state = self.ivars().state.borrow_mut();
+            let maximum = state.maximum_scroll(bounds.size.height);
+            state.scroll_y = (state.scroll_y - event.scrollingDeltaY()).clamp(0.0, maximum);
+            drop(state);
+            self.render_frame();
         }
 
         #[unsafe(method(pollDiffLayout:))]
@@ -733,21 +682,23 @@ define_class!(
             let bounds = self.bounds();
             self.ensure_layout(bounds.size.width, bounds.size.height);
             let mut state = self.ivars().state.borrow_mut();
-            state.elastic_scrolling = false;
             if self.point_in_scrollbar_lane(point) {
-                if let Some(scroll_y) = scrollbar_scroll_for_press(
+                self.set_scrollbar_hovered(true);
+                if let Some(layout) = vertical_scrollbar_layout(
+                    bounds.size.width,
                     bounds.size.height,
                     state.layout.as_ref().map_or(0.0, |layout| layout.content_height),
                     state.scroll_y,
-                    point.y,
+                    1.0,
                 ) {
+                    let scroll_y = vertical_scrollbar_scroll_for_press(layout, point.y);
                     state.scroll_y = scroll_y;
                     self.ivars().scrollbar_drag_start_y.set(point.y);
                     self.ivars().scrollbar_drag_start_scroll.set(scroll_y);
                     self.ivars().scrollbar_active.set(true);
-                    self.ivars().dragging_selection.set(false);
+                    self.ivars().dragging_selection.set(None);
                     drop(state);
-                    self.sync_native_scroll_to_state();
+                    self.refresh_scroll_layout();
                     self.start_display_link();
                     self.render_frame();
                     return;
@@ -764,8 +715,7 @@ define_class!(
                         }
                         drop(state);
                         self.ensure_layout(bounds.size.width, bounds.size.height);
-                        self.update_native_scroll_geometry();
-                        self.sync_native_scroll_to_state();
+                        self.refresh_scroll_layout();
                         self.update_accessibility_selection();
                         self.render_frame();
                         return;
@@ -776,16 +726,21 @@ define_class!(
                 state.text_point_at(point, (bounds.size.width - SCROLLBAR_WIDTH).max(1.0))
             {
                 state.active_side = Some(text_point.side);
-                state.selection_anchor = Some(text_point);
+                let mode = SelectionMode::for_press_count(event.clickCount() as i32);
+                let (drag, selection) = drag_for_mode(
+                    text_point,
+                    mode,
+                    |point| diff_word_bounds(&state, point),
+                    |point| diff_line_bounds(&state, point),
+                );
                 state.selection = Some(DiffTextSelection {
-                    anchor: text_point,
-                    focus: text_point,
+                    anchor: selection.anchor,
+                    focus: selection.focus,
                 });
-                self.ivars().dragging_selection.set(true);
+                self.ivars().dragging_selection.set(Some(drag));
             } else {
                 state.selection = None;
-                state.selection_anchor = None;
-                self.ivars().dragging_selection.set(false);
+                self.ivars().dragging_selection.set(None);
             }
             drop(state);
             self.update_accessibility_selection();
@@ -800,32 +755,29 @@ define_class!(
                 self.ensure_layout(bounds.size.width, bounds.size.height);
                 let mut state = self.ivars().state.borrow_mut();
                 let total_height = state.layout.as_ref().map_or(0.0, |layout| layout.content_height);
-                if let Some((_, thumb_height)) = scrollbar_thumb_geometry(
+                if let Some(layout) = vertical_scrollbar_layout(
+                    bounds.size.width,
                     bounds.size.height,
                     total_height,
                     state.scroll_y,
+                    1.0,
                 ) {
-                    let track_height =
-                        (bounds.size.height - SCROLLBAR_VERTICAL_MARGIN * 2.0).max(1.0);
-                    let travel = (track_height - thumb_height).max(1.0);
-                    let maximum = (total_height - bounds.size.height).max(0.0);
-                    state.scroll_y = (self.ivars().scrollbar_drag_start_scroll.get()
-                        + (point.y - self.ivars().scrollbar_drag_start_y.get()) / travel * maximum)
-                        .clamp(0.0, maximum);
+                    state.scroll_y = vertical_scrollbar_scroll_for_drag(
+                        layout,
+                        self.ivars().scrollbar_drag_start_scroll.get(),
+                        point.y - self.ivars().scrollbar_drag_start_y.get(),
+                    );
                 }
                 drop(state);
-                self.sync_native_scroll_to_state();
+                self.refresh_scroll_layout();
                 self.render_frame();
                 return;
             }
-            if !self.ivars().dragging_selection.get() {
-                return;
-            }
+            let Some(drag) = self.ivars().dragging_selection.get() else { return };
             let point = self.convertPoint_fromView(event.locationInWindow(), None);
             let bounds = self.bounds();
             self.ensure_layout(bounds.size.width, bounds.size.height);
             let mut state = self.ivars().state.borrow_mut();
-            let Some(anchor) = state.selection_anchor else { return };
             if point.y < 0.0 {
                 state.scroll_y = (state.scroll_y - state.line_height).max(0.0);
             } else if point.y > bounds.size.height {
@@ -840,21 +792,32 @@ define_class!(
                 state.selection_focus_at(
                     hit_point,
                     (bounds.size.width - SCROLLBAR_WIDTH).max(1.0),
-                    anchor.side,
+                    drag.anchor().side,
                 )
             {
-                state.selection = Some(DiffTextSelection { anchor, focus });
+                let selection = selection_for_drag(
+                    drag,
+                    focus,
+                    |point| diff_word_bounds(&state, point),
+                    |point| diff_line_bounds(&state, point),
+                );
+                state.selection = Some(DiffTextSelection {
+                    anchor: selection.anchor,
+                    focus: selection.focus,
+                });
             }
             drop(state);
-            self.sync_native_scroll_to_state();
+            self.refresh_scroll_layout();
             self.update_accessibility_selection();
             self.render_frame();
         }
 
         #[unsafe(method(mouseUp:))]
-        fn mouse_up(&self, _event: &NSEvent) {
-            self.ivars().dragging_selection.set(false);
+        fn mouse_up(&self, event: &NSEvent) {
+            self.ivars().dragging_selection.set(None);
             if self.ivars().scrollbar_active.replace(false) {
+                let point = self.convertPoint_fromView(event.locationInWindow(), None);
+                self.set_scrollbar_hovered(self.point_in_scrollbar_lane(point));
                 self.start_display_link();
             }
         }
@@ -920,7 +883,7 @@ define_class!(
             }
             state.clamp_scroll(bounds.size.height);
             drop(state);
-            self.sync_native_scroll_to_state();
+            self.refresh_scroll_layout();
             self.render_frame();
         }
 
@@ -962,13 +925,14 @@ impl DiffMetalView {
         );
         let this = Self::alloc(mtm).set_ivars(DiffMetalViewIvars {
             metal: RefCell::new(None),
+            text_cache: RefCell::new(CodeTextPaintCache::new(font_size as f32)),
             state: RefCell::new(DiffState {
                 font_size,
                 line_height,
                 char_width,
                 ..DiffState::default()
             }),
-            dragging_selection: Cell::new(false),
+            dragging_selection: Cell::new(None),
             search_field: RefCell::new(None),
             search_panel: RefCell::new(None),
             tracking_area: RefCell::new(None),
@@ -980,8 +944,6 @@ impl DiffMetalView {
             display_link: RefCell::new(None),
             window_occluded: Cell::new(false),
             last_frame_timestamp: Cell::new(0.0),
-            native_scroll: RefCell::new(None),
-            native_scroll_document: RefCell::new(None),
             layout_worker: RefCell::new(Some(DiffLayoutWorker::new())),
             layout_pending_signature: RefCell::new(None),
             layout_timer: RefCell::new(None),
@@ -991,7 +953,6 @@ impl DiffMetalView {
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         view.initialize_metal();
         view.initialize_tracking();
-        view.initialize_native_scroll();
         view.addSubview(&view.ivars().layout_spinner);
         view.setAccessibilityRole(Some(unsafe { NSAccessibilityTextAreaRole }));
         view.setAccessibilityLabel(Some(&NSString::from_str("File diff")));
@@ -1012,8 +973,7 @@ impl DiffMetalView {
         state.layout = None;
         drop(state);
         self.ensure_layout(bounds.size.width, bounds.size.height);
-        self.update_native_scroll_geometry();
-        self.sync_native_scroll_to_state();
+        self.refresh_scroll_layout();
         self.render_frame();
         log::debug!(
             "native diff font metrics updated font_size={font_size} line_height={line_height} char_width={char_width}"
@@ -1039,8 +999,7 @@ impl DiffMetalView {
         );
         drop(state);
         self.ensure_layout(bounds.size.width, bounds.size.height);
-        self.update_native_scroll_geometry();
-        self.sync_native_scroll_to_state();
+        self.refresh_scroll_layout();
         self.update_accessibility_content();
         self.render_frame();
     }
@@ -1048,8 +1007,7 @@ impl DiffMetalView {
     pub fn clear(&self) {
         self.clear_pending_layout();
         self.ivars().state.borrow_mut().clear();
-        self.update_native_scroll_geometry();
-        self.sync_native_scroll_to_state();
+        self.refresh_scroll_layout();
         self.update_accessibility_content();
         self.render_frame();
     }
@@ -1104,10 +1062,7 @@ impl DiffMetalView {
             unsafe { self.ivars().layout_spinner.startAnimation(None) };
             self.start_layout_timer();
         }
-        let mut state = self.ivars().state.borrow_mut();
-        if !state.elastic_scrolling {
-            state.clamp_scroll(height);
-        }
+        self.ivars().state.borrow_mut().clamp_scroll(height);
     }
 
     fn drain_layout_results(&self, width: f64, height: f64) -> bool {
@@ -1130,9 +1085,7 @@ impl DiffMetalView {
                 if state.active_search_match.is_some() {
                     state.select_search_match(0, height);
                 }
-                if !state.elastic_scrolling {
-                    state.clamp_scroll(height);
-                }
+                state.clamp_scroll(height);
                 drop(state);
                 self.ivars().layout_pending_signature.borrow_mut().take();
                 unsafe { self.ivars().layout_spinner.stopAnimation(None) };
@@ -1202,8 +1155,7 @@ impl DiffMetalView {
             self.stop_layout_timer();
         }
         if applied {
-            self.update_native_scroll_geometry();
-            self.sync_native_scroll_to_state();
+            self.refresh_scroll_layout();
             self.update_accessibility_selection();
             self.render_frame();
         }
@@ -1221,7 +1173,7 @@ impl DiffMetalView {
             state.select_search_match(0, bounds.size.height);
         }
         drop(state);
-        self.sync_native_scroll_to_state();
+        self.refresh_scroll_layout();
         self.update_accessibility_selection();
         self.render_frame();
     }
@@ -1232,7 +1184,7 @@ impl DiffMetalView {
             .state
             .borrow_mut()
             .select_search_match(1, height);
-        self.sync_native_scroll_to_state();
+        self.refresh_scroll_layout();
         self.update_accessibility_selection();
         self.render_frame();
     }
@@ -1243,7 +1195,7 @@ impl DiffMetalView {
             .state
             .borrow_mut()
             .select_search_match(-1, height);
-        self.sync_native_scroll_to_state();
+        self.refresh_scroll_layout();
         self.update_accessibility_selection();
         self.render_frame();
     }
@@ -1350,119 +1302,16 @@ impl DiffMetalView {
         self.ivars().tracking_area.replace(Some(tracking));
     }
 
-    fn initialize_native_scroll(&self) {
-        let bounds = self.bounds();
-        let scroll = NSScrollView::initWithFrame(
-            NSScrollView::alloc(self.mtm()),
-            NSRect::new(
-                NSPoint::new((bounds.size.width - 1.0).max(0.0), 0.0),
-                NSSize::new(1.0, bounds.size.height.max(1.0)),
-            ),
-        );
-        scroll.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewMinXMargin
-                | NSAutoresizingMaskOptions::ViewHeightSizable,
-        );
-        scroll.setAlphaValue(0.0);
-        scroll.setBorderType(NSBorderType::NoBorder);
-        scroll.setDrawsBackground(false);
-        scroll.setHasVerticalScroller(false);
-        scroll.setHasHorizontalScroller(false);
-        scroll.setVerticalScrollElasticity(NSScrollElasticity::Allowed);
-        scroll.setHorizontalScrollElasticity(NSScrollElasticity::None);
-
-        let document = NativeScrollDocument::new(
-            NSRect::new(NSPoint::ZERO, NSSize::new(1.0, bounds.size.height.max(1.0))),
-            self.mtm(),
-        );
-        scroll.setDocumentView(Some(&document));
-        let clip = scroll.contentView();
-        clip.setDrawsBackground(false);
-        clip.setPostsBoundsChangedNotifications(true);
-        // SAFETY: The observed clip view and this retained diff view share the same AppKit
-        // lifetime, and bounds-change delivery is confined to the main thread.
-        unsafe {
-            NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
-                self,
-                objc2::sel!(nativeScrollBoundsChanged:),
-                Some(NSViewBoundsDidChangeNotification),
-                Some(&clip),
-            );
-        }
-        self.addSubview(&scroll);
-        self.ivars().native_scroll.replace(Some(scroll));
-        self.ivars().native_scroll_document.replace(Some(document));
-        self.update_native_scroll_geometry();
-        log::debug!("native diff scroll physics attached through hidden one-point NSScrollView");
-    }
-
-    fn update_native_scroll_geometry(&self) {
+    fn refresh_scroll_layout(&self) {
         let bounds = self.bounds();
         if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
             return;
         }
         self.ensure_layout(bounds.size.width, bounds.size.height);
-        let content_height = {
-            let state = self.ivars().state.borrow();
-            state
-                .layout
-                .as_ref()
-                .map(|layout| layout.content_height.max(bounds.size.height))
-        };
-        if let Some(scroll) = self.ivars().native_scroll.borrow().as_ref() {
-            scroll.setFrame(NSRect::new(
-                NSPoint::new((bounds.size.width - 1.0).max(0.0), 0.0),
-                NSSize::new(1.0, bounds.size.height),
-            ));
-        }
-        let Some(content_height) = content_height else {
-            return;
-        };
-        if let Some(document) = self.ivars().native_scroll_document.borrow().as_ref() {
-            let frame = document.frame();
-            if (frame.size.width - 1.0).abs() > 0.5
-                || (frame.size.height - content_height).abs() > 0.5
-            {
-                document.setFrameSize(NSSize::new(1.0, content_height));
-            }
-        }
-    }
-
-    fn apply_native_scroll_position(&self) {
-        let Some(scroll) = self.ivars().native_scroll.borrow().as_ref().cloned() else {
-            return;
-        };
-        let bounds = self.bounds();
-        let scroll_y = scroll.contentView().bounds().origin.y;
-        let mut state = self.ivars().state.borrow_mut();
-        if state.layout.is_none() {
-            return;
-        }
-        let maximum = state.maximum_scroll(bounds.size.height);
-        state.scroll_y = scroll_y;
-        state.elastic_scrolling = scroll_y < 0.0 || scroll_y > maximum;
-        drop(state);
-        self.render_frame();
-    }
-
-    fn sync_native_scroll_to_state(&self) {
-        self.update_native_scroll_geometry();
-        let Some(scroll) = self.ivars().native_scroll.borrow().as_ref().cloned() else {
-            return;
-        };
-        let bounds = self.bounds();
-        let scroll_y = {
-            let state = self.ivars().state.borrow();
-            if state.layout.is_none() {
-                return;
-            }
-            state
-                .scroll_y
-                .clamp(0.0, state.maximum_scroll(bounds.size.height))
-        };
-        let clip = scroll.contentView();
-        clip.scrollToPoint(NSPoint::new(0.0, scroll_y));
-        scroll.reflectScrolledClipView(&clip);
+        self.ivars()
+            .state
+            .borrow_mut()
+            .clamp_scroll(bounds.size.height);
     }
 
     fn initialize_display_link(&self) {
@@ -1649,6 +1498,7 @@ impl DiffMetalView {
                     font_size: state.font_size as f32,
                     baseline_offset: (state.font_size * BASELINE_OFFSET_RATIO) as f32,
                 },
+                &mut self.ivars().text_cache.borrow_mut(),
             );
             draw_skia_scrollbar(
                 canvas,

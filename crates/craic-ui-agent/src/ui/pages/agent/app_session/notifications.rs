@@ -5,7 +5,7 @@ use super::super::codex_chat::{
     CollaborationParticipant, CollaborationParticipantStatus, CollaborationProgress, PlanProgress,
     PlanStep, PlanStepStatus, TimelineItem, TimelineItemKind, TimelineItemStatus, TokenUsage,
 };
-use super::{AppChatSessionInner, AppChatState, compact_json, title_case};
+use super::{AppChatSessionInner, AppChatState, compact_json};
 
 impl AppChatSessionInner {
     pub(super) fn handle_notification(&self, method: &str, params: Option<Value>) {
@@ -328,7 +328,10 @@ impl AppChatSessionInner {
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("active");
-        let mut detail = vec![format!("Status: {}", title_case(status))];
+        let mut detail = vec![format!(
+            "Status: {}",
+            craic_agent::display::title_case(status)
+        )];
         if let Some(tokens_used) = goal.get("tokensUsed").and_then(Value::as_i64) {
             let token_budget = goal.get("tokenBudget").and_then(Value::as_i64);
             detail.push(token_budget.map_or_else(
@@ -399,7 +402,10 @@ impl AppChatSessionInner {
         self.upsert_timeline(TimelineItem {
             id: format!("hook:{id}"),
             kind: TimelineItemKind::Tool,
-            title: Some(format!("Hook · {}", title_case(event))),
+            title: Some(format!(
+                "Hook · {}",
+                craic_agent::display::title_case(event)
+            )),
             body: run
                 .get("statusMessage")
                 .and_then(Value::as_str)
@@ -440,7 +446,10 @@ impl AppChatSessionInner {
             .unwrap_or("Codex is reviewing an approval request.")
             .to_owned();
         if let Some(risk) = review.get("riskLevel").and_then(Value::as_str) {
-            body.push_str(&format!("\nRisk: {}", title_case(risk)));
+            body.push_str(&format!(
+                "\nRisk: {}",
+                craic_agent::display::title_case(risk)
+            ));
         }
         self.upsert_timeline(TimelineItem {
             id: format!("approval-review:{id}"),
@@ -559,7 +568,10 @@ impl AppChatSessionInner {
             id: format!("mcp-startup:{name}"),
             kind: TimelineItemKind::McpTool,
             title: Some(format!("MCP · {name}")),
-            body: format!("Startup status: {}.", title_case(status)),
+            body: format!(
+                "Startup status: {}.",
+                craic_agent::display::title_case(status)
+            ),
             detail: params
                 .get("error")
                 .and_then(Value::as_str)
@@ -572,10 +584,13 @@ impl AppChatSessionInner {
     fn apply_account_update(&self, params: &Value) {
         let mut details = Vec::new();
         if let Some(mode) = params.get("authMode").and_then(Value::as_str) {
-            details.push(format!("Authentication: {}", title_case(mode)));
+            details.push(format!(
+                "Authentication: {}",
+                craic_agent::display::title_case(mode)
+            ));
         }
         if let Some(plan) = params.get("planType").and_then(Value::as_str) {
-            details.push(format!("Plan: {}", title_case(plan)));
+            details.push(format!("Plan: {}", craic_agent::display::title_case(plan)));
         }
         self.upsert_timeline(TimelineItem {
             id: "account-status".to_owned(),
@@ -661,7 +676,10 @@ impl AppChatSessionInner {
         self.upsert_timeline(TimelineItem {
             id: format!("catalog-changed:{catalog}"),
             kind: TimelineItemKind::Tool,
-            title: Some(format!("{} changed", title_case(catalog))),
+            title: Some(format!(
+                "{} changed",
+                craic_agent::display::title_case(catalog)
+            )),
             body: count.map_or_else(
                 || format!("The available {catalog} changed."),
                 |count| format!("{count} {catalog} available."),
@@ -723,7 +741,10 @@ impl AppChatSessionInner {
                 TimelineItemKind::Tool
             },
             title: Some("Remote control".to_owned()),
-            body: format!("{server_name}: {}.", title_case(status)),
+            body: format!(
+                "{server_name}: {}.",
+                craic_agent::display::title_case(status)
+            ),
             detail: (!details.is_empty()).then(|| details.join("\n")),
             status: event_status(status, status != "connecting"),
         });
@@ -966,7 +987,10 @@ impl AppChatSessionInner {
             } else {
                 TimelineItemKind::UserMessage
             },
-            title: Some(format!("Realtime {}", title_case(role))),
+            title: Some(format!(
+                "Realtime {}",
+                craic_agent::display::title_case(role)
+            )),
             body: String::new(),
             detail: None,
             status: TimelineItemStatus::Running,
@@ -1017,7 +1041,7 @@ impl AppChatSessionInner {
         let mode = params
             .get("mode")
             .and_then(Value::as_str)
-            .map(title_case)
+            .map(craic_agent::display::title_case)
             .unwrap_or_else(|| "Windows".to_owned());
         self.upsert_timeline(TimelineItem {
             id: "windows-sandbox-setup".to_owned(),
@@ -1064,7 +1088,10 @@ impl AppChatSessionInner {
                         .and_then(Value::as_str)
                         .unwrap_or("Fallback model")
                 ),
-                detail: params.get("reason").and_then(Value::as_str).map(title_case),
+                detail: params
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(craic_agent::display::title_case),
                 status: TimelineItemStatus::Completed,
             },
             "model/verification" => {
@@ -1074,7 +1101,7 @@ impl AppChatSessionInner {
                     .into_iter()
                     .flatten()
                     .filter_map(Value::as_str)
-                    .map(title_case)
+                    .map(craic_agent::display::title_case)
                     .collect::<Vec<_>>();
                 TimelineItem {
                     id: format!("model-verification:{turn_id}"),
@@ -1469,7 +1496,7 @@ impl AppChatSessionInner {
                     label: item
                         .get("tool")
                         .and_then(Value::as_str)
-                        .map(title_case)
+                        .map(craic_agent::display::title_case)
                         .unwrap_or_else(|| "Subagent".to_owned()),
                     detail,
                     status,
@@ -1632,7 +1659,7 @@ pub(super) fn timeline_from_item(item: &Value, completed: bool) -> TimelineItem 
                 .unwrap_or_else(|| {
                     item.get("tool")
                         .and_then(Value::as_str)
-                        .map(title_case)
+                        .map(craic_agent::display::title_case)
                         .unwrap_or_else(|| "Agent activity".to_owned())
                 }),
             Some(compact_json(item)),
@@ -1643,7 +1670,7 @@ pub(super) fn timeline_from_item(item: &Value, completed: bool) -> TimelineItem 
                 "Subagent {}",
                 item.get("kind")
                     .and_then(Value::as_str)
-                    .map(title_case)
+                    .map(craic_agent::display::title_case)
                     .unwrap_or_else(|| "activity".to_owned())
             )),
             item.get("agentPath")
@@ -1714,7 +1741,7 @@ pub(super) fn timeline_from_item(item: &Value, completed: bool) -> TimelineItem 
         ),
         other => (
             TimelineItemKind::Unknown(other.to_owned()),
-            Some(title_case(other)),
+            Some(craic_agent::display::title_case(other)),
             compact_json(item),
             None,
         ),
@@ -1869,7 +1896,7 @@ fn file_change_description(change: &Value) -> Option<String> {
         .and_then(|kind| kind.get("move_path").or_else(|| kind.get("movePath")))
         .and_then(Value::as_str);
     Some(move_path.map_or_else(
-        || format!("{}: {path}", title_case(kind_name)),
+        || format!("{}: {path}", craic_agent::display::title_case(kind_name)),
         |move_path| format!("Move: {path} → {move_path}"),
     ))
 }

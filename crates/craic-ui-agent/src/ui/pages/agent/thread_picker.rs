@@ -3,7 +3,6 @@ use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ui::canvas_scroll;
 
@@ -648,7 +647,7 @@ fn thread_row(row: &ThreadPickerRow, callbacks: &Rc<RefCell<Vec<ActionCallback>>
         .hexpand(true)
         .build();
     let time = gtk::Label::builder()
-        .label(relative_time(row.updated_at_ms))
+        .label(craic_agent::display::relative_time(row.updated_at_ms))
         .css_classes(["dim-label", "caption"])
         .build();
     let heading = gtk::Box::builder()
@@ -857,22 +856,4 @@ fn emit_to(callbacks: &Rc<RefCell<Vec<ActionCallback>>>, action: ThreadPickerAct
 
 fn normalized_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn relative_time(updated_at_ms: i64) -> String {
-    if updated_at_ms <= 0 {
-        return "Unknown time".to_string();
-    }
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(updated_at_ms);
-    let age_seconds = now_ms.saturating_sub(updated_at_ms) / 1_000;
-    match age_seconds {
-        0..=59 => "Just now".to_string(),
-        60..=3_599 => format!("{}m ago", age_seconds / 60),
-        3_600..=86_399 => format!("{}h ago", age_seconds / 3_600),
-        86_400..=2_591_999 => format!("{}d ago", age_seconds / 86_400),
-        _ => format!("{}mo ago", age_seconds / 2_592_000),
-    }
 }

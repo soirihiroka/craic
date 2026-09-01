@@ -1,9 +1,11 @@
 use crate::system::capabilities::files::{
-    FileAccess, FileCopyRequest, FileDownloadDestination, FileDownloadRequest, FileNodeKind,
-    FileOperation, FileReadRequest, FileWriteMode, FileWritePayload, FileWriteRequest,
-    wait_file_operation,
+    FileAccess, FileCopyRequest, FileDeleteRequest, FileDownloadDestination, FileDownloadRequest,
+    FileNodeKind, FileOperation, FileReadRequest, FileWriteMode, FileWritePayload,
+    FileWriteRequest, wait_file_operation,
 };
 use crate::system::path::FileNodePath;
+use crate::system::provider::SystemProvider;
+use crate::system::providers::local::LocalProvider;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -14,6 +16,66 @@ use std::sync::{
 use uuid::Uuid;
 
 const TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
+
+pub fn transfer_local_paths(
+    destination_access: Arc<dyn FileAccess>,
+    sources: Vec<PathBuf>,
+    destination_parent: FileNodePath,
+    cancel_requested: Arc<AtomicBool>,
+) -> Result<Vec<FileNodePath>, String> {
+    if sources.is_empty() {
+        return Err("Choose at least one file or folder to upload.".to_string());
+    }
+
+    let mut transferred = Vec::with_capacity(sources.len());
+    for source in sources {
+        check_canceled(cancel_requested.as_ref())?;
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("Unable to determine a name for {}.", source.display()))?;
+        let parent = source
+            .parent()
+            .ok_or_else(|| format!("Unable to determine the parent of {}.", source.display()))?;
+        let provider = LocalProvider::new();
+        let source_workspace = LocalProvider::workspace_for_path(parent);
+        let source_access = provider
+            .files(&source_workspace)
+            .ok_or_else(|| "Local file access is unavailable.".to_string())?;
+        let source_node =
+            FileNodePath::root(&provider.system_ref(), &source_workspace).join_child(name);
+        let destination = destination_parent.join_child(name);
+        let result = transfer_file_node(
+            source_access,
+            destination_access.clone(),
+            source_node,
+            destination.clone(),
+            cancel_requested.clone(),
+        );
+        match result {
+            Ok(path) => transferred.push(path),
+            Err(error) => {
+                for path in transferred.iter().rev() {
+                    if let Err(cleanup_error) = wait_file_operation(
+                        destination_access.delete_events(FileDeleteRequest {
+                            path: path.clone(),
+                            cancel_requested: None,
+                        }),
+                        FileOperation::Delete,
+                    ) {
+                        log::warn!(
+                            "local transfer cleanup failed path={} error={cleanup_error}",
+                            path.display()
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(transferred)
+}
 
 pub fn transfer_file_node(
     source_access: Arc<dyn FileAccess>,
@@ -49,19 +111,40 @@ pub fn transfer_file_node(
         .ok_or_else(|| "Cannot transfer an item to the workspace root.".to_string())?;
     let staged_destination =
         destination_parent.join_child(format!(".craic-transfer-{}", Uuid::new_v4().simple()));
-    copy_between_file_accesses(
+    if let Err(error) = copy_between_file_accesses(
         source_access,
         destination_access.clone(),
         source,
         staged_destination.clone(),
         cancel_requested.clone(),
-    )?;
-    destination_access.finalize_staged_node(
+    ) {
+        cleanup_staged_node(destination_access.as_ref(), &staged_destination);
+        return Err(error);
+    }
+    if let Err(error) = destination_access.finalize_staged_node(
         &staged_destination,
         &destination,
         cancel_requested.as_ref(),
-    )?;
+    ) {
+        cleanup_staged_node(destination_access.as_ref(), &staged_destination);
+        return Err(error);
+    }
     Ok(destination)
+}
+
+fn cleanup_staged_node(destination_access: &dyn FileAccess, staged_destination: &FileNodePath) {
+    if let Err(error) = wait_file_operation(
+        destination_access.delete_events(FileDeleteRequest {
+            path: staged_destination.clone(),
+            cancel_requested: None,
+        }),
+        FileOperation::Delete,
+    ) {
+        log::warn!(
+            "staged transfer cleanup failed path={} error={error}",
+            staged_destination.display()
+        );
+    }
 }
 
 fn copy_between_file_accesses(

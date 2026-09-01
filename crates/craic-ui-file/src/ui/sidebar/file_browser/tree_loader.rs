@@ -167,7 +167,10 @@ impl FileBrowser {
                             path.display()
                         );
                         cache.insert(path.clone(), Vec::new());
-                        if allow_sudo && sudo_retry.is_none() && permission_denied_message(&err) {
+                        if allow_sudo
+                            && sudo_retry.is_none()
+                            && craic_system::system::is_permission_denied_message(&err)
+                        {
                             sudo_retry = Some((path, err));
                         }
                     }
@@ -246,11 +249,6 @@ struct TreeDirectoryLoadResult {
     path: Option<FileNodePath>,
     rows: Result<Vec<BrowserRow>, String>,
     message: String,
-}
-
-fn permission_denied_message(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("permission denied") || message.contains("operation not permitted")
 }
 
 impl TreeDirectoryLoadResult {

@@ -8,9 +8,10 @@ use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_PROVIDER_ID: &str = crate::config::DEFAULT_AGENT_PROVIDER_ID;
@@ -30,6 +31,54 @@ static PROVIDERS: [&'static dyn AgentProvider; 4] = [
     &agy::PROVIDER,
     &ollama::PROVIDER,
 ];
+
+type OutputReader = JoinHandle<Result<Vec<u8>, String>>;
+
+fn spawn_output_readers(
+    child: &mut Child,
+    label: &str,
+) -> Result<(OutputReader, OutputReader), String> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("Failed to read {label} output."))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("Failed to read {label} errors."))?;
+    Ok((
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+                .map_err(|err| err.to_string())
+        }),
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+                .map_err(|err| err.to_string())
+        }),
+    ))
+}
+
+fn collect_output_readers(
+    stdout: OutputReader,
+    stderr: OutputReader,
+    label: &str,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let stdout = stdout
+        .join()
+        .map_err(|_| format!("Failed to collect {label} output."))?
+        .map_err(|err| format!("Failed to collect {label} output: {err}"))?;
+    let stderr = stderr
+        .join()
+        .map_err(|_| format!("Failed to collect {label} errors."))?
+        .map_err(|err| format!("Failed to collect {label} errors: {err}"))?;
+    Ok((stdout, stderr))
+}
 
 pub trait AgentProvider: Sync {
     fn id(&self) -> &'static str;
@@ -415,10 +464,17 @@ fn run_generation_command(
             )
         })?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(prompt.as_bytes())
-            .map_err(|err| format!("Failed to send prompt to {}: {err}", provider.label()))?;
+    let (stdout_reader, stderr_reader) = spawn_output_readers(&mut child, provider.label())?;
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(err) = stdin.write_all(prompt.as_bytes())
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = collect_output_readers(stdout_reader, stderr_reader, provider.label());
+        return Err(format!(
+            "Failed to send prompt to {}: {err}",
+            provider.label()
+        ));
     }
 
     let started = Instant::now();
@@ -435,11 +491,10 @@ fn run_generation_command(
             .map_err(|err| format!("Failed while waiting for {}: {err}", provider.label()))?
         {
             Some(status) => {
-                let output = child.wait_with_output().map_err(|err| {
-                    format!("Failed to collect {} output: {err}", provider.label())
-                })?;
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let (stdout_bytes, stderr_bytes) =
+                    collect_output_readers(stdout_reader, stderr_reader, provider.label())?;
+                let stdout = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
+                let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
                 log::debug!(
                     "agent command finished provider_id={} status={} stdout_bytes={} stderr_bytes={}",
                     provider.id(),
@@ -499,28 +554,7 @@ fn run_model_command(
                 program.display()
             )
         })?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("Failed to read {} model output.", provider.label()))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| format!("Failed to read {} model errors.", provider.label()))?;
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-            .map_err(|err| err.to_string())
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-            .map_err(|err| err.to_string())
-    });
+    let (stdout_reader, stderr_reader) = spawn_output_readers(&mut child, provider.label())?;
 
     let started = Instant::now();
     loop {
@@ -529,18 +563,8 @@ fn run_model_command(
             .map_err(|err| format!("Failed while loading {} models: {err}", provider.label()))?
         {
             Some(status) => {
-                let stdout_bytes = stdout_reader
-                    .join()
-                    .map_err(|_| format!("Failed to collect {} model output.", provider.label()))?
-                    .map_err(|err| {
-                        format!("Failed to collect {} model output: {err}", provider.label())
-                    })?;
-                let stderr_bytes = stderr_reader
-                    .join()
-                    .map_err(|_| format!("Failed to collect {} model errors.", provider.label()))?
-                    .map_err(|err| {
-                        format!("Failed to collect {} model errors: {err}", provider.label())
-                    })?;
+                let (stdout_bytes, stderr_bytes) =
+                    collect_output_readers(stdout_reader, stderr_reader, provider.label())?;
                 let stdout = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
                 let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
                 log::debug!(

@@ -1,5 +1,11 @@
 use std::collections::HashSet;
 
+use craic_agent::approval::{
+    ApprovalOption, ApprovalOptionStyle, approval_decision_response, approval_description,
+    approval_options as shared_approval_options, permission_approval_options,
+    permission_approval_response,
+};
+use craic_agent::display::compact_json;
 use serde_json::{Map, Value, json};
 
 use super::codex_chat::{
@@ -8,8 +14,6 @@ use super::codex_chat::{
     RequestSelectionMode, RequestUserInput, RequestUserInputQuestion, StructuredRequestOption,
     StructuredRequestResponse,
 };
-
-const MAX_RENDERED_JSON_BYTES: usize = 24 * 1024;
 
 pub(super) fn pending_request_from_server(
     request_id: &str,
@@ -40,19 +44,7 @@ pub(super) fn pending_request_from_server(
             kind: PendingRequestKind::Approval,
             title: "Grant additional permissions?".to_owned(),
             description: approval_description(params, "Codex requested additional access."),
-            options: vec![
-                request_option(
-                    "grant",
-                    "Grant for this turn",
-                    RequestOptionStyle::Suggested,
-                ),
-                request_option(
-                    "grant-session",
-                    "Grant for session",
-                    RequestOptionStyle::Default,
-                ),
-                request_option("decline", "Decline", RequestOptionStyle::Destructive),
-            ],
+            options: map_approval_options(permission_approval_options()),
             allows_text: false,
             text_placeholder: None,
         },
@@ -153,19 +145,9 @@ pub(super) fn response_for_server_request(
     };
     let result = match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            let decision =
-                serde_json::from_str::<Value>(&value).unwrap_or_else(|_| Value::String(value));
-            json!({ "decision": decision })
+            approval_decision_response(value)
         }
-        "item/permissions/requestApproval" => match value.as_str() {
-            "grant" => {
-                json!({ "permissions": params.get("permissions").cloned().unwrap_or_else(|| json!({})), "scope": "turn" })
-            }
-            "grant-session" => {
-                json!({ "permissions": params.get("permissions").cloned().unwrap_or_else(|| json!({})), "scope": "session" })
-            }
-            _ => json!({ "permissions": {}, "scope": "turn" }),
-        },
+        "item/permissions/requestApproval" => permission_approval_response(params, &value),
         "item/tool/requestUserInput" => legacy_user_input_response(params, value)?,
         "mcpServer/elicitation/request" => match value.as_str() {
             "decline" | "cancel" => json!({ "action": value, "content": null, "_meta": null }),
@@ -695,77 +677,23 @@ fn legacy_user_input_response(params: &Value, value: String) -> Result<Value, St
     Ok(json!({ "answers": answers }))
 }
 
-fn approval_description(params: &Value, fallback: &str) -> String {
-    let mut parts = Vec::new();
-    if let Some(reason) = params.get("reason").and_then(Value::as_str) {
-        parts.push(reason.to_owned());
-    }
-    if let Some(command) = params.get("command").and_then(Value::as_str) {
-        parts.push(command.to_owned());
-    }
-    if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
-        parts.push(format!("Working directory: {cwd}"));
-    }
-    if parts.is_empty() {
-        fallback.to_owned()
-    } else {
-        parts.join("\n\n")
-    }
+fn approval_options(params: &Value, command: bool) -> Vec<RequestOption> {
+    map_approval_options(shared_approval_options(params, command))
 }
 
-fn approval_options(params: &Value, command: bool) -> Vec<RequestOption> {
-    let decisions = params
-        .get("availableDecisions")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|decision| {
-                    if let Some(decision) = decision.as_str() {
-                        return Some(request_option(
-                            decision,
-                            decision_label(decision),
-                            decision_style(decision),
-                        ));
-                    }
-                    let id = serde_json::to_string(decision).ok()?;
-                    let label = if decision.get("acceptWithExecpolicyAmendment").is_some() {
-                        "Allow and remember command"
-                    } else if decision.get("applyNetworkPolicyAmendment").is_some() {
-                        "Apply network policy"
-                    } else {
-                        "Apply proposed policy"
-                    };
-                    Some(request_option(&id, label, RequestOptionStyle::Suggested))
-                })
-                .collect::<Vec<_>>()
+fn map_approval_options(options: Vec<ApprovalOption>) -> Vec<RequestOption> {
+    options
+        .into_iter()
+        .map(|option| RequestOption {
+            id: option.value,
+            label: option.label,
+            style: match option.style {
+                ApprovalOptionStyle::Suggested => RequestOptionStyle::Suggested,
+                ApprovalOptionStyle::Default => RequestOptionStyle::Default,
+                ApprovalOptionStyle::Destructive => RequestOptionStyle::Destructive,
+            },
         })
-        .filter(|decisions| !decisions.is_empty());
-    decisions.unwrap_or_else(|| {
-        let mut options = vec![
-            request_option("accept", "Allow once", RequestOptionStyle::Suggested),
-            request_option(
-                "acceptForSession",
-                "Allow for session",
-                RequestOptionStyle::Default,
-            ),
-        ];
-        if !command {
-            options[0].label = "Apply once".to_owned();
-            options[1].label = "Apply for session".to_owned();
-        }
-        options.push(request_option(
-            "decline",
-            "Decline",
-            RequestOptionStyle::Destructive,
-        ));
-        options.push(request_option(
-            "cancel",
-            "Cancel turn",
-            RequestOptionStyle::Destructive,
-        ));
-        options
-    })
+        .collect()
 }
 
 fn request_option(id: &str, label: &str, style: RequestOptionStyle) -> RequestOption {
@@ -773,24 +701,6 @@ fn request_option(id: &str, label: &str, style: RequestOptionStyle) -> RequestOp
         id: id.to_owned(),
         label: label.to_owned(),
         style,
-    }
-}
-
-fn decision_label(decision: &str) -> &str {
-    match decision {
-        "accept" => "Allow once",
-        "acceptForSession" => "Allow for session",
-        "decline" => "Decline",
-        "cancel" => "Cancel turn",
-        _ => decision,
-    }
-}
-
-fn decision_style(decision: &str) -> RequestOptionStyle {
-    match decision {
-        "accept" => RequestOptionStyle::Suggested,
-        "decline" | "cancel" => RequestOptionStyle::Destructive,
-        _ => RequestOptionStyle::Default,
     }
 }
 
@@ -811,17 +721,4 @@ fn number_string(value: Option<&Value>) -> Option<String> {
         Value::String(value) => Some(value.clone()),
         _ => None,
     }
-}
-
-fn compact_json(value: &Value) -> String {
-    let mut rendered = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-    if rendered.len() > MAX_RENDERED_JSON_BYTES {
-        let mut boundary = MAX_RENDERED_JSON_BYTES;
-        while !rendered.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        rendered.truncate(boundary);
-        rendered.push_str("\n… output truncated …");
-    }
-    rendered
 }

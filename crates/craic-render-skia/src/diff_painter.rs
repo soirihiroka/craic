@@ -1,16 +1,13 @@
 use crate::{
-    DiffLayoutCache, DiffRow, DiffRowKind, DiffSearchMatch, DiffSide, DiffSyntaxSpan,
-    DiffTextSelection, DiffWrappedLine, visible_diff_row_range,
+    CodeTextPaintCache, DiffLayoutCache, DiffRow, DiffRowKind, DiffSearchMatch, DiffSide,
+    DiffSyntaxSpan, DiffTextSelection, DiffWrappedLine, visible_diff_row_range,
 };
-use skia_safe::textlayout::{
-    FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, TextStyle,
-};
-use skia_safe::{Canvas, Color, Color4f, FontMgr, Paint, Rect};
+use skia_safe::{Canvas, Color, Color4f, Paint, Rect};
 
 const CELL_PADDING: f32 = 10.0;
 const GUTTER_WIDTH: f32 = 58.0;
 const DIVIDER_WIDTH: f32 = 1.0;
-const OVERSCAN: f64 = 88.0;
+const OVERSCAN: f64 = 0.0;
 
 pub struct DiffPaintRequest<'a> {
     pub rows: &'a [DiffRow],
@@ -27,12 +24,15 @@ pub struct DiffPaintRequest<'a> {
     pub baseline_offset: f32,
 }
 
-pub fn paint_diff(canvas: &Canvas, request: DiffPaintRequest<'_>) {
+pub fn paint_diff(
+    canvas: &Canvas,
+    request: DiffPaintRequest<'_>,
+    text_cache: &mut CodeTextPaintCache,
+) {
     canvas.clear(Color::from_rgb(30, 30, 30));
     let width = request.viewport_width.max(1.0);
     let height = request.viewport_height.max(1.0);
     let divider_x = width / 2.0;
-    let fonts = font_collection();
     let range = visible_diff_row_range(
         request.layout,
         request.scroll_y,
@@ -62,7 +62,7 @@ pub fn paint_diff(canvas: &Canvas, request: DiffPaintRequest<'_>) {
             );
             draw_text(
                 canvas,
-                &fonts,
+                text_cache,
                 row.right_text
                     .as_deref()
                     .or(row.left_text.as_deref())
@@ -77,7 +77,7 @@ pub fn paint_diff(canvas: &Canvas, request: DiffPaintRequest<'_>) {
 
         draw_side(
             canvas,
-            &fonts,
+            text_cache,
             request.rows,
             row_index,
             row.left_number,
@@ -88,6 +88,7 @@ pub fn paint_diff(canvas: &Canvas, request: DiffPaintRequest<'_>) {
             divider_x,
             y,
             row_height,
+            height,
             request.layout.signature.line_height_bits,
             request.selection,
             request.search_matches,
@@ -99,7 +100,7 @@ pub fn paint_diff(canvas: &Canvas, request: DiffPaintRequest<'_>) {
         );
         draw_side(
             canvas,
-            &fonts,
+            text_cache,
             request.rows,
             row_index,
             row.right_number,
@@ -110,6 +111,7 @@ pub fn paint_diff(canvas: &Canvas, request: DiffPaintRequest<'_>) {
             width - divider_x - DIVIDER_WIDTH,
             y,
             row_height,
+            height,
             request.layout.signature.line_height_bits,
             request.selection,
             request.search_matches,
@@ -134,7 +136,7 @@ pub fn paint_diff(canvas: &Canvas, request: DiffPaintRequest<'_>) {
 #[allow(clippy::too_many_arguments)]
 fn draw_side(
     canvas: &Canvas,
-    fonts: &FontCollection,
+    text_cache: &mut CodeTextPaintCache,
     _rows: &[DiffRow],
     row_index: usize,
     number: Option<usize>,
@@ -145,6 +147,7 @@ fn draw_side(
     width: f32,
     y: f32,
     height: f32,
+    viewport_height: f32,
     line_height_bits: u64,
     selection: Option<DiffTextSelection>,
     search_matches: &[DiffSearchMatch],
@@ -180,7 +183,7 @@ fn draw_side(
     if let Some(number) = number {
         draw_text(
             canvas,
-            fonts,
+            text_cache,
             &number.to_string(),
             if side == DiffSide::Left {
                 gutter_x + 8.0
@@ -200,7 +203,7 @@ fn draw_side(
     if !marker.is_empty() {
         draw_text(
             canvas,
-            fonts,
+            text_cache,
             marker,
             if side == DiffSide::Left {
                 gutter_x + GUTTER_WIDTH - 15.0
@@ -218,7 +221,14 @@ fn draw_side(
     } else {
         x + GUTTER_WIDTH + CELL_PADDING
     };
-    for (line_index, line) in lines.iter().enumerate() {
+    let first_line = ((-y).max(0.0) / line_height).floor() as usize;
+    let last_line = ((viewport_height - y).max(0.0) / line_height).ceil() as usize;
+    for (line_index, line) in lines
+        .iter()
+        .enumerate()
+        .skip(first_line.min(lines.len()))
+        .take(last_line.min(lines.len()).saturating_sub(first_line))
+    {
         let line_y = y + line_index as f32 * line_height;
         draw_matches(
             canvas,
@@ -245,7 +255,7 @@ fn draw_side(
         );
         draw_syntax_text(
             canvas,
-            fonts,
+            text_cache,
             &line.text,
             text_x,
             line_y + baseline_offset,
@@ -274,8 +284,14 @@ fn draw_matches(
     active: Option<usize>,
     char_width: f32,
 ) {
-    for (index, search_match) in matches.iter().enumerate() {
-        if search_match.side != side || search_match.row != row {
+    let first_match = matches.partition_point(|search_match| search_match.row < row);
+    let matching_count =
+        matches[first_match..].partition_point(|search_match| search_match.row == row);
+    for (relative_index, search_match) in matches[first_match..first_match + matching_count]
+        .iter()
+        .enumerate()
+    {
+        if search_match.side != side {
             continue;
         }
         let start = search_match.start.max(line.start);
@@ -297,7 +313,7 @@ fn draw_matches(
             y + 2.0,
             text_advance(matched, char_width).max(2.0),
             line_height - 4.0,
-            if Some(index) == active {
+            if Some(first_match + relative_index) == active {
                 rgba(0.92, 0.62, 0.16, 0.72)
             } else {
                 rgba(0.74, 0.53, 0.17, 0.40)
@@ -365,36 +381,20 @@ fn draw_selection(
 
 fn draw_text(
     canvas: &Canvas,
-    fonts: &FontCollection,
+    text_cache: &mut CodeTextPaintCache,
     text: &str,
     x: f32,
     baseline: f32,
     color: Color,
     font_size: f32,
 ) {
-    if text.is_empty() {
-        return;
-    }
-    let mut style = TextStyle::new();
-    style
-        .set_color(color)
-        .set_font_size(font_size)
-        .set_font_families(&["SF Mono", "Menlo", "monospace"]);
-    let mut paragraph_style = ParagraphStyle::new();
-    paragraph_style.set_text_style(&style);
-    let mut builder = ParagraphBuilder::new(&paragraph_style, fonts.clone());
-    builder.push_style(&style);
-    builder.add_text(&text.replace('\t', "    "));
-    builder.pop();
-    let mut paragraph: Paragraph = builder.build();
-    paragraph.layout(1_000_000.0);
-    paragraph.paint(canvas, (x, baseline - paragraph.alphabetic_baseline()));
+    text_cache.draw(canvas, text, x, baseline, color, font_size, false);
 }
 
 #[allow(clippy::too_many_arguments)]
 fn draw_syntax_text(
     canvas: &Canvas,
-    fonts: &FontCollection,
+    text_cache: &mut CodeTextPaintCache,
     text: &str,
     mut x: f32,
     baseline: f32,
@@ -409,13 +409,14 @@ fn draw_syntax_text(
 ) {
     let mut cursor = line_start;
     let Some(line_number) = line_number else {
-        draw_text(canvas, fonts, text, x, baseline, fallback, font_size);
+        draw_text(canvas, text_cache, text, x, baseline, fallback, font_size);
         return;
     };
-    for span in syntax
-        .iter()
-        .filter(|span| span.side == side && span.line_number == line_number)
-    {
+    let key = (line_number, side);
+    let first_span = syntax.partition_point(|span| (span.line_number, span.side) < key);
+    let matching_count =
+        syntax[first_span..].partition_point(|span| (span.line_number, span.side) == key);
+    for span in &syntax[first_span..first_span + matching_count] {
         if span.end <= line_start {
             continue;
         }
@@ -433,7 +434,7 @@ fn draw_syntax_text(
             .get(plain_start..plain_end)
             .filter(|plain| !plain.is_empty())
         {
-            draw_text(canvas, fonts, plain, x, baseline, fallback, font_size);
+            draw_text(canvas, text_cache, plain, x, baseline, fallback, font_size);
             x += text_advance(plain, char_width);
         }
         let segment_start = start.saturating_sub(line_start);
@@ -446,7 +447,7 @@ fn draw_syntax_text(
         };
         draw_text(
             canvas,
-            fonts,
+            text_cache,
             segment,
             x,
             baseline,
@@ -462,15 +463,10 @@ fn draw_syntax_text(
     }
     let remaining_start = cursor.saturating_sub(line_start);
     if let Some(remaining) = text.get(remaining_start..).filter(|text| !text.is_empty()) {
-        draw_text(canvas, fonts, remaining, x, baseline, fallback, font_size);
+        draw_text(
+            canvas, text_cache, remaining, x, baseline, fallback, font_size,
+        );
     }
-}
-
-fn font_collection() -> FontCollection {
-    let mut fonts = FontCollection::new();
-    fonts.set_default_font_manager(FontMgr::new(), Some("SF Mono"));
-    fonts.enable_font_fallback();
-    fonts
 }
 
 fn text_advance(text: &str, char_width: f32) -> f32 {

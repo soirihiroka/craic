@@ -34,11 +34,6 @@ const FILE_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(75);
 const FILE_REFRESH_DEBOUNCE: Duration = Duration::from_millis(120);
 const LIVE_PREVIEW_REFRESH_DEBOUNCE: Duration = Duration::from_millis(60);
 
-fn permission_denied_message(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("permission denied") || message.contains("operation not permitted")
-}
-
 pub struct FilePage {
     ctx: PageContext,
     left: left::LeftPane,
@@ -1226,9 +1221,9 @@ fn load_repository_item_with_access(
                     })
                     .map_err(|err| err.to_string());
                 if allow_sudo
-                    && result
-                        .as_ref()
-                        .is_err_and(|message| permission_denied_message(message))
+                    && result.as_ref().is_err_and(|message| {
+                        craic_system::system::is_permission_denied_message(message)
+                    })
                     && let Some(window) = ctx.window()
                 {
                     let retry_callback = callback.clone();
@@ -1368,7 +1363,7 @@ fn add_gitignore_pattern_with_access(
                 gtk::glib::ControlFlow::Break
             }
             Ok(Err(err)) => {
-                if allow_sudo && permission_denied_message(&err) {
+                if allow_sudo && craic_system::system::is_permission_denied_message(&err) {
                     let Some(window) = ctx.window() else {
                         ctx.show_error("Ignore Failed", &err);
                         return gtk::glib::ControlFlow::Break;
@@ -1456,7 +1451,7 @@ fn add_markdown_lint_ignore_with_access(
                 ));
             }
         }
-        Err(err) if allow_sudo && permission_denied_message(&err) => {
+        Err(err) if allow_sudo && craic_system::system::is_permission_denied_message(&err) => {
             let Some(window) = ctx.window() else {
                 ctx.show_error("Markdown Lint Ignore Failed", &err);
                 return;

@@ -33,6 +33,88 @@ impl ContainerInventory {
     }
 }
 
+pub fn filter_inventory(inventory: &ContainerInventory, query: &str) -> ContainerInventory {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return inventory.clone();
+    }
+
+    ContainerInventory {
+        groups: inventory
+            .groups
+            .iter()
+            .filter_map(|group| {
+                if group_matches(group, &query) {
+                    return Some(group.clone());
+                }
+                let containers = group
+                    .containers
+                    .iter()
+                    .filter(|container| container_matches(container, &query))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!containers.is_empty()).then(|| {
+                    let mut group = group.clone();
+                    group.containers = containers;
+                    group
+                })
+            })
+            .collect(),
+    }
+}
+
+pub fn group_matches(group: &ContainerGroup, query: &str) -> bool {
+    text_matches(query, [&group.title, &group.name, &group.key])
+        || group.compose_metadata().is_some_and(|compose| {
+            text_matches(
+                query,
+                [
+                    &compose.project,
+                    compose.working_dir.as_deref().unwrap_or_default(),
+                    compose.environment_file.as_deref().unwrap_or_default(),
+                    compose.config_files_raw.as_deref().unwrap_or_default(),
+                ],
+            ) || compose
+                .config_files
+                .iter()
+                .any(|value| value.to_lowercase().contains(query))
+        })
+}
+
+pub fn container_matches(container: &ContainerSummary, query: &str) -> bool {
+    text_matches(
+        query,
+        [
+            &container.id,
+            container.short_id(),
+            &container.name,
+            &container.image,
+            &container.command,
+            &container.state,
+            &container.status,
+            container.service.as_deref().unwrap_or_default(),
+            &container.ports,
+            &container.ports_raw,
+            &container.networks_raw,
+            &container.mounts_raw,
+            &container.labels_raw,
+        ],
+    ) || container
+        .networks
+        .iter()
+        .chain(container.mounts.iter())
+        .any(|value| value.to_lowercase().contains(query))
+        || container.labels.iter().any(|(key, value)| {
+            key.to_lowercase().contains(query) || value.to_lowercase().contains(query)
+        })
+}
+
+fn text_matches<const N: usize>(query: &str, values: [&str; N]) -> bool {
+    values
+        .into_iter()
+        .any(|value| value.to_lowercase().contains(query))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContainerGroup {
     pub key: String,

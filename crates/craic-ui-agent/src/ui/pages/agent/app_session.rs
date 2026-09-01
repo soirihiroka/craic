@@ -13,6 +13,7 @@ mod settings;
 mod tools;
 
 use adw::prelude::*;
+use craic_agent::display::{compact_json, concise_title, request_id_key};
 use craic_codex_app_server::protocol::{
     Request, RequestId, RpcError, ThreadStartParams, TurnInterruptParams, TurnStartParams,
     TurnSteerParams, UserInput,
@@ -38,7 +39,6 @@ use crate::system::ProviderKind;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_EVENTS_PER_POLL: usize = 256;
-const MAX_RENDERED_JSON_BYTES: usize = 24 * 1024;
 const PLAN_IMPLEMENTATION_REQUEST_ID: &str = "craic:plan-implementation";
 const PLAN_IMPLEMENTATION_CURRENT: &str = "current";
 const PLAN_IMPLEMENTATION_NEW: &str = "new";
@@ -1821,38 +1821,6 @@ fn submission_display_text(submission: &ComposerSubmission) -> String {
 
 use super::codex_requests::{pending_request_from_server, response_for_server_request};
 
-fn request_id_key(id: &RequestId) -> String {
-    match id {
-        RequestId::Integer(id) => format!("integer:{id}"),
-        RequestId::String(id) => format!("string:{id}"),
-    }
-}
-
-fn compact_json(value: &Value) -> String {
-    let mut rendered = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-    if rendered.len() > MAX_RENDERED_JSON_BYTES {
-        let mut boundary = MAX_RENDERED_JSON_BYTES;
-        while !rendered.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        rendered.truncate(boundary);
-        rendered.push_str("\n… output truncated …");
-    }
-    rendered
-}
-
-fn concise_title(prompt: &str) -> Option<String> {
-    let prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    if prompt.is_empty() {
-        return None;
-    }
-    let mut title = prompt.chars().take(72).collect::<String>();
-    if title.len() < prompt.len() {
-        title.push('…');
-    }
-    Some(title)
-}
-
 fn attachment_kind(reference: &str) -> ComposerAttachmentKind {
     let path = reference.split(['?', '#']).next().unwrap_or(reference);
     let extension = Path::new(path)
@@ -1875,18 +1843,4 @@ fn attachment_kind(reference: &str) -> ComposerAttachmentKind {
 fn is_http_url(reference: &str) -> bool {
     let lower = reference.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
-}
-
-fn title_case(value: &str) -> String {
-    let words = value
-        .replace(['_', '-'], " ")
-        .split_whitespace()
-        .map(|word| {
-            let mut characters = word.chars();
-            characters.next().map_or_else(String::new, |first| {
-                first.to_uppercase().collect::<String>() + characters.as_str()
-            })
-        })
-        .collect::<Vec<_>>();
-    words.join(" ")
 }

@@ -190,57 +190,16 @@ impl ChangesRight {
     }
 
     fn configure_git_action(&self, snapshot: &RepositorySnapshot, action_running: bool) {
-        let Some(remote) = snapshot.remote_name.as_deref() else {
-            self.suggestions_actions.git_card.set_visible(false);
-            return;
-        };
-
-        if !snapshot.has_upstream {
+        if let Some(suggestion) = craic_vcs::git::repository_remote_suggestion(snapshot) {
             self.suggestions_actions
                 .git_title
-                .set_label("Publish your branch");
-            self.suggestions_actions.git_subtitle.set_label(&format!(
-                "Publish the local branch '{}' to the remote '{}' to share your commits.",
-                snapshot.branch, remote
-            ));
-            self.suggestions_actions
-                .git_button
-                .set_label("Publish branch");
-            self.suggestions_actions.git_card.set_visible(true);
-            self.suggestions_actions
-                .git_button
-                .set_sensitive(!action_running);
-        } else if snapshot.behind > 0 {
-            let title = if snapshot.behind == 1 {
-                "Pull 1 commit from remote".to_string()
-            } else {
-                format!("Pull {} commits from remote", snapshot.behind)
-            };
-            self.suggestions_actions.git_title.set_label(&title);
-            self.suggestions_actions.git_subtitle.set_label(&format!(
-                "The current branch '{}' has commits on the remote that do not exist locally.",
-                snapshot.branch
-            ));
-            self.suggestions_actions
-                .git_button
-                .set_label(&format!("Pull {remote}"));
-            self.suggestions_actions.git_card.set_visible(true);
-            self.suggestions_actions
-                .git_button
-                .set_sensitive(!action_running);
-        } else if snapshot.ahead > 0 {
-            let title = if snapshot.ahead == 1 {
-                "Push 1 commit to remote".to_string()
-            } else {
-                format!("Push {} commits to remote", snapshot.ahead)
-            };
-            self.suggestions_actions.git_title.set_label(&title);
+                .set_label(&suggestion.title);
             self.suggestions_actions
                 .git_subtitle
-                .set_label("You have local commits that haven't been pushed to the remote.");
+                .set_label(&suggestion.detail);
             self.suggestions_actions
                 .git_button
-                .set_label(&format!("Push {remote}"));
+                .set_label(&suggestion.button_label);
             self.suggestions_actions.git_card.set_visible(true);
             self.suggestions_actions
                 .git_button

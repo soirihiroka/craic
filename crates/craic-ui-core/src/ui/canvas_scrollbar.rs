@@ -1,4 +1,9 @@
 use adw::prelude::*;
+use craic_render_skia::{
+    VERTICAL_SCROLLBAR_MIN_THUMB, VERTICAL_SCROLLBAR_WIDTH, vertical_scrollbar_handle_rect,
+    vertical_scrollbar_layout, vertical_scrollbar_scroll_for_delta,
+    vertical_scrollbar_scroll_for_press, vertical_scrollbar_track_rect,
+};
 use gtk::gdk::RGBA;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -6,14 +11,8 @@ use std::time::Duration;
 
 use super::canvas_painter::CanvasPainter;
 
-pub const WIDTH: f64 = 24.0;
-pub const MIN_THUMB: f64 = 40.0;
-
-const IDLE_LANE_WIDTH: f64 = 11.0;
-const HOVER_LANE_WIDTH: f64 = 24.0;
-const IDLE_TROUGH_MARGIN: f64 = 4.0;
-const HOVER_TROUGH_MARGIN: f64 = 8.0;
-const TROUGH_VERTICAL_MARGIN: f64 = 9.0;
+pub const WIDTH: f64 = VERTICAL_SCROLLBAR_WIDTH;
+pub const MIN_THUMB: f64 = VERTICAL_SCROLLBAR_MIN_THUMB;
 const HOVER_ANIMATION_DURATION_MS: f64 = 200.0;
 const HOVER_ANIMATION_FRAME_MS: f64 = 16.0;
 const HOVER_TROUGH_ALPHA: f64 = 0.10;
@@ -133,9 +132,14 @@ impl Drag {
         thumb_height: f64,
         max_scroll: f64,
     ) -> f64 {
-        let track_height = (viewport_height - (TROUGH_VERTICAL_MARGIN * 2.0)).max(1.0);
-        let travel = (track_height - thumb_height).max(1.0);
-        self.start_scroll_y + (delta_y / travel) * max_scroll
+        let track = vertical_scrollbar_track_rect(WIDTH, viewport_height);
+        vertical_scrollbar_scroll_for_delta(
+            self.start_scroll_y,
+            delta_y,
+            track.height,
+            thumb_height,
+            max_scroll,
+        )
     }
 }
 
@@ -239,7 +243,8 @@ pub fn is_mouse_scroll(controller: &gtk::EventControllerScroll) -> bool {
 pub fn point_in_lane(width: i32, height: i32, total_height: f64, x: f64) -> bool {
     x >= width as f64 - WIDTH
         && x <= width as f64
-        && thumb_rect(width, height, total_height, 0.0).is_some()
+        && vertical_scrollbar_layout(width as f64, height.max(1) as f64, total_height, 0.0, 0.0)
+            .is_some()
 }
 
 pub fn thumb_rect(
@@ -248,21 +253,19 @@ pub fn thumb_rect(
     total_height: f64,
     scroll_y: f64,
 ) -> Option<(f64, f64, f64, f64)> {
-    let viewport_height = height.max(1) as f64;
-    let total_height = total_height.max(viewport_height);
-    if total_height <= viewport_height + 0.5 {
-        return None;
-    }
-
-    let track = track_rect(width, height);
-    let thumb_height = (track.height * viewport_height / total_height)
-        .max(MIN_THUMB)
-        .min(track.height);
-    let max_scroll = max_scroll(total_height, viewport_height).max(1.0);
-    let travel = (track.height - thumb_height).max(0.0);
-    let y = track.y + (scroll_y.clamp(0.0, max_scroll) / max_scroll) * travel;
-
-    Some((track.x, y, track.width, thumb_height))
+    let layout = vertical_scrollbar_layout(
+        width as f64,
+        height.max(1) as f64,
+        total_height,
+        scroll_y,
+        0.0,
+    )?;
+    Some((
+        layout.track.x,
+        layout.thumb.y,
+        layout.track.width,
+        layout.thumb.height,
+    ))
 }
 
 pub fn scroll_for_lane_press(
@@ -277,30 +280,23 @@ pub fn scroll_for_lane_press(
         return None;
     }
 
-    let viewport_height = height.max(1) as f64;
-    let track = track_rect(width, height);
-    let (_, thumb_y, _, thumb_height) = thumb_rect(width, height, total_height, scroll_y)?;
-    if y >= thumb_y && y <= thumb_y + thumb_height {
-        return Some(scroll_y);
-    }
-
-    let travel = (track.height - thumb_height).max(0.0);
-    let max_scroll = max_scroll(total_height, viewport_height);
-
-    if travel <= f64::EPSILON || max_scroll <= f64::EPSILON {
-        return Some(0.0);
-    }
-
-    let thumb_y = (y - (thumb_height / 2.0)).clamp(track.y, track.y + travel);
-    Some(((thumb_y - track.y) / travel) * max_scroll)
+    let layout = vertical_scrollbar_layout(
+        width as f64,
+        height.max(1) as f64,
+        total_height,
+        scroll_y,
+        0.0,
+    )?;
+    Some(vertical_scrollbar_scroll_for_press(layout, y))
 }
 
 fn track_rect(width: i32, height: i32) -> Rect {
+    let rect = vertical_scrollbar_track_rect(width as f64, height as f64);
     Rect {
-        x: width as f64 - WIDTH,
-        y: TROUGH_VERTICAL_MARGIN,
-        width: WIDTH,
-        height: (height as f64 - (TROUGH_VERTICAL_MARGIN * 2.0)).max(1.0),
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
     }
 }
 
@@ -309,16 +305,12 @@ pub fn visual_track_rect(width: i32, height: i32, hover_progress: f64) -> (f64, 
 }
 
 fn handle_rect(width: i32, height: i32, hover_progress: f64) -> Rect {
-    let track = track_rect(width, height);
-    let progress = hover_progress.clamp(0.0, 1.0);
-    let lane_width = lerp(IDLE_LANE_WIDTH, HOVER_LANE_WIDTH, progress);
-    let margin = lerp(IDLE_TROUGH_MARGIN, HOVER_TROUGH_MARGIN, progress);
-
+    let rect = vertical_scrollbar_handle_rect(width as f64, height as f64, hover_progress);
     Rect {
-        x: width as f64 - lane_width + margin,
-        y: track.y,
-        width: (lane_width - margin * 2.0).max(1.0),
-        height: track.height,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
     }
 }
 

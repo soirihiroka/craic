@@ -127,19 +127,10 @@ pub fn visible_diff_row_range(
 
     let start_y = (scroll_y - overscan).max(0.0);
     let end_y = scroll_y + viewport_height.max(1.0) + overscan;
-    let mut start = cache
+    let start = cache
         .rows
-        .partition_point(|layout| layout.y + layout.height < start_y);
-    if start > 0 {
-        start -= 1;
-    }
-    let mut end = start;
-    while end < cache.rows.len() && cache.rows[end].y <= end_y {
-        end += 1;
-    }
-    if end < cache.rows.len() {
-        end += 1;
-    }
+        .partition_point(|layout| layout.y + layout.height <= start_y);
+    let end = cache.rows.partition_point(|layout| layout.y < end_y);
     start..end
 }
 

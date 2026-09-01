@@ -203,40 +203,32 @@ pub fn visual_line_index_for_offset(lines: &[VisualLine], offset: usize) -> usiz
         return 0;
     }
 
-    let index = lines.partition_point(|line| line.end < offset);
-    if let Some(line) = lines.get(index)
-        && offset >= line.start
-        && offset <= line.end
-    {
-        return index;
+    let index = lines.partition_point(|line| line.end <= offset);
+    let Some(line) = lines.get(index) else {
+        return lines.len() - 1;
+    };
+    if offset >= line.start {
+        index
+    } else {
+        index.saturating_sub(1)
     }
-    if index > 0 {
-        let previous = &lines[index - 1];
-        let next_start = lines
-            .get(index)
-            .map(|line| line.start)
-            .unwrap_or(usize::MAX);
-        if previous.folded.is_some() && offset < next_start {
-            return index - 1;
-        }
-    }
-    index.min(lines.len() - 1)
 }
 
 pub fn max_line_columns(text: &str) -> f64 {
     logical_line_ranges(text)
         .into_iter()
-        .map(|(start, end)| {
-            if text[start..end].is_ascii() {
-                text[start..end]
-                    .bytes()
-                    .map(|byte| if byte == b'\t' { 4.0 } else { 1.0 })
-                    .sum()
-            } else {
-                text[start..end].graphemes(true).map(grapheme_columns).sum()
-            }
-        })
+        .map(|(start, end)| text_columns(&text[start..end]))
         .fold(0.0, f64::max)
+}
+
+pub fn text_columns(text: &str) -> f64 {
+    if text.is_ascii() {
+        text.bytes()
+            .map(|byte| if byte == b'\t' { 4.0 } else { 1.0 })
+            .sum()
+    } else {
+        text.graphemes(true).map(grapheme_columns).sum()
+    }
 }
 
 pub fn column_slice(text: &str, first_column: f64, last_column: f64) -> ColumnSlice {

@@ -164,7 +164,10 @@ impl CommitComposer {
 
         let generate_spinner = NSProgressIndicator::initWithFrame(
             NSProgressIndicator::alloc(mtm),
-            generate_button.frame(),
+            NSRect::new(
+                NSPoint::new(width - 37.0, summary_y + 9.0),
+                NSSize::new(16.0, 16.0),
+            ),
         );
         generate_spinner.setStyle(NSProgressIndicatorStyle::Spinning);
         generate_spinner.setControlSize(NSControlSize::Small);

@@ -1,4 +1,7 @@
 use crate::TextSyntaxSpan;
+use craic_text_layout::{
+    FoldRange, VisualLine, build_visual_lines_monospace, column_slice, text_columns,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EditorSelection {
@@ -269,11 +272,19 @@ impl EditorViewport {
         &mut self,
         width: f64,
         height: f64,
-        document: &EditorDocument,
+        document: &mut EditorDocument,
         metrics: EditorMetrics,
+        trailing_inset: f64,
     ) {
         self.width = width.max(0.0);
         self.height = height.max(0.0);
+        document.reflow(
+            (self.width
+                - metrics.gutter_width as f64
+                - metrics.text_inset as f64 * 2.0
+                - trailing_inset.max(0.0))
+                / metrics.char_width.max(1.0) as f64,
+        );
         self.clamp(document, metrics);
     }
 
@@ -330,11 +341,11 @@ impl EditorViewport {
         metrics: EditorMetrics,
         trailing_inset: f64,
     ) {
-        let (_, column) = document.line_column_for_offset(offset);
         let line = document.visual_line_for_offset(offset);
+        let column = document.visual_column_for_offset(offset);
         let x = metrics.gutter_width as f64
             + metrics.text_inset as f64
-            + column as f64 * metrics.char_width as f64;
+            + column * metrics.char_width as f64;
         let y = metrics.text_inset as f64 + line as f64 * metrics.line_height as f64;
         if x < self.scroll_x + metrics.gutter_width as f64 {
             self.scroll_x = (x - metrics.gutter_width as f64).max(0.0);
@@ -376,24 +387,14 @@ impl EditorViewport {
         let line_height = metrics.line_height.max(1.0) as f64;
         let start_line = (self.scroll_y / line_height).floor() as usize;
         let end_line = ((self.scroll_y + self.height) / line_height).ceil() as usize;
-        let start_source = document
+        let start = document
             .visual_lines()
             .get(start_line.min(document.visual_lines().len().saturating_sub(1)))
-            .copied()
-            .unwrap_or(0);
-        let end_source = document
-            .visual_lines()
-            .get(end_line.min(document.visual_lines().len().saturating_sub(1)))
-            .copied()
-            .unwrap_or_else(|| document.lines().len().saturating_sub(1));
-        let start = document
-            .lines()
-            .get(start_source)
             .map_or(0, |line| line.start);
         let end = document
-            .lines()
-            .get(end_source)
-            .map_or(document.text().len(), |line| line.end_with_newline);
+            .visual_lines()
+            .get(end_line.min(document.visual_lines().len().saturating_sub(1)))
+            .map_or(document.text().len(), |line| line.end);
         start.min(end)..end.max(start)
     }
 
@@ -441,8 +442,9 @@ pub struct EditorDocument {
     lines: Vec<EditorLine>,
     syntax: Vec<TextSyntaxSpan>,
     folds: Vec<EditorFoldRange>,
-    visual_lines: Vec<usize>,
+    visual_lines: Vec<VisualLine>,
     longest_visual_columns: usize,
+    wrap_columns: f64,
 }
 
 impl Default for EditorDocument {
@@ -489,17 +491,15 @@ impl EditorDocument {
         folds.retain(|fold| fold.start_line < fold.end_line && fold.end_line < lines.len());
         folds.sort_by_key(|fold| (fold.start_line, fold.end_line));
         folds.dedup_by_key(|fold| (fold.start_line, fold.end_line));
-        let mut visual_lines = Vec::with_capacity(lines.len());
-        let mut source_line = 0;
-        while source_line < lines.len() {
-            visual_lines.push(source_line);
-            let collapsed_end = folds
-                .iter()
-                .filter(|fold| !fold.expanded && fold.start_line == source_line)
-                .map(|fold| fold.end_line)
-                .max();
-            source_line = collapsed_end.map_or(source_line + 1, |end| end + 1);
-        }
+        let shared_folds = folds
+            .iter()
+            .map(|fold| FoldRange {
+                start_line: fold.start_line,
+                end_line: fold.end_line,
+                expanded: fold.expanded,
+            })
+            .collect::<Vec<_>>();
+        let visual_lines = build_visual_lines_monospace(&text, &shared_folds, false, 1.0);
         Self {
             text,
             lines,
@@ -507,6 +507,7 @@ impl EditorDocument {
             folds,
             visual_lines,
             longest_visual_columns,
+            wrap_columns: 0.0,
         }
     }
 
@@ -526,8 +527,32 @@ impl EditorDocument {
         &self.folds
     }
 
-    pub fn visual_lines(&self) -> &[usize] {
+    pub fn visual_lines(&self) -> &[VisualLine] {
         &self.visual_lines
+    }
+
+    pub fn reflow(&mut self, wrap_columns: f64) {
+        let wrap_columns = wrap_columns.floor().max(1.0);
+        if (self.wrap_columns - wrap_columns).abs() < f64::EPSILON {
+            return;
+        }
+        let folds = self
+            .folds
+            .iter()
+            .map(|fold| FoldRange {
+                start_line: fold.start_line,
+                end_line: fold.end_line,
+                expanded: fold.expanded,
+            })
+            .collect::<Vec<_>>();
+        self.visual_lines = build_visual_lines_monospace(&self.text, &folds, true, wrap_columns);
+        self.longest_visual_columns = self
+            .visual_lines
+            .iter()
+            .map(|line| text_columns(&self.text[line.start..line.end]).ceil() as usize)
+            .max()
+            .unwrap_or(0);
+        self.wrap_columns = wrap_columns;
     }
 
     pub fn fold_starting_at(&self, source_line: usize) -> Option<EditorFoldRange> {
@@ -565,27 +590,27 @@ impl EditorDocument {
     }
 
     pub fn visual_line_for_offset(&self, offset: usize) -> usize {
-        let (source_line, _) = self.line_column_for_offset(offset);
-        match self.visual_lines.binary_search(&source_line) {
-            Ok(line) => line,
-            Err(insertion) => insertion.saturating_sub(1),
-        }
+        craic_text_layout::visual_line_index_for_offset(&self.visual_lines, offset)
     }
 
-    pub fn offset_for_line_column(&self, line: usize, visual_column: usize) -> usize {
-        let Some(line) = self.lines.get(line) else {
+    pub fn visual_column_for_offset(&self, offset: usize) -> f64 {
+        let offset = self.clamp_offset(offset);
+        let visual_line = self.visual_line_for_offset(offset);
+        self.visual_lines
+            .get(visual_line)
+            .and_then(|line| {
+                self.text
+                    .get(line.start..offset.clamp(line.start, line.end))
+            })
+            .map_or(0.0, text_columns)
+    }
+
+    pub fn offset_for_visual_line_column(&self, visual_line: usize, visual_column: f64) -> usize {
+        let Some(line) = self.visual_lines.get(visual_line) else {
             return self.text.len();
         };
         let text = &self.text[line.start..line.end];
-        let mut columns = 0;
-        for (byte, character) in text.char_indices() {
-            let width = if character == '\t' { 4 } else { 1 };
-            if columns + width / 2 >= visual_column {
-                return line.start + byte;
-            }
-            columns += width;
-        }
-        line.end
+        line.start + column_slice(text, visual_column, visual_column + 1.0).start
     }
 
     pub fn content_size(&self, metrics: EditorMetrics) -> (f32, f32) {
@@ -603,10 +628,11 @@ impl EditorDocument {
         viewport_height: f64,
         metrics: EditorMetrics,
     ) -> std::ops::Range<usize> {
-        let overscan = metrics.line_height as f64 * 3.0;
-        let start = ((scroll_y - overscan).max(0.0) / metrics.line_height as f64).floor() as usize;
+        let line_height = metrics.line_height as f64;
+        let text_start = metrics.text_inset as f64;
+        let start = ((scroll_y - text_start).max(0.0) / line_height).floor() as usize;
         let end =
-            ((scroll_y + viewport_height + overscan) / metrics.line_height as f64).ceil() as usize;
+            ((scroll_y + viewport_height - text_start).max(0.0) / line_height).ceil() as usize;
         start.min(self.visual_lines.len())..end.min(self.visual_lines.len())
     }
 
@@ -618,19 +644,18 @@ impl EditorDocument {
         scroll_y: f64,
         metrics: EditorMetrics,
     ) -> usize {
-        let visual_line = ((y + scroll_y - metrics.text_inset as f64).max(0.0)
+        let visual_line = (((y + scroll_y - metrics.text_inset as f64).max(0.0)
             / metrics.line_height as f64)
-            .floor() as usize;
-        let line = self
-            .visual_lines
-            .get(visual_line.min(self.visual_lines.len().saturating_sub(1)))
-            .copied()
-            .unwrap_or(0);
+            .floor() as usize)
+            .min(self.visual_lines.len().saturating_sub(1));
+        if self.visual_lines.is_empty() {
+            return self.text.len();
+        }
         let column = ((x + scroll_x - metrics.gutter_width as f64 - metrics.text_inset as f64)
             .max(0.0)
             / metrics.char_width as f64)
             .round() as usize;
-        self.offset_for_line_column(line.min(self.lines.len().saturating_sub(1)), column)
+        self.offset_for_visual_line_column(visual_line, column as f64)
     }
 }
 
@@ -644,7 +669,5 @@ pub fn selected_editor_text(document: &EditorDocument, selection: EditorSelectio
 }
 
 fn visual_columns(text: &str) -> usize {
-    text.chars()
-        .map(|character| if character == '\t' { 4 } else { 1 })
-        .sum()
+    text_columns(text).ceil() as usize
 }

@@ -37,6 +37,33 @@ fn parse_makefile_targets(contents: &str) -> Vec<RunItem> {
         &mut seen,
         &mut targets,
     );
+    // tree-sitter-make does not expose every rule nested in a conditional as a
+    // named `rule` node. Supplement the syntax tree with conservative target-line
+    // discovery so platform-gated targets such as `dev` remain available.
+    for line in contents.lines() {
+        let line = line.trim_end();
+        if line.starts_with([' ', '\t', '#']) {
+            continue;
+        }
+        let Some((target_words, remainder)) = line.split_once(':') else {
+            continue;
+        };
+        if target_words.contains('=') || remainder.trim_start().starts_with('=') {
+            continue;
+        }
+        for target in target_words.split_whitespace() {
+            if is_runnable_make_target(target) && seen.insert(target.to_string()) {
+                targets.push(RunItem {
+                    id: format!("make:{target}"),
+                    label: target.to_string(),
+                    icon_name: MAKEFILE_ICON_NAME.to_string(),
+                    command: RunCommand::MakeTarget {
+                        target: target.to_string(),
+                    },
+                });
+            }
+        }
+    }
 
     targets
 }
