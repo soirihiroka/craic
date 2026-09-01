@@ -516,14 +516,6 @@ impl AppDelegate {
         if let Some(changes_split) = self.ivars().changes_split.get() {
             changes_split.setHidden(!showing_changes);
         }
-        if let Some(edge_container) = self.ivars().changes_edge_container.get() {
-            edge_container.setHidden(!showing_changes);
-        }
-        if let Some(edge_accessory) = self.ivars().changes_edge_accessory.get() {
-            unsafe {
-                let _: () = msg_send![&**edge_accessory, setHidden: !showing_changes];
-            }
-        }
         if let Some(top_cover) = self.ivars().changes_top_cover.get() {
             top_cover.setHidden(!showing_changes);
         }

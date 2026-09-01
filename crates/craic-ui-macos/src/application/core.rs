@@ -298,11 +298,19 @@ impl AppDelegate {
         let search_visible = self.ivars().changes_search_visible.get();
         let cover_margin = 8.0;
         let search_popup_height = 46.0;
-        let edge_effect_height = if search_visible { 62.0 } else { 52.0 };
-        edge_height_constraint.setConstant(edge_effect_height);
+        let selection_header_inset = SELECTION_HEADER_HEIGHT + 16.0;
+        let search_accessory_visible = self.is_active_page("changes") && search_visible;
+        let search_accessory_height = if search_accessory_visible { 62.0 } else { 0.0 };
+        edge_container.setHidden(!search_accessory_visible);
+        if let Some(edge_accessory) = self.ivars().changes_edge_accessory.get() {
+            unsafe {
+                let _: () = msg_send![&**edge_accessory, setHidden: !search_accessory_visible];
+            }
+        }
+        edge_height_constraint.setConstant(search_accessory_height);
         edge_container.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(sidebar_bounds.size.width, edge_effect_height),
+            NSSize::new(sidebar_bounds.size.width, search_accessory_height),
         ));
         let search_width = 360.0_f64.min((sidebar_bounds.size.width - 24.0).max(1.0));
         search_popup.setHidden(!search_visible);
@@ -325,7 +333,7 @@ impl AppDelegate {
             NSSize::new(search_width, 38.0),
         ));
         let scroll_top = if search_visible {
-            (browser_bounds.size.height - edge_effect_height).max(safe.bottom)
+            (browser_bounds.size.height - search_accessory_height).max(safe.bottom)
         } else {
             browser_bounds.size.height
         };
@@ -340,7 +348,7 @@ impl AppDelegate {
             top: if search_visible {
                 0.0
             } else {
-                edge_effect_height
+                selection_header_inset
             },
             left: 0.0,
             bottom: 0.0,

@@ -590,6 +590,20 @@ define_class!(
             self.render_frame();
         }
 
+        #[unsafe(method(setHidden:))]
+        fn set_hidden(&self, hidden: bool) {
+            let changed = self.isHidden() != hidden;
+            // SAFETY: Dispatching to NSView updates AppKit's hidden-ancestor bookkeeping before
+            // the Skia renderer checks whether it can acquire a drawable.
+            unsafe {
+                let _: () = msg_send![super(self), setHidden: hidden];
+            }
+            self.refresh_renderer_visibility();
+            if changed {
+                log::debug!("native diff renderer visibility changed hidden={hidden}");
+            }
+        }
+
         #[unsafe(method(resetCursorRects))]
         fn reset_cursor_rects(&self) {
             let bounds = self.bounds();
@@ -1411,6 +1425,9 @@ impl DiffMetalView {
         if !self.can_render() {
             return;
         }
+        if self.sync_metal_geometry().is_none() {
+            return;
+        }
         if self.ivars().display_link.borrow().is_none() {
             self.initialize_display_link();
         }
@@ -1432,6 +1449,25 @@ impl DiffMetalView {
         self.render_drawable(&drawable, true);
     }
 
+    fn sync_metal_geometry(&self) -> Option<(NSRect, i32, i32, f32, f32)> {
+        let bounds = self.bounds();
+        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+            return None;
+        }
+        let backing = self.convertRectToBacking(bounds);
+        let pixel_width = backing.size.width.max(1.0).round() as i32;
+        let pixel_height = backing.size.height.max(1.0).round() as i32;
+        let scale_x = pixel_width as f32 / bounds.size.width as f32;
+        let scale_y = pixel_height as f32 / bounds.size.height as f32;
+        let metal = self.ivars().metal.borrow();
+        let metal = metal.as_ref()?;
+        metal.layer.setContentsScale(scale_x as f64);
+        metal
+            .layer
+            .setDrawableSize(CGSize::new(pixel_width as f64, pixel_height as f64));
+        Some((bounds, pixel_width, pixel_height, scale_x, scale_y))
+    }
+
     fn can_render(&self) -> bool {
         self.window().is_some()
             && !self.ivars().window_occluded.get()
@@ -1443,24 +1479,16 @@ impl DiffMetalView {
         drawable: &ProtocolObject<dyn CAMetalDrawable>,
         present_with_command_buffer: bool,
     ) {
-        let bounds = self.bounds();
-        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        let Some((bounds, pixel_width, pixel_height, scale_x, scale_y)) =
+            self.sync_metal_geometry()
+        else {
             return;
-        }
-        let backing = self.convertRectToBacking(bounds);
-        let pixel_width = backing.size.width.max(1.0).round() as i32;
-        let pixel_height = backing.size.height.max(1.0).round() as i32;
-        let scale_x = pixel_width as f32 / bounds.size.width as f32;
-        let scale_y = pixel_height as f32 / bounds.size.height as f32;
+        };
 
         let mut metal_ref = self.ivars().metal.borrow_mut();
         let Some(metal) = metal_ref.as_mut() else {
             return;
         };
-        metal.layer.setContentsScale(scale_x as f64);
-        metal
-            .layer
-            .setDrawableSize(CGSize::new(pixel_width as f64, pixel_height as f64));
         let texture = drawable.texture();
         let texture_info =
             unsafe { mtl::TextureInfo::new(Retained::as_ptr(&texture) as mtl::Handle) };
