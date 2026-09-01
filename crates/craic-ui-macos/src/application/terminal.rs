@@ -408,6 +408,7 @@ impl AppDelegate {
         if placement == NativeTerminalPlacement::Agent {
             self.ensure_native_agent_terminal_usage_timer();
             self.refresh_native_agent_thread_rows();
+            self.restore_agents_page_badge();
         }
         self.activate_native_terminal_session(id);
         match placement {
@@ -937,6 +938,7 @@ impl AppDelegate {
         }
         if agent_session {
             self.refresh_native_agent_thread_rows();
+            self.restore_agents_page_badge();
         }
     }
 
@@ -951,7 +953,12 @@ impl AppDelegate {
             return;
         }
         session.reported_task_active = active;
+        let is_agent = session.placement == NativeTerminalPlacement::Agent;
+        drop(sessions);
         log::debug!("native remote terminal activity changed id={id} active={active}");
+        if is_agent {
+            self.restore_agents_page_badge();
+        }
     }
 
     pub(crate) fn native_terminal_session_interacted(&self, id: isize) {
@@ -1528,6 +1535,7 @@ impl AppDelegate {
                 self.stop_native_agent_terminal_usage_timer();
             }
             self.refresh_native_agent_thread_rows();
+            self.restore_agents_page_badge();
         }
         log::info!("native terminal session closed id={id}");
     }

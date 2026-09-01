@@ -823,6 +823,17 @@ impl AppDelegate {
             return;
         };
         let item = group.subitems().objectAtIndex(index);
+        if let Some(control) = group
+            .view()
+            .and_then(|view| view.downcast::<NSSegmentedControl>().ok())
+        {
+            let label = match badge {
+                NativePageBadge::Count(count) if count > 0 => count.to_string(),
+                _ => String::new(),
+            };
+            control.setLabel_forSegment(&NSString::from_str(&label), index as isize);
+            control.sizeToFit();
+        }
         if AnyClass::get(c"NSItemBadge").is_none() || !item.respondsToSelector(sel!(setBadge:)) {
             return;
         }
@@ -845,6 +856,30 @@ impl AppDelegate {
             .map(|snapshot| snapshot.changed_files.len())
             .unwrap_or(0);
         self.set_page_badge("changes", NativePageBadge::Count(count));
+    }
+
+    fn restore_agents_page_badge(&self) {
+        let app_count = usize::from(self.ivars().agents.get().is_some_and(|agents| {
+            matches!(
+                agents.state.get(),
+                NativeAgentState::Connecting
+                    | NativeAgentState::Initializing
+                    | NativeAgentState::Running
+            )
+        }));
+        let terminal_count = self
+            .ivars()
+            .terminal_sessions
+            .borrow()
+            .iter()
+            .filter(|session| {
+                session.placement == NativeTerminalPlacement::Agent && session.has_active_task()
+            })
+            .count();
+        self.set_page_badge(
+            "agents",
+            NativePageBadge::Count(app_count + terminal_count),
+        );
     }
 
 }

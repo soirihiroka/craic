@@ -80,14 +80,7 @@ impl AppDelegate {
         agents.composer.setEditable(can_compose);
         self.refresh_native_agent_selectors();
         self.refresh_native_agent_thread_rows();
-        self.set_page_badge(
-            "agents",
-            if spinning {
-                NativePageBadge::Indicator
-            } else {
-                NativePageBadge::None
-            },
-        );
+        self.restore_agents_page_badge();
         self.refresh_agent_controls();
     }
 
@@ -1446,7 +1439,7 @@ impl AppDelegate {
         agents.permissions.setEnabled(false);
         self.apply_native_agent_usage(None);
         self.refresh_native_agent_thread_rows();
-        self.set_page_badge("agents", NativePageBadge::None);
+        self.restore_agents_page_badge();
     }
 
 }

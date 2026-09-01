@@ -54,6 +54,7 @@ impl AppDelegate {
             if will_be_inserted && self.ivars().page_switcher.get().is_none() {
                 let _ = self.ivars().page_switcher.set(pages.retain());
                 self.restore_changes_page_badge();
+                self.restore_agents_page_badge();
             }
             return Some(pages.into_super());
         }

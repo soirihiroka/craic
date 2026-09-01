@@ -642,7 +642,7 @@ impl AppDelegate {
         agents.state.set(NativeAgentState::Connecting);
         unsafe { agents.spinner.startAnimation(None) };
         agents.spinner.setHidden(false);
-        self.set_page_badge("agents", NativePageBadge::Indicator);
+        self.restore_agents_page_badge();
         let identity = AgentIdentity {
             workspace_id,
             generation,
