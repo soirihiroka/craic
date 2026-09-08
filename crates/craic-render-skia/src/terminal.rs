@@ -552,8 +552,12 @@ impl TerminalSession {
         )?;
         #[cfg(not(unix))]
         drop(sixel_sender);
+        let terminal_config = Config {
+            kitty_keyboard: true,
+            ..Config::default()
+        };
         let terminal = Arc::new(FairMutex::new(Term::new(
-            Config::default(),
+            terminal_config,
             &viewport,
             event_proxy.clone(),
         )));
