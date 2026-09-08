@@ -80,14 +80,14 @@ pub fn page_descriptor(page: &PageId) -> Option<&'static PageDescriptor> {
 }
 
 pub fn optional_usize(value: Option<&Value>) -> Result<Option<usize>, ()> {
-    value
-        .map(|value| {
-            value
-                .as_u64()
-                .ok_or(())
-                .and_then(|value| usize::try_from(value).map_err(|_| ()))
-        })
-        .transpose()
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .map(Some)
+            .ok_or(()),
+    }
 }
 
 #[derive(

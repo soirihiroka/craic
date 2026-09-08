@@ -1,8 +1,7 @@
-git_date=$1
+git_timezone=$1
 
-if [ -n "$git_date" ]; then
-  export GIT_AUTHOR_DATE="$git_date"
-  export GIT_COMMITTER_DATE="$git_date"
+if [ -n "$git_timezone" ]; then
+  export TZ="$git_timezone"
 fi
 
 git commit -F -
