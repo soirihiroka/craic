@@ -32,7 +32,16 @@ impl GitRepoHandle {
         args: &[String],
         progress: &mut dyn FnMut(String),
     ) -> Result<String, String> {
-        let request = ShellCommandRunRequest::new("git", self.workspace.root.clone(), "git")
+        self.run_command_with_progress("git", args, progress)
+    }
+
+    fn run_command_with_progress(
+        &self,
+        program: &str,
+        args: &[String],
+        progress: &mut dyn FnMut(String),
+    ) -> Result<String, String> {
+        let request = ShellCommandRunRequest::new("git", self.workspace.root.clone(), program)
             .args(args.iter().cloned());
         let mut events = self.shell.stream_fast_command(request);
         while let Some(event) = events.blocking_recv() {
@@ -57,6 +66,62 @@ impl GitRepoHandle {
         }
 
         Err("git command stream stopped before returning a result.".to_string())
+    }
+
+    fn configured_git_timezone(&self) -> Result<Option<String>, String> {
+        let config = crate::workspace_config::git_config_from_file_access(self.files.as_ref());
+        let timezone = match config.commit_timezone {
+            Some(timezone) => crate::workspace_config::normalize_timezone(&timezone)?,
+            None if config.use_system_timezone.unwrap_or(false) => return Ok(None),
+            None => DEFAULT_COMMIT_TIMEZONE.to_string(),
+        };
+        let sign = if timezone.starts_with('+') { '-' } else { '+' };
+        Ok(Some(format!(
+            "UTC{sign}{}:{}",
+            &timezone[1..3],
+            &timezone[3..5]
+        )))
+    }
+
+    fn git_command_with_configured_timezone(
+        &self,
+        args: &[String],
+    ) -> Result<(String, Vec<String>), String> {
+        let Some(timezone) = self.configured_git_timezone()? else {
+            log::debug!("using system timezone for git operation");
+            return Ok(("git".to_string(), args.to_vec()));
+        };
+
+        log::debug!("using configured timezone {timezone} for git operation");
+        let mut env_args = Vec::with_capacity(args.len() + 2);
+        env_args.push(format!("TZ={timezone}"));
+        env_args.push("git".to_string());
+        env_args.extend_from_slice(args);
+        Ok(("env".to_string(), env_args))
+    }
+
+    fn git_with_configured_timezone(&self, args: &[String]) -> Result<String, String> {
+        let (program, args) = self.git_command_with_configured_timezone(args)?;
+        self.run_command_text("git", &program, &args, None, &[0])
+    }
+
+    fn git_with_configured_timezone_and_progress(
+        &self,
+        args: &[String],
+        progress: &mut dyn FnMut(String),
+    ) -> Result<String, String> {
+        let (program, args) = self.git_command_with_configured_timezone(args)?;
+        self.run_command_with_progress(&program, &args, progress)
+    }
+
+    fn git_output_with_configured_timezone(
+        &self,
+        operation: &str,
+        args: &[String],
+        success_codes: &[i32],
+    ) -> Result<ShellCommandOutput, String> {
+        let (program, args) = self.git_command_with_configured_timezone(args)?;
+        self.run_command_output(operation, &program, &args, None, success_codes)
     }
 
     fn git_ok(&self, args: &[String]) -> Result<String, String> {

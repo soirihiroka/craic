@@ -371,26 +371,7 @@ impl GitRepoHandle {
             return Err("Select at least one file to commit.".to_string());
         }
 
-        let config = crate::workspace_config::git_config_from_file_access(self.files.as_ref());
-        let timezone = match config.commit_timezone {
-            Some(timezone) => Some(crate::workspace_config::normalize_timezone(&timezone)?),
-            None if config.use_system_timezone.unwrap_or(false) => None,
-            None => Some(DEFAULT_COMMIT_TIMEZONE.to_string()),
-        };
-        let git_date = match timezone {
-            Some(timezone) => {
-                let seconds = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|err| err.to_string())?
-                    .as_secs();
-                log::debug!("using commit timezone {timezone}");
-                format!("@{seconds} {timezone}")
-            }
-            None => {
-                log::debug!("using system timezone for commit");
-                String::new()
-            }
-        };
+        let git_timezone = self.configured_git_timezone()?.unwrap_or_default();
 
         if self
             .git_ok(&["rev-parse".into(), "--verify".into(), "HEAD".into()])
@@ -443,7 +424,7 @@ impl GitRepoHandle {
             )?;
         }
 
-        let script = shell_script_with_args(COMMIT_SELECTED_SCRIPT, &[git_date]);
+        let script = shell_script_with_args(COMMIT_SELECTED_SCRIPT, &[git_timezone]);
 
         let stdin = commit_message_stdin(summary, description);
         let output = self.run_script_output("git commit", &script, Some(&stdin), &[0])?;
@@ -614,7 +595,7 @@ impl GitRepoHandle {
 
     fn pull_blocking(&self) -> Result<String, String> {
         let result = self.run_with_hooks("git pull", || {
-            self.git(&[
+            self.git_with_configured_timezone(&[
                 "-c".into(),
                 "rebase.backend=merge".into(),
                 "pull".into(),
@@ -633,7 +614,7 @@ impl GitRepoHandle {
         progress: &mut dyn FnMut(String),
     ) -> Result<String, String> {
         let result = self.run_with_hooks("git pull", || {
-            self.git_with_progress(
+            self.git_with_configured_timezone_and_progress(
                 &[
                     "-c".into(),
                     "rebase.backend=merge".into(),
@@ -748,11 +729,9 @@ impl GitRepoHandle {
             branch
         );
         self.run_with_hooks("git merge branch", || {
-            let output = self.run_command_output(
+            let output = self.git_output_with_configured_timezone(
                 "git merge branch",
-                "git",
                 &["merge".into(), branch.into()],
-                None,
                 &[0, 1],
             )?;
             let stdout = output.stdout_text_trimmed();
@@ -837,7 +816,7 @@ impl GitRepoHandle {
             self.workspace.display_name,
             short_hash(hash)
         );
-        self.git(&["revert".into(), "--no-edit".into(), hash.into()])
+        self.git_with_configured_timezone(&["revert".into(), "--no-edit".into(), hash.into()])
     }
 
     fn cherry_pick_commit_blocking(&self, hash: &str) -> Result<String, String> {
@@ -846,7 +825,7 @@ impl GitRepoHandle {
             self.workspace.display_name,
             short_hash(hash)
         );
-        self.git(&["cherry-pick".into(), hash.into()])
+        self.git_with_configured_timezone(&["cherry-pick".into(), hash.into()])
     }
 
     fn amend_head_blocking(&self, summary: &str, description: &str) -> Result<String, String> {
@@ -872,7 +851,7 @@ impl GitRepoHandle {
             args.push("-m".to_string());
             args.push(description.to_string());
         }
-        self.git(&args)
+        self.git_with_configured_timezone(&args)
     }
 
     fn stash_changes_blocking(&self) -> Result<String, String> {
@@ -880,7 +859,7 @@ impl GitRepoHandle {
             "shell git stash start workspace={}",
             self.workspace.display_name
         );
-        self.git(&["stash".into(), "-u".into()])
+        self.git_with_configured_timezone(&["stash".into(), "-u".into()])
     }
 
     fn pop_stash_blocking(&self) -> Result<String, String> {
