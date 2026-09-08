@@ -45,7 +45,7 @@ DOCS_BUILD_DIR := $(DOCS_DIR)/build
 DEBUG_APP_BUNDLE := $(CARGO_TARGET_DIR)/debug/$(APP_NAME).app
 DEBUG_APP_EXECUTABLE := $(DEBUG_APP_BUNDLE)/Contents/MacOS/$(BIN_NAME)
 
-.PHONY: dev run build release check test doc resource-watch macos-app run-macos clean install uninstall
+.PHONY: dev run build release check fmt test doc resource-watch macos-app run-macos clean install uninstall
 
 ifeq ($(UNAME_S),Darwin)
 dev: macos-app
@@ -65,6 +65,9 @@ release:
 
 check:
 	$(CARGO_ENV) $(CARGO) check
+
+fmt:
+	$(CARGO_ENV) $(CARGO) fmt --all
 
 test:
 	$(CARGO_ENV) $(CARGO) test

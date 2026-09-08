@@ -532,6 +532,33 @@ define_class!(
                 .charactersIgnoringModifiers()
                 .map(|text| text.to_string())
                 .unwrap_or_default();
+            let mut modifier_parameter = 1;
+            if modifiers.contains(NSEventModifierFlags::Shift) {
+                modifier_parameter += 1;
+            }
+            if modifiers.contains(NSEventModifierFlags::Option) {
+                modifier_parameter += 2;
+            }
+            if modifiers.contains(NSEventModifierFlags::Control) {
+                modifier_parameter += 4;
+            }
+            if modifiers.contains(NSEventModifierFlags::Command) {
+                modifier_parameter += 8;
+            }
+            let disambiguates_modified_keys = self
+                .ivars()
+                .session
+                .borrow()
+                .as_ref()
+                .is_some_and(TerminalSession::disambiguates_modified_keys);
+            if disambiguates_modified_keys
+                && modifier_parameter != 1
+                && let Some(sequence) =
+                    terminal_special_key(event.keyCode(), modifier_parameter)
+            {
+                self.send_input(sequence.into_bytes());
+                return;
+            }
             if modifiers.contains(NSEventModifierFlags::Command) {
                 let font_delta = match (unmodified.as_str(), event.keyCode()) {
                     ("=" | "+", _) | (_, 69) => Some(1.0),
@@ -571,8 +598,8 @@ define_class!(
                 self.send_input(vec![(character.to_ascii_uppercase() as u8) & 0x1f]);
                 return;
             }
-            if let Some(sequence) = terminal_special_key(event.keyCode()) {
-                self.send_input(sequence.as_bytes().to_vec());
+            if let Some(sequence) = terminal_special_key(event.keyCode(), 1) {
+                self.send_input(sequence.into_bytes());
                 return;
             }
             self.interpretKeyEvents(&NSArray::from_slice(&[event]));
@@ -1425,25 +1452,49 @@ fn terminal_input_text(string: &AnyObject) -> String {
     }
 }
 
-fn terminal_special_key(key_code: u16) -> Option<&'static str> {
+fn terminal_special_key(key_code: u16, modifier_parameter: u8) -> Option<String> {
+    if modifier_parameter != 1 {
+        let sequence = match key_code {
+            36 | 76 => format!("\x1b[13;{modifier_parameter}:1u"),
+            48 => format!("\x1b[9;{modifier_parameter}:1u"),
+            51 => format!("\x1b[127;{modifier_parameter}:1u"),
+            53 => format!("\x1b[27;{modifier_parameter}:1u"),
+            117 => format!("\x1b[3;{modifier_parameter}~"),
+            123 => format!("\x1b[1;{modifier_parameter}D"),
+            124 => format!("\x1b[1;{modifier_parameter}C"),
+            125 => format!("\x1b[1;{modifier_parameter}B"),
+            126 => format!("\x1b[1;{modifier_parameter}A"),
+            115 => format!("\x1b[1;{modifier_parameter}H"),
+            119 => format!("\x1b[1;{modifier_parameter}F"),
+            116 => format!("\x1b[5;{modifier_parameter}~"),
+            121 => format!("\x1b[6;{modifier_parameter}~"),
+            122 => format!("\x1b[11;{modifier_parameter}~"),
+            120 => format!("\x1b[12;{modifier_parameter}~"),
+            99 => format!("\x1b[13;{modifier_parameter}~"),
+            118 => format!("\x1b[14;{modifier_parameter}~"),
+            _ => return None,
+        };
+        return Some(sequence);
+    }
+
     match key_code {
-        36 | 76 => Some("\r"),
-        48 => Some("\t"),
-        51 => Some("\x7f"),
-        53 => Some("\x1b"),
-        117 => Some("\x1b[3~"),
-        123 => Some("\x1b[D"),
-        124 => Some("\x1b[C"),
-        125 => Some("\x1b[B"),
-        126 => Some("\x1b[A"),
-        115 => Some("\x1b[H"),
-        119 => Some("\x1b[F"),
-        116 => Some("\x1b[5~"),
-        121 => Some("\x1b[6~"),
-        122 => Some("\x1bOP"),
-        120 => Some("\x1bOQ"),
-        99 => Some("\x1bOR"),
-        118 => Some("\x1bOS"),
+        36 | 76 => Some("\r".to_string()),
+        48 => Some("\t".to_string()),
+        51 => Some("\x7f".to_string()),
+        53 => Some("\x1b".to_string()),
+        117 => Some("\x1b[3~".to_string()),
+        123 => Some("\x1b[D".to_string()),
+        124 => Some("\x1b[C".to_string()),
+        125 => Some("\x1b[B".to_string()),
+        126 => Some("\x1b[A".to_string()),
+        115 => Some("\x1b[H".to_string()),
+        119 => Some("\x1b[F".to_string()),
+        116 => Some("\x1b[5~".to_string()),
+        121 => Some("\x1b[6~".to_string()),
+        122 => Some("\x1bOP".to_string()),
+        120 => Some("\x1bOQ".to_string()),
+        99 => Some("\x1bOR".to_string()),
+        118 => Some("\x1bOS".to_string()),
         _ => None,
     }
 }

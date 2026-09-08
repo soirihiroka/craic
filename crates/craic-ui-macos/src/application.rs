@@ -1280,6 +1280,15 @@ include!("application/helpers.rs");
 pub fn run() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
+    match crate::environment::import_login_shell_path() {
+        Ok(path) => log::info!(
+            "startup login shell PATH imported shell={} entries={} changed={}",
+            path.shell.to_string_lossy(),
+            path.entry_count,
+            path.changed
+        ),
+        Err(error) => log::warn!("startup login shell PATH import failed: {error}"),
+    }
     let (startup_options, startup_error) = match startup_options() {
         Ok(options) => (options, None),
         Err(error) => {

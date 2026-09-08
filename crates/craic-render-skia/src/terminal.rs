@@ -589,6 +589,13 @@ impl TerminalSession {
             .map_err(|error| io::Error::other(error.to_string()))
     }
 
+    pub fn disambiguates_modified_keys(&self) -> bool {
+        self.terminal
+            .lock()
+            .mode()
+            .contains(TermMode::DISAMBIGUATE_ESC_CODES)
+    }
+
     pub fn resize(&mut self, viewport: TerminalViewport) -> io::Result<()> {
         if self.viewport == viewport {
             return Ok(());
