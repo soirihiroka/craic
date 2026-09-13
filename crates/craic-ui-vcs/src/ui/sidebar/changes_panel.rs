@@ -1,7 +1,7 @@
 use super::super::{canvas_scroll, widgets};
 use super::changes::{
     ChangedFileContextCallback, ChangedFileItem, changed_file_factory, file_signature,
-    install_empty_space_unselect, set_realized_file_checks,
+    install_click_away_unselect, set_realized_file_checks,
     update_commit_button_sensitivity_for_paths,
 };
 use super::commit_panel::CommitPanel;
@@ -143,7 +143,6 @@ impl ChangesPanel {
             canvas_scroll::AutoscrollAxes::Vertical,
             "changes_list",
         );
-        install_empty_space_unselect(&files_scroller, &files_list, &selection);
 
         let initialize_button = gtk::Button::builder()
             .label("Initialize Git Repository")
@@ -200,6 +199,24 @@ impl ChangesPanel {
         root.add_named(&content, Some("content"));
         root.add_named(&status_page, Some("status"));
         root.set_visible_child_name("content");
+
+        install_click_away_unselect(root.upcast_ref(), &files_list, &selection);
+        // Reset the preview when tabbing into sidebar controls as well as clicking them.
+        // Keep focus changes inside the file list or its preview independent of selection.
+        for widget in [
+            commit_panel.root.clone().upcast::<gtk::Widget>(),
+            search_panel.widget().upcast::<gtk::Widget>(),
+            selection_header.clone().upcast::<gtk::Widget>(),
+        ] {
+            let focus = gtk::EventControllerFocus::new();
+            focus.connect_enter({
+                let selection = selection.clone();
+                move |_| {
+                    selection.unselect_all();
+                }
+            });
+            widget.add_controller(focus);
+        }
 
         let panel = Self {
             root,

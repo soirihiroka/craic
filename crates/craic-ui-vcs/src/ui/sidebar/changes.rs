@@ -234,24 +234,27 @@ pub fn set_realized_file_checks(view: &gtk::ListView, active: bool) {
     set_descendant_checks(view.upcast_ref(), active);
 }
 
-pub fn install_empty_space_unselect(
-    scroller: &gtk::ScrolledWindow,
+pub fn install_click_away_unselect(
+    root: &gtk::Widget,
     list: &gtk::ListView,
     selection: &gtk::SingleSelection,
 ) {
     let click = gtk::GestureClick::builder().button(1).build();
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
     click.connect_pressed({
-        let scroller = scroller.clone().upcast::<gtk::Widget>();
+        let root = root.downgrade();
         let list = list.clone().upcast::<gtk::Widget>();
         let selection = selection.clone();
 
         move |_, _, x, y| {
-            let Some(mut target) = scroller.pick(x, y, gtk::PickFlags::DEFAULT) else {
+            let Some(root) = root.upgrade() else {
+                return;
+            };
+            let Some(mut target) = root.pick(x, y, gtk::PickFlags::DEFAULT) else {
                 return;
             };
             loop {
-                if target.is::<gtk::Scrollbar>() {
+                if target.is::<gtk::Scrollbar>() || target.is::<gtk::Popover>() {
                     return;
                 }
                 let Some(parent) = target.parent() else {
@@ -260,7 +263,7 @@ pub fn install_empty_space_unselect(
                 if parent == list {
                     return;
                 }
-                if target == scroller {
+                if target == root {
                     break;
                 }
                 target = parent;
@@ -268,7 +271,7 @@ pub fn install_empty_space_unselect(
             selection.unselect_all();
         }
     });
-    scroller.add_controller(click);
+    root.add_controller(click);
 }
 
 fn set_descendant_checks(widget: &gtk::Widget, active: bool) {
