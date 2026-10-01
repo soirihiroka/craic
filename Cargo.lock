@@ -649,6 +649,8 @@ dependencies = [
  "libadwaita",
  "libpanel",
  "log",
+ "tempfile",
+ "yeslogic-fontconfig-sys",
 ]
 
 [[package]]

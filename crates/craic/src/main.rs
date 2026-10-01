@@ -1,4 +1,7 @@
 #[cfg(target_os = "linux")]
+mod fontconfig;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use adw::prelude::*;
     use gtk::{gio, glib};
@@ -11,6 +14,15 @@ mod linux {
     const APP_ID: &str = "dev.craic.Craic";
 
     pub fn run() -> glib::ExitCode {
+        // Keep the private configuration alive until all renderers have shut down.
+        // This must precede GTK initialization and the creation of any threads.
+        let font_config = match crate::fontconfig::prepare() {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("craic: unable to initialize safe font enumeration: {error}");
+                return glib::ExitCode::FAILURE;
+            }
+        };
         let (renderer, renderer_source) = match std::env::var_os("GSK_RENDERER") {
             Some(renderer) => (renderer, "environment"),
             None => {
@@ -24,6 +36,11 @@ mod linux {
         let crash_log_dir = craic_ui::install_crash_log();
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
         log::info!("startup process begin app_id={APP_ID}");
+        if let Some((_, skipped)) = font_config.as_ref() {
+            log::warn!(
+                "font initialization excluded {skipped} entries without a family name from Craic's private font configuration"
+            );
+        }
         log::info!(
             "startup renderer configured renderer={} source={renderer_source}",
             renderer.to_string_lossy()
