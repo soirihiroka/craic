@@ -14,8 +14,9 @@ mod linux {
     const APP_ID: &str = "dev.craic.Craic";
 
     pub fn run() -> glib::ExitCode {
-        // Keep the private configuration alive until all renderers have shut down.
-        // This must precede GTK initialization and the creation of any threads.
+        // Initialize the editor/diff's retained font collection before GTK or any
+        // threads start, then restore the environment before launching workers.
+        let original_font_config = std::env::var_os("FONTCONFIG_FILE");
         let font_config = match crate::fontconfig::prepare() {
             Ok(config) => config,
             Err(error) => {
@@ -23,6 +24,21 @@ mod linux {
                 return glib::ExitCode::FAILURE;
             }
         };
+        let skipped_fonts = font_config.as_ref().map_or(0, |(_, skipped)| *skipped);
+        if font_config.is_some() {
+            craic_ui_editor::code_editor::canvas::measure_font_metrics_headless(14.0, |size| {
+                (size + 9.0).ceil()
+            });
+            // SAFETY: GTK and application workers have not started. The retained
+            // font manager has already loaded its private configuration.
+            unsafe {
+                match original_font_config {
+                    Some(value) => std::env::set_var("FONTCONFIG_FILE", value),
+                    None => std::env::remove_var("FONTCONFIG_FILE"),
+                }
+            }
+        }
+        drop(font_config);
         let (renderer, renderer_source) = match std::env::var_os("GSK_RENDERER") {
             Some(renderer) => (renderer, "environment"),
             None => {
@@ -36,9 +52,9 @@ mod linux {
         let crash_log_dir = craic_ui::install_crash_log();
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
         log::info!("startup process begin app_id={APP_ID}");
-        if let Some((_, skipped)) = font_config.as_ref() {
+        if skipped_fonts > 0 {
             log::warn!(
-                "font initialization excluded {skipped} entries without a family name from Craic's private font configuration"
+                "font initialization excluded {skipped_fonts} entries without a family name from Craic's private font configuration"
             );
         }
         log::info!(

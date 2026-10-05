@@ -8,6 +8,7 @@ license.workspace = true
 adw.workspace = true
 craic-config.workspace = true
 craic-ui.workspace = true
+craic-ui-editor.workspace = true
 env_logger.workspace = true
 gtk.workspace = true
 libpanel.workspace = true

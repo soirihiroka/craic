@@ -643,6 +643,7 @@ version = "0.1.0"
 dependencies = [
  "craic-config",
  "craic-ui",
+ "craic-ui-editor",
  "craic-ui-macos",
  "env_logger",
  "gtk4",

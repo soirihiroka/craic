@@ -92,7 +92,7 @@ pub fn prepare() -> io::Result<Option<(NamedTempFile, usize)>> {
     writeln!(configuration, "</fontconfig>")?;
     configuration.flush()?;
     // SAFETY: The only caller runs at process startup, before GTK or workers can
-    // read the environment. The override applies only to this process and its children.
+    // read the environment. The caller restores it after retaining the font manager.
     unsafe { std::env::set_var("FONTCONFIG_FILE", configuration.path()) };
     Ok(Some((configuration, excluded.len())))
 }
