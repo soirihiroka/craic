@@ -42,30 +42,32 @@ pub struct HistoryRight {
 impl HistoryRight {
     pub fn new() -> Self {
         let title = widgets::title("Select a commit");
-        title.set_wrap(true);
-        title.set_wrap_mode(pango::WrapMode::WordChar);
+        title.set_wrap(false);
+        title.set_single_line_mode(true);
+        title.set_lines(1);
         title.set_halign(gtk::Align::Fill);
         title.set_xalign(0.0);
         title.set_width_chars(1);
-        title.set_ellipsize(pango::EllipsizeMode::None);
+        title.set_ellipsize(pango::EllipsizeMode::End);
         title.set_selectable(true);
         title.set_hexpand(true);
 
         let comment = widgets::muted("");
-        comment.set_wrap(true);
-        comment.set_wrap_mode(pango::WrapMode::WordChar);
+        comment.set_wrap(false);
+        comment.set_single_line_mode(true);
+        comment.set_lines(1);
         comment.set_hexpand(true);
         comment.set_halign(gtk::Align::Fill);
         comment.set_width_chars(1);
         comment.set_xalign(0.0);
-        comment.set_ellipsize(pango::EllipsizeMode::None);
+        comment.set_ellipsize(pango::EllipsizeMode::End);
         comment.set_selectable(true);
         comment.set_visible(false);
 
         let title_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(4)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .hexpand(true)
             .build();
         title_box.append(&title);

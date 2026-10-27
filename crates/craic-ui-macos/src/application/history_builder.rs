@@ -127,6 +127,11 @@ impl AppDelegate {
         );
         title.setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
         title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        title.setMaximumNumberOfLines(1);
+        if let Some(cell) = title.cell() {
+            cell.setUsesSingleLineMode(true);
+            cell.setTruncatesLastVisibleLine(true);
+        }
         title.setSelectable(true);
         content_root.addSubview(&title);
 
@@ -195,7 +200,7 @@ impl AppDelegate {
         deleted.setHidden(true);
         content_root.addSubview(&deleted);
 
-        let comment = NSTextField::wrappingLabelWithString(&NSString::new(), mtm);
+        let comment = NSTextField::labelWithString(&NSString::new(), mtm);
         comment.setFrame(NSRect::new(
             NSPoint::new(20.0, content_bounds.size.height - 88.0),
             NSSize::new((content_bounds.size.width - 40.0).max(1.0), 38.0),
@@ -203,7 +208,12 @@ impl AppDelegate {
         comment.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
         );
-        comment.setMaximumNumberOfLines(2);
+        comment.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        comment.setMaximumNumberOfLines(1);
+        if let Some(cell) = comment.cell() {
+            cell.setUsesSingleLineMode(true);
+            cell.setTruncatesLastVisibleLine(true);
+        }
         comment.setTextColor(Some(&NSColor::secondaryLabelColor()));
         comment.setSelectable(true);
         content_root.addSubview(&comment);
