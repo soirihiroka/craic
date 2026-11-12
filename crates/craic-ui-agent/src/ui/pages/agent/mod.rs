@@ -31,13 +31,6 @@ pub struct AgentPage {
 }
 
 #[derive(Clone)]
-pub(super) struct HistoryIndicator {
-    root: gtk::Box,
-    spinner: adw::Spinner,
-    label: gtk::Label,
-}
-
-#[derive(Clone)]
 struct AgentPageState {
     list: Rc<AgentList>,
     chat: Rc<AgentChat>,
@@ -65,7 +58,7 @@ impl AgentPage {
         log::info!("agent page initialization started");
         let chat = Rc::new(AgentChat::new(self.ctx.clone()));
         let state = AgentPageState {
-            list: AgentList::new(self.ctx.clone(), &chat.history_indicator),
+            list: AgentList::new(self.ctx.clone()),
             chat,
         };
         let workspace = self.ctx.workspace_ref();

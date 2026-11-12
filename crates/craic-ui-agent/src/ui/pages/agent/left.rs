@@ -1,5 +1,6 @@
 use adw::prelude::*;
-use gtk::glib;
+use gtk::glib::prelude::ToVariant;
+use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -76,13 +77,12 @@ pub struct AgentList {
     ctx: super::PageContext,
     codex_history: Arc<Mutex<Option<agent_history::CodexHistoryReader>>>,
     grok_history: Arc<Mutex<Option<agent_history::GrokHistoryReader>>>,
-    history_status: gtk::Label,
-    history_loading_row: gtk::Box,
-    history_spinner: adw::Spinner,
-    grok_button: gtk::Button,
-    opencode_button: gtk::Button,
-    codex_cli_button: gtk::Button,
-    agy_button: gtk::Button,
+    history_status: gtk::Stack,
+    history_loading_label: gtk::Label,
+    history_indicator_delay: Rc<RefCell<Option<glib::SourceId>>>,
+    history_loaded: Rc<Cell<bool>>,
+    provider_button: adw::SplitButton,
+    selected_provider: Rc<Cell<AgentLaunch>>,
     search_panel: SearchPanel,
     list: gtk::ListBox,
     scroller: gtk::ScrolledWindow,
@@ -264,29 +264,6 @@ impl TimelineRow<'_> {
             TimelineRow::History(row) => u64::try_from(row.id).unwrap_or(0),
         }
     }
-}
-
-fn new_agent_button(provider: &dyn AgentProvider) -> gtk::Button {
-    let label_text = provider.label();
-    let icon = gtk::Image::from_icon_name(provider.session_icon_name());
-    icon.set_pixel_size(AGENT_ICON_PIXEL_SIZE);
-
-    let label = gtk::Label::new(Some(label_text));
-
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(4)
-        .build();
-    content.append(&icon);
-    content.append(&label);
-
-    let button = gtk::Button::builder()
-        .child(&content)
-        .tooltip_text(format!("New {label_text} chat"))
-        .halign(gtk::Align::Start)
-        .build();
-    button.add_css_class("flat");
-    button
 }
 
 fn sorted_tags(tags: &HashSet<String>) -> Vec<String> {

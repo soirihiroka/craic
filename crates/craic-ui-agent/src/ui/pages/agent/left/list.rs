@@ -1,5 +1,5 @@
 impl AgentList {
-    pub fn new(ctx: super::PageContext, indicator: &super::HistoryIndicator) -> Rc<Self> {
+    pub fn new(ctx: super::PageContext) -> Rc<Self> {
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
         list.add_css_class("navigation-sidebar");
@@ -28,35 +28,123 @@ impl AgentList {
             "agent_list",
         );
 
-        let grok_button = new_agent_button(&provider::grok::PROVIDER);
-        let opencode_button = new_agent_button(&provider::opencode::PROVIDER);
-        let codex_cli_button = new_agent_button(&provider::codex::PROVIDER);
-        let agy_button = new_agent_button(&provider::agy::PROVIDER);
+        let selected_provider = Rc::new(Cell::new(AgentLaunch::CodexCli));
+        let initial_provider = selected_provider.get().terminal_provider();
+        let provider_icon = gtk::Image::from_icon_name(initial_provider.session_icon_name());
+        provider_icon.set_pixel_size(AGENT_ICON_PIXEL_SIZE);
+        let provider_label = gtk::Label::new(Some(initial_provider.label()));
+        let provider_content = gtk::Box::builder().spacing(6).build();
+        provider_content.append(&provider_icon);
+        provider_content.append(&provider_label);
+        let provider_button = adw::SplitButton::builder()
+            .child(&provider_content)
+            .tooltip_text(format!("New {} chat", initial_provider.label()))
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Center)
+            .build();
+        let menu = gio::Menu::new();
+        for launch in [
+            AgentLaunch::CodexCli,
+            AgentLaunch::Grok,
+            AgentLaunch::OpenCode,
+            AgentLaunch::Agy,
+        ] {
+            let provider = launch.terminal_provider();
+            let item = gio::MenuItem::new(Some(provider.label()), None);
+            item.set_icon(&gio::ThemedIcon::new(provider.session_icon_name()));
+            item.set_action_and_target_value(
+                Some("agent.provider"),
+                Some(&provider.provider_id().to_variant()),
+            );
+            menu.append_item(&item);
+        }
+        let provider_action = gio::SimpleAction::new_stateful(
+            "provider",
+            Some(glib::VariantTy::STRING),
+            &initial_provider.provider_id().to_variant(),
+        );
+        provider_action.connect_activate({
+            let selected_provider = selected_provider.clone();
+            let provider_button = provider_button.downgrade();
+            move |action, target| {
+                let Some(target) = target.and_then(|value| value.get::<String>()) else {
+                    return;
+                };
+                let Some(launch) = [
+                    AgentLaunch::CodexCli,
+                    AgentLaunch::Grok,
+                    AgentLaunch::OpenCode,
+                    AgentLaunch::Agy,
+                ]
+                .into_iter()
+                .find(|launch| launch.terminal_provider().provider_id() == target) else {
+                    return;
+                };
+                selected_provider.set(launch);
+                let provider = launch.terminal_provider();
+                provider_icon.set_icon_name(Some(provider.session_icon_name()));
+                provider_label.set_label(provider.label());
+                action.set_state(&target.to_variant());
+                if let Some(button) = provider_button.upgrade() {
+                    button.set_tooltip_text(Some(&format!("New {} chat", provider.label())));
+                }
+            }
+        });
+        let actions = gio::SimpleActionGroup::new();
+        actions.add_action(&provider_action);
+        provider_button.insert_action_group("agent", Some(&actions));
+        provider_button.set_menu_model(Some(&menu));
+
+        let history_loading_label = gtk::Label::builder()
+            .label("Loading history…")
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        let spinner = adw::Spinner::new();
+        spinner.set_size_request(18, 18);
+        let loading_status = gtk::Box::builder().spacing(6).build();
+        loading_status.append(&spinner);
+        loading_status.append(&history_loading_label);
+        let error_status = gtk::Box::builder().spacing(6).build();
+        let error_icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
+        error_icon.set_pixel_size(18);
+        error_status.append(&error_icon);
+        error_status.append(
+            &gtk::Label::builder()
+                .label("History unavailable")
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .build(),
+        );
+        let history_status = gtk::Stack::builder()
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .width_request(24)
+            .build();
+        history_status.add_named(
+            &gtk::Box::new(gtk::Orientation::Horizontal, 0),
+            Some("idle"),
+        );
+        history_status.add_named(&loading_status, Some("loading"));
+        history_status.add_named(&error_status, Some("error"));
+        history_status.set_visible_child_name("idle");
+        let bottom_bar = gtk::Box::builder()
+            .spacing(12)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(8)
+            .margin_bottom(8)
+            .build();
+        bottom_bar.append(&history_status);
+        bottom_bar.append(&provider_button);
 
         let search_panel = SearchPanel::new("Search agents");
         search_panel.set_options_visible(false);
         search_panel.set_navigation_visible(false);
-
-        let bottom_bar = gtk::Grid::builder()
-            .column_homogeneous(true)
-            .halign(gtk::Align::Center)
-            .column_spacing(8)
-            .row_spacing(4)
-            .margin_top(8)
-            .margin_bottom(8)
-            .build();
-        bottom_bar.attach(&grok_button, 0, 0, 1, 1);
-        bottom_bar.attach(&opencode_button, 1, 0, 1, 1);
-        bottom_bar.attach(&codex_cli_button, 0, 1, 1, 1);
-        bottom_bar.attach(&agy_button, 1, 1, 1, 1);
-
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .vexpand(true)
             .build();
-        let history_status = indicator.label.clone();
-        let history_spinner = indicator.spinner.clone();
-        let history_loading_row = indicator.root.clone();
         root.append(&search_panel.widget());
         root.append(&scroller_overlay);
         root.append(&bottom_bar);
@@ -66,13 +154,12 @@ impl AgentList {
             ctx,
             codex_history: Arc::new(Mutex::new(None)),
             history_status,
-            history_loading_row,
-            history_spinner,
+            history_loading_label,
+            history_indicator_delay: Rc::new(RefCell::new(None)),
+            history_loaded: Rc::new(Cell::new(false)),
             grok_history: Arc::new(Mutex::new(None)),
-            grok_button,
-            opencode_button,
-            codex_cli_button,
-            agy_button,
+            provider_button,
+            selected_provider,
             search_panel,
             list,
             scroller,
@@ -101,10 +188,7 @@ impl AgentList {
         agent_list.install_search_shortcuts(&agent_list.root);
         agent_list.install_search_shortcuts(&agent_list.list);
         agent_list.install_search_shortcuts(&agent_list.scroller);
-        agent_list.install_search_shortcuts(&agent_list.grok_button);
-        agent_list.install_search_shortcuts(&agent_list.opencode_button);
-        agent_list.install_search_shortcuts(&agent_list.codex_cli_button);
-        agent_list.install_search_shortcuts(&agent_list.agy_button);
+        agent_list.install_search_shortcuts(&agent_list.provider_button);
         agent_list.connect_selection();
         agent_list.connect_context_menu();
         agent_list.connect_auto_paging();
@@ -141,6 +225,9 @@ impl AgentList {
             next.repo_path().display()
         );
         self.workspace.replace(Some(next));
+        self.history_loaded.set(false);
+        self.history_status.set_visible_child_name("idle");
+        self.history_status.set_tooltip_text(None);
         self.history_warnings.borrow_mut().clear();
         self.search_panel.set_status("");
         if !is_local {
@@ -188,8 +275,10 @@ impl AgentList {
             .filter(|_| self.native_history_enabled.get())
         else {
             self.loading.set(false);
-            self.history_spinner.set_visible(false);
-            self.history_loading_row.set_visible(false);
+            if let Some(delay) = self.history_indicator_delay.borrow_mut().take() {
+                delay.remove();
+            }
+            self.history_status.set_visible_child_name("idle");
             self.history_rows.borrow_mut().clear();
             self.has_more.set(false);
             self.apply_rows();
@@ -206,15 +295,31 @@ impl AgentList {
         let provider_kind = self.ctx.system_ref().provider_kind;
         let codex_history = self.codex_history.clone();
         let grok_history = self.grok_history.clone();
-        self.history_status
-            .set_label(if self.history_rows.borrow().is_empty() {
-                "Loading history…"
-            } else {
+        self.history_loading_label
+            .set_label(if self.history_loaded.get() {
                 "Refreshing history…"
+            } else {
+                "Loading history…"
             });
-        self.history_status.set_visible(true);
-        self.history_spinner.set_visible(true);
-        self.history_loading_row.set_visible(true);
+        if let Some(delay) = self.history_indicator_delay.borrow_mut().take() {
+            delay.remove();
+        }
+        if !self.history_loaded.get() {
+            self.history_status.set_visible_child_name("loading");
+        } else {
+            let status = self.history_status.downgrade();
+            let loading = self.loading.clone();
+            let pending = self.history_indicator_delay.clone();
+            let delay = glib::timeout_add_local_once(Duration::from_millis(750), move || {
+                pending.borrow_mut().take();
+                if loading.get()
+                    && let Some(status) = status.upgrade()
+                {
+                    status.set_visible_child_name("loading");
+                }
+            });
+            self.history_indicator_delay.replace(Some(delay));
+        }
 
         thread::spawn({
             let workspace_key = workspace_key.clone();
@@ -295,10 +400,13 @@ impl AgentList {
                 Err(TryRecvError::Disconnected) => {
                     agent_list.loading.set(false);
                     log::warn!("agent history load worker disconnected");
-                    agent_list.history_spinner.set_visible(false);
+                    if let Some(delay) = agent_list.history_indicator_delay.borrow_mut().take() {
+                        delay.remove();
+                    }
+                    agent_list.history_status.set_visible_child_name("error");
                     agent_list
                         .history_status
-                        .set_label("Could not load history");
+                        .set_tooltip_text(Some("Could not load history"));
                     glib::ControlFlow::Break
                 }
             }
@@ -307,6 +415,9 @@ impl AgentList {
 
     fn finish_history_load(&self, load: AgentHistoryLoad) {
         self.loading.set(false);
+        if let Some(delay) = self.history_indicator_delay.borrow_mut().take() {
+            delay.remove();
+        }
         if !self.history_load_matches(&load) {
             log::debug!(
                 "discarding stale agent history load workspace={} query_len={} tags={} limit={}",
@@ -337,23 +448,21 @@ impl AgentList {
             self.history_warnings.replace(warnings);
         }
         let warning_text = self.history_warnings.borrow().join("\n");
-        self.history_status.set_label(if warning_text.is_empty() {
-            ""
-        } else {
-            "Could not load all provider history"
-        });
+        self.history_status
+            .set_visible_child_name(if warning_text.is_empty() {
+                "idle"
+            } else {
+                "error"
+            });
         self.history_status
             .set_tooltip_text((!warning_text.is_empty()).then_some(warning_text.as_str()));
-        self.history_spinner.set_visible(false);
-        self.history_status.set_visible(!warning_text.is_empty());
-        self.history_loading_row
-            .set_visible(!warning_text.is_empty());
         if let Some(tags) = load.tags {
             self.apply_tags(tags);
         }
 
         match load.rows {
             Ok(mut rows) => {
+                self.history_loaded.set(true);
                 let has_more = rows.len() > load.loaded_limit;
                 if has_more {
                     rows.truncate(load.loaded_limit);
@@ -392,29 +501,9 @@ impl AgentList {
     where
         F: Fn(AgentLaunch) + 'static,
     {
-        let callback = Rc::new(callback);
-
-        self.grok_button.connect_clicked({
-            let callback = callback.clone();
-
-            move |_| {
-                callback(AgentLaunch::Grok);
-            }
-        });
-        self.codex_cli_button.connect_clicked({
-            let callback = callback.clone();
-
-            move |_| {
-                callback(AgentLaunch::CodexCli);
-            }
-        });
-        self.opencode_button.connect_clicked({
-            let callback = callback.clone();
-            move |_| callback(AgentLaunch::OpenCode)
-        });
-        self.agy_button.connect_clicked(move |_| {
-            callback(AgentLaunch::Agy);
-        });
+        let selected_provider = self.selected_provider.clone();
+        self.provider_button
+            .connect_clicked(move |_| callback(selected_provider.get()));
     }
 
     pub fn add_session_row(

@@ -29,33 +29,7 @@ impl AgentChat {
         search_panel.set_key_capture_widget(&search_widget);
         search_panel.install_shortcuts(&search_widget);
         root.append(&search_widget);
-        let history_spinner = adw::Spinner::new();
-        history_spinner.set_size_request(18, 18);
-        let history_label = gtk::Label::builder()
-            .xalign(0.0)
-            .wrap(true)
-            .css_classes(["dim-label"])
-            .build();
-        let indicator_root = gtk::Box::builder()
-            .spacing(6)
-            .halign(gtk::Align::Start)
-            .valign(gtk::Align::End)
-            .margin_start(12)
-            .margin_bottom(12)
-            .can_target(false)
-            .visible(false)
-            .build();
-        indicator_root.append(&history_spinner);
-        indicator_root.append(&history_label);
-        let notebook_overlay = gtk::Overlay::builder().hexpand(true).vexpand(true).build();
-        notebook_overlay.set_child(Some(&notebook));
-        notebook_overlay.add_overlay(&indicator_root);
-        root.append(&notebook_overlay);
-        let history_indicator = super::HistoryIndicator {
-            root: indicator_root,
-            spinner: history_spinner,
-            label: history_label,
-        };
+        root.append(&notebook);
         let focus_handlers = Rc::new(RefCell::new(Vec::<Box<dyn Fn(bool)>>::new()));
         if let Some(application) = ctx.window().and_then(|window| window.application()) {
             focus_handlers.borrow_mut().push(Box::new(move |focused| {
@@ -65,7 +39,6 @@ impl AgentChat {
 
         let chat = Self {
             root,
-            history_indicator,
             ctx,
             prompt_bar,
             search_panel,

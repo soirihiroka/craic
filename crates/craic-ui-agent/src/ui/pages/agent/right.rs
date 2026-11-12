@@ -138,7 +138,6 @@ pub struct ActiveSessionStatus {
 
 pub struct AgentChat {
     pub root: gtk::Box,
-    pub(super) history_indicator: super::HistoryIndicator,
     ctx: PageContext,
     prompt_bar: PromptBar,
     search_panel: SearchPanel,
