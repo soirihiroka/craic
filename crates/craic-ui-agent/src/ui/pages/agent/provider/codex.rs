@@ -107,7 +107,24 @@ impl AgentShellIntegration for ShellIntegration {
 
 fn codex_title_from_text(text: &str) -> Option<String> {
     let lines = text.lines().collect::<Vec<_>>();
+    let mut session_picker = false;
     for (index, line) in lines.iter().enumerate() {
+        let normalized = normalize_title_text(line);
+        if matches!(
+            normalized.as_str(),
+            "Resume a previous session" | "Fork a previous session"
+        ) {
+            session_picker = true;
+            continue;
+        }
+        // Returning to the chat renders its banner after the picker. A picker
+        // row also uses `›`, but it is never the conversation's user prompt.
+        if normalized.contains("OpenAI Codex") {
+            session_picker = false;
+        }
+        if session_picker {
+            continue;
+        }
         let Some(title) = codex_prompt_title(line) else {
             continue;
         };

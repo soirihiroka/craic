@@ -59,7 +59,7 @@ impl AgentPage {
         let started = Instant::now();
         log::info!("agent page initialization started");
         let state = AgentPageState {
-            list: AgentList::new(),
+            list: AgentList::new(self.ctx.clone()),
             chat: Rc::new(AgentChat::new(self.ctx.clone())),
         };
         let workspace = self.ctx.workspace_ref();

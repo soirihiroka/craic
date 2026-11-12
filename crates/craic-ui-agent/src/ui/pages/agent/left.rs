@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -72,6 +73,9 @@ struct AgentListContextTarget {
 #[derive(Clone)]
 pub struct AgentList {
     pub root: gtk::Box,
+    ctx: super::PageContext,
+    codex_history: Arc<Mutex<Option<agent_history::CodexHistoryReader>>>,
+    history_status: gtk::Label,
     grok_button: gtk::Button,
     opencode_button: gtk::Button,
     codex_cli_button: gtk::Button,

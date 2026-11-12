@@ -1,5 +1,5 @@
 mod native;
-pub use native::{NativeHistory, list_native_sessions};
+pub use native::{CodexHistoryReader, NativeHistory, list_native_sessions};
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
@@ -567,8 +567,8 @@ fn history_connection() -> Result<Connection, rusqlite::Error> {
     }
 
     let conn = Connection::open(path)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", DB_BUSY_TIMEOUT_MS)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS agent_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -756,45 +756,6 @@ fn escape_like_pattern(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
-}
-
-fn newest_usable_codex_state_db() -> Option<PathBuf> {
-    let codex_dir = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
-    let mut paths = fs::read_dir(codex_dir)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("state_") && name.ends_with(".sqlite"))
-        })
-        .collect::<Vec<_>>();
-
-    paths.sort_by_key(|path| {
-        fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(UNIX_EPOCH)
-    });
-    paths.reverse();
-
-    paths
-        .into_iter()
-        .find(|path| codex_state_db_is_usable(path))
-}
-
-fn codex_state_db_is_usable(path: &Path) -> bool {
-    let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-        return false;
-    };
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads'",
-        [],
-        |_| Ok(()),
-    )
-    .is_ok()
 }
 
 pub fn unix_now_ms() -> i64 {

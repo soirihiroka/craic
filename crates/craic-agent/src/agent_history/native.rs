@@ -1,3 +1,6 @@
+mod codex;
+pub use codex::CodexHistoryReader;
+
 use super::*;
 use std::collections::HashMap;
 
@@ -22,13 +25,27 @@ pub fn list_native_sessions(
     limit: usize,
     title_query: Option<&str>,
     tag_filters: &[String],
+    codex: Result<&CodexHistoryReader, String>,
 ) -> Result<NativeHistory, String> {
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
     for (provider, result) in [
         (
             "Codex",
-            read_codex_sessions(workspace.repo_path(), &mut sessions),
+            codex
+                .and_then(|reader| {
+                    reader.list(
+                        workspace.repo_path(),
+                        if title_query.is_some_and(|query| !query.trim().is_empty())
+                            || !tag_filters.is_empty()
+                        {
+                            usize::MAX
+                        } else {
+                            limit
+                        },
+                    )
+                })
+                .map(|threads| sessions.extend(threads)),
         ),
         (
             "OpenCode",
@@ -44,8 +61,10 @@ pub fn list_native_sessions(
         }
     }
 
-    let conn = history_connection().map_err(db_error)?;
-    let tx = conn.unchecked_transaction().map_err(db_error)?;
+    let mut conn = history_connection().map_err(db_error)?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(db_error)?;
     let mut native_ids = HashSet::new();
     for mut session in sessions {
         session.title = normalize_title(&session.title);
@@ -66,16 +85,17 @@ pub fn list_native_sessions(
             tx.execute(
                 "UPDATE agent_sessions SET title = ?2, normalized_title = ?3,
                  created_at_ms = ?4, updated_at_ms = ?5, last_seen_at_ms = ?5,
-                 restore_state = 'restorable', session_uuid = cli_session_id
+                 restore_state = 'restorable', session_uuid = COALESCE(session_uuid, ?6)
                  WHERE id = ?1 AND (title <> ?2 OR normalized_title <> ?3
                    OR created_at_ms <> ?4 OR updated_at_ms <> ?5 OR last_seen_at_ms <> ?5
-                   OR restore_state <> 'restorable' OR session_uuid <> cli_session_id)",
+                   OR restore_state <> 'restorable' OR session_uuid IS NULL)",
                 params![
                     id,
                     session.title,
                     identity,
                     session.created_at_ms,
-                    session.updated_at_ms
+                    session.updated_at_ms,
+                    new_session_uuid()
                 ],
             )
             .map_err(db_error)?;
@@ -85,9 +105,9 @@ pub fn list_native_sessions(
                 "INSERT INTO agent_sessions
                  (session_uuid, provider, workspace_key, repo_path, title, normalized_title,
                   cli_session_id, restore_state, metadata_json, created_at_ms, updated_at_ms, last_seen_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?1, 'restorable', '{}', ?7, ?8, ?8)",
+                 VALUES (?9, ?2, ?3, ?4, ?5, ?6, ?1, 'restorable', '{}', ?7, ?8, ?8)",
                 params![session.id, session.provider, workspace.key(), workspace.repo_path().to_string_lossy(),
-                    session.title, identity, session.created_at_ms, session.updated_at_ms],
+                    session.title, identity, session.created_at_ms, session.updated_at_ms, new_session_uuid()],
             ).map_err(db_error)?;
             native_ids.insert(tx.last_insert_rowid());
         }
@@ -156,57 +176,6 @@ pub fn list_native_sessions(
         tags,
         warnings,
     })
-}
-
-fn read_codex_sessions(cwd: &Path, sessions: &mut Vec<NativeSession>) -> Result<(), String> {
-    let Some(path) = newest_usable_codex_state_db() else {
-        return Ok(());
-    };
-    let conn =
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db_error)?;
-    conn.pragma_update(None, "busy_timeout", DB_BUSY_TIMEOUT_MS)
-        .map_err(db_error)?;
-    let columns = conn
-        .prepare("PRAGMA table_info(threads)")
-        .map_err(db_error)?
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(db_error)?
-        .collect::<Result<HashSet<_>, _>>()
-        .map_err(db_error)?;
-    let created = if columns.contains("created_at_ms") {
-        "COALESCE(created_at_ms, created_at * 1000)"
-    } else {
-        "created_at * 1000"
-    };
-    let updated = if columns.contains("recency_at_ms") && columns.contains("updated_at_ms") {
-        "MAX(COALESCE(recency_at_ms, 0), COALESCE(updated_at_ms, updated_at * 1000))"
-    } else if columns.contains("updated_at_ms") {
-        "COALESCE(updated_at_ms, updated_at * 1000)"
-    } else {
-        "updated_at * 1000"
-    };
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT id, title, {created}, {updated} FROM threads
-         WHERE cwd = ?1 AND archived = 0
-           AND CASE WHEN json_valid(source) THEN json_type(source, '$.subagent') IS NULL ELSE 1 END"
-        ))
-        .map_err(db_error)?;
-    sessions.extend(
-        stmt.query_map(params![cwd.to_string_lossy()], |row| {
-            Ok(NativeSession {
-                provider: "codex",
-                id: row.get(0)?,
-                title: row.get(1)?,
-                created_at_ms: row.get(2)?,
-                updated_at_ms: row.get(3)?,
-            })
-        })
-        .map_err(db_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_error)?,
-    );
-    Ok(())
 }
 
 fn read_opencode_sessions(cwd: &Path, sessions: &mut Vec<NativeSession>) -> Result<(), String> {

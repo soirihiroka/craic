@@ -1,5 +1,5 @@
 impl AgentList {
-    pub fn new() -> Rc<Self> {
+    pub fn new(ctx: super::PageContext) -> Rc<Self> {
         if let Err(err) = agent_history::initialize_history_database() {
             log::warn!("agent history database initialization failed: {err}");
         }
@@ -59,12 +59,26 @@ impl AgentList {
             .orientation(gtk::Orientation::Vertical)
             .vexpand(true)
             .build();
+        let history_status = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .margin_bottom(6)
+            .css_classes(["dim-label"])
+            .visible(false)
+            .build();
         root.append(&search_panel.widget());
+        root.append(&history_status);
         root.append(&scroller_overlay);
         root.append(&bottom_bar);
 
         let agent_list = Rc::new(Self {
             root,
+            ctx,
+            codex_history: Arc::new(Mutex::new(None)),
+            history_status,
             grok_button,
             opencode_button,
             codex_cli_button,
@@ -194,6 +208,14 @@ impl AgentList {
         let selected_tags = sorted_tags(&self.selected_tags.borrow());
         let loaded_limit = self.loaded_limit.get();
         let (sender, receiver) = mpsc::channel();
+        let shell = self.ctx.shell();
+        let workspace_ref = self.ctx.workspace_ref();
+        let provider_kind = self.ctx.system_ref().provider_kind;
+        let codex_history = self.codex_history.clone();
+        if self.history_rows.borrow().is_empty() && self.history_warnings.borrow().is_empty() {
+            self.history_status.set_label("Loading history…");
+            self.history_status.set_visible(true);
+        }
 
         thread::spawn({
             let workspace_key = workspace_key.clone();
@@ -201,11 +223,26 @@ impl AgentList {
             let selected_tags = selected_tags.clone();
 
             move || {
+                let codex = (|| {
+                    let mut reader = codex_history
+                        .lock()
+                        .map_err(|_| "Codex history worker lock failed".to_string())?;
+                    if reader.is_none() {
+                        let shell = shell
+                            .as_deref()
+                            .ok_or_else(|| "Shell access is unavailable".to_string())?;
+                        let config =
+                            craic_agent::app_server::config(shell, &workspace_ref, provider_kind)?;
+                        *reader = Some(agent_history::CodexHistoryReader::new(config)?);
+                    }
+                    Ok(reader.as_ref().unwrap().clone())
+                })();
                 let result = agent_history::list_native_sessions(
                     &workspace,
                     loaded_limit.saturating_add(1),
                     Some(&search_query),
                     &selected_tags,
+                    codex.as_ref().map_err(Clone::clone),
                 );
                 let (rows, tags, warnings) = match result {
                     Ok(history) => (
@@ -275,6 +312,15 @@ impl AgentList {
             });
             self.history_warnings.replace(warnings);
         }
+        let warning_text = self.history_warnings.borrow().join("\n");
+        self.history_status.set_label(if warning_text.is_empty() {
+            ""
+        } else {
+            "Could not load all provider history"
+        });
+        self.history_status
+            .set_tooltip_text((!warning_text.is_empty()).then_some(warning_text.as_str()));
+        self.history_status.set_visible(!warning_text.is_empty());
         if let Some(tags) = load.tags {
             self.apply_tags(tags);
         }
