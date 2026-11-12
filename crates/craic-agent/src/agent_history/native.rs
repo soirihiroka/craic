@@ -1,5 +1,7 @@
 mod codex;
 pub use codex::CodexHistoryReader;
+mod grok;
+pub use grok::GrokHistoryReader;
 
 use super::*;
 use std::collections::HashMap;
@@ -26,38 +28,43 @@ pub fn list_native_sessions(
     title_query: Option<&str>,
     tag_filters: &[String],
     codex: Result<&CodexHistoryReader, String>,
+    grok: Result<&GrokHistoryReader, String>,
 ) -> Result<NativeHistory, String> {
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
-    for (provider, result) in [
-        (
-            "Codex",
-            codex
-                .and_then(|reader| {
-                    reader.list(
-                        workspace.repo_path(),
-                        if title_query.is_some_and(|query| !query.trim().is_empty())
-                            || !tag_filters.is_empty()
-                        {
-                            usize::MAX
-                        } else {
-                            limit
-                        },
-                    )
-                })
-                .map(|threads| sessions.extend(threads)),
-        ),
-        (
-            "OpenCode",
-            read_opencode_sessions(workspace.repo_path(), &mut sessions),
-        ),
-        (
-            "Grok",
-            read_grok_sessions(workspace.repo_path(), &mut sessions),
-        ),
-    ] {
-        if let Err(error) = result {
-            warnings.push(format!("{provider} history: {error}"));
+    let provider_limit =
+        if title_query.is_some_and(|query| !query.trim().is_empty()) || !tag_filters.is_empty() {
+            usize::MAX
+        } else {
+            limit
+        };
+    let results = std::thread::scope(|scope| {
+        let codex = scope
+            .spawn(|| codex.and_then(|reader| reader.list(workspace.repo_path(), provider_limit)));
+        let grok = scope
+            .spawn(|| grok.and_then(|reader| reader.list(workspace.repo_path(), provider_limit)));
+        let mut opencode = Vec::new();
+        let opencode =
+            read_opencode_sessions(workspace.repo_path(), &mut opencode).map(|()| opencode);
+        [
+            (
+                "Codex",
+                codex
+                    .join()
+                    .unwrap_or_else(|_| Err("Codex history worker failed".to_string())),
+            ),
+            (
+                "Grok",
+                grok.join()
+                    .unwrap_or_else(|_| Err("Grok history worker failed".to_string())),
+            ),
+            ("OpenCode", opencode),
+        ]
+    });
+    for (provider, result) in results {
+        match result {
+            Ok(rows) => sessions.extend(rows),
+            Err(error) => warnings.push(format!("{provider} history: {error}")),
         }
     }
 
@@ -212,79 +219,5 @@ fn read_opencode_sessions(cwd: &Path, sessions: &mut Vec<NativeSession>) -> Resu
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_error)?,
     );
-    Ok(())
-}
-
-fn read_grok_sessions(cwd: &Path, sessions: &mut Vec<NativeSession>) -> Result<(), String> {
-    let home = std::env::var_os("GROK_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".grok")));
-    let Some(root) = home
-        .map(|home| home.join("sessions"))
-        .filter(|path| path.is_dir())
-    else {
-        return Ok(());
-    };
-    // Grok keeps its index in summary.json beneath each encoded working directory.
-    let clock = Connection::open_in_memory().map_err(db_error)?;
-    for directory in fs::read_dir(root).map_err(|err| err.to_string())? {
-        let directory = directory.map_err(|err| err.to_string())?.path();
-        if !directory.is_dir() {
-            continue;
-        }
-        for session in fs::read_dir(directory).map_err(|err| err.to_string())? {
-            let path = session
-                .map_err(|err| err.to_string())?
-                .path()
-                .join("summary.json");
-            if !path.is_file() {
-                continue;
-            }
-            let summary = fs::read(&path).map_err(|err| err.to_string())?;
-            // A provider may be replacing a summary while history is loading.
-            let Ok(value) = serde_json::from_slice::<Value>(&summary) else {
-                continue;
-            };
-            let Some(info) = value.get("info") else {
-                continue;
-            };
-            if info.get("cwd").and_then(Value::as_str).map(Path::new) != Some(cwd) {
-                continue;
-            }
-            let Some(id) = info
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-            else {
-                continue;
-            };
-            let title = ["generated_title", "session_summary"]
-                .iter()
-                .find_map(|key| {
-                    value
-                        .get(key)
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.trim().is_empty())
-                })
-                .unwrap_or("Untitled Grok session");
-            let created = value.get("created_at").and_then(Value::as_str);
-            let updated = value.get("updated_at").and_then(Value::as_str).or(created);
-            let (created_at_ms, updated_at_ms) = clock
-                .query_row(
-                    "SELECT COALESCE(CAST(unixepoch(?1, 'subsec') * 1000 AS INTEGER), 0),
-                        COALESCE(CAST(unixepoch(?2, 'subsec') * 1000 AS INTEGER), 0)",
-                    params![created, updated],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(db_error)?;
-            sessions.push(NativeSession {
-                provider: "grok",
-                id: id.to_string(),
-                title: normalize_title(title),
-                created_at_ms,
-                updated_at_ms,
-            });
-        }
-    }
     Ok(())
 }

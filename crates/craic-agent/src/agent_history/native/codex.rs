@@ -80,26 +80,36 @@ fn list_threads(
     loop {
         // Match the native resume picker's interactive, unarchived listing. Let
         // Codex resolve its own configured database, rollouts, names and paths.
-        let request_id = server
-            .thread_list(ThreadListParams {
-                cwd: Some(ThreadListCwdFilter::One(cwd.to_string_lossy().into_owned())),
-                limit: Some(100),
-                archived: Some(false),
-                cursor: cursor.clone(),
-                extra: json!({
-                    "sortKey": "updated_at",
-                    "modelProviders": [],
-                    "useStateDbOnly": false,
-                    "includeAttachedThreads": false,
-                    "currentAccountOnly": true
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
-                ..Default::default()
+        let mut params = ThreadListParams {
+            cwd: Some(ThreadListCwdFilter::One(cwd.to_string_lossy().into_owned())),
+            limit: Some(limit.saturating_sub(sessions.len()).clamp(1, 100) as u32),
+            archived: Some(false),
+            cursor: cursor.clone(),
+            extra: json!({
+                "sortKey": "updated_at",
+                "modelProviders": [],
+                "useStateDbOnly": true,
+                "includeAttachedThreads": false,
+                "currentAccountOnly": true
             })
+            .as_object()
+            .unwrap()
+            .clone(),
+            ..Default::default()
+        };
+        let request_id = server
+            .thread_list(params.clone())
             .map_err(|error| error.to_string())?;
-        let result = wait_for_response(server, Some(&request_id))?;
+        let result = match wait_for_response(server, Some(&request_id)) {
+            Err(error) if error.contains("state DB unavailable") => {
+                params.extra.insert("useStateDbOnly".into(), json!(false));
+                let request_id = server
+                    .thread_list(params)
+                    .map_err(|error| error.to_string())?;
+                wait_for_response(server, Some(&request_id))?
+            }
+            result => result?,
+        };
         let threads = result
             .get("data")
             .and_then(Value::as_array)

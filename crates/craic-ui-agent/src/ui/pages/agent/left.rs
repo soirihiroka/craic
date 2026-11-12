@@ -75,7 +75,10 @@ pub struct AgentList {
     pub root: gtk::Box,
     ctx: super::PageContext,
     codex_history: Arc<Mutex<Option<agent_history::CodexHistoryReader>>>,
+    grok_history: Arc<Mutex<Option<agent_history::GrokHistoryReader>>>,
     history_status: gtk::Label,
+    history_loading_row: gtk::Box,
+    history_spinner: adw::Spinner,
     grok_button: gtk::Button,
     opencode_button: gtk::Button,
     codex_cli_button: gtk::Button,
@@ -263,8 +266,9 @@ impl TimelineRow<'_> {
     }
 }
 
-fn new_agent_button(label_text: &str) -> gtk::Button {
-    let icon = gtk::Image::from_icon_name("list-add-symbolic");
+fn new_agent_button(provider: &dyn AgentProvider) -> gtk::Button {
+    let label_text = provider.label();
+    let icon = gtk::Image::from_icon_name(provider.session_icon_name());
     icon.set_pixel_size(AGENT_ICON_PIXEL_SIZE);
 
     let label = gtk::Label::new(Some(label_text));
@@ -279,7 +283,7 @@ fn new_agent_button(label_text: &str) -> gtk::Button {
     let button = gtk::Button::builder()
         .child(&content)
         .tooltip_text(format!("New {label_text} chat"))
-        .halign(gtk::Align::Center)
+        .halign(gtk::Align::Start)
         .build();
     button.add_css_class("flat");
     button

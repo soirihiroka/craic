@@ -1,8 +1,5 @@
 impl AgentList {
-    pub fn new(ctx: super::PageContext) -> Rc<Self> {
-        if let Err(err) = agent_history::initialize_history_database() {
-            log::warn!("agent history database initialization failed: {err}");
-        }
+    pub fn new(ctx: super::PageContext, indicator: &super::HistoryIndicator) -> Rc<Self> {
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
         list.add_css_class("navigation-sidebar");
@@ -31,46 +28,36 @@ impl AgentList {
             "agent_list",
         );
 
-        let grok_button = new_agent_button(provider::grok::PROVIDER.label());
-        let opencode_button = new_agent_button(provider::opencode::PROVIDER.label());
-        let codex_cli_button = new_agent_button(provider::codex::PROVIDER.label());
-        let agy_button = new_agent_button(provider::agy::PROVIDER.label());
+        let grok_button = new_agent_button(&provider::grok::PROVIDER);
+        let opencode_button = new_agent_button(&provider::opencode::PROVIDER);
+        let codex_cli_button = new_agent_button(&provider::codex::PROVIDER);
+        let agy_button = new_agent_button(&provider::agy::PROVIDER);
 
         let search_panel = SearchPanel::new("Search agents");
         search_panel.set_options_visible(false);
         search_panel.set_navigation_visible(false);
 
-        let bottom_bar = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .min_children_per_line(2)
-            .max_children_per_line(2)
+        let bottom_bar = gtk::Grid::builder()
+            .column_homogeneous(true)
             .halign(gtk::Align::Center)
             .column_spacing(8)
             .row_spacing(4)
             .margin_top(8)
             .margin_bottom(8)
             .build();
-        bottom_bar.append(&grok_button);
-        bottom_bar.append(&opencode_button);
-        bottom_bar.append(&codex_cli_button);
-        bottom_bar.append(&agy_button);
+        bottom_bar.attach(&grok_button, 0, 0, 1, 1);
+        bottom_bar.attach(&opencode_button, 1, 0, 1, 1);
+        bottom_bar.attach(&codex_cli_button, 0, 1, 1, 1);
+        bottom_bar.attach(&agy_button, 1, 1, 1, 1);
 
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .vexpand(true)
             .build();
-        let history_status = gtk::Label::builder()
-            .xalign(0.0)
-            .wrap(true)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(6)
-            .margin_bottom(6)
-            .css_classes(["dim-label"])
-            .visible(false)
-            .build();
+        let history_status = indicator.label.clone();
+        let history_spinner = indicator.spinner.clone();
+        let history_loading_row = indicator.root.clone();
         root.append(&search_panel.widget());
-        root.append(&history_status);
         root.append(&scroller_overlay);
         root.append(&bottom_bar);
 
@@ -79,6 +66,9 @@ impl AgentList {
             ctx,
             codex_history: Arc::new(Mutex::new(None)),
             history_status,
+            history_loading_row,
+            history_spinner,
+            grok_history: Arc::new(Mutex::new(None)),
             grok_button,
             opencode_button,
             codex_cli_button,
@@ -162,7 +152,8 @@ impl AgentList {
         self.history_rows.borrow_mut().clear();
         self.search_panel.set_tags(Vec::new());
         self.apply_rows();
-        self.reload_workspace_history();
+        let list = self.clone();
+        glib::idle_add_local_once(move || list.reload_workspace_history());
     }
 
     pub fn install_search_shortcuts<W: IsA<gtk::Widget>>(&self, widget: &W) {
@@ -197,6 +188,8 @@ impl AgentList {
             .filter(|_| self.native_history_enabled.get())
         else {
             self.loading.set(false);
+            self.history_spinner.set_visible(false);
+            self.history_loading_row.set_visible(false);
             self.history_rows.borrow_mut().clear();
             self.has_more.set(false);
             self.apply_rows();
@@ -212,10 +205,16 @@ impl AgentList {
         let workspace_ref = self.ctx.workspace_ref();
         let provider_kind = self.ctx.system_ref().provider_kind;
         let codex_history = self.codex_history.clone();
-        if self.history_rows.borrow().is_empty() && self.history_warnings.borrow().is_empty() {
-            self.history_status.set_label("Loading history…");
-            self.history_status.set_visible(true);
-        }
+        let grok_history = self.grok_history.clone();
+        self.history_status
+            .set_label(if self.history_rows.borrow().is_empty() {
+                "Loading history…"
+            } else {
+                "Refreshing history…"
+            });
+        self.history_status.set_visible(true);
+        self.history_spinner.set_visible(true);
+        self.history_loading_row.set_visible(true);
 
         thread::spawn({
             let workspace_key = workspace_key.clone();
@@ -237,12 +236,33 @@ impl AgentList {
                     }
                     Ok(reader.as_ref().unwrap().clone())
                 })();
+                let grok = (|| {
+                    let mut reader = grok_history
+                        .lock()
+                        .map_err(|_| "Grok history worker lock failed".to_string())?;
+                    if reader.is_none() {
+                        let shell = shell
+                            .as_deref()
+                            .ok_or_else(|| "Shell access is unavailable".to_string())?;
+                        let grok = shell
+                            .which("grok")?
+                            .ok_or_else(|| "Grok CLI is not installed".to_string())?;
+                        let command = shell.fast_command(
+                            &workspace_ref.root,
+                            &grok,
+                            &["agent".to_string(), "stdio".to_string()],
+                        )?;
+                        *reader = Some(agent_history::GrokHistoryReader::new(command)?);
+                    }
+                    Ok(reader.as_ref().unwrap().clone())
+                })();
                 let result = agent_history::list_native_sessions(
                     &workspace,
                     loaded_limit.saturating_add(1),
                     Some(&search_query),
                     &selected_tags,
                     codex.as_ref().map_err(Clone::clone),
+                    grok.as_ref().map_err(Clone::clone),
                 );
                 let (rows, tags, warnings) = match result {
                     Ok(history) => (
@@ -275,6 +295,10 @@ impl AgentList {
                 Err(TryRecvError::Disconnected) => {
                     agent_list.loading.set(false);
                     log::warn!("agent history load worker disconnected");
+                    agent_list.history_spinner.set_visible(false);
+                    agent_list
+                        .history_status
+                        .set_label("Could not load history");
                     glib::ControlFlow::Break
                 }
             }
@@ -320,7 +344,10 @@ impl AgentList {
         });
         self.history_status
             .set_tooltip_text((!warning_text.is_empty()).then_some(warning_text.as_str()));
+        self.history_spinner.set_visible(false);
         self.history_status.set_visible(!warning_text.is_empty());
+        self.history_loading_row
+            .set_visible(!warning_text.is_empty());
         if let Some(tags) = load.tags {
             self.apply_tags(tags);
         }

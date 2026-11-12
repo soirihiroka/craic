@@ -19,7 +19,7 @@ impl AgentProvider for Provider {
         "Grok CLI"
     }
     fn session_icon_name(&self) -> &'static str {
-        "utilities-terminal-symbolic"
+        "craic-grok-symbolic"
     }
     fn command(
         &self,

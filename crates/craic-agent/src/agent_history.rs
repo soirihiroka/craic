@@ -1,5 +1,5 @@
 mod native;
-pub use native::{CodexHistoryReader, NativeHistory, list_native_sessions};
+pub use native::{CodexHistoryReader, GrokHistoryReader, NativeHistory, list_native_sessions};
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};

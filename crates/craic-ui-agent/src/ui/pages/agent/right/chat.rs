@@ -29,7 +29,33 @@ impl AgentChat {
         search_panel.set_key_capture_widget(&search_widget);
         search_panel.install_shortcuts(&search_widget);
         root.append(&search_widget);
-        root.append(&notebook);
+        let history_spinner = adw::Spinner::new();
+        history_spinner.set_size_request(18, 18);
+        let history_label = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["dim-label"])
+            .build();
+        let indicator_root = gtk::Box::builder()
+            .spacing(6)
+            .halign(gtk::Align::Start)
+            .valign(gtk::Align::End)
+            .margin_start(12)
+            .margin_bottom(12)
+            .can_target(false)
+            .visible(false)
+            .build();
+        indicator_root.append(&history_spinner);
+        indicator_root.append(&history_label);
+        let notebook_overlay = gtk::Overlay::builder().hexpand(true).vexpand(true).build();
+        notebook_overlay.set_child(Some(&notebook));
+        notebook_overlay.add_overlay(&indicator_root);
+        root.append(&notebook_overlay);
+        let history_indicator = super::HistoryIndicator {
+            root: indicator_root,
+            spinner: history_spinner,
+            label: history_label,
+        };
         let focus_handlers = Rc::new(RefCell::new(Vec::<Box<dyn Fn(bool)>>::new()));
         if let Some(application) = ctx.window().and_then(|window| window.application()) {
             focus_handlers.borrow_mut().push(Box::new(move |focused| {
@@ -39,13 +65,16 @@ impl AgentChat {
 
         let chat = Self {
             root,
+            history_indicator,
             ctx,
             prompt_bar,
             search_panel,
             search_options: TerminalSearchOptions::new(),
             notebook,
             sessions: Rc::new(RefCell::new(Vec::new())),
-            next_session_id: Rc::new(Cell::new(1)),
+            // Restored tabs use positive SQLite row IDs. New terminal tabs use
+            // the upper half of u64, so launching never has to wait for history.
+            next_session_id: Rc::new(Cell::new(1 << 63)),
             working_directory: Rc::new(RefCell::new(initial_workspace_path)),
             workspace_history: Rc::new(RefCell::new(initial_workspace_history)),
             new_session_callback: Rc::new(RefCell::new(None)),
@@ -421,7 +450,6 @@ impl AgentChat {
     }
 
     fn reserve_session_id(&self) -> u64 {
-        self.sync_next_session_id_with_history();
         let mut session_id = self.next_session_id.get().max(1);
         while session_by_id(&self.sessions, session_id).is_some() {
             session_id = session_id.saturating_add(1);
@@ -433,21 +461,6 @@ impl AgentChat {
     fn reserve_session_id_at_least(&self, session_id: u64) {
         if session_id >= self.next_session_id.get() {
             self.next_session_id.set(session_id.saturating_add(1));
-        }
-    }
-
-    fn sync_next_session_id_with_history(&self) {
-        match agent_history::max_local_session_id() {
-            Ok(Some(max_id)) => match history_session_id(max_id) {
-                Ok(max_session_id) => self.reserve_session_id_at_least(max_session_id),
-                Err(err) => {
-                    log::warn!("agent history max session id ignored: {err}");
-                }
-            },
-            Ok(None) => {}
-            Err(err) => {
-                log::warn!("agent history max session id lookup failed: {err}");
-            }
         }
     }
 

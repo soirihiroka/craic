@@ -17,9 +17,7 @@ use left::{AgentList, AgentListContextAction, AgentListSelection};
 use right::AgentChat;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 pub const AGENT_ICON_PIXEL_SIZE: i32 = 18;
 
@@ -30,6 +28,13 @@ pub struct AgentPage {
     initializing: Rc<Cell<bool>>,
     init_callbacks: Rc<RefCell<Vec<PageInitializeComplete>>>,
     pending_commands: Rc<RefCell<Vec<PageCommand>>>,
+}
+
+#[derive(Clone)]
+pub(super) struct HistoryIndicator {
+    root: gtk::Box,
+    spinner: adw::Spinner,
+    label: gtk::Label,
 }
 
 #[derive(Clone)]
@@ -58,9 +63,10 @@ impl AgentPage {
 
         let started = Instant::now();
         log::info!("agent page initialization started");
+        let chat = Rc::new(AgentChat::new(self.ctx.clone()));
         let state = AgentPageState {
-            list: AgentList::new(self.ctx.clone()),
-            chat: Rc::new(AgentChat::new(self.ctx.clone())),
+            list: AgentList::new(self.ctx.clone(), &chat.history_indicator),
+            chat,
         };
         let workspace = self.ctx.workspace_ref();
         state.list.set_workspace_key(
@@ -504,48 +510,14 @@ impl Page for AgentPage {
         }
 
         log::info!("agent page initialization queued");
-        let (sender, receiver) = mpsc::channel();
-        let shell = self.ctx.shell();
-        thread::spawn(move || {
-            let started = Instant::now();
-            if let Some(shell) = shell {
-                for program in ["codex", "grok", "agy", "opencode"] {
-                    match shell.which(program) {
-                        Ok(Some(path)) => {
-                            log::debug!("agent page warmed command program={program} path={path}");
-                        }
-                        Ok(None) => {
-                            log::debug!("agent page command unavailable program={program}");
-                        }
-                        Err(err) => {
-                            log::warn!("agent page command warm failed program={program}: {err}");
-                        }
-                    }
-                }
-            }
-            log::info!(
-                "agent page background initialization completed elapsed_ms={}",
-                started.elapsed().as_millis()
-            );
-            let _ = sender.send(());
-        });
-
         let page = self.clone();
-        gtk::glib::timeout_add_local(Duration::from_millis(30), move || {
-            match receiver.try_recv() {
-                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
-                    page.finish_initialize();
-                    gtk::glib::ControlFlow::Break
-                }
-                Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
-            }
-        });
+        gtk::glib::idle_add_local_once(move || page.finish_initialize());
     }
 
     fn activate(&self) {
         if let Some(state) = self.state.borrow().as_ref() {
-            state.list.reload_workspace_history();
             state.chat.show();
+            state.list.reload_workspace_history();
             return;
         }
 
