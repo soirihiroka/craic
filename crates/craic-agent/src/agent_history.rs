@@ -1,15 +1,15 @@
+mod native;
+pub use native::{NativeHistory, list_native_sessions};
+
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DB_BUSY_TIMEOUT_MS: i32 = 3000;
-const DEFAULT_METADATA_JSON: &str = "{}";
-const CODEX_TIME_MATCH_WINDOW_MS: i64 = 5 * 60 * 1000;
-const CODEX_TIME_MATCH_AMBIGUITY_MS: i64 = 10 * 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceKey {
@@ -119,24 +119,6 @@ pub struct WorkspaceTag {
     pub session_count: usize,
 }
 
-#[derive(Clone, Debug)]
-pub struct AgentSessionUpsert {
-    pub provider_id: String,
-    pub workspace: WorkspaceKey,
-    pub title: String,
-    pub initial_restore_state: RestoreState,
-    pub session_uuid: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CodexMappingOutcome {
-    Restorable(String),
-    Ambiguous,
-    Missing,
-    Unsupported,
-    Skipped,
-}
-
 pub fn workspace_for_system_path(
     workspace_key: impl Into<String>,
     target_root: impl Into<String>,
@@ -153,243 +135,8 @@ pub fn normalize_title(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn default_title_should_persist(title: &str) -> bool {
-    let title = normalize_title(title);
-    let lower = title.to_ascii_lowercase();
-    !title.is_empty()
-        && !matches!(
-            lower.as_str(),
-            "new chat"
-                | "new app chat"
-                | "new codex chat"
-                | "new codex cli chat"
-                | "new agy chat"
-                | "new opencode chat"
-        )
-}
-
 pub fn initialize_history_database() -> Result<(), String> {
     history_connection().map(|_| ()).map_err(db_error)
-}
-
-pub fn upsert_session(input: AgentSessionUpsert) -> Result<AgentSessionRow, String> {
-    let title = normalize_title(&input.title);
-    if !default_title_should_persist(&title) {
-        return Err("default agent session title is not persisted".to_string());
-    }
-
-    let normalized_title = normalize_title_for_match(&title);
-    let now = unix_now_ms();
-    let conn = history_connection().map_err(db_error)?;
-    conn.execute(
-        "INSERT INTO agent_sessions (
-            session_uuid, provider, workspace_key, git_remote_url, repo_path, title,
-            normalized_title, restore_state, metadata_json, created_at_ms,
-            updated_at_ms, last_seen_at_ms
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10)
-        ON CONFLICT(provider, workspace_key, normalized_title) DO UPDATE SET
-            git_remote_url = excluded.git_remote_url,
-            repo_path = excluded.repo_path,
-            title = excluded.title,
-            cli_session_id = NULL,
-            restore_state = excluded.restore_state,
-            metadata_json = excluded.metadata_json,
-            updated_at_ms = excluded.updated_at_ms,
-            last_seen_at_ms = excluded.last_seen_at_ms,
-            ended_at_ms = NULL",
-        params![
-            input.session_uuid.unwrap_or_else(new_session_uuid),
-            input.provider_id,
-            input.workspace.key(),
-            input.workspace.git_remote_url(),
-            input.workspace.repo_path().to_string_lossy(),
-            title,
-            normalized_title,
-            input.initial_restore_state.as_str(),
-            DEFAULT_METADATA_JSON,
-            now,
-        ],
-    )
-    .map_err(db_error)?;
-
-    lookup_by_title(
-        &conn,
-        input.workspace.key(),
-        &input.provider_id,
-        &normalized_title,
-    )?
-    .ok_or_else(|| "agent session row was not readable after upsert".to_string())
-}
-
-pub fn upsert_restorable_session(
-    input: AgentSessionUpsert,
-    external_session_id: &str,
-) -> Result<AgentSessionRow, String> {
-    let title = normalize_title(&input.title);
-    let external_session_id = external_session_id.trim();
-    if title.is_empty() || external_session_id.is_empty() {
-        return Err("restorable agent session title or external id is empty".to_string());
-    }
-
-    let normalized_title = format!(
-        "{} [{}]",
-        normalize_title_for_match(&title),
-        external_session_id.to_ascii_lowercase()
-    );
-    let now = unix_now_ms();
-    let conn = history_connection().map_err(db_error)?;
-    let existing_id = conn
-        .query_row(
-            "SELECT id
-             FROM agent_sessions
-             WHERE provider = ?1
-               AND workspace_key = ?2
-               AND cli_session_id = ?3
-             ORDER BY id DESC
-             LIMIT 1",
-            params![
-                input.provider_id,
-                input.workspace.key(),
-                external_session_id
-            ],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(db_error)?;
-    if let Some(existing_id) = existing_id {
-        conn.execute(
-            "UPDATE agent_sessions
-             SET session_uuid = ?2,
-                 git_remote_url = ?3,
-                 repo_path = ?4,
-                 title = ?5,
-                 normalized_title = ?6,
-                 cli_session_id = ?2,
-                 restore_state = ?7,
-                 metadata_json = ?8,
-                 updated_at_ms = ?9,
-                 last_seen_at_ms = ?9,
-                 ended_at_ms = NULL
-             WHERE id = ?1",
-            params![
-                existing_id,
-                external_session_id,
-                input.workspace.git_remote_url(),
-                input.workspace.repo_path().to_string_lossy(),
-                title,
-                normalized_title,
-                RestoreState::Restorable.as_str(),
-                json!({ "native_app_session": true }).to_string(),
-                now,
-            ],
-        )
-        .map_err(db_error)?;
-        return lookup_by_title(
-            &conn,
-            input.workspace.key(),
-            &input.provider_id,
-            &normalized_title,
-        )?
-        .ok_or_else(|| "restorable agent session row was not readable after update".to_string());
-    }
-    conn.execute(
-        "INSERT INTO agent_sessions (
-            session_uuid, provider, workspace_key, git_remote_url, repo_path, title,
-            normalized_title, cli_session_id, restore_state, metadata_json,
-            created_at_ms, updated_at_ms, last_seen_at_ms
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11)
-        ON CONFLICT(provider, workspace_key, normalized_title) DO UPDATE SET
-            session_uuid = excluded.session_uuid,
-            git_remote_url = excluded.git_remote_url,
-            repo_path = excluded.repo_path,
-            title = excluded.title,
-            cli_session_id = excluded.cli_session_id,
-            restore_state = excluded.restore_state,
-            metadata_json = excluded.metadata_json,
-            updated_at_ms = excluded.updated_at_ms,
-            last_seen_at_ms = excluded.last_seen_at_ms,
-            ended_at_ms = NULL",
-        params![
-            input.session_uuid.unwrap_or_else(new_session_uuid),
-            input.provider_id,
-            input.workspace.key(),
-            input.workspace.git_remote_url(),
-            input.workspace.repo_path().to_string_lossy(),
-            title,
-            normalized_title,
-            external_session_id,
-            RestoreState::Restorable.as_str(),
-            json!({ "native_app_session": true }).to_string(),
-            now,
-        ],
-    )
-    .map_err(db_error)?;
-
-    lookup_by_title(
-        &conn,
-        input.workspace.key(),
-        &input.provider_id,
-        &normalized_title,
-    )?
-    .ok_or_else(|| "restorable agent session was not readable after upsert".to_string())
-}
-
-pub fn upsert_session_for_manual_id(
-    input: AgentSessionUpsert,
-    session_id: u64,
-) -> Result<AgentSessionRow, String> {
-    let title = normalize_title(&input.title);
-    if title.is_empty() {
-        return Err("agent session title is empty".to_string());
-    }
-
-    let normalized_title = if default_title_should_persist(&title) {
-        normalize_title_for_match(&title)
-    } else {
-        format!("{} #{session_id}", normalize_title_for_match(&title))
-    };
-    let now = unix_now_ms();
-    let conn = history_connection().map_err(db_error)?;
-    conn.execute(
-        "INSERT INTO agent_sessions (
-            session_uuid, provider, workspace_key, git_remote_url, repo_path, title,
-            normalized_title, restore_state, metadata_json, created_at_ms,
-            updated_at_ms, last_seen_at_ms
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10)
-        ON CONFLICT(provider, workspace_key, normalized_title) DO UPDATE SET
-            git_remote_url = excluded.git_remote_url,
-            repo_path = excluded.repo_path,
-            title = excluded.title,
-            restore_state = excluded.restore_state,
-            metadata_json = excluded.metadata_json,
-            updated_at_ms = excluded.updated_at_ms,
-            last_seen_at_ms = excluded.last_seen_at_ms,
-            ended_at_ms = NULL",
-        params![
-            input.session_uuid.unwrap_or_else(new_session_uuid),
-            input.provider_id,
-            input.workspace.key(),
-            input.workspace.git_remote_url(),
-            input.workspace.repo_path().to_string_lossy(),
-            title,
-            normalized_title,
-            input.initial_restore_state.as_str(),
-            DEFAULT_METADATA_JSON,
-            now,
-        ],
-    )
-    .map_err(db_error)?;
-
-    lookup_by_title(
-        &conn,
-        input.workspace.key(),
-        &input.provider_id,
-        &normalized_title,
-    )?
-    .ok_or_else(|| "agent session row was not readable after upsert".to_string())
 }
 
 pub fn list_sessions(
@@ -776,97 +523,6 @@ pub fn max_local_session_id() -> Result<Option<i64>, String> {
         .map_err(db_error)
 }
 
-pub fn update_mapping(
-    local_id: i64,
-    cli_session_id: Option<&str>,
-    restore_state: RestoreState,
-    metadata_json: &str,
-) -> Result<(), String> {
-    let conn = history_connection().map_err(db_error)?;
-    let now = unix_now_ms();
-    conn.execute(
-        "UPDATE agent_sessions
-         SET cli_session_id = ?2,
-             restore_state = ?3,
-             metadata_json = ?4,
-             updated_at_ms = ?5
-         WHERE id = ?1",
-        params![
-            local_id,
-            cli_session_id,
-            restore_state.as_str(),
-            metadata_json,
-            now,
-        ],
-    )
-    .map_err(db_error)?;
-    Ok(())
-}
-
-pub fn update_session_title(local_id: i64, title: &str) -> Result<AgentSessionRow, String> {
-    let title = normalize_title(title);
-    if !default_title_should_persist(&title) {
-        return Err("default agent session title is not persisted".to_string());
-    }
-
-    let conn = history_connection().map_err(db_error)?;
-    let normalized_title = normalize_title_for_match(&title);
-    let now = unix_now_ms();
-    conn.execute(
-        "UPDATE agent_sessions
-         SET title = ?2,
-             normalized_title = ?3,
-             updated_at_ms = ?4
-         WHERE id = ?1",
-        params![local_id, title, normalized_title, now],
-    )
-    .map_err(db_error)?;
-
-    lookup_session(local_id)?
-        .ok_or_else(|| format!("Agent history session {local_id} was not found."))
-}
-
-pub fn set_manual_session_id(local_id: i64, cli_session_id: &str) -> Result<(), String> {
-    let Some(row) = lookup_session(local_id)? else {
-        return Err(format!("Agent history session {local_id} was not found."));
-    };
-    let restore_state = if row.provider_id == "codex" {
-        RestoreState::Restorable
-    } else {
-        RestoreState::Unsupported
-    };
-    let metadata = json!({
-        "manual_cli_session_id": true,
-        "previous_restore_state": row.restore_state.as_str(),
-    })
-    .to_string();
-    update_mapping(local_id, Some(cli_session_id), restore_state, &metadata)?;
-    log::info!(
-        "agent history manual session id set local_id={} provider={} cli_session_id={} restore_state={}",
-        local_id,
-        row.provider_id,
-        cli_session_id,
-        restore_state.as_str()
-    );
-    Ok(())
-}
-
-pub fn suggested_cli_session_id(row: &AgentSessionRow) -> Option<String> {
-    row.cli_session_id
-        .clone()
-        .or_else(|| metadata_string(&row.metadata_json, "candidate_cli_session_id"))
-}
-
-pub fn cli_session_id_is_empty(local_id: i64) -> Result<bool, String> {
-    Ok(lookup_session(local_id)?.is_some_and(|row| {
-        row.cli_session_id
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .is_empty()
-    }))
-}
-
 pub fn mark_ended(local_id: i64) -> Result<(), String> {
     let conn = history_connection().map_err(db_error)?;
     let now = unix_now_ms();
@@ -882,80 +538,22 @@ pub fn mark_ended(local_id: i64) -> Result<(), String> {
     Ok(())
 }
 
-pub fn delete_session(local_id: i64) -> Result<(), String> {
-    let conn = history_connection().map_err(db_error)?;
-    let deleted = conn
+pub fn hide_native_session(local_id: i64) -> Result<(), String> {
+    let row =
+        lookup_session(local_id)?.ok_or_else(|| "Agent session was not found.".to_string())?;
+    let mut metadata = serde_json::from_str::<Value>(&row.metadata_json)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    metadata["hidden"] = Value::Bool(true);
+    history_connection()
+        .map_err(db_error)?
         .execute(
-            "DELETE FROM agent_sessions WHERE id = ?1",
-            params![local_id],
+            "UPDATE agent_sessions SET metadata_json = ?2 WHERE id = ?1",
+            params![local_id, metadata.to_string()],
         )
         .map_err(db_error)?;
-    if deleted == 0 {
-        return Err(format!("Agent history session {local_id} was not found."));
-    }
-    log::info!("agent history deleted local_id={local_id}");
     Ok(())
-}
-
-pub fn map_codex_session(local_id: i64) -> Result<CodexMappingOutcome, String> {
-    let Some(row) = lookup_session(local_id)? else {
-        return Ok(CodexMappingOutcome::Skipped);
-    };
-    if row.provider_id != "codex" {
-        update_mapping(
-            row.id,
-            row.cli_session_id.as_deref(),
-            RestoreState::Unsupported,
-            &row.metadata_json,
-        )?;
-        return Ok(CodexMappingOutcome::Unsupported);
-    }
-    if row.restore_state == RestoreState::Restorable && row.cli_session_id.is_some() {
-        return Ok(CodexMappingOutcome::Restorable(
-            row.cli_session_id.unwrap_or_default(),
-        ));
-    }
-
-    match find_codex_thread(&row) {
-        Ok(CodexThreadMatch::Matched(matched)) => {
-            let metadata = json!({
-                "codex_state_path": matched.state_path.to_string_lossy(),
-                "matched_field": matched.field,
-                "match_score": matched.score,
-                "recency_at_ms": matched.recency_at_ms,
-            })
-            .to_string();
-            update_mapping(
-                row.id,
-                Some(&matched.thread_id),
-                RestoreState::Restorable,
-                &metadata,
-            )?;
-            log::info!(
-                "agent history mapped codex session local_id={} cli_session_id={} field={} score={}",
-                row.id,
-                matched.thread_id,
-                matched.field,
-                matched.score
-            );
-            Ok(CodexMappingOutcome::Restorable(matched.thread_id))
-        }
-        Ok(CodexThreadMatch::Ambiguous(metadata)) => {
-            update_mapping(row.id, None, RestoreState::Ambiguous, &metadata)?;
-            log::warn!("agent history codex mapping ambiguous local_id={}", row.id);
-            Ok(CodexMappingOutcome::Ambiguous)
-        }
-        Ok(CodexThreadMatch::Missing(metadata)) => {
-            update_mapping(row.id, None, RestoreState::Missing, &metadata)?;
-            log::debug!("agent history codex mapping missing local_id={}", row.id);
-            Ok(CodexMappingOutcome::Missing)
-        }
-        Err(err) => {
-            let metadata = json!({ "error": err }).to_string();
-            update_mapping(row.id, None, RestoreState::Missing, &metadata)?;
-            Err(err)
-        }
-    }
 }
 
 fn history_connection() -> Result<Connection, rusqlite::Error> {
@@ -1067,26 +665,6 @@ fn ensure_history_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-fn lookup_by_title(
-    conn: &Connection,
-    workspace_key: &str,
-    provider_id: &str,
-    normalized_title: &str,
-) -> Result<Option<AgentSessionRow>, String> {
-    conn.query_row(
-        "SELECT id, session_uuid, provider, workspace_key, git_remote_url, repo_path, title,
-                normalized_title, task_description, normalized_task_description,
-                cli_session_id, restore_state, metadata_json,
-                created_at_ms, updated_at_ms, last_seen_at_ms, ended_at_ms
-         FROM agent_sessions
-         WHERE workspace_key = ?1 AND provider = ?2 AND normalized_title = ?3",
-        params![workspace_key, provider_id, normalized_title],
-        row_from_db,
-    )
-    .optional()
-    .map_err(db_error)
-}
-
 fn row_from_db(row: &rusqlite::Row<'_>) -> Result<AgentSessionRow, rusqlite::Error> {
     let restore_state: String = row.get(11)?;
     let repo_path: String = row.get(5)?;
@@ -1180,118 +758,10 @@ fn escape_like_pattern(text: &str) -> String {
         .replace('_', "\\_")
 }
 
-enum CodexThreadMatch {
-    Matched(MatchedCodexThread),
-    Ambiguous(String),
-    Missing(String),
-}
-
-struct MatchedCodexThread {
-    thread_id: String,
-    state_path: PathBuf,
-    field: &'static str,
-    score: i64,
-    recency_at_ms: i64,
-}
-
-struct CodexThreadCandidate {
-    id: String,
-    title: String,
-    preview: String,
-    first_user_message: String,
-    created_at_ms: i64,
-    recency_at_ms: i64,
-}
-
-fn find_codex_thread(row: &AgentSessionRow) -> Result<CodexThreadMatch, String> {
-    let Some(state_path) = newest_usable_codex_state_db() else {
-        return Ok(CodexThreadMatch::Missing(
-            json!({ "reason": "codex_state_db_not_found" }).to_string(),
-        ));
-    };
-
-    let conn = Connection::open_with_flags(&state_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|err| format!("Failed to open Codex state {}: {err}", state_path.display()))?;
-    conn.pragma_update(None, "busy_timeout", DB_BUSY_TIMEOUT_MS)
-        .map_err(db_error)?;
-
-    let cwd = row.repo_path.to_string_lossy().to_string();
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, title, preview, first_user_message, created_at_ms, recency_at_ms
-             FROM threads
-             WHERE source = 'cli'
-               AND cwd = ?1
-               AND archived = 0
-               AND preview <> ''
-             ORDER BY recency_at_ms DESC, updated_at_ms DESC",
-        )
-        .map_err(|err| {
-            format!(
-                "Failed to query Codex threads from {}: {err}",
-                state_path.display()
-            )
-        })?;
-
-    let candidates = stmt
-        .query_map(params![cwd], |row| {
-            Ok(CodexThreadCandidate {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                preview: row.get(2)?,
-                first_user_message: row.get(3)?,
-                created_at_ms: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                recency_at_ms: row.get(5)?,
-            })
-        })
-        .map_err(db_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_error)?;
-
-    let Some(best) = best_codex_match(&row.title, &candidates)
-        .or_else(|| best_codex_time_match(row, &candidates))
-    else {
-        return Ok(CodexThreadMatch::Missing(
-            json!({
-                "codex_state_path": state_path.to_string_lossy(),
-                "candidate_count": candidates.len(),
-            })
-            .to_string(),
-        ));
-    };
-
-    let best_score = best.score;
-    let ambiguous = candidates.iter().filter_map(|candidate| {
-        codex_candidate_match(&row.title, candidate).filter(|matched| matched.score == best_score)
-    });
-    let ambiguous_count = ambiguous.count();
-    if ambiguous_count > 1 {
-        return Ok(CodexThreadMatch::Ambiguous(
-            json!({
-                "codex_state_path": state_path.to_string_lossy(),
-                "candidate_count": candidates.len(),
-                "ambiguous_count": ambiguous_count,
-                "candidate_cli_session_id": best.thread_id,
-                "candidate_field": best.field,
-                "candidate_recency_at_ms": best.recency_at_ms,
-                "score": best_score,
-            })
-            .to_string(),
-        ));
-    }
-
-    Ok(CodexThreadMatch::Matched(MatchedCodexThread {
-        thread_id: best.thread_id,
-        state_path,
-        field: best.field,
-        score: best.score,
-        recency_at_ms: best.recency_at_ms,
-    }))
-}
-
 fn newest_usable_codex_state_db() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let codex_dir = PathBuf::from(home).join(".codex");
+    let codex_dir = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
     let mut paths = fs::read_dir(codex_dir)
         .ok()?
         .flatten()
@@ -1325,125 +795,6 @@ fn codex_state_db_is_usable(path: &Path) -> bool {
         |_| Ok(()),
     )
     .is_ok()
-}
-
-struct CandidateMatch {
-    thread_id: String,
-    field: &'static str,
-    score: i64,
-    recency_at_ms: i64,
-}
-
-fn best_codex_match(title: &str, candidates: &[CodexThreadCandidate]) -> Option<CandidateMatch> {
-    candidates
-        .iter()
-        .filter_map(|candidate| codex_candidate_match(title, candidate))
-        .max_by_key(|matched| (matched.score, matched.recency_at_ms))
-}
-
-fn best_codex_time_match(
-    row: &AgentSessionRow,
-    candidates: &[CodexThreadCandidate],
-) -> Option<CandidateMatch> {
-    let mut timed = candidates
-        .iter()
-        .map(|candidate| {
-            let distance_ms = (candidate.created_at_ms - row.created_at_ms).abs();
-            (candidate, distance_ms)
-        })
-        .filter(|(_, distance_ms)| *distance_ms <= CODEX_TIME_MATCH_WINDOW_MS)
-        .collect::<Vec<_>>();
-    timed.sort_by_key(|(_, distance_ms)| *distance_ms);
-
-    let (best, best_distance_ms) = timed.first()?;
-    if timed.get(1).is_some_and(|(_, distance_ms)| {
-        *distance_ms - *best_distance_ms < CODEX_TIME_MATCH_AMBIGUITY_MS
-    }) {
-        log::warn!(
-            "agent history codex time match ambiguous local_id={} best_distance_ms={}",
-            row.id,
-            best_distance_ms
-        );
-        return None;
-    }
-
-    log::info!(
-        "agent history codex time match selected local_id={} cli_session_id={} distance_ms={}",
-        row.id,
-        best.id,
-        best_distance_ms
-    );
-    Some(CandidateMatch {
-        thread_id: best.id.clone(),
-        field: "created_at",
-        score: 100,
-        recency_at_ms: best.recency_at_ms,
-    })
-}
-
-fn codex_candidate_match(title: &str, candidate: &CodexThreadCandidate) -> Option<CandidateMatch> {
-    [
-        ("title", candidate.title.as_str()),
-        ("preview", candidate.preview.as_str()),
-        ("first_user_message", candidate.first_user_message.as_str()),
-    ]
-    .into_iter()
-    .filter_map(|(field, value)| match_score(title, value).map(|score| (field, score)))
-    .max_by_key(|(_, score)| *score)
-    .map(|(field, score)| CandidateMatch {
-        thread_id: candidate.id.clone(),
-        field,
-        score,
-        recency_at_ms: candidate.recency_at_ms,
-    })
-}
-
-fn match_score(left: &str, right: &str) -> Option<i64> {
-    let left = normalize_title_for_match(left);
-    let right = normalize_title_for_match(right);
-    if left.is_empty() || right.is_empty() {
-        return None;
-    }
-    if left == right {
-        return Some(300);
-    }
-
-    let left_chars = left.chars().count();
-    let right_chars = right.chars().count();
-    let length_ratio = left_chars.min(right_chars) as f64 / left_chars.max(right_chars) as f64;
-    if length_ratio >= 0.85 && (left.starts_with(&right) || right.starts_with(&left)) {
-        return Some(220);
-    }
-    if length_ratio >= 0.85 && (left.contains(&right) || right.contains(&left)) {
-        return Some(180);
-    }
-    if left_chars >= 12 && right.contains(&left) {
-        return Some(170);
-    }
-    if right_chars >= 12 && left.contains(&right) {
-        return Some(165);
-    }
-
-    let left_tokens = token_set(&left);
-    let right_tokens = token_set(&right);
-    if left_tokens.len().min(right_tokens.len()) >= 4 {
-        let overlap = left_tokens.intersection(&right_tokens).count();
-        let overlap_ratio = overlap as f64 / left_tokens.len().max(right_tokens.len()) as f64;
-        if overlap_ratio >= 0.90 {
-            return Some(140);
-        }
-    }
-
-    None
-}
-
-fn token_set(text: &str) -> HashSet<&str> {
-    text.split_whitespace().collect()
-}
-
-fn metadata_string(metadata_json: &str, key: &str) -> Option<String> {
-    let value = serde_json::from_str::<Value>(metadata_json).ok()?;
-    value.get(key)?.as_str().map(ToString::to_string)
 }
 
 pub fn unix_now_ms() -> i64 {

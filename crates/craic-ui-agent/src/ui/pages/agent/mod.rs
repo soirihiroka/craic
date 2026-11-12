@@ -1,14 +1,10 @@
 mod agent_shell_integration;
-mod app_session;
-mod codex_chat;
-mod codex_requests;
 mod left;
 mod prompts;
 mod provider;
 mod remote_image;
 mod right;
 mod smart_summary;
-mod thread_picker;
 
 use super::{
     Page, PageBadge, PageCommand, PageCommandResult, PageContext, PageInitializeComplete,
@@ -17,8 +13,7 @@ use super::{
 use crate::git::WorkspaceSnapshot;
 use crate::ui::agent_history;
 use adw::prelude::*;
-use gtk::gio;
-use left::{AgentLaunch, AgentList, AgentListContextAction, AgentListSelection};
+use left::{AgentList, AgentListContextAction, AgentListSelection};
 use right::AgentChat;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -64,13 +59,15 @@ impl AgentPage {
         let started = Instant::now();
         log::info!("agent page initialization started");
         let state = AgentPageState {
-            list: Rc::new(AgentList::new()),
+            list: AgentList::new(),
             chat: Rc::new(AgentChat::new(self.ctx.clone())),
         };
         let workspace = self.ctx.workspace_ref();
-        state
-            .list
-            .set_workspace_key(self.ctx.workspace_key(), workspace.root.absolute);
+        state.list.set_workspace_key(
+            self.ctx.workspace_key(),
+            workspace.root.absolute,
+            self.ctx.local_workspace_path().is_some(),
+        );
         self.connect_session_lifecycle(&state);
         state.chat.connect_prompt_bar();
         self.state.replace(Some(state));
@@ -171,11 +168,7 @@ impl AgentPage {
             let chat = chat.clone();
 
             move |launch| {
-                if launch == AgentLaunch::App {
-                    chat.start_app();
-                } else if let Some(provider) = launch.terminal_provider() {
-                    chat.start_chat(provider);
-                }
+                chat.start_chat(launch.terminal_provider());
             }
         });
 
@@ -220,8 +213,8 @@ impl AgentPage {
 
         list.connect_context_action({
             let ctx = self.ctx.clone();
-            let list = list.clone();
             let chat = chat.clone();
+            let list = list.clone();
 
             move |action| match action {
                 AgentListContextAction::ViewStatusHistory(local_id) => {
@@ -236,17 +229,15 @@ impl AgentPage {
                 AgentListContextAction::GenerateSummaryActive(session_id) => {
                     request_generate_active_summary(&ctx, &chat, session_id);
                 }
-                AgentListContextAction::SetSessionIdHistory(local_id) => {
-                    prompt_set_history_session_id(&ctx, &list, local_id);
-                }
-                AgentListContextAction::SetSessionIdActive(session_id) => {
-                    prompt_set_active_session_id(&ctx, &list, &chat, session_id);
-                }
+
                 AgentListContextAction::Unload(local_id) => {
                     chat.request_unload_history_session(local_id);
                 }
-                AgentListContextAction::Delete(local_id) => {
-                    prompt_delete_session(&ctx, &list, &chat, local_id);
+                AgentListContextAction::Hide(local_id) => {
+                    match agent_history::hide_native_session(local_id) {
+                        Ok(()) => list.reload_workspace_history(),
+                        Err(error) => ctx.show_error("Hide Session Failed", &error),
+                    }
                 }
             }
         });
@@ -279,126 +270,6 @@ fn request_generate_active_summary(ctx: &PageContext, chat: &Rc<AgentChat>, sess
         }
         Err(err) => ctx.show_error("Generate Summary Failed", &err),
     }
-}
-
-fn prompt_set_history_session_id(ctx: &PageContext, list: &AgentList, local_id: i64) {
-    let Some(window) = ctx.window() else {
-        return;
-    };
-    let row = match agent_history::lookup_session(local_id) {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            ctx.show_error(
-                "Set Session ID Failed",
-                "Agent session history was not found.",
-            );
-            return;
-        }
-        Err(err) => {
-            ctx.show_error("Set Session ID Failed", &err);
-            return;
-        }
-    };
-
-    let dialog = adw::AlertDialog::builder()
-        .heading("Set Session ID")
-        .body("Enter the CLI session ID to use when restoring this session.")
-        .build();
-    let default_session_id = agent_history::suggested_cli_session_id(&row).unwrap_or_default();
-    let entry = gtk::Entry::builder()
-        .placeholder_text("Session ID")
-        .text(&default_session_id)
-        .activates_default(true)
-        .build();
-    dialog.set_extra_child(Some(&entry));
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("save", "Save");
-    dialog.set_default_response(Some("save"));
-    dialog.set_close_response("cancel");
-
-    dialog.choose(Some(&window), None::<&gio::Cancellable>, {
-        let ctx = ctx.clone();
-        let list = list.clone();
-        move |response| {
-            if response.as_str() != "save" {
-                return;
-            }
-
-            let cli_session_id = entry.text().trim().to_string();
-            if cli_session_id.is_empty() {
-                ctx.show_error("Set Session ID Failed", "Enter a session ID.");
-                return;
-            }
-
-            match agent_history::set_manual_session_id(local_id, &cli_session_id) {
-                Ok(()) => {
-                    log::info!("agent session id manually saved local_id={local_id}");
-                    list.reload_history();
-                    ctx.refresh(Some("Agent session ID saved.".to_string()));
-                }
-                Err(err) => ctx.show_error("Set Session ID Failed", &err),
-            }
-        }
-    });
-}
-
-fn prompt_set_active_session_id(
-    ctx: &PageContext,
-    list: &AgentList,
-    chat: &Rc<AgentChat>,
-    session_id: u64,
-) {
-    let Some(window) = ctx.window() else {
-        return;
-    };
-    let Some(status) = chat.active_session_status(session_id) else {
-        ctx.show_error("Set Session ID Failed", "Agent session is not active.");
-        return;
-    };
-
-    let dialog = adw::AlertDialog::builder()
-        .heading("Set Session ID")
-        .body("Enter the CLI session ID to use when restoring this session.")
-        .build();
-    let entry = gtk::Entry::builder()
-        .placeholder_text("Session ID")
-        .activates_default(true)
-        .build();
-    dialog.set_extra_child(Some(&entry));
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("save", "Save");
-    dialog.set_default_response(Some("save"));
-    dialog.set_close_response("cancel");
-
-    dialog.choose(Some(&window), None::<&gio::Cancellable>, {
-        let ctx = ctx.clone();
-        let list = list.clone();
-        let chat = chat.clone();
-        move |response| {
-            if response.as_str() != "save" {
-                return;
-            }
-
-            let cli_session_id = entry.text().trim().to_string();
-            if cli_session_id.is_empty() {
-                ctx.show_error("Set Session ID Failed", "Enter a session ID.");
-                return;
-            }
-
-            match chat.set_active_session_cli_id(status.session_id, &cli_session_id) {
-                Ok(local_id) => {
-                    log::info!(
-                        "agent active session id manually saved session_id={} local_id={}",
-                        status.session_id,
-                        local_id
-                    );
-                    list.reload_history();
-                    ctx.refresh(Some("Agent session ID saved.".to_string()));
-                }
-                Err(err) => ctx.show_error("Set Session ID Failed", &err),
-            }
-        }
-    });
 }
 
 fn show_history_session_status(ctx: &PageContext, chat: &Rc<AgentChat>, local_id: i64) {
@@ -609,67 +480,6 @@ fn format_history_ms(ms: i64) -> String {
         .unwrap_or_else(|_| ms.to_string())
 }
 
-fn prompt_delete_session(ctx: &PageContext, list: &AgentList, chat: &Rc<AgentChat>, local_id: i64) {
-    let Some(window) = ctx.window() else {
-        return;
-    };
-    let row = match agent_history::lookup_session(local_id) {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            ctx.show_error(
-                "Delete Session Failed",
-                "Agent session history was not found.",
-            );
-            return;
-        }
-        Err(err) => {
-            ctx.show_error("Delete Session Failed", &err);
-            return;
-        }
-    };
-
-    let loaded = chat.history_session_is_loaded(local_id);
-    let body = if loaded {
-        format!(
-            "Delete \"{}\" from agent history and close its loaded tab?",
-            row.title
-        )
-    } else {
-        format!("Delete \"{}\" from agent history?", row.title)
-    };
-    let dialog = adw::AlertDialog::builder()
-        .heading("Delete Agent Session?")
-        .body(&body)
-        .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("delete", "Delete Session");
-    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
-
-    dialog.choose(Some(&window), None::<&gio::Cancellable>, {
-        let ctx = ctx.clone();
-        let list = list.clone();
-        let chat = chat.clone();
-
-        move |response| {
-            if response.as_str() != "delete" {
-                log::info!("agent history delete cancelled local_id={local_id}");
-                return;
-            }
-
-            chat.close_history_session(local_id);
-            match agent_history::delete_session(local_id) {
-                Ok(()) => {
-                    list.reload_history();
-                    ctx.refresh(Some("Agent session deleted.".to_string()));
-                }
-                Err(err) => ctx.show_error("Delete Session Failed", &err),
-            }
-        }
-    });
-}
-
 impl Page for AgentPage {
     fn label(&self) -> &'static str {
         "Agents"
@@ -699,7 +509,7 @@ impl Page for AgentPage {
         thread::spawn(move || {
             let started = Instant::now();
             if let Some(shell) = shell {
-                for program in ["codex", "agy", "opencode"] {
+                for program in ["codex", "grok", "agy", "opencode"] {
                     match shell.which(program) {
                         Ok(Some(path)) => {
                             log::debug!("agent page warmed command program={program} path={path}");
@@ -734,6 +544,7 @@ impl Page for AgentPage {
 
     fn activate(&self) {
         if let Some(state) = self.state.borrow().as_ref() {
+            state.list.reload_workspace_history();
             state.chat.show();
             return;
         }
@@ -841,7 +652,9 @@ fn refresh_agent_workspace(ctx: &PageContext, state: &AgentPageState) {
         workspace.root.absolute,
         closed_sessions
     );
-    state
-        .list
-        .set_workspace_key(workspace_key, workspace.root.absolute);
+    state.list.set_workspace_key(
+        workspace_key,
+        workspace.root.absolute,
+        ctx.local_workspace_path().is_some(),
+    );
 }

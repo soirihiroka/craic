@@ -1,5 +1,5 @@
 impl AgentList {
-    pub fn new() -> Self {
+    pub fn new() -> Rc<Self> {
         if let Err(err) = agent_history::initialize_history_database() {
             log::warn!("agent history database initialization failed: {err}");
         }
@@ -31,7 +31,8 @@ impl AgentList {
             "agent_list",
         );
 
-        let app_button = new_agent_button("App");
+        let grok_button = new_agent_button(provider::grok::PROVIDER.label());
+        let opencode_button = new_agent_button(provider::opencode::PROVIDER.label());
         let codex_cli_button = new_agent_button(provider::codex::PROVIDER.label());
         let agy_button = new_agent_button(provider::agy::PROVIDER.label());
 
@@ -39,14 +40,18 @@ impl AgentList {
         search_panel.set_options_visible(false);
         search_panel.set_navigation_visible(false);
 
-        let bottom_bar = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
+        let bottom_bar = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .min_children_per_line(2)
+            .max_children_per_line(2)
             .halign(gtk::Align::Center)
-            .spacing(8)
+            .column_spacing(8)
+            .row_spacing(4)
             .margin_top(8)
             .margin_bottom(8)
             .build();
-        bottom_bar.append(&app_button);
+        bottom_bar.append(&grok_button);
+        bottom_bar.append(&opencode_button);
         bottom_bar.append(&codex_cli_button);
         bottom_bar.append(&agy_button);
 
@@ -58,9 +63,10 @@ impl AgentList {
         root.append(&scroller_overlay);
         root.append(&bottom_bar);
 
-        let agent_list = Self {
+        let agent_list = Rc::new(Self {
             root,
-            app_button,
+            grok_button,
+            opencode_button,
             codex_cli_button,
             agy_button,
             search_panel,
@@ -72,6 +78,8 @@ impl AgentList {
             close_callback: Rc::new(RefCell::new(None)),
             active_sessions: Rc::new(RefCell::new(Vec::new())),
             workspace: Rc::new(RefCell::new(None)),
+            native_history_enabled: Rc::new(Cell::new(true)),
+            history_warnings: Rc::new(RefCell::new(Vec::new())),
             history_rows: Rc::new(RefCell::new(Vec::new())),
             search_query: Rc::new(RefCell::new(String::new())),
             selected_tags: Rc::new(RefCell::new(HashSet::new())),
@@ -80,12 +88,8 @@ impl AgentList {
             loaded_limit: Rc::new(Cell::new(HISTORY_PAGE_SIZE)),
             has_more: Rc::new(Cell::new(false)),
             loading: Rc::new(Cell::new(false)),
-            history_monitor: Rc::new(RefCell::new(None)),
-            debounce_source: Rc::new(RefCell::new(None)),
-            history_db_signature: Rc::new(RefCell::new(HistoryDbSignature::default())),
-            history_monitor_stats: Rc::new(RefCell::new(HistoryMonitorStats::default())),
             active_context_menu: Rc::new(RefCell::new(None)),
-        };
+        });
         agent_list.connect_search();
         agent_list
             .search_panel
@@ -93,17 +97,30 @@ impl AgentList {
         agent_list.install_search_shortcuts(&agent_list.root);
         agent_list.install_search_shortcuts(&agent_list.list);
         agent_list.install_search_shortcuts(&agent_list.scroller);
-        agent_list.install_search_shortcuts(&agent_list.app_button);
+        agent_list.install_search_shortcuts(&agent_list.grok_button);
+        agent_list.install_search_shortcuts(&agent_list.opencode_button);
         agent_list.install_search_shortcuts(&agent_list.codex_cli_button);
         agent_list.install_search_shortcuts(&agent_list.agy_button);
         agent_list.connect_selection();
         agent_list.connect_context_menu();
         agent_list.connect_auto_paging();
-        agent_list.restart_history_monitor();
+        // Keep externally created provider conversations visible. The weak owner
+        // stops polling when the page is released.
+        let weak_list = Rc::downgrade(&agent_list);
+        glib::timeout_add_local(Duration::from_secs(5), move || {
+            let Some(list) = weak_list.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if list.root.is_mapped() {
+                list.reload_workspace_history();
+            }
+            glib::ControlFlow::Continue
+        });
         agent_list
     }
 
-    pub fn set_workspace_key(&self, workspace_key: String, target_root: String) {
+    pub fn set_workspace_key(&self, workspace_key: String, target_root: String, is_local: bool) {
+        self.native_history_enabled.set(is_local);
         let next = agent_history::workspace_for_system_path(workspace_key, target_root);
         if self
             .workspace
@@ -120,6 +137,11 @@ impl AgentList {
             next.repo_path().display()
         );
         self.workspace.replace(Some(next));
+        self.history_warnings.borrow_mut().clear();
+        self.search_panel.set_status("");
+        if !is_local {
+            log::info!("native provider history skipped for remote workspace");
+        }
         self.loaded_limit.set(HISTORY_PAGE_SIZE);
         self.has_more.set(false);
         self.selected_tags.borrow_mut().clear();
@@ -142,7 +164,6 @@ impl AgentList {
             return;
         }
 
-        self.acknowledge_history_db_signature();
         self.spawn_history_load(false);
     }
 
@@ -151,12 +172,16 @@ impl AgentList {
             return;
         }
 
-        self.acknowledge_history_db_signature();
         self.spawn_history_load(true);
     }
 
     fn spawn_history_load(&self, load_tags: bool) {
-        let Some(workspace) = self.workspace.borrow().clone() else {
+        let Some(workspace) = self
+            .workspace
+            .borrow()
+            .clone()
+            .filter(|_| self.native_history_enabled.get())
+        else {
             self.loading.set(false);
             self.history_rows.borrow_mut().clear();
             self.has_more.set(false);
@@ -176,14 +201,20 @@ impl AgentList {
             let selected_tags = selected_tags.clone();
 
             move || {
-                let tags = load_tags.then(|| agent_history::workspace_tag_counts(&workspace_key));
-                let rows = agent_history::list_sessions(
-                    &workspace_key,
+                let result = agent_history::list_native_sessions(
+                    &workspace,
                     loaded_limit.saturating_add(1),
-                    0,
                     Some(&search_query),
                     &selected_tags,
                 );
+                let (rows, tags, warnings) = match result {
+                    Ok(history) => (
+                        Ok(history.rows),
+                        load_tags.then_some(history.tags),
+                        history.warnings,
+                    ),
+                    Err(error) => (Err(error), None, Vec::new()),
+                };
                 let _ = sender.send(AgentHistoryLoad {
                     workspace_key,
                     search_query,
@@ -191,6 +222,7 @@ impl AgentList {
                     loaded_limit,
                     rows,
                     tags,
+                    warnings,
                 });
             }
         });
@@ -228,14 +260,23 @@ impl AgentList {
             return;
         }
 
-        if let Some(tags) = load.tags {
-            match tags {
-                Ok(tags) => self.apply_tags(tags),
-                Err(err) => {
-                    log::warn!("agent history tags load failed: {err}");
-                    self.search_panel.set_tags(Vec::new());
-                }
+        let mut warnings = load.warnings;
+        if let Err(error) = &load.rows {
+            warnings.push(format!("Agent history: {error}"));
+        }
+        if *self.history_warnings.borrow() != warnings {
+            for warning in &warnings {
+                log::warn!("{warning}");
             }
+            self.search_panel.set_status(if warnings.is_empty() {
+                ""
+            } else {
+                "History partially unavailable"
+            });
+            self.history_warnings.replace(warnings);
+        }
+        if let Some(tags) = load.tags {
+            self.apply_tags(tags);
         }
 
         match load.rows {
@@ -245,13 +286,20 @@ impl AgentList {
                     rows.truncate(load.loaded_limit);
                 }
                 self.has_more.set(has_more);
+                for active in self.active_sessions.borrow_mut().iter_mut() {
+                    if let Some(row) = rows
+                        .iter()
+                        .find(|row| Some(row.id) == active.local_history_id)
+                    {
+                        active.title = row.title.clone();
+                        active.last_seen_at_ms = row.last_seen_at_ms;
+                    }
+                }
                 self.history_rows.replace(rows);
                 self.apply_rows();
             }
-            Err(err) => {
-                log::warn!("agent history load failed: {err}");
+            Err(_) => {
                 self.has_more.set(false);
-                self.history_rows.replace(Vec::new());
                 self.apply_rows();
             }
         }
@@ -273,11 +321,11 @@ impl AgentList {
     {
         let callback = Rc::new(callback);
 
-        self.app_button.connect_clicked({
+        self.grok_button.connect_clicked({
             let callback = callback.clone();
 
             move |_| {
-                callback(AgentLaunch::App);
+                callback(AgentLaunch::Grok);
             }
         });
         self.codex_cli_button.connect_clicked({
@@ -286,6 +334,10 @@ impl AgentList {
             move |_| {
                 callback(AgentLaunch::CodexCli);
             }
+        });
+        self.opencode_button.connect_clicked({
+            let callback = callback.clone();
+            move |_| callback(AgentLaunch::OpenCode)
         });
         self.agy_button.connect_clicked(move |_| {
             callback(AgentLaunch::Agy);
@@ -634,125 +686,6 @@ impl AgentList {
         self.reload_history();
     }
 
-    fn restart_history_monitor(&self) {
-        if let Some(source_id) = self.debounce_source.borrow_mut().take() {
-            source_id.remove();
-        }
-        if let Some(monitor) = self.history_monitor.borrow_mut().take() {
-            monitor.cancel();
-        }
-
-        {
-            let stats = self.history_monitor_stats.borrow();
-            if stats.raw_events > 0 || stats.reloads > 0 {
-                log::info!(
-                    "agent history monitor stopped lifetime_ms={} raw_events={} suppressed_events={} reloads={}",
-                    stats.started_at.elapsed().as_millis(),
-                    stats.raw_events,
-                    stats.suppressed_events,
-                    stats.reloads
-                );
-            }
-        }
-        self.history_monitor_stats
-            .replace(HistoryMonitorStats::default());
-
-        let Some(craic_dir) = crate::config::craic_dir() else {
-            log::debug!("agent history monitor skipped because HOME is not set");
-            return;
-        };
-        if let Err(err) = std::fs::create_dir_all(&craic_dir) {
-            log::warn!(
-                "agent history monitor could not create {}: {err}",
-                craic_dir.display()
-            );
-            return;
-        }
-        self.history_db_signature
-            .replace(history_db_signature(&craic_dir));
-
-        let file = gio::File::for_path(&craic_dir);
-        let flags = gio::FileMonitorFlags::WATCH_MOVES | gio::FileMonitorFlags::SEND_MOVED;
-        let monitor = match file.monitor_directory(flags, None::<&gio::Cancellable>) {
-            Ok(monitor) => monitor,
-            Err(err) => {
-                log::warn!(
-                    "agent history monitor failed for {}: {err}",
-                    craic_dir.display()
-                );
-                return;
-            }
-        };
-        monitor.set_rate_limit(HISTORY_DB_MONITOR_RATE_LIMIT_MS);
-        monitor.connect_changed({
-            let agent_list = self.clone();
-
-            move |_, file, other_file, event_type| {
-                if history_monitor_event_should_reload(file, other_file, event_type) {
-                    agent_list.history_monitor_stats.borrow_mut().raw_events += 1;
-                    agent_list.queue_history_reload();
-                }
-            }
-        });
-        self.history_monitor.replace(Some(monitor));
-    }
-
-    fn queue_history_reload(&self) {
-        if self.debounce_source.borrow().is_some() {
-            return;
-        }
-
-        let agent_list = self.clone();
-        let source_id = glib::timeout_add_local(HISTORY_DB_REFRESH_DEBOUNCE, move || {
-            agent_list.debounce_source.borrow_mut().take();
-            if agent_list.loading.get() {
-                agent_list.queue_history_reload();
-                return glib::ControlFlow::Break;
-            }
-            if agent_list.history_db_changed() {
-                let mut stats = agent_list.history_monitor_stats.borrow_mut();
-                stats.reloads += 1;
-                log::debug!(
-                    "agent history monitor reloading raw_events={} suppressed_events={} reloads={}",
-                    stats.raw_events,
-                    stats.suppressed_events,
-                    stats.reloads
-                );
-                drop(stats);
-                agent_list.reload_workspace_history();
-            } else {
-                let mut stats = agent_list.history_monitor_stats.borrow_mut();
-                stats.suppressed_events += 1;
-                if stats.suppressed_events == 1 {
-                    log::debug!("agent history monitor suppressed sidecar-only database events");
-                }
-            }
-            glib::ControlFlow::Break
-        });
-        self.debounce_source.replace(Some(source_id));
-    }
-
-    fn acknowledge_history_db_signature(&self) {
-        let Some(craic_dir) = crate::config::craic_dir() else {
-            return;
-        };
-        self.history_db_signature
-            .replace(history_db_signature(&craic_dir));
-    }
-
-    fn history_db_changed(&self) -> bool {
-        let Some(craic_dir) = crate::config::craic_dir() else {
-            return false;
-        };
-        let next = history_db_signature(&craic_dir);
-        let mut current = self.history_db_signature.borrow_mut();
-        if *current == next {
-            return false;
-        }
-        *current = next;
-        true
-    }
-
     fn apply_tags(&self, tags: Vec<WorkspaceTag>) {
         let selected_tags = self.selected_tags.borrow();
         let tags = tags
@@ -798,7 +731,7 @@ impl AgentList {
         for session in pinned_active_sessions {
             elements.push((
                 AgentRowKey::Active(session.session_id),
-                active_row_render_state(session, history_rows.as_slice()),
+                active_row_render_state(session),
             ));
         }
 
@@ -812,13 +745,7 @@ impl AgentList {
             .map(TimelineRow::Active)
             .collect::<Vec<_>>();
         for row in history_rows.iter() {
-            if !history_filter_active
-                && (active_keys.contains(&format!("id:{}", row.id))
-                    || active_keys.contains(&format!(
-                        "title:{}:{}",
-                        row.provider_id, row.normalized_title
-                    )))
-            {
+            if !history_filter_active && (active_keys.contains(&format!("id:{}", row.id))) {
                 continue;
             }
             timeline_rows.push(TimelineRow::History(row));
@@ -844,7 +771,7 @@ impl AgentList {
                 TimelineRow::Active(session) => {
                     elements.push((
                         AgentRowKey::Active(session.session_id),
-                        active_row_render_state(session, history_rows.as_slice()),
+                        active_row_render_state(session),
                     ));
                 }
                 TimelineRow::History(row) => {
@@ -956,7 +883,7 @@ impl AgentList {
                     local_id: Some(local_id),
                     loaded: false,
                     has_summary: history.task_description.is_some(),
-                    terminal_session: history.provider_id != "codex-app",
+                    can_summarize: true,
                 }),
             RowIdentity::Active(session_id) => self
                 .active_sessions
@@ -970,7 +897,7 @@ impl AgentList {
                     has_summary: session
                         .local_history_id
                         .is_some_and(|local_id| self.history_row_has_summary(local_id)),
-                    terminal_session: session.provider.provider_id() != "codex-app",
+                    can_summarize: session.local_history_id.is_some(),
                 }),
             RowIdentity::Header => None,
         }

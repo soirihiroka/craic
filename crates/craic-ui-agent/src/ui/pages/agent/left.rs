@@ -1,11 +1,11 @@
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::glib;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
 use crate::ui::agent_history::{self, AgentSessionRow, RestoreState, WorkspaceKey, WorkspaceTag};
 use crate::ui::agent_status::{AgentActiveState, AgentInactiveState, AgentSessionState};
@@ -21,12 +21,7 @@ use super::{
 
 const HISTORY_PAGE_SIZE: usize = 32;
 const HISTORY_PREFETCH_DISTANCE: f64 = 360.0;
-const HISTORY_DB_REFRESH_DEBOUNCE: Duration = Duration::from_millis(150);
-const HISTORY_DB_MONITOR_RATE_LIMIT_MS: i32 = 250;
 const HISTORY_AGENT_SESSION_ICON_OPACITY: f64 = 0.58;
-const ACTIVE_MISSING_CLI_SESSION_ID_LABEL: &str = "No session ID yet";
-const ACTIVE_MISSING_CLI_SESSION_ID_TOOLTIP: &str =
-    "This active chat has not been mapped to a CLI session ID yet.";
 const WAITING_AGENT_SESSION_ICON: &str = "hand-touch-symbolic";
 const UNRESTORABLE_AGENT_SESSION_ICON: &str = "background-app-ghost-symbolic";
 
@@ -38,17 +33,19 @@ pub enum AgentListSelection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentLaunch {
-    App,
+    Grok,
+    OpenCode,
     CodexCli,
     Agy,
 }
 
 impl AgentLaunch {
-    pub fn terminal_provider(self) -> Option<&'static dyn AgentProvider> {
+    pub fn terminal_provider(self) -> &'static dyn AgentProvider {
         match self {
-            AgentLaunch::App => None,
-            AgentLaunch::CodexCli => Some(&provider::codex::PROVIDER),
-            AgentLaunch::Agy => Some(&provider::agy::PROVIDER),
+            AgentLaunch::Grok => &provider::grok::PROVIDER,
+            AgentLaunch::OpenCode => &provider::opencode::PROVIDER,
+            AgentLaunch::CodexCli => &provider::codex::PROVIDER,
+            AgentLaunch::Agy => &provider::agy::PROVIDER,
         }
     }
 }
@@ -59,10 +56,8 @@ pub enum AgentListContextAction {
     ViewStatusActive(u64),
     GenerateSummaryHistory(i64),
     GenerateSummaryActive(u64),
-    SetSessionIdHistory(i64),
-    SetSessionIdActive(u64),
     Unload(i64),
-    Delete(i64),
+    Hide(i64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,13 +66,14 @@ struct AgentListContextTarget {
     local_id: Option<i64>,
     loaded: bool,
     has_summary: bool,
-    terminal_session: bool,
+    can_summarize: bool,
 }
 
 #[derive(Clone)]
 pub struct AgentList {
     pub root: gtk::Box,
-    app_button: gtk::Button,
+    grok_button: gtk::Button,
+    opencode_button: gtk::Button,
     codex_cli_button: gtk::Button,
     agy_button: gtk::Button,
     search_panel: SearchPanel,
@@ -89,6 +85,8 @@ pub struct AgentList {
     close_callback: Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
     active_sessions: Rc<RefCell<Vec<ActiveSessionInfo>>>,
     workspace: Rc<RefCell<Option<WorkspaceKey>>>,
+    native_history_enabled: Rc<Cell<bool>>,
+    history_warnings: Rc<RefCell<Vec<String>>>,
     history_rows: Rc<RefCell<Vec<AgentSessionRow>>>,
     search_query: Rc<RefCell<String>>,
     selected_tags: Rc<RefCell<HashSet<String>>>,
@@ -97,41 +95,7 @@ pub struct AgentList {
     loaded_limit: Rc<Cell<usize>>,
     has_more: Rc<Cell<bool>>,
     loading: Rc<Cell<bool>>,
-    history_monitor: Rc<RefCell<Option<gio::FileMonitor>>>,
-    debounce_source: Rc<RefCell<Option<glib::SourceId>>>,
-    history_db_signature: Rc<RefCell<HistoryDbSignature>>,
-    history_monitor_stats: Rc<RefCell<HistoryMonitorStats>>,
     active_context_menu: Rc<RefCell<Option<gtk::Popover>>>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct HistoryDbSignature {
-    database: Option<HistoryDbFileSignature>,
-    wal: Option<HistoryDbFileSignature>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct HistoryDbFileSignature {
-    len: u64,
-    modified: Option<SystemTime>,
-}
-
-struct HistoryMonitorStats {
-    started_at: Instant,
-    raw_events: u64,
-    suppressed_events: u64,
-    reloads: u64,
-}
-
-impl Default for HistoryMonitorStats {
-    fn default() -> Self {
-        Self {
-            started_at: Instant::now(),
-            raw_events: 0,
-            suppressed_events: 0,
-            reloads: 0,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -151,7 +115,8 @@ struct AgentHistoryLoad {
     selected_tags: Vec<String>,
     loaded_limit: usize,
     rows: Result<Vec<AgentSessionRow>, String>,
-    tags: Option<Result<Vec<WorkspaceTag>, String>>,
+    tags: Option<Vec<WorkspaceTag>>,
+    warnings: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,7 +142,6 @@ enum AgentRowRenderState {
         title: String,
         state: AgentSessionState,
         usage_label: Option<String>,
-        missing_cli_session_id: bool,
     },
     History {
         local_id: i64,
@@ -229,11 +193,6 @@ fn agent_session_context_menu_sections(
         (None, Some(session_id)) => AgentListContextAction::ViewStatusActive(session_id),
         (None, None) => return Vec::new(),
     };
-    let set_session_id_action = match (target.local_id, target.session_id) {
-        (Some(local_id), _) => AgentListContextAction::SetSessionIdHistory(local_id),
-        (None, Some(session_id)) => AgentListContextAction::SetSessionIdActive(session_id),
-        (None, None) => return Vec::new(),
-    };
     let summary_action = match (target.local_id, target.session_id) {
         (Some(local_id), _) => AgentListContextAction::GenerateSummaryHistory(local_id),
         (None, Some(session_id)) => AgentListContextAction::GenerateSummaryActive(session_id),
@@ -246,16 +205,11 @@ fn agent_session_context_menu_sections(
     };
 
     let mut session_items = vec![ActionMenuItem::new("View Status", view_action, true)];
-    if target.terminal_session {
+    if target.can_summarize {
         session_items.push(ActionMenuItem::new(
             summary_label,
             summary_action,
             target.loaded,
-        ));
-        session_items.push(ActionMenuItem::new(
-            "Set Session ID...",
-            set_session_id_action,
-            true,
         ));
     }
     if let Some(local_id) = target.local_id {
@@ -264,17 +218,14 @@ fn agent_session_context_menu_sections(
             AgentListContextAction::Unload(local_id),
             target.loaded,
         ));
+        session_items.push(ActionMenuItem::new(
+            "Hide from History",
+            AgentListContextAction::Hide(local_id),
+            true,
+        ));
     }
 
-    let mut sections = vec![ActionMenuSection::new(session_items)];
-    if let Some(local_id) = target.local_id {
-        sections.push(ActionMenuSection::new(vec![ActionMenuItem::new(
-            "Delete Session...",
-            AgentListContextAction::Delete(local_id),
-            true,
-        )]));
-    }
-    sections
+    vec![ActionMenuSection::new(session_items)]
 }
 
 fn retain_context_menu(
@@ -336,10 +287,7 @@ fn sorted_tags(tags: &HashSet<String>) -> Vec<String> {
     tags
 }
 
-fn active_row_render_state(
-    session: &ActiveSessionInfo,
-    history_rows: &[AgentSessionRow],
-) -> AgentRowRenderState {
+fn active_row_render_state(session: &ActiveSessionInfo) -> AgentRowRenderState {
     AgentRowRenderState::Active {
         session_id: session.session_id,
         provider_label: session.provider.label(),
@@ -351,7 +299,6 @@ fn active_row_render_state(
         },
         state: session.state,
         usage_label: session.usage.map(|usage| usage.sidebar_label()),
-        missing_cli_session_id: active_session_missing_cli_session_id(session, history_rows),
     }
 }
 
@@ -376,7 +323,6 @@ fn agent_row(state: &AgentRowRenderState, close_callback: Rc<dyn Fn(u64)>) -> gt
             title,
             state,
             usage_label,
-            missing_cli_session_id,
         } => active_chat_row_for_state(
             *session_id,
             provider_label,
@@ -384,7 +330,6 @@ fn agent_row(state: &AgentRowRenderState, close_callback: Rc<dyn Fn(u64)>) -> gt
             title,
             *state,
             usage_label.as_deref(),
-            *missing_cli_session_id,
             close_callback,
         ),
         AgentRowRenderState::History {
@@ -427,7 +372,6 @@ fn update_agent_row(
             title,
             state,
             usage_label,
-            missing_cli_session_id,
         } => update_active_row(
             &row,
             *session_id,
@@ -436,7 +380,6 @@ fn update_agent_row(
             title,
             *state,
             usage_label.as_deref(),
-            *missing_cli_session_id,
         ),
         AgentRowRenderState::History {
             local_id,
@@ -514,7 +457,6 @@ fn active_chat_row_for_state(
     title: &str,
     state: AgentSessionState,
     usage_label: Option<&str>,
-    missing_cli_session_id: bool,
     close_callback: Rc<dyn Fn(u64)>,
 ) -> gtk::ListBoxRow {
     let icon = gtk::Image::from_icon_name(state_icon_name(provider_icon_name, state));
@@ -542,7 +484,7 @@ fn active_chat_row_for_state(
     let title_label = title_label(title);
     let meta_text = format!("{provider_label} · {}", state_label(state));
     let meta_label = meta_label(&meta_text);
-    let resource_label = active_caption_label(usage_label, missing_cli_session_id);
+    let resource_label = active_caption_label(usage_label);
     let labels = labels_box(&title_label, &meta_label, &resource_label);
 
     let close_button = gtk::Button::builder()
@@ -570,7 +512,6 @@ fn active_chat_row_for_state(
         title,
         state,
         usage_label,
-        missing_cli_session_id,
     );
     row
 }
@@ -736,7 +677,6 @@ fn update_active_row(
     title: &str,
     state: AgentSessionState,
     usage_label: Option<&str>,
-    missing_cli_session_id: bool,
 ) {
     row.set_widget_name(&format!("active:{session_id}"));
     row.set_tooltip_text(Some(title));
@@ -746,7 +686,7 @@ fn update_active_row(
         title_label.set_label(title);
     }
     set_active_row_state(row, provider_label, provider_icon_name, state);
-    update_active_row_caption(row, session_id, usage_label, missing_cli_session_id);
+    update_active_row_caption(row, usage_label);
 }
 
 fn update_history_row(
@@ -829,46 +769,16 @@ fn set_active_row_state(
     }
 }
 
-fn update_active_row_caption(
-    row: &gtk::ListBoxRow,
-    session_id: u64,
-    usage_label: Option<&str>,
-    missing_cli_session_id: bool,
-) {
-    let Some(caption_label) = row_label_at(row, 2) else {
-        return;
-    };
-    let was_missing = caption_label.is_visible()
-        && caption_label.text().as_str() == ACTIVE_MISSING_CLI_SESSION_ID_LABEL;
-
-    if let Some(label) = usage_label {
-        caption_label.set_label(label);
-        caption_label.set_tooltip_text(Some(label));
-        caption_label.set_visible(true);
-    } else if missing_cli_session_id {
-        caption_label.set_label(ACTIVE_MISSING_CLI_SESSION_ID_LABEL);
-        caption_label.set_tooltip_text(Some(ACTIVE_MISSING_CLI_SESSION_ID_TOOLTIP));
-        caption_label.set_visible(true);
-    } else {
-        caption_label.set_label("");
-        caption_label.set_tooltip_text(None);
-        caption_label.set_visible(false);
-    }
-
-    let is_missing = caption_label.is_visible()
-        && caption_label.text().as_str() == ACTIVE_MISSING_CLI_SESSION_ID_LABEL;
-    if was_missing != is_missing {
-        log::debug!(
-            "agent list active session id visual changed session_id={} missing_cli_session_id={}",
-            session_id,
-            is_missing
-        );
+fn update_active_row_caption(row: &gtk::ListBoxRow, usage_label: Option<&str>) {
+    if let Some(caption) = row_label_at(row, 2) {
+        caption.set_label(usage_label.unwrap_or_default());
+        caption.set_tooltip_text(usage_label);
+        caption.set_visible(usage_label.is_some());
     }
 }
 
-fn active_caption_label(usage_label: Option<&str>, missing_cli_session_id: bool) -> gtk::Label {
-    let label_text =
-        usage_label.or(missing_cli_session_id.then_some(ACTIVE_MISSING_CLI_SESSION_ID_LABEL));
+fn active_caption_label(usage_label: Option<&str>) -> gtk::Label {
+    let label_text = usage_label;
     let label = gtk::Label::builder()
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .width_chars(12)
@@ -880,75 +790,9 @@ fn active_caption_label(usage_label: Option<&str>, missing_cli_session_id: bool)
     label.add_css_class("caption");
     if let Some(text) = label_text {
         label.set_label(text);
-        label.set_tooltip_text(Some(if usage_label.is_some() {
-            text
-        } else {
-            ACTIVE_MISSING_CLI_SESSION_ID_TOOLTIP
-        }));
+        label.set_tooltip_text(Some(text));
     }
     label
-}
-
-fn active_session_missing_cli_session_id(
-    session: &ActiveSessionInfo,
-    history_rows: &[AgentSessionRow],
-) -> bool {
-    if session.provider.provider_id() == "codex-app" {
-        return false;
-    }
-    if let Some(row) = active_session_history_row(session, history_rows) {
-        return cli_session_id_is_missing(row.cli_session_id.as_deref());
-    }
-
-    let Some(local_id) = session.local_history_id else {
-        return true;
-    };
-
-    match agent_history::lookup_session(local_id) {
-        Ok(Some(row)) => cli_session_id_is_missing(row.cli_session_id.as_deref()),
-        Ok(None) => {
-            log::debug!(
-                "agent list active session id visual skipped missing history row session_id={} local_id={}",
-                session.session_id,
-                local_id
-            );
-            false
-        }
-        Err(err) => {
-            log::warn!(
-                "agent list active session id visual lookup failed session_id={} local_id={} error={}",
-                session.session_id,
-                local_id,
-                err
-            );
-            false
-        }
-    }
-}
-
-fn active_session_history_row<'a>(
-    session: &ActiveSessionInfo,
-    history_rows: &'a [AgentSessionRow],
-) -> Option<&'a AgentSessionRow> {
-    if let Some(local_id) = session.local_history_id {
-        if let Some(row) = history_rows.iter().find(|row| row.id == local_id) {
-            return Some(row);
-        }
-    }
-
-    let normalized_title = agent_history::normalize_title(&session.title).to_ascii_lowercase();
-    if !agent_history::default_title_should_persist(&normalized_title) {
-        return None;
-    }
-
-    history_rows.iter().find(|row| {
-        row.provider_id == session.provider.provider_id()
-            && row.normalized_title == normalized_title
-    })
-}
-
-fn cli_session_id_is_missing(cli_session_id: Option<&str>) -> bool {
-    cli_session_id.unwrap_or("").trim().is_empty()
 }
 
 fn row_label_at(row: &gtk::ListBoxRow, index: usize) -> Option<gtk::Label> {
@@ -986,20 +830,11 @@ fn state_icon_name(provider_icon_name: &'static str, state: AgentSessionState) -
     }
 }
 
-fn active_history_keys(active_sessions: &[ActiveSessionInfo]) -> std::collections::HashSet<String> {
+fn active_history_keys(active_sessions: &[ActiveSessionInfo]) -> HashSet<String> {
     active_sessions
         .iter()
-        .flat_map(|session| {
-            let mut keys = Vec::new();
-            if let Some(local_id) = session.local_history_id {
-                keys.push(format!("id:{local_id}"));
-            }
-            let title = agent_history::normalize_title(&session.title).to_ascii_lowercase();
-            if agent_history::default_title_should_persist(&title) {
-                keys.push(format!("title:{}:{title}", session.provider.provider_id()));
-            }
-            keys
-        })
+        .filter_map(|session| session.local_history_id)
+        .map(|id| format!("id:{id}"))
         .collect()
 }
 
@@ -1056,50 +891,6 @@ fn restore_state_label(state: RestoreState) -> &'static str {
         RestoreState::Ambiguous => "Restore ambiguous",
         RestoreState::Missing => "Restore unavailable",
     }
-}
-
-fn history_monitor_event_should_reload(
-    file: &gio::File,
-    other_file: Option<&gio::File>,
-    event_type: gio::FileMonitorEvent,
-) -> bool {
-    if matches!(
-        event_type,
-        gio::FileMonitorEvent::AttributeChanged
-            | gio::FileMonitorEvent::PreUnmount
-            | gio::FileMonitorEvent::Unmounted
-    ) {
-        return false;
-    }
-
-    [file.path(), other_file.and_then(|file| file.path())]
-        .into_iter()
-        .flatten()
-        .any(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| matches!(name, "sessions.sqlite" | "sessions.sqlite-wal"))
-        })
-}
-
-fn history_db_signature(craic_dir: &std::path::Path) -> HistoryDbSignature {
-    let database = history_db_file_signature(&craic_dir.join("sessions.sqlite"), false);
-    let wal = history_db_file_signature(&craic_dir.join("sessions.sqlite-wal"), true);
-    HistoryDbSignature { database, wal }
-}
-
-fn history_db_file_signature(
-    path: &std::path::Path,
-    ignore_empty: bool,
-) -> Option<HistoryDbFileSignature> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if ignore_empty && metadata.len() == 0 {
-        return None;
-    }
-    Some(HistoryDbFileSignature {
-        len: metadata.len(),
-        modified: metadata.modified().ok(),
-    })
 }
 
 fn adjustment_is_near_bottom(adjustment: &gtk::Adjustment) -> bool {

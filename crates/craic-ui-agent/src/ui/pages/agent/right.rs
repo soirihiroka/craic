@@ -11,7 +11,6 @@ use std::sync::mpsc::{self, TryRecvError};
 
 use super::super::PageContext;
 use super::agent_shell_integration::{self, AgentNotification, AgentShellIntegration};
-use super::app_session::{AppChatSession, AppChatState};
 use super::prompts::{PromptBar, PromptSelection};
 use super::smart_summary;
 use super::{
@@ -22,7 +21,7 @@ use crate::config;
 use crate::system::capabilities::shell::ShellAccess;
 use crate::system::capabilities::terminal_link::TerminalLinkTarget;
 use crate::system::{ProviderKind, WorkspacePath};
-use crate::ui::agent_history::{self, AgentSessionRow, RestoreState};
+use crate::ui::agent_history::{self, AgentSessionRow};
 use crate::ui::agent_status::{AgentActiveState, AgentInactiveState, AgentSessionState};
 use crate::ui::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsageTracker};
 use crate::ui::components::search::{SearchOption, SearchPanel};
@@ -40,7 +39,6 @@ const NOTIFICATION_APP_NAME: &str = "Craic";
 const NOTIFICATION_TIMEOUT_MS: &str = "5000";
 const WAITING_AGENT_SESSION_ICON: &str = "hand-touch-symbolic";
 const SMART_SUMMARY_TRIGGER_ROWS: i64 = 500;
-const CODEX_MAPPING_RETRY_DELAYS_MS: &[u64] = &[1_800, 8_000, 30_000, 90_000];
 const TERMINAL_CONFLICTING_ACCELS: &[(&str, &[&str])] = &[
     ("app.pull", &["<Control>p"]),
     ("app.push", &["<Control>u"]),
@@ -146,7 +144,6 @@ pub struct AgentChat {
     search_options: TerminalSearchOptions,
     notebook: gtk::Notebook,
     sessions: Rc<RefCell<Vec<AgentSession>>>,
-    app_sessions: Rc<RefCell<Vec<AppChatSession>>>,
     next_session_id: Rc<Cell<u64>>,
     working_directory: Rc<RefCell<PathBuf>>,
     workspace_history: Rc<RefCell<agent_history::WorkspaceKey>>,
@@ -225,51 +222,14 @@ fn request_unload_history_session(
         return;
     };
 
-    let mapping = if session.provider.provider_id() == "codex" {
-        agent_history::map_codex_session(local_id)
-    } else {
-        Ok(agent_history::CodexMappingOutcome::Unsupported)
-    };
-
-    match mapping {
-        Ok(agent_history::CodexMappingOutcome::Restorable(cli_session_id)) => {
-            log::info!(
-                "agent unload mapped session local_id={} session_id={} cli_session_id={}",
-                local_id,
-                session.id,
-                cli_session_id
-            );
-            close_session(
-                session.id,
-                sessions,
-                notebook,
-                close_callback,
-                history_callback,
-            );
-        }
-        Ok(outcome) => {
-            confirm_unload_without_restorable_id(
-                &session,
-                &format!("Craic could not find a restorable CLI session ID ({outcome:?})."),
-                root,
-                sessions,
-                notebook,
-                close_callback,
-                history_callback,
-            );
-        }
-        Err(err) => {
-            confirm_unload_without_restorable_id(
-                &session,
-                &format!("Craic could not find a restorable CLI session ID: {err}"),
-                root,
-                sessions,
-                notebook,
-                close_callback,
-                history_callback,
-            );
-        }
-    }
+    request_close_session(
+        session.id,
+        root,
+        sessions,
+        notebook,
+        close_callback,
+        history_callback,
+    );
 }
 
 fn close_confirmation_state(session: &AgentSession) -> Option<AgentActiveState> {
@@ -377,63 +337,6 @@ fn confirm_close_active_agent_session(
     });
 }
 
-fn confirm_unload_without_restorable_id(
-    session: &AgentSession,
-    reason: &str,
-    root: &gtk::Box,
-    sessions: &Rc<RefCell<Vec<AgentSession>>>,
-    notebook: &gtk::Notebook,
-    close_callback: &Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
-    history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
-) {
-    let body = format!(
-        "{reason}\n\nUnloading this session will close the agent tab, but it may not be restorable until a session ID is set manually."
-    );
-    log::warn!(
-        "agent unload confirmation shown without restorable id session_id={} local_id={:?} provider={} reason={}",
-        session.id,
-        session.local_history_id.get(),
-        session.provider.provider_id(),
-        reason
-    );
-
-    let dialog = adw::AlertDialog::builder()
-        .heading("Unload Without Session ID?")
-        .body(&body)
-        .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("unload", "Unload Session");
-    dialog.set_response_appearance("unload", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
-
-    let parent = root
-        .root()
-        .and_then(|root| root.downcast::<gtk::Window>().ok());
-    dialog.choose(parent.as_ref(), None::<&gio::Cancellable>, {
-        let session_id = session.id;
-        let sessions = sessions.clone();
-        let notebook = notebook.clone();
-        let close_callback = close_callback.clone();
-        let history_callback = history_callback.clone();
-
-        move |response| {
-            if response.as_str() != "unload" {
-                log::info!("agent unload cancelled session_id={session_id}");
-                return;
-            }
-            log::info!("agent unload confirmed session_id={session_id}");
-            close_session(
-                session_id,
-                &sessions,
-                &notebook,
-                &close_callback,
-                &history_callback,
-            );
-        }
-    });
-}
-
 fn close_session(
     session_id: u64,
     sessions: &Rc<RefCell<Vec<AgentSession>>>,
@@ -469,178 +372,6 @@ fn close_session(
     }
 
     mark_agent_history_ended(&session, history_callback);
-}
-
-fn close_app_session(
-    session_id: u64,
-    sessions: &Rc<RefCell<Vec<AppChatSession>>>,
-    notebook: &gtk::Notebook,
-    close_callback: &Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
-    history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
-) {
-    let session = {
-        let mut sessions = sessions.borrow_mut();
-        let Some(index) = sessions
-            .iter()
-            .position(|session| session.id() == session_id)
-        else {
-            return;
-        };
-        sessions.remove(index)
-    };
-    let root = session.root();
-    if let Some(page_num) = notebook.page_num(&root) {
-        notebook.remove_page(Some(page_num));
-    }
-    session.shutdown();
-    if let Some(local_id) = session.local_history_id() {
-        if let Err(error) = agent_history::mark_ended(local_id) {
-            log::warn!(
-                "failed marking Codex App session ended session_id={session_id} local_id={local_id}: {error}"
-            );
-        } else {
-            notify_history_changed(history_callback);
-        }
-    }
-    if let Some(callback) = close_callback.borrow().clone() {
-        callback(session_id);
-    }
-}
-
-fn request_close_app_session(
-    session_id: u64,
-    root: &gtk::Box,
-    sessions: &Rc<RefCell<Vec<AppChatSession>>>,
-    notebook: &gtk::Notebook,
-    close_callback: &Rc<RefCell<Option<Rc<dyn Fn(u64)>>>>,
-    history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
-) {
-    let Some(session) = app_session_by_id(sessions, session_id) else {
-        return;
-    };
-    if !matches!(
-        session.state(),
-        AppChatState::Connecting
-            | AppChatState::Initializing
-            | AppChatState::StartingThread
-            | AppChatState::Running
-            | AppChatState::AwaitingInput
-    ) {
-        close_app_session(
-            session_id,
-            sessions,
-            notebook,
-            close_callback,
-            history_callback,
-        );
-        return;
-    }
-
-    log::info!(
-        "native Codex close confirmation shown session_id={} state={:?}",
-        session_id,
-        session.state()
-    );
-    let dialog = adw::AlertDialog::builder()
-        .heading("Close Codex App Tab?")
-        .body("Codex is still connecting, working, or waiting for input. Closing this tab will stop its App Server process.")
-        .build();
-    dialog.add_response("cancel", "Keep Open");
-    dialog.add_response("close", "Close Tab");
-    dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
-    let parent = root
-        .root()
-        .and_then(|root| root.downcast::<gtk::Window>().ok());
-    dialog.choose(parent.as_ref(), None::<&gio::Cancellable>, {
-        let sessions = sessions.clone();
-        let notebook = notebook.clone();
-        let close_callback = close_callback.clone();
-        let history_callback = history_callback.clone();
-        move |response| {
-            if response.as_str() == "close" {
-                close_app_session(
-                    session_id,
-                    &sessions,
-                    &notebook,
-                    &close_callback,
-                    &history_callback,
-                );
-            }
-        }
-    });
-}
-
-fn app_session_by_id(
-    sessions: &Rc<RefCell<Vec<AppChatSession>>>,
-    session_id: u64,
-) -> Option<AppChatSession> {
-    sessions
-        .borrow()
-        .iter()
-        .find(|session| session.id() == session_id)
-        .cloned()
-}
-
-fn app_session_by_local_history_id(
-    sessions: &Rc<RefCell<Vec<AppChatSession>>>,
-    local_id: i64,
-) -> Option<AppChatSession> {
-    sessions
-        .borrow()
-        .iter()
-        .find(|session| session.local_history_id() == Some(local_id))
-        .cloned()
-}
-
-fn app_session_by_thread_id(
-    sessions: &Rc<RefCell<Vec<AppChatSession>>>,
-    thread_id: &str,
-) -> Option<AppChatSession> {
-    sessions
-        .borrow()
-        .iter()
-        .find(|session| session.thread_id().as_deref() == Some(thread_id))
-        .cloned()
-}
-
-fn app_session_by_page(
-    sessions: &Rc<RefCell<Vec<AppChatSession>>>,
-    page: &gtk::Widget,
-) -> Option<AppChatSession> {
-    page.widget_name()
-        .parse::<u64>()
-        .ok()
-        .and_then(|session_id| app_session_by_id(sessions, session_id))
-}
-
-fn app_agent_session_state(state: &AppChatState) -> AgentSessionState {
-    match state {
-        AppChatState::Ready => AgentSessionState::Active(AgentActiveState::Idle),
-        AppChatState::AwaitingInput => AgentSessionState::Active(AgentActiveState::Asking),
-        AppChatState::Connecting
-        | AppChatState::Initializing
-        | AppChatState::StartingThread
-        | AppChatState::Running => AgentSessionState::Active(AgentActiveState::Loading),
-        AppChatState::Failed(_) | AppChatState::Closing | AppChatState::Closed => {
-            AgentSessionState::Inactive(AgentInactiveState::Dead)
-        }
-    }
-}
-
-fn app_chat_state_label(state: &AppChatState) -> &'static str {
-    match state {
-        AppChatState::Connecting => "Connecting",
-        AppChatState::Initializing => "Initializing",
-        AppChatState::StartingThread => "Starting thread",
-        AppChatState::Ready => "Ready",
-        AppChatState::Running => "Running",
-        AppChatState::AwaitingInput => "Needs input",
-        AppChatState::Failed(_) => "Failed",
-        AppChatState::Closing => "Closing",
-        AppChatState::Closed => "Closed",
-    }
 }
 
 fn session_by_id(
@@ -713,46 +444,6 @@ fn terminal_session_state_label(state: TerminalSessionState) -> &'static str {
         TerminalSessionState::Exited => "Exited",
         TerminalSessionState::Closing => "Closing",
     }
-}
-
-fn ensure_agent_history_session(
-    session: &AgentSession,
-    workspace_history: &Rc<RefCell<agent_history::WorkspaceKey>>,
-    history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
-) -> Result<i64, String> {
-    if let Some(local_id) = session.local_history_id.get() {
-        return Ok(local_id);
-    }
-
-    let workspace = workspace_history.borrow().clone();
-    let initial_restore_state = if session.provider.provider_id() == "codex" {
-        RestoreState::Unmapped
-    } else {
-        RestoreState::Unsupported
-    };
-    let row = agent_history::upsert_session_for_manual_id(
-        agent_history::AgentSessionUpsert {
-            provider_id: session.provider.provider_id().to_string(),
-            workspace,
-            title: session.label.text().to_string(),
-            initial_restore_state,
-            session_uuid: Some(session.session_uuid.clone()),
-        },
-        session.id,
-    )?;
-    session.local_history_id.set(Some(row.id));
-    log::info!(
-        "agent history persisted for manual session id session_id={} local_id={} provider={} title={}",
-        session.id,
-        row.id,
-        session.provider.provider_id(),
-        agent_shell_integration::log_preview(
-            &row.title,
-            agent_shell_integration::TERMINAL_LOG_PREVIEW_CHARS
-        )
-    );
-    notify_history_changed(history_callback);
-    Ok(row.id)
 }
 
 fn history_session_id(local_id: i64) -> Result<u64, String> {
@@ -1302,16 +993,13 @@ fn connect_child_exit(
 
 fn connect_title_updates(
     session_id: u64,
-    session_uuid: &str,
     provider: &'static dyn AgentProvider,
     terminal: &VteTerminal,
     label: &gtk::Label,
     state: &Rc<Cell<TerminalSessionState>>,
     title_locked: &Rc<Cell<bool>>,
     active_state: &Rc<Cell<AgentActiveState>>,
-    local_history_id: &Rc<Cell<Option<i64>>>,
     notebook: &gtk::Notebook,
-    workspace_history: &Rc<RefCell<agent_history::WorkspaceKey>>,
     state_callback: &Rc<
         RefCell<Option<Rc<dyn Fn(u64, &'static dyn AgentProvider, AgentSessionState)>>>,
     >,
@@ -1324,13 +1012,10 @@ fn connect_title_updates(
         let state = state.clone();
         let title_locked = title_locked.clone();
         let active_state = active_state.clone();
-        let local_history_id = local_history_id.clone();
         let notebook = notebook.clone();
-        let workspace_history = workspace_history.clone();
         let state_callback = state_callback.clone();
         let title_callback = title_callback.clone();
         let history_callback = history_callback.clone();
-        let session_uuid = session_uuid.to_string();
 
         move |_| {
             if state.get() == TerminalSessionState::Closing {
@@ -1383,15 +1068,7 @@ fn connect_title_updates(
                     AgentSessionState::Active(next_active_state),
                 );
             }
-            persist_agent_session_title(
-                session_id,
-                provider,
-                &title,
-                &workspace_history,
-                &local_history_id,
-                &session_uuid,
-                &history_callback,
-            );
+            notify_history_changed(&history_callback);
             if let Some(ref cb) = *title_callback.borrow() {
                 cb(session_id, title);
             }
@@ -1399,230 +1076,14 @@ fn connect_title_updates(
     });
 }
 
-fn persist_agent_session_title(
-    session_id: u64,
-    provider: &'static dyn AgentProvider,
-    title: &str,
-    workspace_history: &Rc<RefCell<agent_history::WorkspaceKey>>,
-    local_history_id: &Rc<Cell<Option<i64>>>,
-    session_uuid: &str,
-    history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
-) {
-    if !agent_history::default_title_should_persist(title) {
-        return;
-    }
-    if let Some(local_id) = local_history_id.get() {
-        match agent_history::update_session_title(local_id, title) {
-            Ok(row) => {
-                log::info!(
-                    "agent history title updated session_id={} local_id={} provider={} title={}",
-                    session_id,
-                    row.id,
-                    provider.provider_id(),
-                    agent_shell_integration::log_preview(
-                        &row.title,
-                        agent_shell_integration::TERMINAL_LOG_PREVIEW_CHARS
-                    )
-                );
-                if provider.provider_id() == "codex" {
-                    let outcome = map_codex_session_now(row.id, "title-update");
-                    schedule_codex_mapping_retries(row.id, outcome, history_callback);
-                }
-                notify_history_changed(history_callback);
-            }
-            Err(err) => {
-                log::warn!(
-                    "agent history title update failed session_id={} local_id={} provider={} error={}",
-                    session_id,
-                    local_id,
-                    provider.provider_id(),
-                    err
-                );
-            }
-        }
-        return;
-    }
-
-    let workspace = workspace_history.borrow().clone();
-    let initial_restore_state = if provider.provider_id() == "codex" {
-        RestoreState::Unmapped
-    } else {
-        RestoreState::Unsupported
-    };
-    let upsert = agent_history::AgentSessionUpsert {
-        provider_id: provider.provider_id().to_string(),
-        workspace,
-        title: title.to_string(),
-        initial_restore_state,
-        session_uuid: Some(session_uuid.to_string()),
-    };
-
-    match agent_history::upsert_session(upsert) {
-        Ok(row) => {
-            local_history_id.set(Some(row.id));
-            log::info!(
-                "agent history persisted session_id={} local_id={} provider={} title={}",
-                session_id,
-                row.id,
-                provider.provider_id(),
-                agent_shell_integration::log_preview(
-                    &row.title,
-                    agent_shell_integration::TERMINAL_LOG_PREVIEW_CHARS
-                )
-            );
-            if provider.provider_id() == "codex" {
-                let outcome = map_codex_session_now(row.id, "title");
-                schedule_codex_mapping_retries(row.id, outcome, history_callback);
-            }
-            notify_history_changed(history_callback);
-        }
-        Err(err) => {
-            log::warn!(
-                "agent history persist failed session_id={} provider={} error={}",
-                session_id,
-                provider.provider_id(),
-                err
-            );
-        }
-    }
-}
-
-fn schedule_codex_mapping_retries(
-    local_id: i64,
-    outcome: Option<agent_history::CodexMappingOutcome>,
-    history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
-) {
-    if !codex_mapping_should_retry(outcome.as_ref()) {
-        return;
-    }
-    schedule_codex_mapping_retry(local_id, 0, history_callback.clone());
-}
-
-fn schedule_codex_mapping_retry(
-    local_id: i64,
-    attempt: usize,
-    history_callback: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
-) {
-    let Some(delay_ms) = CODEX_MAPPING_RETRY_DELAYS_MS.get(attempt).copied() else {
-        return;
-    };
-    glib::timeout_add_local_once(std::time::Duration::from_millis(delay_ms), move || {
-        let reason = format!("retry-{}", attempt + 1);
-        let outcome = map_codex_session_now(local_id, &reason);
-        notify_history_changed(&history_callback);
-        if codex_mapping_should_retry(outcome.as_ref()) {
-            schedule_codex_mapping_retry(local_id, attempt + 1, history_callback);
-        }
-    });
-}
-
-fn codex_mapping_should_retry(outcome: Option<&agent_history::CodexMappingOutcome>) -> bool {
-    matches!(
-        outcome,
-        None | Some(agent_history::CodexMappingOutcome::Missing)
-    )
-}
-
-fn retry_empty_codex_mapping_on_status_change(
-    session: &AgentSession,
-    previous_state: AgentSessionState,
-    next_state: AgentSessionState,
-    history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
-) {
-    if session.provider.provider_id() != "codex" {
-        return;
-    }
-    if !status_change_should_retry_codex_mapping(previous_state, next_state) {
-        return;
-    }
-    if matches!(
-        (previous_state, next_state),
-        (AgentSessionState::Active(AgentActiveState::NewChat), _)
-            | (_, AgentSessionState::Active(AgentActiveState::NewChat))
-    ) {
-        log::debug!(
-            "agent history codex mapping status-change retry skipped new chat session_id={} previous_state={:?} next_state={:?}",
-            session.id,
-            previous_state,
-            next_state
-        );
-        return;
-    }
-
-    let Some(local_id) = session.local_history_id.get() else {
-        return;
-    };
-    match agent_history::cli_session_id_is_empty(local_id) {
-        Ok(true) => {
-            log::info!(
-                "agent history codex mapping retry on status change session_id={} local_id={} previous_state={:?} next_state={:?}",
-                session.id,
-                local_id,
-                previous_state,
-                next_state
-            );
-            let outcome = map_codex_session_now(local_id, "status-change");
-            schedule_codex_mapping_retries(local_id, outcome, history_callback);
-            notify_history_changed(history_callback);
-        }
-        Ok(false) => {}
-        Err(err) => {
-            log::warn!(
-                "agent history codex mapping status-change check failed session_id={} local_id={} error={}",
-                session.id,
-                local_id,
-                err
-            );
-        }
-    }
-}
-
-fn status_change_should_retry_codex_mapping(
-    previous_state: AgentSessionState,
-    next_state: AgentSessionState,
-) -> bool {
-    matches!(
-        (previous_state, next_state),
-        (AgentSessionState::Active(_), AgentSessionState::Active(_))
-    )
-}
-
-fn map_codex_session_now(
-    local_id: i64,
-    reason: &str,
-) -> Option<agent_history::CodexMappingOutcome> {
-    match agent_history::map_codex_session(local_id) {
-        Ok(outcome) => {
-            log::debug!(
-                "agent history codex mapping result local_id={} reason={} outcome={:?}",
-                local_id,
-                reason,
-                outcome
-            );
-            Some(outcome)
-        }
-        Err(err) => {
-            log::warn!(
-                "agent history codex mapping failed local_id={} reason={} error={}",
-                local_id,
-                reason,
-                err
-            );
-            None
-        }
-    }
-}
-
 fn mark_agent_history_ended(
     session: &AgentSession,
     history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 ) {
     let Some(local_id) = session.local_history_id.get() else {
+        notify_history_changed(history_callback);
         return;
     };
-    if session.provider.provider_id() == "codex" {
-        map_codex_session_now(local_id, "close");
-    }
     match agent_history::mark_ended(local_id) {
         Ok(()) => {
             log::info!(

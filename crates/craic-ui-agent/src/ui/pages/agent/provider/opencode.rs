@@ -43,12 +43,17 @@ impl AgentProvider for Provider {
 
     fn restore_command(
         &self,
-        _shell: Option<&dyn ShellAccess>,
-        _system: &SystemRef,
-        _workspace: &WorkspaceRef,
-        _cli_session_id: &str,
+        shell: Option<&dyn ShellAccess>,
+        system: &SystemRef,
+        workspace: &WorkspaceRef,
+        cli_session_id: &str,
     ) -> Result<CommandSpec, String> {
-        Err("OpenCode sessions cannot be restored from CLI history yet".to_string())
+        Ok(CommandSpec::target(
+            system,
+            workspace,
+            command_binary("opencode", shell)?,
+            vec!["--session".into(), cli_session_id.into()],
+        ))
     }
 
     fn shell_integration(&self) -> &'static dyn AgentShellIntegration {

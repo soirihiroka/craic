@@ -35,7 +35,6 @@ enum SmartSummaryMode {
 
 fn maybe_start_smart_summary(
     session: &AgentSession,
-    workspace_history: &Rc<RefCell<agent_history::WorkspaceKey>>,
     history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 ) {
     if session.state.get() != TerminalSessionState::Running {
@@ -47,19 +46,11 @@ fn maybe_start_smart_summary(
         return;
     }
 
-    if start_smart_summary(
-        session,
-        workspace_history,
-        history_callback,
-        SmartSummaryMode::Automatic,
-    )
-    .is_err()
-    {}
+    if start_smart_summary(session, history_callback, SmartSummaryMode::Automatic).is_err() {}
 }
 
 fn start_smart_summary(
     session: &AgentSession,
-    workspace_history: &Rc<RefCell<agent_history::WorkspaceKey>>,
     history_callback: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     mode: SmartSummaryMode,
 ) -> Result<(), String> {
@@ -73,13 +64,12 @@ fn start_smart_summary(
         return Err("The session terminal is not running.".to_string());
     }
 
-    let local_id = ensure_agent_history_session(session, workspace_history, history_callback)
-        .map_err(|err| {
-            if mode == SmartSummaryMode::Automatic {
-                session.summary_requested.set(true);
-            }
-            err
-        })?;
+    let local_id = session.local_history_id.get().ok_or_else(|| {
+        if mode == SmartSummaryMode::Automatic {
+            session.summary_requested.set(true);
+        }
+        "Open this conversation from provider history before generating a summary.".to_string()
+    })?;
 
     let existing_tags = match agent_history::lookup_session(local_id) {
         Ok(Some(row)) => {

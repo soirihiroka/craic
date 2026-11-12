@@ -1,6 +1,6 @@
 pub mod agy;
-pub mod app;
 pub mod codex;
+pub mod grok;
 pub mod opencode;
 
 use std::ffi::OsString;
@@ -111,7 +111,7 @@ impl CommandSpec {
 
 pub fn all_providers() -> &'static [&'static dyn AgentProvider] {
     static PROVIDERS: [&'static dyn AgentProvider; 4] = [
-        &app::PROVIDER,
+        &grok::PROVIDER,
         &codex::PROVIDER,
         &agy::PROVIDER,
         &opencode::PROVIDER,
@@ -121,7 +121,7 @@ pub fn all_providers() -> &'static [&'static dyn AgentProvider] {
 
 pub fn is_default_agent_title(title: &str) -> bool {
     title == "New Chat"
-        || title == app::PROVIDER.default_title().as_str()
+        || title == grok::PROVIDER.default_title().as_str()
         || title == codex::PROVIDER.default_title().as_str()
         || title == agy::PROVIDER.default_title().as_str()
         || title == opencode::PROVIDER.default_title().as_str()

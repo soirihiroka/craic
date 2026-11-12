@@ -6,14 +6,11 @@ license.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 adw.workspace = true
-base64.workspace = true
 craic-agent.workspace = true
 craic-config.workspace = true
-craic-codex-app-server.workspace = true
 craic-system.workspace = true
 craic-vcs.workspace = true
 craic-ui-core.workspace = true
-craic-ui-markdown.workspace = true
 craic-ui-terminal.workspace = true
 gtk.workspace = true
 libc.workspace = true
