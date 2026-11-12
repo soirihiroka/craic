@@ -14,7 +14,7 @@ mod linux {
     const APP_ID: &str = "dev.craic.Craic";
 
     pub fn run() -> glib::ExitCode {
-        // Initialize the editor/diff's retained font collection before GTK or any
+        // Initialize the diff renderer's retained font collection before GTK or any
         // threads start, then restore the environment before launching workers.
         let original_font_config = std::env::var_os("FONTCONFIG_FILE");
         let font_config = match crate::fontconfig::prepare() {
@@ -26,7 +26,7 @@ mod linux {
         };
         let skipped_fonts = font_config.as_ref().map_or(0, |(_, skipped)| *skipped);
         if font_config.is_some() {
-            craic_ui_editor::code_editor::canvas::measure_font_metrics_headless(14.0, |size| {
+            craic_ui_editor::diff_canvas::text::measure_font_metrics_headless(14.0, |size| {
                 (size + 9.0).ceil()
             });
             // SAFETY: GTK and application workers have not started. The retained

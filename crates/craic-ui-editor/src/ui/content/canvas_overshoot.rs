@@ -17,8 +17,6 @@ const GLOW_COLOR: (f64, f64, f64) = (0.92, 0.94, 0.98);
 pub struct EdgeGlow {
     top: Rc<Cell<f64>>,
     bottom: Rc<Cell<f64>>,
-    left: Rc<Cell<f64>>,
-    right: Rc<Cell<f64>>,
     animating: Rc<Cell<bool>>,
 }
 
@@ -26,8 +24,6 @@ pub struct EdgeGlow {
 pub enum Edge {
     Top,
     Bottom,
-    Left,
-    Right,
 }
 
 impl EdgeGlow {
@@ -35,8 +31,6 @@ impl EdgeGlow {
         Self {
             top: Rc::new(Cell::new(0.0)),
             bottom: Rc::new(Cell::new(0.0)),
-            left: Rc::new(Cell::new(0.0)),
-            right: Rc::new(Cell::new(0.0)),
             animating: Rc::new(Cell::new(false)),
         }
     }
@@ -58,8 +52,6 @@ impl EdgeGlow {
         match edge {
             Edge::Top => &self.top,
             Edge::Bottom => &self.bottom,
-            Edge::Left => &self.left,
-            Edge::Right => &self.right,
         }
     }
 
@@ -67,8 +59,6 @@ impl EdgeGlow {
         match edge {
             Edge::Top => self.bottom.set(0.0),
             Edge::Bottom => self.top.set(0.0),
-            Edge::Left => self.right.set(0.0),
-            Edge::Right => self.left.set(0.0),
         }
     }
 
@@ -81,10 +71,7 @@ impl EdgeGlow {
         let area = area.clone();
         let state = self.clone();
         gtk::glib::timeout_add_local(Duration::from_millis(FRAME_MS), move || {
-            let active = decay_cell(&state.top)
-                | decay_cell(&state.bottom)
-                | decay_cell(&state.left)
-                | decay_cell(&state.right);
+            let active = decay_cell(&state.top) | decay_cell(&state.bottom);
 
             area.queue_render();
             if active {
@@ -142,8 +129,6 @@ pub fn draw(context: &skia_canvas::Context, width: i32, height: i32, state: &Edg
     let height = height as f64;
     draw_vertical_edge(context, width, height, state.top.get(), true);
     draw_vertical_edge(context, width, height, state.bottom.get(), false);
-    draw_horizontal_edge(context, width, height, state.left.get(), true);
-    draw_horizontal_edge(context, width, height, state.right.get(), false);
 }
 
 fn draw_vertical_edge(
@@ -190,55 +175,6 @@ fn draw_vertical_edge(
             (0.0, height - narrow, width, narrow),
             (width / 2.0, height),
             (width / 2.0, narrow),
-            0.180 * strength,
-        );
-    }
-}
-
-fn draw_horizontal_edge(
-    context: &skia_canvas::Context,
-    width: f64,
-    height: f64,
-    distance: f64,
-    left: bool,
-) {
-    let distance = distance.clamp(0.0, MAX_OVERSHOOT_DISTANCE).min(width);
-    if distance <= 0.5 {
-        return;
-    }
-
-    let strength = (distance / MAX_OVERSHOOT_DISTANCE).sqrt();
-    let broad = (distance * 0.50).max(1.0);
-    let narrow = (distance * 0.03).clamp(2.0, 5.0).min(distance);
-
-    if left {
-        fill_edge_gradient(
-            context,
-            (0.0, 0.0, broad, height),
-            (0.0, height / 2.0),
-            (broad, height / 2.0),
-            0.075 * strength,
-        );
-        fill_edge_gradient(
-            context,
-            (0.0, 0.0, narrow, height),
-            (0.0, height / 2.0),
-            (narrow, height / 2.0),
-            0.180 * strength,
-        );
-    } else {
-        fill_edge_gradient(
-            context,
-            (width - broad, 0.0, broad, height),
-            (width, height / 2.0),
-            (broad, height / 2.0),
-            0.075 * strength,
-        );
-        fill_edge_gradient(
-            context,
-            (width - narrow, 0.0, narrow, height),
-            (width, height / 2.0),
-            (narrow, height / 2.0),
             0.180 * strength,
         );
     }

@@ -1,25 +1,19 @@
 use super::skia_canvas;
-use super::{
-    canvas_overshoot,
-    code_editor::{
-        canvas::{self, TextColor},
-        selection::{
-            AnchoredSelection, DragSelection, SelectionMode, clipped_bounds, drag_for_mode,
-            selection_for_drag, selection_for_mode, word_bounds_at as text_word_bounds_at,
-        },
-    },
-    skia_gl_area,
-};
+pub mod text;
+use self::text::{self as canvas, TextColor};
+use super::{canvas_overshoot, skia_gl_area};
 use crate::config;
 use crate::ui::components::context_menu;
 use crate::ui::{canvas_scroll, canvas_scrollbar};
 use adw::prelude::*;
 use craic_render_skia::{
-    DiffLayoutCache, DiffLayoutRequest, DiffLayoutSignature, DiffMarkerKind, DiffRow, DiffRowKind,
-    DiffRowLayout as RowLayout, DiffSearchMatch, DiffSide, DiffSyntaxSpan, DiffTextPoint,
-    DiffTextSelection, DiffWrappedLine as WrappedLine, build_diff_layout, build_diff_syntax,
-    diff_row_index_at_y, diff_text_for_side, find_diff_search_matches, select_all_diff_text,
-    selected_diff_text, visible_diff_row_range,
+    AnchoredSelection, DiffLayoutCache, DiffLayoutRequest, DiffLayoutSignature, DiffMarkerKind,
+    DiffRow, DiffRowKind, DiffRowLayout as RowLayout, DiffSearchMatch, DiffSide, DiffSyntaxSpan,
+    DiffTextPoint, DiffTextSelection, DiffWrappedLine as WrappedLine, DragSelection, SelectionMode,
+    build_diff_layout, build_diff_syntax, clipped_bounds, diff_row_index_at_y, diff_text_for_side,
+    drag_for_mode, find_diff_search_matches, select_all_diff_text, selected_diff_text,
+    selection_for_drag, selection_for_mode, visible_diff_row_range,
+    word_bounds_at as text_word_bounds_at,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

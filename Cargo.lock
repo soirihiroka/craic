@@ -894,16 +894,15 @@ dependencies = [
  "craic-file-support",
  "craic-language",
  "craic-render-skia",
- "craic-text-layout",
  "craic-ui-gtk-core",
  "craic-vcs",
- "criterion",
  "gdk4-wayland",
  "gl",
  "gtk4",
  "libadwaita",
  "log",
  "skia-safe",
+ "sourceview5",
  "unicode-segmentation",
 ]
 
@@ -4415,6 +4414,41 @@ dependencies = [
  "glib-sys",
  "gobject-sys",
  "libc",
+ "system-deps",
+]
+
+[[package]]
+name = "sourceview5"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5b64e13e9ae8d8e35529a2d32d80c7ecd60ffb348c1188b5b790676f5d5b50c"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "gdk-pixbuf",
+ "gdk4",
+ "gio",
+ "glib",
+ "gtk4",
+ "libc",
+ "pango",
+ "sourceview5-sys",
+]
+
+[[package]]
+name = "sourceview5-sys"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23a6d23d5b5a052b39ad92ff8ab0730cff284378d7f97012368317a5e622452e"
+dependencies = [
+ "gdk-pixbuf-sys",
+ "gdk4-sys",
+ "gio-sys",
+ "glib-sys",
+ "gobject-sys",
+ "gtk4-sys",
+ "libc",
+ "pango-sys",
  "system-deps",
 ]
 
