@@ -13,3 +13,4 @@
 markdown-lint-sample.md
 TODO.md
 *.heic
+.DS_Store
