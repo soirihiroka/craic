@@ -9,7 +9,7 @@ Source0:        %{name}-%{version}.tar.gz
 ExclusiveArch:  x86_64
 
 BuildRequires:  cargo
-BuildRequires:  rust >= 1.92
+BuildRequires:  rust >= 1.94
 BuildRequires:  clang
 BuildRequires:  clang-devel
 BuildRequires:  gcc-c++
@@ -42,10 +42,10 @@ repository tools, terminals, and document previews.
 
 %build
 export CARGO_INCREMENTAL=0
-%make_build release CARGO='cargo --locked'
+cargo build --release --locked
 
 %install
-%make_install PREFIX=%{_prefix} CARGO='cargo --locked' \
+%make_install -o release PREFIX=%{_prefix} \
     GTK_UPDATE_ICON_CACHE=true UPDATE_DESKTOP_DATABASE=true FC_CACHE=true
 
 %check

@@ -53,7 +53,7 @@ jobs:
       - name: Check formatting and Rust
         run: |
           cargo fmt --all -- --check
-          make check CARGO='cargo --locked'
+          cargo check --locked
 
       - name: Build RPM and source RPM
         run: |
