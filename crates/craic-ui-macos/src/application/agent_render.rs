@@ -7,6 +7,12 @@ impl AppDelegate {
             .history_request_id
             .set(agents.history_request_id.get().wrapping_add(1));
         agents.history_loading.set(false);
+        agents.history_started_at.set(None);
+        if let Some(cancellation) = agents.history_cancellation.borrow_mut().take() {
+            cancellation.cancel();
+        }
+        agents.default_launch_attempted.set(false);
+        agents.history_request_filter.replace(Default::default());
         agents.history_refresh_pending.set(false);
         agents.history_loaded.set(false);
         agents.history_last_refresh_ms.set(0);
@@ -57,13 +63,12 @@ impl AppDelegate {
                 preview: String::new(),
                 smart_summary: row.task_description.clone(),
                 model: Some(
-                    match row.provider_id.as_str() {
-                        "codex" => "Codex CLI",
-                        "grok" => "Grok CLI",
-                        "opencode" => "OpenCode",
-                        _ => "AGY",
-                    }
-                    .to_owned(),
+                    NATIVE_AGENT_PROVIDERS
+                        .iter()
+                        .find(|provider| provider.provider_id() == row.provider_id)
+                        .map(|provider| provider.label())
+                        .unwrap_or("Agent")
+                        .to_owned(),
                 ),
                 status: Some(
                     if row.restore_state.is_restorable() {
@@ -112,6 +117,7 @@ impl AppDelegate {
                     }),
                     session.agent_last_seen_ms,
                     session.agent_history_id.is_none(),
+                    session.launch_cancellation.is_some(),
                 )
             })
             .collect::<Vec<_>>();
@@ -273,12 +279,14 @@ impl AppDelegate {
             agents.threads_document.addSubview(&empty);
             return;
         }
-        for (id, title, provider, running, usage, active_state, provider_icon, _, _) in
+        for (id, title, provider, running, usage, active_state, provider_icon, _, _, preparing) in
             &agent_sessions
         {
             let selected = agent_surface_visible && active_agent_id == Some(*id);
             let usage_label = usage.map(AgentResourceUsage::sidebar_label);
-            let state = if *running {
+            let state = if *preparing {
+                "Starting"
+            } else if *running {
                 match active_state {
                     AgentActiveState::NewChat => "New chat",
                     AgentActiveState::Idle => "Idle",
@@ -289,7 +297,9 @@ impl AppDelegate {
                 "Exited"
             };
             let provider = provider.as_deref().unwrap_or("Terminal agent");
-            let resource = if *running {
+            let resource = if *preparing {
+                "Starting terminal…"
+            } else if *running {
                 usage_label.as_deref().unwrap_or("Measuring resources…")
             } else {
                 "Session ended"

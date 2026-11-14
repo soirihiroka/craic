@@ -1,5 +1,93 @@
+struct ChangesClickAwayMonitor(Retained<AnyObject>);
+
+impl Drop for ChangesClickAwayMonitor {
+    fn drop(&mut self) {
+        // SAFETY: This is the event-monitor token returned by AppKit, owned by the
+        // main-thread application delegate for the lifetime of its Changes sidebar.
+        unsafe { NSEvent::removeMonitor(&self.0) };
+    }
+}
+
 impl AppDelegate {
+    fn install_changed_file_click_away_monitor(&self) {
+        if self.ivars().changes_click_away_monitor.borrow().is_some() {
+            return;
+        }
+        let delegate = Weak::new(self);
+        let handler = block2::RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| {
+            if let Some(delegate) = delegate.load() {
+                // SAFETY: AppKit supplies a live event for this synchronous callback.
+                delegate.clear_changed_file_on_click_away(unsafe { event.as_ref() });
+            }
+            // Observe clicks without consuming or delaying native control actions.
+            event.as_ptr()
+        });
+        // SAFETY: The callback always returns the original live event pointer unchanged.
+        let monitor = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(
+                objc2_app_kit::NSEventMask::LeftMouseDown,
+                &handler,
+            )
+        };
+        if let Some(monitor) = monitor {
+            self.ivars()
+                .changes_click_away_monitor
+                .replace(Some(ChangesClickAwayMonitor(monitor)));
+            log::debug!("native Changes click-away monitor installed");
+        }
+    }
+
+    fn clear_changed_file_on_click_away(&self, event: &NSEvent) {
+        if !self.is_active_page("changes")
+            || self.ivars().selected_change_path.borrow().is_none()
+        {
+            return;
+        }
+        let (Some(window), Some(sidebar), Some(list)) = (
+            self.ivars().window.get(),
+            self.ivars().sidebar.get(),
+            self.ivars().changes_list.get(),
+        ) else {
+            return;
+        };
+        // Popovers, sheets, and menus have their own windows and retain selection.
+        if event.window(self.mtm()).as_deref() != Some(&**window) {
+            return;
+        }
+        // SAFETY: The retained sidebar and its ancestors belong to this live main-thread window.
+        let point = unsafe { sidebar.superview() }
+            .map(|parent| parent.convertPoint_fromView(event.locationInWindow(), None))
+            .unwrap_or_else(|| event.locationInWindow());
+        let Some(mut target) = sidebar.hitTest(point) else {
+            return;
+        };
+        loop {
+            if target.isKindOfClass(objc2_app_kit::NSScroller::class()) {
+                return;
+            }
+            // SAFETY: hitTest returned a retained view in the live sidebar hierarchy.
+            let Some(parent) = (unsafe { target.superview() }) else {
+                return;
+            };
+            // A row includes its checkbox, label, status icon, and padded background.
+            if &*parent == &**list {
+                return;
+            }
+            if &*target == &**sidebar {
+                break;
+            }
+            target = parent;
+        }
+        self.clear_changed_file_preview("Select a changed file to review its diff");
+        self.refresh_changed_file_results();
+        if let Some(snapshot) = self.ivars().repository_snapshot.borrow().clone() {
+            self.update_repository_home(&snapshot, self.ivars().workspace_refresh_loading.get());
+        }
+        log::debug!("native Changes selection cleared by sidebar click-away");
+    }
+
     fn refresh_changed_file_results(&self) {
+        self.install_changed_file_click_away_monitor();
         let Some(list) = self.ivars().changes_list.get() else {
             return;
         };

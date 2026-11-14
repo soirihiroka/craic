@@ -1,6 +1,7 @@
 use super::integration::{AgentNotification, AgentShellIntegration};
 use super::{
-    AgentProvider, CommandSpec, command_binary, prompt_title_from_text, window_title_active_state,
+    AgentProvider, CommandSpec, command_binary, prompt_title_from_text, target_command,
+    window_title_active_state,
 };
 use crate::agent_status::AgentActiveState;
 use crate::system::capabilities::shell::ShellAccess;
@@ -24,25 +25,25 @@ impl AgentProvider for Provider {
     fn command(
         &self,
         shell: Option<&dyn ShellAccess>,
-        system: &SystemRef,
+        _system: &SystemRef,
         workspace: &WorkspaceRef,
     ) -> Result<CommandSpec, String> {
-        Ok(CommandSpec::target(
-            system,
+        target_command(
+            shell,
             workspace,
             command_binary("grok", shell)?,
             vec!["--no-alt-screen".into()],
-        ))
+        )
     }
     fn restore_command(
         &self,
         shell: Option<&dyn ShellAccess>,
-        system: &SystemRef,
+        _system: &SystemRef,
         workspace: &WorkspaceRef,
         cli_session_id: &str,
     ) -> Result<CommandSpec, String> {
-        Ok(CommandSpec::target(
-            system,
+        target_command(
+            shell,
             workspace,
             command_binary("grok", shell)?,
             vec![
@@ -50,7 +51,7 @@ impl AgentProvider for Provider {
                 "--resume".into(),
                 cli_session_id.into(),
             ],
-        ))
+        )
     }
     fn shell_integration(&self) -> &'static dyn AgentShellIntegration {
         &SHELL_INTEGRATION

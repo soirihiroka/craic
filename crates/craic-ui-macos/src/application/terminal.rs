@@ -80,6 +80,40 @@ impl AppDelegate {
         )
     }
 
+    fn activate_native_agent_page(&self, entering: bool) {
+        let Some(agents) = self.ivars().agents.get() else {
+            return;
+        };
+        if entering {
+            agents.default_launch_attempted.set(false);
+        }
+        let existing = self.ivars().active_agent_terminal_id.get().or_else(|| {
+            self.ivars()
+                .terminal_sessions
+                .borrow()
+                .iter()
+                .find(|session| session.placement == NativeTerminalPlacement::Agent)
+                .map(|session| session.id)
+        });
+        if let Some(id) = existing {
+            agents.default_launch_attempted.set(true);
+            if entering {
+                self.activate_native_terminal_session(id);
+                self.set_native_agent_terminal_visible(true);
+            }
+        } else if self.ivars().workspace_handle.borrow().is_some()
+            && self.ivars().agent_commands.get().is_some()
+            && !agents.default_launch_attempted.replace(true)
+        {
+            let provider = NATIVE_AGENT_PROVIDERS
+                .iter()
+                .copied()
+                .find(|provider| provider.provider_id() == "codex")
+                .expect("shared agent registry includes Codex");
+            self.start_native_terminal_agent(provider.provider_id(), provider.label(), None);
+        }
+    }
+
     fn start_native_terminal_agent(
         &self,
         program: &str,
@@ -103,32 +137,84 @@ impl AppDelegate {
         let Some(workspace) = workspace else {
             return;
         };
+        if let Some(existing) = history.and_then(|history| {
+            self.ivars()
+                .terminal_sessions
+                .borrow()
+                .iter()
+                .find(|session| session.agent_history_id == Some(history.id))
+                .map(|session| session.id)
+        }) {
+            self.activate_native_terminal_session(existing);
+            self.set_native_agent_terminal_visible(true);
+            return;
+        }
+        let Some(handle) = self.ivars().workspace_handle.borrow().clone() else {
+            return;
+        };
+        let files = handle.workspace_files();
+        let root = files.root();
+        let cancellation = cancellation.child_token();
+        let session_id = match self.create_native_terminal_session_at(
+            None,
+            ShellCommandActivity::Command,
+            title.to_owned(),
+            files.copy_path(&root),
+            files.local_path(&root),
+            NativeTerminalPlacement::Agent,
+            None,
+            Some(cancellation.clone()),
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                self.present_path_action_error("Unable to Start Agent", &error);
+                return;
+            }
+        };
+        if let Some(history) = history
+            && let Some(session) = self
+                .ivars()
+                .terminal_sessions
+                .borrow_mut()
+                .iter_mut()
+                .find(|session| session.id == session_id)
+        {
+            session.agent_history_id = Some(history.id);
+            session.agent_title_locked = true;
+            session.agent_active_state = AgentActiveState::Loading;
+            session.agent_last_seen_ms = history.last_seen_at_ms;
+            session.title_label = history.title.clone();
+            session.title.setTitle(&NSString::from_str(&history.title));
+        }
+        self.refresh_native_agent_thread_rows();
         let command = NativeAgentCommand::PrepareTerminal {
             identity,
+            session_id,
             workspace,
             provider_id: program.to_owned(),
             history: history.cloned(),
             cancellation,
         };
         if let Err(error) = commands.try_send(command) {
+            self.finish_native_terminal_close(session_id);
             self.present_path_action_error(
                 "Unable to Start Agent",
                 &format!("The agent launch could not be queued: {error}"),
             );
-        } else if let Some(agents) = self.ivars().agents.get() {
-            agents.new_chat.setEnabled(false);
-            agents
-                .new_chat
-                .setToolTip(Some(&NSString::from_str(&format!("Starting {title}…"))));
+        } else {
+            log::info!(
+                "native agent terminal shown before preparation session={session_id} provider={program}"
+            );
         }
     }
 
     fn finish_native_terminal_agent_start(
         &self,
         identity: &AgentIdentity,
+        session_id: isize,
         program: &str,
         history: Option<craic_agent::agent_history::AgentSessionRow>,
-        result: Result<ShellCommandSpec, String>,
+        result: Result<craic_system::terminal::TerminalCommand, String>,
     ) {
         if !self.agent_event_is_current(identity) {
             return;
@@ -141,51 +227,36 @@ impl AppDelegate {
             return;
         };
         let title = provider.label();
-        if let Some(agents) = self.ivars().agents.get() {
-            agents.new_chat.setEnabled(true);
-            let selected = NATIVE_AGENT_PROVIDERS[agents.selected_provider.get()];
-            agents
-                .new_chat
-                .setToolTip(Some(&NSString::from_str(&format!(
-                    "New {} chat",
-                    selected.label()
-                ))));
-        }
-        let existing = history.as_ref().and_then(|history| {
-            self.ivars()
-                .terminal_sessions
-                .borrow()
-                .iter()
-                .find(|session| session.agent_history_id == Some(history.id))
-                .map(|session| session.id)
-        });
-        if let Some(id) = existing {
-            self.activate_native_terminal_session(id);
-            self.set_native_agent_terminal_visible(true);
+        let terminal = self
+            .ivars()
+            .terminal_sessions
+            .borrow()
+            .iter()
+            .find(|session| session.id == session_id)
+            .filter(|session| {
+                session
+                    .launch_cancellation
+                    .as_ref()
+                    .is_some_and(|token| !token.is_cancelled())
+            })
+            .map(|session| session.view.clone());
+        let Some(terminal) = terminal else {
+            log::debug!("ignoring native agent preparation after close session={session_id}");
             return;
-        }
+        };
         let command = match result {
             Ok(command) => command,
             Err(error) => {
+                self.finish_native_terminal_close(session_id);
                 self.present_path_action_error("Unable to Start Agent", &error);
                 return;
             }
         };
-        let Some(handle) = self.ivars().workspace_handle.borrow().clone() else {
-            self.present_path_action_error(
-                "Unable to Start Agent",
-                "Open a workspace before starting an agent session.",
-            );
-            return;
-        };
-        let files = handle.workspace_files();
-        let root = files.root();
-        let working_directory = files.copy_path(&root);
-        let local_working_directory = files.local_path(&root);
         let remote_media = if program == "codex" {
             match self.native_terminal_remote_media_context() {
                 Ok(context) => context,
                 Err(error) => {
+                    self.finish_native_terminal_close(session_id);
                     self.present_path_action_error("Unable to Start Agent", &error);
                     return;
                 }
@@ -193,29 +264,29 @@ impl AppDelegate {
         } else {
             None
         };
-        if let Err(error) = self.spawn_native_terminal_command_with_directory_at(
-            command,
-            title.to_string(),
-            working_directory,
-            local_working_directory,
-            NativeTerminalPlacement::Agent,
-            remote_media,
-        ) {
+        if let Err(error) = terminal.spawn(command, title) {
+            self.finish_native_terminal_close(session_id);
             self.present_path_action_error("Unable to Start Agent", &error);
             return;
         }
-        if let Some(history) = history
-            && let Some(session) = self.ivars().terminal_sessions.borrow_mut().last_mut()
+        if let Some(session) = self
+            .ivars()
+            .terminal_sessions
+            .borrow_mut()
+            .iter_mut()
+            .find(|session| session.id == session_id)
         {
-            session.agent_history_id = Some(history.id);
-            session.agent_title_locked = true;
-            session.agent_active_state = AgentActiveState::Loading;
-            session.agent_last_seen_ms = history.last_seen_at_ms;
-            session.title_label = history.title.clone();
-            session.title.setTitle(&NSString::from_str(&history.title));
+            session.launch_cancellation.take();
+            session.remote_media = remote_media;
+            session.agent_active_state = if history.is_some() {
+                AgentActiveState::Loading
+            } else {
+                AgentActiveState::NewChat
+            };
         }
         self.refresh_native_agent_thread_rows();
         self.restore_agents_page_badge();
+        self.request_native_cli_history(false);
         log::info!(
             "native terminal agent started provider={program} title={title} placement=agents-detail"
         );
@@ -293,48 +364,80 @@ impl AppDelegate {
         placement: NativeTerminalPlacement,
         remote_media: Option<NativeTerminalRemoteMedia>,
     ) -> Result<(), String> {
-        let mut activity = command.activity;
-        let mut program = command.program.into_string().map_err(|program| {
-            format!(
-                "The terminal program is not valid UTF-8: {}",
-                program.to_string_lossy()
-            )
-        })?;
-        let mut arguments = command
-            .args
-            .into_iter()
-            .map(|argument| {
-                argument.into_string().map_err(|argument| {
-                    format!(
-                        "A terminal argument is not valid UTF-8: {}",
-                        argument.to_string_lossy()
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        self.spawn_native_terminal_request_at(
+            command.terminal_command(),
+            command.activity,
+            title,
+            working_directory_label,
+            local_working_directory,
+            placement,
+            remote_media,
+        )
+    }
+
+    fn spawn_native_terminal_request_at(
+        &self,
+        mut command: craic_system::terminal::TerminalCommand,
+        mut activity: ShellCommandActivity,
+        title: String,
+        working_directory_label: String,
+        local_working_directory: Option<PathBuf>,
+        placement: NativeTerminalPlacement,
+        remote_media: Option<NativeTerminalRemoteMedia>,
+    ) -> Result<(), String> {
         if activity == ShellCommandActivity::LocalInteractiveShell {
             let mut wrapped_arguments = vec![
                 "-c".to_string(),
                 NATIVE_LOCAL_SHELL_ACTIVITY_WRAPPER.to_string(),
                 "craic-shell-wrapper".to_string(),
                 NATIVE_LOCAL_SHELL_ACTIVITY_MONITOR.to_string(),
-                program,
+                command
+                    .program
+                    .to_str()
+                    .ok_or_else(|| "Terminal program is not valid UTF-8".to_owned())?
+                    .to_owned(),
             ];
-            wrapped_arguments.append(&mut arguments);
-            program = "/bin/sh".to_string();
-            arguments = wrapped_arguments;
+            wrapped_arguments.extend(
+                command
+                    .args
+                    .iter()
+                    .map(|argument| {
+                        argument
+                            .to_str()
+                            .map(str::to_owned)
+                            .ok_or_else(|| "Terminal argument is not valid UTF-8".to_owned())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            command.program = "/bin/sh".into();
+            command.args = wrapped_arguments.into_iter().map(Into::into).collect();
             activity = ShellCommandActivity::ReportedInteractiveShell;
         }
-        let requested_directory = PathBuf::from(command.working_dir.absolute);
-        let spawn_working_directory = requested_directory
-            .is_dir()
-            .then_some(requested_directory)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .or_else(|| std::env::current_dir().ok())
-            });
+        self.create_native_terminal_session_at(
+            Some(command),
+            activity,
+            title,
+            working_directory_label,
+            local_working_directory,
+            placement,
+            remote_media,
+            None,
+        )
+        .map(|_| ())
+    }
 
+    fn create_native_terminal_session_at(
+        &self,
+        command: Option<craic_system::terminal::TerminalCommand>,
+        activity: ShellCommandActivity,
+        title: String,
+        working_directory_label: String,
+        local_working_directory: Option<PathBuf>,
+        placement: NativeTerminalPlacement,
+        remote_media: Option<NativeTerminalRemoteMedia>,
+        launch_cancellation: Option<WorkspaceCancellationToken>,
+    ) -> Result<isize, String> {
+        let preparing = launch_cancellation.is_some();
         let (stack, strip) = match placement {
             NativeTerminalPlacement::General => (
                 self.ivars().terminal_stack.get(),
@@ -358,7 +461,11 @@ impl AppDelegate {
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
-        terminal.spawn(program, arguments, spawn_working_directory, &title)?;
+        if let Some(command) = command {
+            terminal.spawn(command, &title)?;
+        } else {
+            terminal.setAccessibilityLabel(Some(&NSString::from_str(&format!("Starting {title}"))));
+        }
         let agent_provider_label =
             (placement == NativeTerminalPlacement::Agent).then(|| title.clone());
         let agent_provider = agent_provider_label.as_deref().and_then(|label| {
@@ -487,6 +594,7 @@ impl AppDelegate {
                 agent_summary_in_flight: false,
                 agent_last_seen_ms: craic_agent::agent_history::unix_now_ms(),
                 agent_history_id: None,
+                launch_cancellation,
                 view: terminal.clone(),
                 working_directory: working_directory_label,
                 local_working_directory,
@@ -501,7 +609,9 @@ impl AppDelegate {
             self.ensure_native_agent_terminal_usage_timer();
             self.refresh_native_agent_thread_rows();
             self.restore_agents_page_badge();
-            self.request_native_cli_history(false);
+            if !preparing {
+                self.request_native_cli_history(false);
+            }
         }
         self.activate_native_terminal_session(id);
         match placement {
@@ -509,7 +619,7 @@ impl AppDelegate {
             NativeTerminalPlacement::Agent => self.set_native_agent_terminal_visible(true),
         }
         terminal.focus_terminal();
-        Ok(())
+        Ok(id)
     }
 
     fn layout_native_terminal_tabs(&self) {
@@ -616,7 +726,9 @@ impl AppDelegate {
             let Some(card) = cards.get(&session.id) else {
                 continue;
             };
-            let resource = if session.view.is_active() {
+            let resource = if session.launch_cancellation.is_some() {
+                "Starting terminal…".to_owned()
+            } else if session.view.is_active() {
                 usage
                     .get(&session.id)
                     .copied()
@@ -629,7 +741,9 @@ impl AppDelegate {
                 .agent_provider_label
                 .as_deref()
                 .unwrap_or("Terminal agent");
-            let state = if session.view.is_active() {
+            let state = if session.launch_cancellation.is_some() {
+                "Starting"
+            } else if session.view.is_active() {
                 match session.agent_active_state {
                     AgentActiveState::NewChat => "New chat",
                     AgentActiveState::Idle => "Idle",
@@ -1425,6 +1539,7 @@ impl AppDelegate {
             return;
         };
         agents.terminal_panel.setHidden(!visible);
+        agents.empty.setHidden(visible);
         for session in self
             .ivars()
             .terminal_sessions
@@ -1577,6 +1692,10 @@ impl AppDelegate {
             (entry, replacement, was_active)
         };
         let placement = entry.placement;
+        if let Some(cancellation) = entry.launch_cancellation.take() {
+            cancellation.cancel();
+            log::info!("cancelled native agent preparation on close session={id}");
+        }
         if let Some(timer) = entry.auto_close_timer.take() {
             timer.invalidate();
         }
@@ -1641,6 +1760,9 @@ impl AppDelegate {
         self.stop_native_agent_terminal_usage_timer();
         let sessions = std::mem::take(&mut *self.ivars().terminal_sessions.borrow_mut());
         for mut session in sessions {
+            if let Some(cancellation) = session.launch_cancellation.take() {
+                cancellation.cancel();
+            }
             if let Some(timer) = session.auto_close_timer.take() {
                 timer.invalidate();
             }
@@ -1682,10 +1804,13 @@ impl AppDelegate {
         if let Some(timer) = self.ivars().toast_timer.borrow_mut().take() {
             timer.invalidate();
         }
-        if let Some(agents) = self.ivars().agents.get()
-            && let Some(timer) = agents.history_refresh_timer.borrow_mut().take()
-        {
-            timer.invalidate();
+        if let Some(agents) = self.ivars().agents.get() {
+            if let Some(cancellation) = agents.history_cancellation.borrow_mut().take() {
+                cancellation.cancel();
+            }
+            if let Some(timer) = agents.history_refresh_timer.borrow_mut().take() {
+                timer.invalidate();
+            }
         }
         self.shutdown_all_native_terminals();
         if let Some(diff) = self.ivars().diff_view.get() {

@@ -17,6 +17,27 @@ pub struct ShellCommandSpec {
     pub activity: ShellCommandActivity,
 }
 
+impl ShellCommandSpec {
+    pub fn terminal_command(&self) -> craic_platform::terminal::TerminalCommand {
+        let requested = std::path::PathBuf::from(&self.working_dir.absolute);
+        let local_directory = if requested.is_dir() {
+            requested
+        } else {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| std::path::PathBuf::from("/"))
+        };
+        let mut command = craic_platform::terminal::TerminalCommand::new(
+            self.program.clone(),
+            self.args.clone(),
+            local_directory,
+        );
+        command.target_working_directory = self.working_dir.absolute.clone();
+        command
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ShellCommandActivity {
     #[default]

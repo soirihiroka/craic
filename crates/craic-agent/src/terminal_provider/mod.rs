@@ -9,7 +9,9 @@ pub mod integration;
 use self::integration::AgentShellIntegration;
 use crate::agent_status::AgentActiveState;
 use crate::system::capabilities::shell::ShellAccess;
-use crate::system::{ProviderKind, SystemRef, WorkspacePath, WorkspaceRef};
+use crate::system::{SystemRef, WorkspaceRef};
+
+pub use craic_system::terminal::TerminalCommand as CommandSpec;
 
 pub trait AgentProvider: Sync {
     fn default_title(&self) -> String {
@@ -34,89 +36,39 @@ pub trait AgentProvider: Sync {
     fn shell_integration(&self) -> &'static dyn AgentShellIntegration;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommandSpec {
+fn target_command(
+    shell: Option<&dyn ShellAccess>,
+    workspace: &WorkspaceRef,
     program: OsString,
     args: Vec<OsString>,
-    target_working_dir: WorkspacePath,
-    spawn_working_dir: String,
+) -> Result<CommandSpec, String> {
+    let shell = shell.ok_or_else(|| "Shell access is unavailable.".to_owned())?;
+    let program = program
+        .to_str()
+        .ok_or_else(|| "Terminal program is not valid UTF-8.".to_owned())?;
+    let args = args
+        .into_iter()
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| "Terminal argument is not valid UTF-8.".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut command = shell
+        .command(&workspace.root, program, &args)?
+        .terminal_command();
+    command.target_working_directory = workspace.root.absolute.clone();
+    command.utf8_argv()?;
+    Ok(command)
 }
 
-impl CommandSpec {
-    pub fn target(
-        system: &SystemRef,
-        workspace: &WorkspaceRef,
-        program: impl Into<OsString>,
-        args: Vec<OsString>,
-    ) -> Self {
-        let program = program.into();
-        if system.provider_kind == ProviderKind::Ssh
-            && let Some(host) = system.host.as_ref().map(|host| host.label().to_string())
-        {
-            let mut remote = format!(
-                "cd {} && {}",
-                shell_quote(&workspace.root.absolute),
-                remote_command_start(&program)
-            );
-            for arg in &args {
-                remote.push(' ');
-                remote.push_str(&shell_quote(&arg.to_string_lossy()));
-            }
-            log::debug!(
-                "agent command adapted for ssh host={} workspace={}",
-                host,
-                workspace.display_name
-            );
-            return Self {
-                program: OsString::from("ssh"),
-                args: vec![
-                    OsString::from(host),
-                    OsString::from("-t"),
-                    OsString::from(remote),
-                ],
-                target_working_dir: workspace.root.clone(),
-                spawn_working_dir: "/".to_string(),
-            };
-        }
-
-        Self {
-            program,
-            args,
-            target_working_dir: workspace.root.clone(),
-            spawn_working_dir: workspace.root.absolute.clone(),
-        }
-    }
-
-    pub fn display(&self) -> String {
-        self.argv()
-            .iter()
-            .map(|part| part.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    pub fn argv(&self) -> Vec<OsString> {
-        std::iter::once(self.program.clone())
-            .chain(self.args.iter().cloned())
-            .collect()
-    }
-
-    pub fn working_dir(&self) -> &str {
-        &self.spawn_working_dir
-    }
-
-    pub fn target_working_dir(&self) -> &str {
-        self.target_working_dir.display()
-    }
-}
+pub const PROVIDERS: [&'static dyn AgentProvider; 4] = [
+    &codex::PROVIDER,
+    &grok::PROVIDER,
+    &opencode::PROVIDER,
+    &agy::PROVIDER,
+];
 
 pub fn all_providers() -> &'static [&'static dyn AgentProvider] {
-    static PROVIDERS: [&'static dyn AgentProvider; 4] = [
-        &grok::PROVIDER,
-        &codex::PROVIDER,
-        &agy::PROVIDER,
-        &opencode::PROVIDER,
-    ];
     &PROVIDERS
 }
 
@@ -146,18 +98,6 @@ fn command_binary(name: &str, shell: Option<&dyn ShellAccess>) -> Result<OsStrin
     }
     log::debug!("agent command resolved program={} path={}", name, path);
     Ok(OsString::from(path))
-}
-
-fn remote_command_start(program: &OsString) -> String {
-    let program = program.to_string_lossy();
-    format!("exec {}", shell_quote(&program))
-}
-
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn window_title_active_state(title: Option<&str>) -> Option<AgentActiveState> {

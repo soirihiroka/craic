@@ -249,9 +249,9 @@ pub fn generate_text(
         return Err(CANCELED_ERROR.to_string());
     }
     log::info!(
-        "agent generation attempt provider_id={} model_configured={} prompt_bytes={}",
+        "agent generation attempt provider_id={} model={} prompt_bytes={}",
         provider.id(),
-        model.is_some(),
+        model.unwrap_or("provider-default"),
         prompt.len()
     );
     let result = provider.generate_text(model, prompt, cancellation);
@@ -266,9 +266,10 @@ pub fn generate_text(
         }
         Err(err) => {
             log::error!(
-                "agent generation failed provider_id={} error={}",
+                "agent generation failed provider_id={} canceled={} error_chars={}",
                 provider.id(),
-                preview_text(&err)
+                is_canceled_error(&err),
+                err.chars().count()
             );
             Err(err)
         }
@@ -306,9 +307,9 @@ where
             let retry_output = generate_text(provider_id, model, &repair_prompt, cancellation)
                 .map_err(|err| {
                     log::error!(
-                        "structured generation repair failed provider_id={} error={}",
+                        "structured generation repair failed provider_id={} error_chars={}",
                         provider_id,
-                        preview_text(&err)
+                        err.chars().count()
                     );
                     err
                 })?;
@@ -436,6 +437,88 @@ fn check_command_available(label: &str, program: &Path) -> Result<(), String> {
     }
 }
 
+fn provider_command(program: &Path, args: &[impl AsRef<std::ffi::OsStr>]) -> Command {
+    // Resolve and launch in the same shell environment. Finder does not inherit
+    // the login-shell PATH or exported provider authentication/configuration.
+    // Positional arguments keep CLI options and model IDs out of shell syntax.
+    let mut command = Command::new(default_shell());
+    command
+        .arg(if cfg!(target_os = "macos") {
+            "-il"
+        } else {
+            "-i"
+        })
+        .arg("-c")
+        .arg("exec \"$@\"")
+        .arg("craic-agent-provider")
+        .arg(program)
+        .args(args)
+        // Keep the CLI isolated from workspace-specific instructions; commit
+        // generation already supplies the selected repository context.
+        .current_dir(std::env::temp_dir());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+}
+
+fn stop_provider_command(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        // Every provider command starts its own group, including helper
+        // processes that may retain our output pipes after cancellation.
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn provider_command_error(
+    provider: &dyn AgentProvider,
+    status: std::process::ExitStatus,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    let event_error = stdout.lines().rev().find_map(|line| {
+        let event: serde_json::Value = serde_json::from_str(line).ok()?;
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("error") => event.get("message")?.as_str().map(str::to_string),
+            Some("turn.failed") => event
+                .get("error")?
+                .get("message")?
+                .as_str()
+                .map(str::to_string),
+            _ => None,
+        }
+    });
+    let detail = event_error.or_else(|| {
+        stderr.lines().rev().map(str::trim).find_map(|line| {
+            line.strip_prefix("Error:")
+                .or_else(|| line.strip_prefix("error:"))
+                .map(|detail| detail.trim().to_string())
+        })
+    });
+    match detail.filter(|detail| !detail.is_empty()) {
+        Some(detail) => {
+            let normalized = detail.to_ascii_lowercase();
+            if normalized.contains("401")
+                || normalized.contains("unauthorized")
+                || normalized.contains("missing bearer")
+            {
+                format!(
+                    "{} authentication failed. Check the CLI account and provider authentication.",
+                    provider.label()
+                )
+            } else {
+                format!("{}: {}", provider.label(), truncate_chars(&detail, 600))
+            }
+        }
+        None => format!("{} exited with status {status}.", provider.label()),
+    }
+}
+
 fn run_generation_command(
     provider: &dyn AgentProvider,
     invocation: CommandInvocation,
@@ -450,9 +533,7 @@ fn run_generation_command(
         return Err(CANCELED_ERROR.to_string());
     }
 
-    let mut child = Command::new(&invocation.program)
-        .args(&invocation.args)
-        .current_dir(std::env::temp_dir())
+    let mut child = provider_command(&invocation.program, &invocation.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -468,8 +549,7 @@ fn run_generation_command(
     if let Some(mut stdin) = child.stdin.take()
         && let Err(err) = stdin.write_all(prompt.as_bytes())
     {
-        let _ = child.kill();
-        let _ = child.wait();
+        stop_provider_command(&mut child);
         let _ = collect_output_readers(stdout_reader, stderr_reader, provider.label());
         return Err(format!(
             "Failed to send prompt to {}: {err}",
@@ -480,16 +560,24 @@ fn run_generation_command(
     let started = Instant::now();
     loop {
         if cancellation.is_canceled() {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_provider_command(&mut child);
+            let _ = collect_output_readers(stdout_reader, stderr_reader, provider.label());
             log::info!("agent command canceled provider_id={}", provider.id());
             return Err(CANCELED_ERROR.to_string());
         }
 
-        match child
-            .try_wait()
-            .map_err(|err| format!("Failed while waiting for {}: {err}", provider.label()))?
-        {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(err) => {
+                stop_provider_command(&mut child);
+                let _ = collect_output_readers(stdout_reader, stderr_reader, provider.label());
+                return Err(format!(
+                    "Failed while waiting for {}: {err}",
+                    provider.label()
+                ));
+            }
+        };
+        match status {
             Some(status) => {
                 let (stdout_bytes, stderr_bytes) =
                     collect_output_readers(stdout_reader, stderr_reader, provider.label())?;
@@ -510,15 +598,11 @@ fn run_generation_command(
                     };
                 }
 
-                return Err(if stderr.is_empty() {
-                    format!("{} exited with status {status}.", provider.label())
-                } else {
-                    stderr
-                });
+                return Err(provider_command_error(provider, status, &stdout, &stderr));
             }
             None if started.elapsed() >= GENERATION_TIMEOUT => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_provider_command(&mut child);
+                let _ = collect_output_readers(stdout_reader, stderr_reader, provider.label());
                 return Err(format!(
                     "{} did not finish within {} seconds.",
                     provider.label(),
@@ -541,9 +625,8 @@ fn run_model_command(
         program.display(),
         args.join(" ")
     );
-    let mut child = Command::new(&program)
-        .args(args)
-        .current_dir(std::env::temp_dir())
+    let mut child = provider_command(&program, args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -558,10 +641,18 @@ fn run_model_command(
 
     let started = Instant::now();
     loop {
-        match child
-            .try_wait()
-            .map_err(|err| format!("Failed while loading {} models: {err}", provider.label()))?
-        {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(err) => {
+                stop_provider_command(&mut child);
+                let _ = collect_output_readers(stdout_reader, stderr_reader, provider.label());
+                return Err(format!(
+                    "Failed while loading {} models: {err}",
+                    provider.label()
+                ));
+            }
+        };
+        match status {
             Some(status) => {
                 let (stdout_bytes, stderr_bytes) =
                     collect_output_readers(stdout_reader, stderr_reader, provider.label())?;
@@ -580,18 +671,11 @@ fn run_model_command(
                     return Ok(if stdout.is_empty() { stderr } else { stdout });
                 }
 
-                return Err(if stderr.is_empty() {
-                    format!(
-                        "{} model command exited with status {status}.",
-                        provider.label()
-                    )
-                } else {
-                    stderr
-                });
+                return Err(provider_command_error(provider, status, &stdout, &stderr));
             }
             None if started.elapsed() >= MODEL_LIST_TIMEOUT => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_provider_command(&mut child);
+                let _ = collect_output_readers(stdout_reader, stderr_reader, provider.label());
                 return Err(format!(
                     "{} models did not load within {} seconds.",
                     provider.label(),

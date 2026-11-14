@@ -690,6 +690,7 @@ dependencies = [
 name = "craic-codex-app-server"
 version = "0.1.0"
 dependencies = [
+ "craic-platform",
  "libc",
  "log",
  "serde",
@@ -766,6 +767,8 @@ dependencies = [
 name = "craic-platform"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "log",
  "serde",
  "uuid",
 ]

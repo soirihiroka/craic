@@ -18,9 +18,7 @@ impl AppDelegate {
         settings.window.makeKeyAndOrderFront(Some(self));
         settings.provider.setEnabled(false);
         settings.model.setEnabled(false);
-        settings
-            .status
-            .setStringValue(&NSString::from_str("Loading commit-message settings…"));
+        settings.status.setHidden(true);
         settings.spinner.setHidden(false);
         unsafe { settings.spinner.startAnimation(None) };
         let request_id = settings.request_id.get().wrapping_add(1);
@@ -64,28 +62,15 @@ impl AppDelegate {
         title.setFont(Some(&NSFont::boldSystemFontOfSize(18.0)));
         ai_pane.addSubview(&title);
 
-        let description = NSTextField::wrappingLabelWithString(
-            &NSString::from_str(
-                "Choose the provider and model used by the commit composer’s magic-wand action.",
-            ),
-            mtm,
-        );
-        description.setFrame(NSRect::new(
-            NSPoint::new(24.0, 356.0),
-            NSSize::new(512.0, 32.0),
-        ));
-        description.setTextColor(Some(&NSColor::secondaryLabelColor()));
-        ai_pane.addSubview(&description);
-
         let provider_label = NSTextField::labelWithString(&NSString::from_str("Provider"), mtm);
         provider_label.setFrame(NSRect::new(
-            NSPoint::new(24.0, 318.0),
+            NSPoint::new(24.0, 354.0),
             NSSize::new(92.0, 24.0),
         ));
         ai_pane.addSubview(&provider_label);
         let provider = NSPopUpButton::initWithFrame_pullsDown(
             NSPopUpButton::alloc(mtm),
-            NSRect::new(NSPoint::new(122.0, 314.0), NSSize::new(414.0, 30.0)),
+            NSRect::new(NSPoint::new(122.0, 350.0), NSSize::new(414.0, 30.0)),
             false,
         );
         let providers = registered_providers();
@@ -105,13 +90,13 @@ impl AppDelegate {
 
         let model_label = NSTextField::labelWithString(&NSString::from_str("Model"), mtm);
         model_label.setFrame(NSRect::new(
-            NSPoint::new(24.0, 278.0),
+            NSPoint::new(24.0, 314.0),
             NSSize::new(92.0, 24.0),
         ));
         ai_pane.addSubview(&model_label);
         let model = NSPopUpButton::initWithFrame_pullsDown(
             NSPopUpButton::alloc(mtm),
-            NSRect::new(NSPoint::new(122.0, 274.0), NSSize::new(380.0, 30.0)),
+            NSRect::new(NSPoint::new(122.0, 310.0), NSSize::new(380.0, 30.0)),
             false,
         );
         model.addItemWithTitle(&NSString::from_str("Loading…"));
@@ -124,7 +109,7 @@ impl AppDelegate {
 
         let spinner = NSProgressIndicator::initWithFrame(
             NSProgressIndicator::alloc(mtm),
-            NSRect::new(NSPoint::new(512.0, 280.0), NSSize::new(16.0, 16.0)),
+            NSRect::new(NSPoint::new(512.0, 316.0), NSSize::new(16.0, 16.0)),
         );
         spinner.setStyle(NSProgressIndicatorStyle::Spinning);
         spinner.setControlSize(NSControlSize::Small);
@@ -135,11 +120,12 @@ impl AppDelegate {
 
         let status = NSTextField::wrappingLabelWithString(&NSString::new(), mtm);
         status.setFrame(NSRect::new(
-            NSPoint::new(24.0, 237.0),
+            NSPoint::new(24.0, 273.0),
             NSSize::new(512.0, 32.0),
         ));
         status.setTextColor(Some(&NSColor::secondaryLabelColor()));
         status.setMaximumNumberOfLines(2);
+        status.setHidden(true);
         ai_pane.addSubview(&status);
 
         let appearance_pane =
@@ -833,9 +819,7 @@ impl AppDelegate {
         settings.model.setEnabled(false);
         settings.spinner.setHidden(false);
         unsafe { settings.spinner.startAnimation(None) };
-        settings
-            .status
-            .setStringValue(&NSString::from_str("Loading available models…"));
+        settings.status.setHidden(true);
         let Some(requests) = self.ivars().repository_requests.get() else {
             self.set_commit_message_settings_error("The settings service is unavailable.");
             return;
@@ -922,14 +906,13 @@ impl AppDelegate {
                     .unwrap_or(0);
                 settings.model.selectItemAtIndex(selected_index as isize);
                 settings.model.setEnabled(true);
-                settings.status.setStringValue(&NSString::from_str(
-                    "Selections apply to the next generated commit message.",
-                ));
+                settings.status.setHidden(true);
             }
             Err(error) => {
                 settings.model.selectItemAtIndex(0);
                 settings.model.setEnabled(true);
                 settings.status.setStringValue(&NSString::from_str(&error));
+                settings.status.setHidden(false);
             }
         }
         settings.model_ids.replace(model_ids);
@@ -944,6 +927,7 @@ impl AppDelegate {
         settings.provider.setEnabled(true);
         settings.model.setEnabled(false);
         settings.status.setStringValue(&NSString::from_str(message));
+        settings.status.setHidden(false);
     }
 
     fn install_main_menu(&self, application: &NSApplication) {
@@ -1195,20 +1179,20 @@ impl AppDelegate {
 
     fn toolbar_item_identifiers(&self) -> Retained<NSArray<NSToolbarItemIdentifier>> {
         let workspace = NSString::from_str(TOOLBAR_WORKSPACE);
-        let pages = NSString::from_str(TOOLBAR_PAGES);
         let branch = NSString::from_str(TOOLBAR_BRANCH);
         let fetch = NSString::from_str(TOOLBAR_FETCH);
         let terminal = NSString::from_str(TOOLBAR_TERMINAL);
         let add_action = NSString::from_str(TOOLBAR_ADD_ACTION);
-        NSArray::from_slice(&[
-            &pages,
-            &workspace,
-            &branch,
-            unsafe { NSToolbarFlexibleSpaceItemIdentifier },
-            &add_action,
-            unsafe { NSToolbarSpaceItemIdentifier },
-            &terminal,
-            &fetch,
-        ])
+        let mut identifiers = vec![NSString::from_str(TOOLBAR_PAGES)];
+        identifiers.extend([
+            workspace,
+            branch,
+            unsafe { NSToolbarFlexibleSpaceItemIdentifier }.retain(),
+            add_action,
+            unsafe { NSToolbarSpaceItemIdentifier }.retain(),
+            terminal,
+            fetch,
+        ]);
+        NSArray::from_retained_slice(&identifiers)
     }
 }

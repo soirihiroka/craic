@@ -4,8 +4,8 @@ use super::integration::{
 use crate::agent_status::AgentActiveState;
 
 use super::{
-    AgentProvider, CommandSpec, command_binary, normalize_title_text, title_candidate,
-    window_title_active_state,
+    AgentProvider, CommandSpec, command_binary, normalize_title_text, target_command,
+    title_candidate, window_title_active_state,
 };
 use crate::system::capabilities::shell::ShellAccess;
 use crate::system::{SystemRef, WorkspaceRef};
@@ -32,30 +32,30 @@ impl AgentProvider for Provider {
     fn command(
         &self,
         shell: Option<&dyn ShellAccess>,
-        system: &SystemRef,
+        _system: &SystemRef,
         workspace: &WorkspaceRef,
     ) -> Result<CommandSpec, String> {
-        Ok(CommandSpec::target(
-            system,
+        target_command(
+            shell,
             workspace,
             command_binary("codex", shell)?,
             launch_args(workspace, None),
-        ))
+        )
     }
 
     fn restore_command(
         &self,
         shell: Option<&dyn ShellAccess>,
-        system: &SystemRef,
+        _system: &SystemRef,
         workspace: &WorkspaceRef,
         cli_session_id: &str,
     ) -> Result<CommandSpec, String> {
-        Ok(CommandSpec::target(
-            system,
+        target_command(
+            shell,
             workspace,
             command_binary("codex", shell)?,
             launch_args(workspace, Some(cli_session_id)),
-        ))
+        )
     }
 
     fn shell_integration(&self) -> &'static dyn AgentShellIntegration {

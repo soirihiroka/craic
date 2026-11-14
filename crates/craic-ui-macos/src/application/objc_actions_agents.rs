@@ -70,16 +70,12 @@ impl AppDelegate {
         self.request_native_cli_history(false);
     }
 
-    fn handle_objc_select_page(&self, sender: &NSToolbarItemGroup) {
-        let Some((index, descriptor)) =
-            usize::try_from(sender.selectedIndex())
-                .ok()
-                .and_then(|index| {
-                    PAGE_DESCRIPTORS
-                        .get(index)
-                        .map(|descriptor| (index, descriptor))
-                })
-        else {
+    fn handle_objc_select_page(&self, tag: isize) {
+        let Some((index, descriptor)) = usize::try_from(tag).ok().and_then(|index| {
+            PAGE_DESCRIPTORS
+                .get(index)
+                .map(|descriptor| (index, descriptor))
+        }) else {
             return;
         };
         let Some(handle) = self.ivars().app_handle.get() else {

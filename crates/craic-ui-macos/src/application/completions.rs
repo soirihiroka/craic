@@ -801,16 +801,16 @@ impl AppDelegate {
     }
 
     fn render_page_badge(&self, page_id: &str, badge: NativePageBadge) {
-        let Some(group) = self.ivars().page_switcher.get() else {
-            return;
-        };
         let Some(index) = PAGE_DESCRIPTORS
             .iter()
             .position(|descriptor| descriptor.id == page_id)
         else {
             return;
         };
-        let item = group.subitems().objectAtIndex(index);
+        let items = self.ivars().page_switcher.borrow();
+        let Some(item) = items.iter().find(|item| item.tag() == index as isize) else {
+            return;
+        };
         let page = PAGE_DESCRIPTORS[index];
         let tooltip = match badge {
             NativePageBadge::Count(count) if count > 0 => match page_id {
@@ -821,54 +821,6 @@ impl AppDelegate {
             _ => page.label.to_owned(),
         };
         item.setToolTip(Some(&NSString::from_str(&tooltip)));
-        if matches!(page_id, "changes" | "agents") {
-            let count = match badge {
-                NativePageBadge::Count(count) => count,
-                _ => 0,
-            };
-            let image_name = format!("dev.craic.page-badge.{page_id}.{count}");
-            if item
-                .image()
-                .and_then(|image| image.name())
-                .as_ref()
-                .map(|name| name.to_string())
-                == Some(image_name)
-            {
-                return;
-            }
-            if let Some(image) = native_page_badge_image(page_id, count) {
-                item.setImage(Some(&image));
-                // Grouped toolbar items do not display NSItemBadge. Refresh the native
-                // segments with an image that includes the count circle instead.
-                let selected = group.selectedIndex();
-                group.setSubitems(&group.subitems());
-                group.setSelectedIndex(selected);
-            }
-        }
-        // AppKit may wrap the group's segmented control in its native glass container.
-        let mut views = group.view().into_iter().collect::<Vec<_>>();
-        while let Some(view) = views.pop() {
-            if let Some(control) = view.downcast_ref::<NSSegmentedControl>() {
-                if index >= control.segmentCount() as usize {
-                    continue;
-                }
-                control.setImage_forSegment(item.image().as_deref(), index as isize);
-                control.setLabel_forSegment(&NSString::new(), index as isize);
-                control.setToolTip_forSegment(Some(&NSString::from_str(&tooltip)), index as isize);
-                control.setWidth_forSegment(0.0, index as isize);
-                control.sizeToFit();
-                if AnyClass::get(c"NSItemBadge").is_some()
-                    && item.respondsToSelector(sel!(setBadge:))
-                {
-                    item.setBadge(None);
-                }
-                return;
-            }
-            views.extend(view.subviews().iter());
-        }
-        if matches!(page_id, "changes" | "agents") {
-            return;
-        }
         if AnyClass::get(c"NSItemBadge").is_none() || !item.respondsToSelector(sel!(setBadge:)) {
             return;
         }
@@ -901,7 +853,7 @@ impl AppDelegate {
             .iter()
             .filter(|session| {
                 session.placement == NativeTerminalPlacement::Agent
-                    && session.view.is_active()
+                    && (session.view.is_active() || session.launch_cancellation.is_some())
                     && matches!(
                         session.agent_active_state,
                         AgentActiveState::Loading | AgentActiveState::Asking

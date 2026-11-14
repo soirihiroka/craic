@@ -6,9 +6,10 @@ use crate::application::AppDelegate;
 use craic_render_skia::{
     TerminalClipboard, TerminalMouseAction, TerminalMouseButton, TerminalMouseModifiers,
     TerminalPaintCache, TerminalPaintRequest, TerminalScroll, TerminalSearchDirection,
-    TerminalSelectionType, TerminalSession, TerminalSide, TerminalSnapshot, TerminalSpawnOptions,
-    TerminalViewport, paint_terminal,
+    TerminalSelectionType, TerminalSession, TerminalSide, TerminalSnapshot, TerminalViewport,
+    paint_terminal,
 };
+use craic_system::terminal::{TerminalBackend, TerminalCommand, TerminalLifecycle, TerminalSize};
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{
@@ -793,25 +794,11 @@ impl TerminalMetalView {
         view
     }
 
-    pub fn spawn(
-        &self,
-        program: String,
-        arguments: Vec<String>,
-        working_directory: Option<PathBuf>,
-        title: &str,
-    ) -> Result<(), String> {
+    pub fn spawn(&self, command: TerminalCommand, title: &str) -> Result<(), String> {
         self.shutdown()?;
         let viewport = self.viewport();
-        let session = TerminalSession::spawn(
-            TerminalSpawnOptions {
-                working_directory,
-                shell_program: Some(program),
-                shell_arguments: arguments,
-                environment: Default::default(),
-            },
-            viewport,
-        )
-        .map_err(|error| format!("Unable to start terminal: {error}"))?;
+        let session = TerminalSession::spawn(command, viewport)
+            .map_err(|error| format!("Unable to start terminal: {error}"))?;
         log::info!(
             "native terminal session started pid={} columns={} lines={}",
             session.child_pid(),
@@ -847,7 +834,16 @@ impl TerminalMetalView {
     }
 
     pub fn is_active(&self) -> bool {
-        self.has_session() && !self.ivars().exited.get()
+        self.ivars()
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| {
+                matches!(
+                    session.lifecycle(),
+                    TerminalLifecycle::Starting | TerminalLifecycle::Running
+                )
+            })
     }
 
     pub fn agent_content(&self) -> Option<(String, String, String, usize)> {
@@ -874,7 +870,7 @@ impl TerminalMetalView {
             .session
             .borrow()
             .as_ref()
-            .map(|session| session.child_pid())
+            .and_then(TerminalBackend::process_id)
     }
 
     pub fn exited_successfully(&self) -> bool {
@@ -938,22 +934,23 @@ impl TerminalMetalView {
     }
 
     pub fn shutdown(&self) -> Result<(), String> {
-        let Some(session) = self.ivars().session.borrow_mut().take() else {
+        let Some(mut session) = self.ivars().session.borrow_mut().take() else {
             return Ok(());
         };
         let pid = session.child_pid();
-        let result = session
-            .shutdown()
-            .map_err(|error| format!("Unable to stop terminal: {error}"));
+        session.begin_shutdown();
+        std::thread::Builder::new()
+            .name("terminal-shutdown".to_owned())
+            .spawn(move || match session.terminate_process() {
+                Ok(()) => log::info!("native terminal session stopped pid={pid}"),
+                Err(error) => log::warn!("native terminal shutdown failed pid={pid}: {error}"),
+            })
+            .map_err(|error| format!("Unable to schedule terminal shutdown: {error}"))?;
         self.ivars().marked_text.borrow_mut().clear();
         self.ivars().exited.set(true);
         self.ivars().snapshot.borrow_mut().cells.clear();
-        log::info!(
-            "native terminal session stopped pid={pid} status={}",
-            if result.is_ok() { "ok" } else { "error" }
-        );
         self.render_frame();
-        result
+        Ok(())
     }
 
     pub fn teardown_renderer(&self) {
@@ -1078,7 +1075,12 @@ impl TerminalMetalView {
     fn resize_terminal(&self) {
         let viewport = self.viewport();
         if let Some(session) = self.ivars().session.borrow_mut().as_mut()
-            && let Err(error) = session.resize(viewport)
+            && let Err(error) = session.resize_terminal(TerminalSize {
+                columns: viewport.columns,
+                rows: viewport.lines,
+                cell_width: viewport.cell_width,
+                cell_height: viewport.cell_height,
+            })
         {
             log::warn!("native terminal resize failed: {error}");
         }
@@ -1255,7 +1257,7 @@ impl TerminalMetalView {
 
     pub(crate) fn send_input(&self, bytes: Vec<u8>) {
         if let Some(session) = self.ivars().session.borrow().as_ref() {
-            if let Err(error) = session.input(bytes) {
+            if let Err(error) = session.send_input(&bytes) {
                 log::warn!("native terminal input failed: {error}");
             } else {
                 session.scroll(TerminalScroll::Bottom);

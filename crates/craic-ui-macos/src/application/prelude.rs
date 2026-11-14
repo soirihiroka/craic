@@ -105,28 +105,26 @@ use objc2_app_kit::{
     NSCellImagePosition, NSColor, NSComboButton, NSComboButtonStyle, NSControlSize,
     NSControlStateValueMixed, NSControlStateValueOff, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSDragOperation, NSDraggingInfo, NSEvent, NSEventModifierFlags,
-    NSEventType, NSFindPanelAction, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
-    NSGlassEffectView, NSGlassEffectViewStyle, NSImage, NSImageScaling, NSImageView, NSItemBadge,
-    NSLayoutConstraint, NSLayoutConstraintOrientation, NSLayoutPriorityDefaultHigh,
-    NSLayoutPriorityDefaultLow, NSLineBreakMode, NSMenu, NSMenuDelegate, NSMenuItem,
-    NSMenuItemValidation, NSMenuToolbarItem, NSModalResponseOK, NSOpenPanel, NSPasteboard,
-    NSPasteboardTypeFileURL, NSPasteboardTypeString, NSPopUpButton, NSPopover, NSPopoverBehavior,
-    NSProgressIndicator, NSProgressIndicatorStyle, NSRunningApplication, NSSavePanel, NSScrollView,
-    NSSearchField, NSSecureTextField, NSSegmentedControl, NSSplitView, NSSplitViewController,
-    NSSplitViewDelegate, NSSplitViewDividerStyle, NSSplitViewItem, NSTabViewController,
-    NSTabViewControllerTabStyle, NSTabViewItem, NSTableColumn, NSTableHeaderView, NSTableRowView,
-    NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewDropOperation, NSTableViewStyle, NSTextAlignment, NSTextDelegate, NSTextField,
-    NSTextFieldDelegate, NSTextView, NSTextViewDelegate, NSTitlePosition, NSTokenField,
-    NSTokenStyle, NSToolbar, NSToolbarDelegate, NSToolbarDisplayMode,
-    NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemGroup,
-    NSToolbarItemGroupControlRepresentation, NSToolbarItemGroupSelectionMode,
-    NSToolbarItemIdentifier, NSToolbarItemVisibilityPriorityHigh,
-    NSToolbarItemVisibilityPriorityLow, NSToolbarItemVisibilityPriorityUser,
-    NSToolbarSpaceItemIdentifier, NSUserInterfaceItemIdentifier, NSView,
-    NSViewBoundsDidChangeNotification, NSViewController, NSWindow, NSWindowDelegate,
-    NSWindowOcclusionState, NSWindowStyleMask, NSWindowTitleVisibility, NSWindowToolbarStyle,
-    NSWorkspace, NSWorkspaceOpenConfiguration,
+    NSEventType, NSFindPanelAction, NSFont, NSFontAttributeName, NSGlassEffectView,
+    NSGlassEffectViewStyle, NSImage, NSImageScaling, NSImageView, NSItemBadge, NSLayoutConstraint,
+    NSLayoutConstraintOrientation, NSLayoutPriorityDefaultHigh, NSLayoutPriorityDefaultLow,
+    NSLineBreakMode, NSMenu, NSMenuDelegate, NSMenuItem, NSMenuItemValidation, NSMenuToolbarItem,
+    NSModalResponseOK, NSOpenPanel, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypeString,
+    NSPopUpButton, NSPopover, NSPopoverBehavior, NSProgressIndicator, NSProgressIndicatorStyle,
+    NSRunningApplication, NSSavePanel, NSScrollView, NSSearchField, NSSecureTextField, NSSplitView,
+    NSSplitViewController, NSSplitViewDelegate, NSSplitViewDividerStyle, NSSplitViewItem,
+    NSTabViewController, NSTabViewControllerTabStyle, NSTabViewItem, NSTableColumn,
+    NSTableHeaderView, NSTableRowView, NSTableView, NSTableViewColumnAutoresizingStyle,
+    NSTableViewDataSource, NSTableViewDelegate, NSTableViewDropOperation, NSTableViewStyle,
+    NSTextAlignment, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
+    NSTextViewDelegate, NSTitlePosition, NSTokenField, NSTokenStyle, NSToolbar, NSToolbarDelegate,
+    NSToolbarDisplayMode, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemGroup,
+    NSToolbarItemGroupControlRepresentation, NSToolbarItemIdentifier,
+    NSToolbarItemVisibilityPriorityHigh, NSToolbarItemVisibilityPriorityLow,
+    NSToolbarItemVisibilityPriorityUser, NSToolbarSpaceItemIdentifier,
+    NSUserInterfaceItemIdentifier, NSView, NSViewBoundsDidChangeNotification, NSViewController,
+    NSWindow, NSWindowDelegate, NSWindowOcclusionState, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSWindowToolbarStyle, NSWorkspace, NSWorkspaceOpenConfiguration,
 };
 use objc2_core_foundation::{CFArray, CFData, CFRetained};
 use objc2_core_text::{
@@ -136,9 +134,9 @@ use objc2_core_text::{
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSBundle, NSData, NSDate, NSDateFormatter, NSDateFormatterStyle,
-    NSEdgeInsets, NSError, NSIndexSet, NSMutableAttributedString, NSNotification,
-    NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSRectEdge, NSSize,
-    NSString, NSTimer, NSURL, NSUserDefaults,
+    NSEdgeInsets, NSError, NSIndexSet, NSNotification, NSNotificationCenter, NSObject,
+    NSObjectProtocol, NSPoint, NSRange, NSRect, NSRectEdge, NSSize, NSString, NSTimer, NSURL,
+    NSUserDefaults,
 };
 use objc2_pdf_kit::{PDFDisplayDirection, PDFDisplayMode, PDFDocument, PDFView};
 use objc2_uniform_type_identifiers::UTType;
@@ -226,12 +224,8 @@ done
 "#;
 const ACTIVE_PAGE_DEFAULT: &str = "dev.craic.page.active-index";
 
-const NATIVE_AGENT_PROVIDERS: [&'static dyn terminal_agent::AgentProvider; 4] = [
-    &terminal_agent::codex::PROVIDER,
-    &terminal_agent::grok::PROVIDER,
-    &terminal_agent::opencode::PROVIDER,
-    &terminal_agent::agy::PROVIDER,
-];
+const NATIVE_AGENT_PROVIDERS: [&'static dyn terminal_agent::AgentProvider; 4] =
+    terminal_agent::PROVIDERS;
 
 enum NativePageBadge {
     None,

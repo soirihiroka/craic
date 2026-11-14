@@ -1,14 +1,14 @@
+use craic_platform::terminal::{TerminalBackend, TerminalCommand, TerminalLifecycle, TerminalSize};
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io::{self, Read};
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::thread;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener, OnResize, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, State};
@@ -32,14 +32,6 @@ const SIXEL_EVENT_CAPACITY: usize = 8;
 const MAX_SIXEL_IMAGES: usize = 32;
 const MAX_SIXEL_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 static NEXT_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TerminalSpawnOptions {
-    pub working_directory: Option<PathBuf>,
-    pub shell_program: Option<String>,
-    pub shell_arguments: Vec<String>,
-    pub environment: HashMap<String, String>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalViewport {
@@ -256,10 +248,35 @@ pub struct TerminalEventBatch {
 #[derive(Clone)]
 struct TerminalEventProxy {
     sender: SyncSender<Event>,
+    exit: Arc<Mutex<TerminalExitState>>,
+}
+
+#[derive(Default)]
+struct TerminalExitState {
+    exited: bool,
+    drained: bool,
+    reported: bool,
+    code: Option<i32>,
 }
 
 impl EventListener for TerminalEventProxy {
     fn send_event(&self, event: Event) {
+        // Exit is process state, not a best-effort redraw notification. Record
+        // it before enqueueing so a full UI queue cannot lose it or leave a
+        // reaped process ID eligible for shutdown signals.
+        match &event {
+            Event::ChildExit(status) => {
+                let mut exit = self.exit.lock().unwrap_or_else(|error| error.into_inner());
+                exit.exited = true;
+                exit.code = status.code();
+            }
+            Event::Exit => {
+                let mut exit = self.exit.lock().unwrap_or_else(|error| error.into_inner());
+                exit.exited = true;
+                exit.drained = true;
+            }
+            _ => {}
+        }
         match self.sender.try_send(event) {
             Ok(()) | Err(TrySendError::Full(Event::Wakeup | Event::MouseCursorDirty)) => {}
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
@@ -513,36 +530,41 @@ pub struct TerminalSession {
     sender: alacritty_terminal::event_loop::EventLoopSender,
     events: Receiver<Event>,
     io_thread: Option<TerminalIoThread>,
+    shutdown_started: bool,
+    process_shutdown: Option<craic_platform::terminal::ProcessGroupShutdown>,
     viewport: TerminalViewport,
     child_pid: u32,
-    child_exited: AtomicBool,
+    exit: Arc<Mutex<TerminalExitState>>,
+    #[cfg(unix)]
+    control_pty: std::fs::File,
     sixel: SixelPlane,
 }
 
 impl TerminalSession {
-    pub fn spawn(options: TerminalSpawnOptions, viewport: TerminalViewport) -> io::Result<Self> {
+    pub fn spawn(command: TerminalCommand, viewport: TerminalViewport) -> io::Result<Self> {
+        let mut argv = command.spawn_argv().map_err(io::Error::other)?.into_iter();
+        let program = argv
+            .next()
+            .ok_or_else(|| io::Error::other("Terminal command is empty"))?;
         let (event_sender, events) = sync_channel(TERMINAL_EVENT_CAPACITY);
         let (sixel_sender, sixel_receiver) = sync_channel(SIXEL_EVENT_CAPACITY);
         let sixel_output_line = Arc::new(AtomicU64::new(0));
+        let exit = Arc::new(Mutex::new(TerminalExitState::default()));
         let event_proxy = TerminalEventProxy {
             sender: event_sender,
+            exit: Arc::clone(&exit),
         };
-        let mut environment = craic_platform::terminal_environment();
-        environment.extend(options.environment);
-        let shell = options.shell_program.map(|program| {
-            let mut arguments = vec!["-u".to_owned(), "NO_COLOR".to_owned(), program];
-            arguments.extend(options.shell_arguments);
-            Shell::new("/usr/bin/env".to_owned(), arguments)
-        });
         let pty_options = Options {
-            shell,
-            working_directory: options.working_directory,
-            drain_on_exit: false,
-            env: environment,
+            shell: Some(Shell::new(program, argv.collect())),
+            working_directory: Some(command.working_directory),
+            drain_on_exit: true,
+            env: command.environment,
         };
         let window_id = NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed);
         let pty = tty::new(&pty_options, viewport.window_size(), window_id)?;
         let child_pid = pty.child().id();
+        #[cfg(unix)]
+        let control_pty = pty.file().try_clone()?;
         #[cfg(unix)]
         let pty = SixelPty::new(
             pty,
@@ -576,9 +598,13 @@ impl TerminalSession {
             sender,
             events,
             io_thread,
+            shutdown_started: false,
+            process_shutdown: None,
             viewport,
             child_pid,
-            child_exited: AtomicBool::new(false),
+            exit,
+            #[cfg(unix)]
+            control_pty,
             sixel: SixelPlane::new(sixel_receiver, sixel_output_line),
         })
     }
@@ -927,18 +953,15 @@ impl TerminalSession {
                     let _ = self.input(formatter(self.viewport.window_size()).into_bytes());
                 }
                 Event::Bell => batch.bell = true,
-                Event::Exit => {
-                    self.child_exited.store(true, Ordering::Release);
-                    batch.exited = true;
-                    batch.needs_redraw = true;
-                }
-                Event::ChildExit(status) => {
-                    self.child_exited.store(true, Ordering::Release);
-                    batch.exited = true;
-                    batch.exit_code = status.code();
-                    batch.needs_redraw = true;
-                }
+                Event::Exit | Event::ChildExit(_) => {}
             }
+        }
+        let mut exit = self.exit.lock().unwrap_or_else(|error| error.into_inner());
+        if exit.drained && !exit.reported {
+            exit.reported = true;
+            batch.exited = true;
+            batch.exit_code = exit.code;
+            batch.needs_redraw = true;
         }
         batch
     }
@@ -1008,19 +1031,40 @@ impl TerminalSession {
         self.stop_io()
     }
 
+    /// Signal the child immediately before transferring cleanup to a worker.
+    /// The shared plan owns the remaining wait/escalation without repeating HUP.
+    pub fn begin_shutdown(&mut self) {
+        if self.io_thread.is_none() || self.shutdown_started {
+            return;
+        }
+        self.shutdown_started = true;
+        if !self
+            .exit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .exited
+        {
+            #[cfg(unix)]
+            let foreground = {
+                let group = unsafe { libc::tcgetpgrp(self.control_pty.as_raw_fd()) };
+                (group > 0).then_some(group)
+            };
+            #[cfg(not(unix))]
+            let foreground = None;
+            self.process_shutdown = craic_platform::terminal::begin_process_group_shutdown(
+                self.child_pid as i32,
+                foreground,
+            );
+        }
+    }
+
     fn stop_io(&mut self) -> io::Result<()> {
         if self.io_thread.is_none() {
             return Ok(());
         }
-        if !self.child_exited.load(Ordering::Acquire) {
-            signal_process_group(self.child_pid, libc::SIGHUP);
-            if !wait_for_process_group_exit(self.child_pid, Duration::from_millis(150)) {
-                signal_process_group(self.child_pid, libc::SIGTERM);
-            }
-            if !wait_for_process_group_exit(self.child_pid, Duration::from_millis(250)) {
-                signal_process_group(self.child_pid, libc::SIGKILL);
-                let _ = wait_for_process_group_exit(self.child_pid, Duration::from_millis(250));
-            }
+        self.begin_shutdown();
+        if let Some(shutdown) = self.process_shutdown.take() {
+            shutdown.finish();
         }
         let _ = self.sender.send(Msg::Shutdown);
         let join_result = self
@@ -1119,28 +1163,52 @@ fn terminal_cursor_shape(shape: CursorShape) -> TerminalCursorShape {
     }
 }
 
-fn signal_process_group(child_pid: u32, signal: libc::c_int) {
-    if let Ok(process_group) = i32::try_from(child_pid) {
-        unsafe {
-            libc::kill(-process_group, signal);
+impl TerminalBackend for TerminalSession {
+    fn process_id(&self) -> Option<u32> {
+        (!self
+            .exit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .exited
+            && self.io_thread.is_some()
+            && !self.shutdown_started)
+            .then_some(self.child_pid)
+    }
+
+    fn lifecycle(&self) -> TerminalLifecycle {
+        if self.io_thread.is_none() || self.shutdown_started {
+            TerminalLifecycle::Closing
+        } else if self
+            .exit
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .exited
+        {
+            TerminalLifecycle::Exited
+        } else {
+            TerminalLifecycle::Running
         }
     }
-}
 
-fn wait_for_process_group_exit(child_pid: u32, timeout: Duration) -> bool {
-    let Ok(process_group) = i32::try_from(child_pid) else {
-        return true;
-    };
-    let deadline = Instant::now() + timeout;
-    loop {
-        let alive = unsafe { libc::kill(-process_group, 0) } == 0
-            || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
-        if !alive {
-            return true;
+    fn send_input(&self, bytes: &[u8]) -> Result<(), String> {
+        if self.lifecycle() != TerminalLifecycle::Running {
+            return Err("Terminal process is not running.".to_owned());
         }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(10));
+        self.input(bytes.to_vec())
+            .map_err(|error| error.to_string())
+    }
+
+    fn resize_terminal(&mut self, size: TerminalSize) -> Result<(), String> {
+        self.resize(TerminalViewport::new(
+            size.columns,
+            size.rows,
+            size.cell_width,
+            size.cell_height,
+        ))
+        .map_err(|error| error.to_string())
+    }
+
+    fn terminate_process(&mut self) -> Result<(), String> {
+        self.stop_io().map_err(|error| error.to_string())
     }
 }

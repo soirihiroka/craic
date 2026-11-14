@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
+pub mod process;
+pub mod terminal;
+
 pub fn terminal_environment() -> HashMap<String, String> {
     let mut environment = std::env::vars().collect::<HashMap<_, _>>();
     environment.remove("NO_COLOR");

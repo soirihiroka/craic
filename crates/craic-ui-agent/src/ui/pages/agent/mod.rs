@@ -1,7 +1,6 @@
 mod agent_shell_integration;
 mod left;
 mod prompts;
-mod provider;
 mod remote_image;
 mod right;
 mod smart_summary;
@@ -13,6 +12,7 @@ use super::{
 use crate::git::WorkspaceSnapshot;
 use crate::ui::agent_history;
 use adw::prelude::*;
+use craic_agent::terminal_provider as provider;
 use left::{AgentList, AgentListContextAction, AgentListSelection};
 use right::AgentChat;
 use std::cell::{Cell, RefCell};

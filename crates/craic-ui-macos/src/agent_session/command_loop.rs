@@ -47,16 +47,19 @@ where
                             Some(Event::ProviderUpdatePrepared { identity, generation, result })
                         });
                     }
-                    Command::PrepareTerminal { identity, workspace, provider_id, history, cancellation } => {
+                    Command::PrepareTerminal { identity, session_id, workspace, provider_id, history, cancellation } => {
                         jobs.spawn(async move {
                             let worker_provider = provider_id.clone();
                             let worker_history = history.clone();
                             let task = tokio::task::spawn_blocking(move || prepare_terminal(&workspace, &worker_provider, worker_history.as_ref()));
                             let result = tokio::select! {
                                 _ = cancellation.cancelled() => return None,
-                                result = task => result.unwrap_or_else(|error| Err(format!("Agent launch task failed: {error}"))),
+                                result = tokio::time::timeout(std::time::Duration::from_secs(30), task) => match result {
+                                    Ok(result) => result.unwrap_or_else(|error| Err(format!("Agent launch task failed: {error}"))),
+                                    Err(_) => Err("Agent launch preparation timed out after 30 seconds.".to_owned()),
+                                },
                             };
-                            Some(Event::TerminalPrepared { identity, provider_id, history, result })
+                            Some(Event::TerminalPrepared { identity, session_id, provider_id, history, result })
                         });
                     }
                     Command::GenerateSummary { identity, session_id, local_id, provider_id, title, transcript, automatic, cancellation } => {
@@ -89,7 +92,10 @@ where
                             });
                             let result = tokio::select! {
                                 _ = cancellation.cancelled() => return None,
-                                result = task => result.unwrap_or_else(|error| Err(format!("Agent history task failed: {error}"))),
+                                result = tokio::time::timeout(std::time::Duration::from_secs(75), task) => match result {
+                                    Ok(result) => result.unwrap_or_else(|error| Err(format!("Agent history task failed: {error}"))),
+                                    Err(_) => Err("Agent history timed out after 75 seconds; the connection will be retried.".to_owned()),
+                                },
                             };
                             Some(Event::HistoryLoaded { identity, request_id, result })
                         });
@@ -98,6 +104,10 @@ where
                         jobs.abort_all();
                         history_readers = Arc::new(Mutex::new(CliHistory::default()));
                         log::debug!("native terminal-agent jobs reset for workspace transition");
+                    }
+                    Command::ResetHistory => {
+                        history_readers = Arc::new(Mutex::new(CliHistory::default()));
+                        log::info!("native agent history readers reset after an expired request");
                     }
                     Command::Shutdown { completed } => {
                         jobs.abort_all();
@@ -110,7 +120,12 @@ where
             }
             completed = jobs.join_next(), if !jobs.is_empty() => {
                 match completed {
-                    Some(Ok(Some(event))) => emit(event),
+                    Some(Ok(Some(event))) => {
+                        if matches!(&event, Event::HistoryLoaded { result: Err(_), .. }) {
+                            history_readers = Arc::new(Mutex::new(CliHistory::default()));
+                        }
+                        emit(event);
+                    },
                     Some(Err(error)) if !error.is_cancelled() => log::warn!("native agent background job failed: {error}"),
                     _ => {}
                 }

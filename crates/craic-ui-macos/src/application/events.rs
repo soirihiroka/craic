@@ -633,6 +633,7 @@ impl AppDelegate {
                 self.request_containers();
             }
         } else if showing_agents {
+            self.activate_native_agent_page(provider_changed);
             self.ensure_native_agent_history_timer();
             self.request_native_provider_updates(false);
             if self.ivars().agents.get().is_some_and(|agents| {
@@ -733,12 +734,25 @@ impl AppDelegate {
             empty.setStringValue(&NSString::from_str(message));
             empty.setHidden(false);
         }
-        if let Some(page_switcher) = self.ivars().page_switcher.get()
-            && let Some(index) = PAGE_DESCRIPTORS
-                .iter()
-                .position(|candidate| candidate.id == descriptor.id)
-        {
-            page_switcher.setSelectedIndex(index as isize);
+        for item in self.ivars().page_switcher.borrow().iter() {
+            if let Some(button) = item
+                .view()
+                .and_then(|view| view.downcast::<NSButton>().ok())
+            {
+                let selected = PAGE_DESCRIPTORS
+                    .get(item.tag() as usize)
+                    .is_some_and(|page| page.id == descriptor.id);
+                button.setBezelColor(
+                    selected
+                        .then(NSColor::unemphasizedSelectedContentBackgroundColor)
+                        .as_deref(),
+                );
+                button.setState(if selected {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+            }
         }
         if let Some(diff) = self.ivars().diff_view.get() {
             diff.refresh_renderer_visibility();

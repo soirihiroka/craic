@@ -3,7 +3,6 @@ use super::{
     check_command_available, command_path, json_value_from_output, run_generation_command,
     run_model_command,
 };
-use std::path::PathBuf;
 
 pub(super) static PROVIDER: Provider = Provider;
 
@@ -19,11 +18,15 @@ impl AgentProvider for Provider {
     }
 
     fn check_available(&self) -> Result<(), String> {
-        check_command_available(self.label(), &codex_command())
+        check_command_available(self.label(), &command_path("codex"))
     }
 
     fn fetch_models(&self) -> Result<Vec<ModelOption>, String> {
-        let output = run_model_command(self, codex_command(), &["debug", "models", "--bundled"])?;
+        let output = run_model_command(
+            self,
+            command_path("codex"),
+            &["debug", "models", "--bundled"],
+        )?;
         parse_codex_model_options(&output)
     }
 
@@ -38,14 +41,31 @@ impl AgentProvider for Provider {
             "--sandbox".to_string(),
             "read-only".to_string(),
             "--skip-git-repo-check".to_string(),
+            "--json".to_string(),
         ];
         append_model_args(&mut args, model);
-        run_generation_command(
+        let output = run_generation_command(
             self,
-            CommandInvocation::new(codex_command(), args),
+            CommandInvocation::new(command_path("codex"), args),
             prompt,
             cancellation,
-        )
+        )?;
+        output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| {
+                event.get("type").and_then(serde_json::Value::as_str) == Some("item.completed")
+            })
+            .filter_map(|event| {
+                let item = event.get("item")?;
+                if item.get("type").and_then(serde_json::Value::as_str) != Some("agent_message") {
+                    return None;
+                }
+                item.get("text")?.as_str().map(str::to_string)
+            })
+            .filter(|message| !message.trim().is_empty())
+            .last()
+            .ok_or_else(|| "Codex did not return a final response.".to_string())
     }
 }
 
@@ -98,15 +118,4 @@ fn parse_codex_model_options(output: &str) -> Result<Vec<ModelOption>, String> {
         );
         Ok(models)
     }
-}
-
-fn codex_command() -> PathBuf {
-    let local = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("../codex/target/debug/codex");
-    if local.is_file() {
-        return local;
-    }
-
-    command_path("codex")
 }

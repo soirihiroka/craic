@@ -1,10 +1,10 @@
-use crate::process::signal_terminal_process_groups;
+use crate::process::begin_process_group_shutdown;
 use crate::ui::components::terminal::{TerminalActivation, TerminalFileActivation};
+use craic_platform::terminal::{TerminalBackend, TerminalCommand, TerminalLifecycle, TerminalSize};
 use craic_ui_core::ui::{canvas_scroll, components::context_menu};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
@@ -46,17 +46,51 @@ pub struct VteTerminal {
     file_drop_handler: Rc<RefCell<Option<FileDropHandler>>>,
 }
 
-pub struct SpawnSpec {
-    pub program: String,
-    pub args: Vec<String>,
-    pub working_directory: PathBuf,
-    pub env: HashMap<String, String>,
-}
+impl TerminalBackend for VteTerminal {
+    fn process_id(&self) -> Option<u32> {
+        self.child_pid.get().and_then(|pid| pid.try_into().ok())
+    }
 
-pub fn terminal_environment() -> HashMap<String, String> {
-    let mut environment = craic_platform::terminal_environment();
-    environment.insert("VTE_VERSION".to_string(), VTE_VERSION.to_string());
-    environment
+    fn lifecycle(&self) -> TerminalLifecycle {
+        if self.terminated.get() {
+            TerminalLifecycle::Closing
+        } else if self.spawning.get() {
+            TerminalLifecycle::Starting
+        } else if self.child_pid.get().is_some() {
+            TerminalLifecycle::Running
+        } else {
+            TerminalLifecycle::Exited
+        }
+    }
+
+    fn send_input(&self, bytes: &[u8]) -> Result<(), String> {
+        if self.lifecycle() != TerminalLifecycle::Running {
+            return Err("Terminal process is not running.".to_owned());
+        }
+        self.terminal.feed_child(bytes);
+        Ok(())
+    }
+
+    fn resize_terminal(&mut self, size: TerminalSize) -> Result<(), String> {
+        self.terminal.set_size(
+            size.columns.max(1).min(i64::MAX as usize) as i64,
+            size.rows.max(1).min(i64::MAX as usize) as i64,
+        );
+        Ok(())
+    }
+
+    fn terminate_process(&mut self) -> Result<(), String> {
+        self.terminated.set(true);
+        let Some(pid) = self.child_pid.take() else {
+            log::debug!("VTE terminal shutdown deferred or already complete");
+            return Ok(());
+        };
+        let foreground = self.foreground_process_group();
+        if let Some(shutdown) = begin_process_group_shutdown(pid, foreground) {
+            std::thread::spawn(move || shutdown.finish());
+        }
+        Ok(())
+    }
 }
 
 impl VteTerminal {
@@ -178,31 +212,28 @@ impl VteTerminal {
         self.terminal.grab_focus();
     }
 
-    pub fn spawn<F>(&self, spec: SpawnSpec, launch_dir: String, callback: F) -> Result<(), String>
+    pub fn spawn<F>(&self, mut command: TerminalCommand, callback: F) -> Result<(), String>
     where
         F: FnOnce(Result<i32, String>) + 'static,
     {
         if self.spawning.get() || self.child_pid.get().is_some() {
             return Err("Terminal process has already been started.".to_string());
         }
+        let argv = command.spawn_argv()?;
+        let working_directory = command
+            .working_directory
+            .to_str()
+            .expect("validated terminal working directory");
+        command
+            .environment
+            .insert("VTE_VERSION".to_owned(), VTE_VERSION.to_owned());
         self.spawning.set(true);
-        let working_directory = spec.working_directory.to_str().ok_or_else(|| {
-            self.spawning.set(false);
-            "Terminal working directory is not valid UTF-8.".to_string()
-        })?;
-        if spec.program.is_empty() {
-            self.spawning.set(false);
-            return Err("Cannot start an empty terminal command.".to_string());
-        }
         self.terminated.set(false);
-        self.launch_dir.replace(launch_dir);
+        self.launch_dir.replace(command.target_working_directory);
 
-        let argv = std::iter::once(spec.program)
-            .chain(spec.args)
-            .collect::<Vec<_>>();
         let argv_refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-        let env = spec
-            .env
+        let env = command
+            .environment
             .into_iter()
             .map(|(key, value)| format!("{key}={value}"))
             .collect::<Vec<_>>();
@@ -225,12 +256,7 @@ impl VteTerminal {
                             this.child_pid.set(Some(pid.0));
                             log::info!("VTE terminal PTY started pid={}", pid.0);
                             if this.terminated.get() {
-                                signal_terminal_process_groups(
-                                    pid.0,
-                                    this.foreground_process_group(),
-                                    libc::SIGHUP,
-                                );
-                                this.child_pid.set(None);
+                                this.terminate();
                             }
                             callback(Ok(pid.0));
                         }
@@ -293,16 +319,7 @@ impl VteTerminal {
     }
 
     pub fn terminate(&self) {
-        self.terminated.set(true);
-        let Some(pid) = self.child_pid.take() else {
-            log::debug!("VTE terminal shutdown deferred or already complete");
-            return;
-        };
-        log::info!(
-            "VTE terminal shutdown started pid={pid} foreground_pgid={:?}",
-            self.foreground_process_group()
-        );
-        signal_terminal_process_groups(pid, self.foreground_process_group(), libc::SIGHUP);
+        let _ = self.clone().terminate_process();
     }
 
     pub fn set_font_size(&self, font_size: f64) {
@@ -343,7 +360,7 @@ impl VteTerminal {
     }
 
     pub fn feed_child(&self, bytes: &[u8]) {
-        self.terminal.feed_child(bytes);
+        let _ = self.send_input(bytes);
     }
 
     pub fn feed(&self, bytes: &[u8]) {

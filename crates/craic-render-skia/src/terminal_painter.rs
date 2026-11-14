@@ -1,4 +1,6 @@
 use skia_safe::{Canvas, Color, Font, FontMgr, FontStyle, Paint, PaintStyle, Rect};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 use crate::{
     TerminalCell, TerminalCellStyle, TerminalColor, TerminalCursorShape, TerminalSnapshot,
@@ -238,10 +240,12 @@ fn paint_cell(
 }
 
 struct TerminalFonts {
+    manager: FontMgr,
     regular: Font,
     bold: Font,
     italic: Font,
     bold_italic: Font,
+    fallback: RefCell<HashMap<(bool, bool, String, u32), Option<Font>>>,
 }
 
 impl TerminalFonts {
@@ -261,6 +265,8 @@ impl TerminalFonts {
             bold: font(FontStyle::bold()),
             italic: font(FontStyle::italic()),
             bold_italic: font(FontStyle::bold_italic()),
+            manager,
+            fallback: RefCell::new(HashMap::new()),
         }
     }
 
@@ -286,13 +292,25 @@ impl TerminalFonts {
         else {
             return ResolvedTerminalFont::Borrowed(primary);
         };
+        let key = (
+            style.bold,
+            style.italic,
+            text.to_owned(),
+            available_width.to_bits(),
+        );
+        if let Some(cached) = self.fallback.borrow().get(&key) {
+            return match cached {
+                Some(font) => ResolvedTerminalFont::Owned(font.clone()),
+                None => ResolvedTerminalFont::Borrowed(primary),
+            };
+        }
         let font_style = match (style.bold, style.italic) {
             (true, true) => FontStyle::bold_italic(),
             (true, false) => FontStyle::bold(),
             (false, true) => FontStyle::italic(),
             (false, false) => FontStyle::normal(),
         };
-        let manager = FontMgr::default();
+        let manager = &self.manager;
         let typeface = [
             "JetBrainsMono Nerd Font Mono",
             "Symbols Nerd Font Mono",
@@ -310,15 +328,23 @@ impl TerminalFonts {
                 })
         })
         .or_else(|| manager.match_family_style_character("", font_style, &[], missing as i32));
-        let Some(typeface) = typeface else {
-            return ResolvedTerminalFont::Borrowed(primary);
-        };
-        let mut fallback = Font::new(typeface, primary.size());
-        let (text_width, _) = fallback.measure_str(text, None);
-        if text_width > available_width && available_width > 0.0 {
-            fallback.set_scale_x((available_width / text_width).clamp(0.55, 1.0));
+        let fallback = typeface.map(|typeface| {
+            let mut font = Font::new(typeface, primary.size());
+            let (text_width, _) = font.measure_str(text, None);
+            if text_width > available_width && available_width > 0.0 {
+                font.set_scale_x((available_width / text_width).clamp(0.55, 1.0));
+            }
+            font
+        });
+        let mut cache = self.fallback.borrow_mut();
+        if cache.len() >= 2048 {
+            cache.clear();
         }
-        ResolvedTerminalFont::Owned(fallback)
+        cache.insert(key, fallback.clone());
+        match fallback {
+            Some(font) => ResolvedTerminalFont::Owned(font),
+            None => ResolvedTerminalFont::Borrowed(primary),
+        }
     }
 }
 

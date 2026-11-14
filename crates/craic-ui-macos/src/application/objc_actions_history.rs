@@ -303,17 +303,14 @@ impl AppDelegate {
             self.set_commit_message_settings_error("The settings service is unavailable.");
             return;
         };
-        if let Err(error) = requests.try_send(RepositoryRequest::SaveCommitMessageModel {
-            provider_id,
-            model,
-        }) {
+        if let Err(error) =
+            requests.try_send(RepositoryRequest::SaveCommitMessageModel { provider_id, model })
+        {
             self.set_commit_message_settings_error(&format!(
                 "Unable to save the model selection: {error}"
             ));
         } else {
-            settings
-                .status
-                .setStringValue(&NSString::from_str("Commit-message settings saved."));
+            settings.status.setHidden(true);
         }
     }
 
@@ -332,7 +329,11 @@ impl AppDelegate {
         let Some(snapshot) = self.ivars().repository_snapshot.borrow().clone() else {
             return;
         };
-        let Some(branch) = snapshot.branches.get(index).map(|branch| branch.name.clone()) else {
+        let Some(branch) = snapshot
+            .branches
+            .get(index)
+            .map(|branch| branch.name.clone())
+        else {
             log::warn!("branch selection index out of range index={index}");
             return;
         };

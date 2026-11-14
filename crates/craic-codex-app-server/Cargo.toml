@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+craic-platform.workspace = true
 libc.workspace = true
 log.workspace = true
 serde.workspace = true

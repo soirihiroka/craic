@@ -719,15 +719,24 @@ impl AppDelegate {
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
         let toast_label = NSTextField::labelWithString(&NSString::new(), mtm);
-        toast_label.setFrame(NSRect::new(
-            NSPoint::new(18.0, 12.0),
-            NSSize::new(toast_width - 36.0, 20.0),
-        ));
-        toast_label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+        toast_label.setTranslatesAutoresizingMaskIntoConstraints(false);
+        toast_label.setUsesSingleLineMode(true);
         toast_label.setAlignment(NSTextAlignment::Center);
         toast_label.setFont(Some(&NSFont::systemFontOfSize(12.5)));
         toast_label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
         toast_content.addSubview(&toast_label);
+        toast_label
+            .centerYAnchor()
+            .constraintEqualToAnchor(&toast_content.centerYAnchor())
+            .setActive(true);
+        toast_label
+            .leadingAnchor()
+            .constraintEqualToAnchor_constant(&toast_content.leadingAnchor(), 18.0)
+            .setActive(true);
+        toast_label
+            .trailingAnchor()
+            .constraintEqualToAnchor_constant(&toast_content.trailingAnchor(), -18.0)
+            .setActive(true);
         toast.setContentView(Some(&toast_content));
         toast.setHidden(true);
         content.addSubview(&toast);

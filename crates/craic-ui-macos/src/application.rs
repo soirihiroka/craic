@@ -419,8 +419,13 @@ define_class!(
 
 
         #[unsafe(method(selectPage:))]
-        fn select_page(&self, sender: &NSToolbarItemGroup){
-            self.handle_objc_select_page(sender)
+        fn select_page(&self, sender: &NSToolbarItem){
+            self.handle_objc_select_page(sender.tag())
+        }
+
+        #[unsafe(method(selectPageButton:))]
+        fn select_page_button(&self, sender: &NSButton){
+            self.handle_objc_select_page(sender.tag())
         }
 
         #[unsafe(method(filterFiles:))]
@@ -1158,6 +1163,14 @@ define_class!(
 
     // SAFETY: Method signatures match NSToolbarDelegate and all returned objects are owned.
     unsafe impl NSToolbarDelegate for AppDelegate {
+        #[unsafe(method_id(toolbarSelectableItemIdentifiers:))]
+        fn toolbar_selectable_item_identifiers(
+            &self,
+            _toolbar: &NSToolbar,
+        ) -> Retained<NSArray<NSToolbarItemIdentifier>> {
+            NSArray::new()
+        }
+
         #[unsafe(method_id(toolbarDefaultItemIdentifiers:))]
         fn toolbar_default_item_identifiers(
             &self,
@@ -1206,7 +1219,6 @@ include!("application/repository_state.rs");
 include!("application/workspace_create.rs");
 include!("application/completions.rs");
 include!("application/toolbar.rs");
-include!("application/page_badges.rs");
 include!("application/history_builder.rs");
 include!("application/files_builder.rs");
 include!("application/containers_builder.rs");

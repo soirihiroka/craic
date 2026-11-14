@@ -1,5 +1,6 @@
 use std::fmt;
 use std::process::Command;
+use std::time::Duration;
 
 /// Oldest Codex CLI release supported by the native client.
 pub const MINIMUM_CODEX_VERSION: CodexVersion = CodexVersion::new(0, 145, 0);
@@ -101,7 +102,8 @@ impl std::error::Error for VersionError {}
 
 /// Runs the supplied version command and enforces [`MINIMUM_CODEX_VERSION`].
 pub fn check_codex_version(command: &mut Command) -> Result<CodexVersion, VersionError> {
-    let output = command.output().map_err(VersionError::Command)?;
+    let output = craic_platform::process::command_output(command, Duration::from_secs(10))
+        .map_err(VersionError::Command)?;
     if !output.status.success() {
         return Err(VersionError::CommandFailed {
             status: output.status.code(),

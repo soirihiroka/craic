@@ -27,11 +27,12 @@ pub fn list_native_sessions(
     limit: usize,
     title_query: Option<&str>,
     tag_filters: &[String],
-    codex: Result<&CodexHistoryReader, String>,
-    grok: Result<&GrokHistoryReader, String>,
+    codex: Result<Option<&CodexHistoryReader>, String>,
+    grok: Result<Option<&GrokHistoryReader>, String>,
 ) -> Result<NativeHistory, String> {
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
+    let mut had_success = false;
     let provider_limit =
         if title_query.is_some_and(|query| !query.trim().is_empty()) || !tag_filters.is_empty() {
             usize::MAX
@@ -39,13 +40,23 @@ pub fn list_native_sessions(
             limit
         };
     let results = std::thread::scope(|scope| {
-        let codex = scope
-            .spawn(|| codex.and_then(|reader| reader.list(workspace.repo_path(), provider_limit)));
-        let grok = scope
-            .spawn(|| grok.and_then(|reader| reader.list(workspace.repo_path(), provider_limit)));
+        let codex = scope.spawn(|| {
+            codex.and_then(|reader| {
+                reader
+                    .map(|reader| reader.list(workspace.repo_path(), provider_limit))
+                    .transpose()
+            })
+        });
+        let grok = scope.spawn(|| {
+            grok.and_then(|reader| {
+                reader
+                    .map(|reader| reader.list(workspace.repo_path(), provider_limit))
+                    .transpose()
+            })
+        });
         let mut opencode = Vec::new();
-        let opencode =
-            read_opencode_sessions(workspace.repo_path(), &mut opencode).map(|()| opencode);
+        let opencode = read_opencode_sessions(workspace.repo_path(), &mut opencode)
+            .map(|available| available.then_some(opencode));
         [
             (
                 "Codex",
@@ -63,9 +74,18 @@ pub fn list_native_sessions(
     });
     for (provider, result) in results {
         match result {
-            Ok(rows) => sessions.extend(rows),
+            Ok(Some(rows)) => {
+                had_success = true;
+                sessions.extend(rows);
+            }
+            Ok(None) => {}
             Err(error) => warnings.push(format!("{provider} history: {error}")),
         }
+    }
+    if !had_success && !warnings.is_empty() {
+        // A failed read is not an authoritative empty list. Let both frontends
+        // retain their current view without reviving account-unscoped SQL rows.
+        return Err(warnings.join("\n"));
     }
 
     let mut conn = history_connection().map_err(db_error)?;
@@ -185,7 +205,7 @@ pub fn list_native_sessions(
     })
 }
 
-fn read_opencode_sessions(cwd: &Path, sessions: &mut Vec<NativeSession>) -> Result<(), String> {
+fn read_opencode_sessions(cwd: &Path, sessions: &mut Vec<NativeSession>) -> Result<bool, String> {
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
@@ -193,7 +213,7 @@ fn read_opencode_sessions(cwd: &Path, sessions: &mut Vec<NativeSession>) -> Resu
         .map(|data| data.join("opencode/opencode.db"))
         .filter(|path| path.is_file())
     else {
-        return Ok(());
+        return Ok(false);
     };
     let conn =
         Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db_error)?;
@@ -219,5 +239,5 @@ fn read_opencode_sessions(cwd: &Path, sessions: &mut Vec<NativeSession>) -> Resu
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_error)?,
     );
-    Ok(())
+    Ok(true)
 }

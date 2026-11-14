@@ -163,7 +163,7 @@ impl AgentChat {
             session_id,
             provider,
             title,
-            command.target_working_dir(),
+            &command.target_working_directory,
             &command.display(),
         );
         let _ = self.create_session(

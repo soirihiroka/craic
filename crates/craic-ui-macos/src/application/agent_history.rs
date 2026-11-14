@@ -28,6 +28,24 @@ impl AppDelegate {
             return;
         };
         if agents.history_loading.get() {
+            if agents
+                .history_started_at
+                .get()
+                .is_some_and(|started| started.elapsed() >= Duration::from_secs(90))
+            {
+                if let Some(cancellation) = agents.history_cancellation.borrow_mut().take() {
+                    cancellation.cancel();
+                }
+                if let Some(commands) = self.ivars().agent_commands.get() {
+                    let _ = commands.try_send(NativeAgentCommand::ResetHistory);
+                }
+                let request_id = agents.history_request_id.get().wrapping_add(1);
+                agents.history_request_id.set(request_id);
+                if let Some(identity) = self.active_agent_identity() {
+                    self.apply_native_cli_history(&identity, request_id,
+                        Err("Agent history stopped responding; its connection has been reset and will be retried.".to_owned()));
+                }
+            }
             return;
         }
         let now = craic_agent::agent_history::unix_now_ms();
@@ -71,6 +89,13 @@ impl AppDelegate {
         agents.history_request_id.set(request_id);
         agents.history_loading.set(true);
         agents
+            .history_started_at
+            .set(Some(std::time::Instant::now()));
+        let cancellation = cancellation.child_token();
+        agents
+            .history_cancellation
+            .replace(Some(cancellation.clone()));
+        agents
             .history_last_refresh_ms
             .set(craic_agent::agent_history::unix_now_ms());
         if !agents.history_loaded.get() {
@@ -79,21 +104,25 @@ impl AppDelegate {
                 .setStringValue(&NSString::from_str("Loading history…"));
         }
         agents.history_scope.setEnabled(false);
+        let query = agents.history_query.borrow().clone();
+        let mut tags = agents
+            .selected_history_tags
+            .borrow()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        tags.sort();
+        agents.history_request_filter.replace((
+            query.clone(),
+            tags.clone(),
+            agents.history_limit.get(),
+        ));
         let result = commands.try_send(NativeAgentCommand::LoadHistory {
             identity: identity.clone(),
             request_id,
             workspace,
-            query: agents.history_query.borrow().clone(),
-            tags: {
-                let mut tags = agents
-                    .selected_history_tags
-                    .borrow()
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                tags.sort();
-                tags
-            },
+            query,
+            tags,
             limit: agents.history_limit.get().saturating_add(1),
             cancellation,
         });
@@ -123,7 +152,23 @@ impl AppDelegate {
             return;
         }
         agents.history_loading.set(false);
-        if agents.history_refresh_pending.replace(false) {
+        agents.history_started_at.set(None);
+        agents.history_cancellation.borrow_mut().take();
+        let refresh_pending = agents.history_refresh_pending.replace(false);
+        let filter_matches = {
+            let filter = agents.history_request_filter.borrow();
+            let mut tags = agents
+                .selected_history_tags
+                .borrow()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            tags.sort();
+            filter.0 == *agents.history_query.borrow()
+                && filter.1 == tags
+                && filter.2 == agents.history_limit.get()
+        };
+        if !filter_matches {
             self.request_native_cli_history(false);
             return;
         }
@@ -142,26 +187,36 @@ impl AppDelegate {
                 agents.history_rows.replace(rows);
                 agents.history_tags.replace(tags);
                 self.refresh_native_agent_history_tags();
+                let warning_text = warnings.join("\n");
+                let warnings_changed = agents
+                    .history_status
+                    .toolTip()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+                    != warning_text;
                 let status = if warnings.is_empty() {
                     format!("{count} recent sessions")
                 } else {
-                    format!("⚠ {count} sessions · history warnings")
+                    format!("⚠ {count} sessions · {}", warnings[0])
                 };
                 agents
                     .history_status
                     .setStringValue(&NSString::from_str(&status));
                 agents.history_status.setToolTip(
                     (!warnings.is_empty())
-                        .then(|| NSString::from_str(&warnings.join("\n")))
+                        .then(|| NSString::from_str(&warning_text))
                         .as_deref(),
                 );
-                for warning in warnings {
-                    log::warn!("native agent {warning}");
+                if warnings_changed {
+                    for warning in warnings {
+                        log::warn!("native agent {warning}");
+                    }
                 }
                 self.complete_pending_page_service("agents", Ok(serde_json::Value::Null));
                 log::debug!("native CLI history applied request={request_id} sessions={count}");
             }
             Err(error) => {
+                agents.history_has_more.set(false);
                 agents
                     .history_status
                     .setStringValue(&NSString::from_str("⚠ Couldn’t load agent history"));
@@ -177,6 +232,9 @@ impl AppDelegate {
             .setEnabled(agents.history_has_more.get());
         self.refresh_native_agent_thread_rows();
         self.layout_sidebar();
+        if refresh_pending {
+            self.request_native_cli_history(false);
+        }
     }
 
     fn resume_native_cli_history(&self, tag: isize) {
@@ -205,17 +263,16 @@ impl AppDelegate {
         else {
             return;
         };
-        let label = match row.provider_id.as_str() {
-            "codex" => "Codex CLI",
-            "grok" => "Grok CLI",
-            "opencode" => "OpenCode",
-            _ => {
-                self.present_path_action_error(
-                    "Unable to Resume Agent",
-                    "This provider does not support restoring sessions.",
-                );
-                return;
-            }
+        let Some(provider) = NATIVE_AGENT_PROVIDERS
+            .iter()
+            .copied()
+            .find(|provider| provider.provider_id() == row.provider_id)
+        else {
+            self.present_path_action_error(
+                "Unable to Resume Agent",
+                "The session provider is unavailable.",
+            );
+            return;
         };
         if !row.restore_state.is_restorable() || row.cli_session_id.is_none() {
             self.present_path_action_error(
@@ -224,7 +281,7 @@ impl AppDelegate {
             );
             return;
         }
-        self.start_native_terminal_agent(&row.provider_id, label, Some(&row));
+        self.start_native_terminal_agent(provider.provider_id(), provider.label(), Some(&row));
     }
 
     fn refresh_native_agent_history_tags(&self) {

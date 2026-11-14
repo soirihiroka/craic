@@ -10,7 +10,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc as tokio_mpsc;
 
 #[derive(Clone, Debug)]
@@ -211,22 +211,24 @@ impl ShellAccess for LocalShellAccess {
             self.workspace.root.absolute
         );
         let script = format!("command -v {}", shell_quote(program));
-        let output = Command::new(&shell)
-            .arg(if cfg!(target_os = "macos") {
-                "-il"
-            } else {
-                "-i"
-            })
-            .arg("-c")
-            .arg(&script)
-            .current_dir(&self.workspace.root.absolute)
-            .output()
-            .map_err(|err| {
-                format!(
-                    "Failed to start default shell {} for command lookup: {err}",
-                    shell.to_string_lossy()
-                )
-            })?;
+        let output = craic_platform::process::command_output(
+            Command::new(&shell)
+                .arg(if cfg!(target_os = "macos") {
+                    "-il"
+                } else {
+                    "-i"
+                })
+                .arg("-c")
+                .arg(&script)
+                .current_dir(&self.workspace.root.absolute),
+            Duration::from_secs(10),
+        )
+        .map_err(|err| {
+            format!(
+                "Failed to resolve {program} using default shell {}: {err}",
+                shell.to_string_lossy()
+            )
+        })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let resolved = if output.status.success() {
             shell_which_output(&stdout)

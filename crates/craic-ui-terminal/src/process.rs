@@ -1,37 +1,7 @@
-pub(super) fn signal_terminal_process_groups(
-    child_pid: libc::pid_t,
-    foreground_pgid: Option<libc::pid_t>,
-    signal: libc::c_int,
-) {
-    for (role, pgid) in [
-        ("foreground", foreground_pgid),
-        ("session-leader", Some(child_pid)),
-    ] {
-        let Some(pgid) = pgid.filter(|pgid| *pgid > 0) else {
-            continue;
-        };
-        if role == "session-leader" && foreground_pgid == Some(pgid) {
-            continue;
-        }
-        let result = unsafe { libc::kill(-pgid, signal) };
-        if result == 0 {
-            log::info!(
-                "VTE terminal process group signaled role={role} pgid={pgid} signal={signal} pid={child_pid}"
-            );
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                log::debug!(
-                    "VTE terminal process group already exited role={role} pgid={pgid} signal={signal} pid={child_pid}"
-                );
-            } else {
-                log::warn!(
-                    "VTE terminal process group signal failed role={role} pgid={pgid} signal={signal} pid={child_pid} error={error}"
-                );
-            }
-        }
-    }
-}
+pub(super) use craic_platform::terminal::begin_process_group_shutdown;
+
+#[cfg(test)]
+use craic_platform::terminal::signal_process_groups as signal_terminal_process_groups;
 
 #[cfg(test)]
 mod tests {

@@ -66,11 +66,18 @@ impl AppDelegate {
         match event {
             NativeAgentEvent::TerminalPrepared {
                 identity,
+                session_id,
                 provider_id,
                 history,
                 result,
             } => {
-                self.finish_native_terminal_agent_start(&identity, &provider_id, history, result);
+                self.finish_native_terminal_agent_start(
+                    &identity,
+                    session_id,
+                    &provider_id,
+                    history,
+                    result,
+                );
             }
             NativeAgentEvent::HistoryLoaded {
                 identity,

@@ -4,18 +4,19 @@ use crate::ui::components::{
     search::{SearchOption, SearchPanel},
     terminal as terminal_component,
 };
-use crate::vte::{SpawnSpec, VteTerminal, terminal_environment};
+use crate::vte::VteTerminal;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
-use std::ffi::OsString;
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::rc::Rc;
 
 pub use crate::ui::components::terminal::{TerminalActivation, TerminalFileActivation};
+pub use craic_platform::terminal::{
+    TerminalCommand as CommandSpec, TerminalLifecycle as TerminalSessionState,
+};
 
 const SESSION_RAIL_WIDTH: i32 = 120;
 const SESSION_RAIL_PANEL_WIDTH: i32 = 132;
@@ -24,13 +25,6 @@ const CTRL_BACKSPACE_SEQUENCE: &[u8] = b"\x17";
 type EmptyHandlers = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
 type FocusHandlers = Rc<RefCell<Vec<Box<dyn Fn(bool)>>>>;
 type ActivationHandlers = Rc<RefCell<Vec<Box<dyn Fn(TerminalActivation)>>>>;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommandSpec {
-    program: OsString,
-    args: Vec<OsString>,
-    working_dir: PathBuf,
-}
 
 #[derive(Clone)]
 pub struct TerminalPanel {
@@ -68,14 +62,6 @@ struct TerminalSearchOptions {
     regex: Rc<Cell<bool>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TerminalSessionState {
-    Starting,
-    Running,
-    Exited,
-    Closing,
-}
-
 #[derive(Clone, Copy, Debug)]
 enum TerminalSearchMove {
     Keep,
@@ -90,22 +76,6 @@ impl TerminalSearchOptions {
             whole_word: Rc::new(Cell::new(false)),
             regex: Rc::new(Cell::new(false)),
         }
-    }
-}
-
-impl CommandSpec {
-    fn display(&self) -> String {
-        self.argv()
-            .iter()
-            .map(|part| part.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    fn argv(&self) -> Vec<OsString> {
-        std::iter::once(self.program.clone())
-            .chain(self.args.iter().cloned())
-            .collect()
     }
 }
 
@@ -242,12 +212,7 @@ impl TerminalPanel {
 
     pub fn run(&self, command: &CommandSpec, title: &str) -> Result<(), String> {
         self.set_visible(true);
-        self.create_session(
-            title,
-            command,
-            ShellCommandActivity::Command,
-            command.working_dir.to_string_lossy().as_ref(),
-        )?;
+        self.create_session(title, command, ShellCommandActivity::Command)?;
         Ok(())
     }
 
@@ -261,15 +226,10 @@ impl TerminalPanel {
         title: &str,
         completion: Option<Rc<dyn Fn(bool)>>,
     ) -> Result<(), String> {
-        let launch_dir = command.working_dir.absolute.clone();
         let activity = command.activity;
-        let command = CommandSpec {
-            program: command.program.clone(),
-            args: command.args.clone(),
-            working_dir: local_spawn_dir_for_shell_command(command),
-        };
+        let command = command.terminal_command();
         self.set_visible(true);
-        let session = self.create_session(title, &command, activity, &launch_dir)?;
+        let session = self.create_session(title, &command, activity)?;
         if let Some(completion) = completion {
             // Watch state as well as exit: asynchronous spawn failure and closing
             // a terminal before spawn completes must also release the caller.
@@ -429,7 +389,6 @@ impl TerminalPanel {
         title: &str,
         command: &CommandSpec,
         activity: ShellCommandActivity,
-        launch_dir: &str,
     ) -> Result<TerminalSession, String> {
         let session_id = self.next_session_id.get();
         self.next_session_id.set(session_id + 1);
@@ -554,7 +513,7 @@ impl TerminalPanel {
             &self.empty_handlers,
             &auto_close_source,
         );
-        if let Err(err) = spawn_command(&terminal, command, launch_dir, &child_pid, &state) {
+        if let Err(err) = spawn_command(&terminal, command, &child_pid, &state) {
             self.session_stack.remove(&root);
             self.session_rail.remove(&row);
             return Err(err);
@@ -1101,25 +1060,12 @@ fn install_exit_key_handler(
 fn spawn_command(
     terminal: &VteTerminal,
     command: &CommandSpec,
-    launch_dir: &str,
     child_pid: &Rc<Cell<Option<glib::Pid>>>,
     state: &Rc<Cell<TerminalSessionState>>,
 ) -> Result<(), String> {
-    let argv = command_argv(command)?;
-    let env = terminal_environment();
-    let mut argv = argv.into_iter();
-    let program = argv
-        .next()
-        .ok_or_else(|| "Cannot start an empty terminal command.".to_string())?;
     let display = command.display();
     terminal.spawn(
-        SpawnSpec {
-            program,
-            args: argv.collect(),
-            working_directory: command.working_dir.clone(),
-            env,
-        },
-        launch_dir.to_string(),
+        command.clone(),
         {
             let terminal = terminal.clone();
             let child_pid = child_pid.clone();
@@ -1156,33 +1102,6 @@ fn spawn_command(
         },
     )?;
     Ok(())
-}
-
-fn local_spawn_dir_for_shell_command(command: &ShellCommandSpec) -> PathBuf {
-    let target_dir = PathBuf::from(&command.working_dir.absolute);
-    if target_dir.is_dir() {
-        return target_dir;
-    }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("/"))
-}
-
-fn command_argv(command: &CommandSpec) -> Result<Vec<String>, String> {
-    command
-        .argv()
-        .into_iter()
-        .map(|part| {
-            part.into_string().map_err(|part| {
-                format!(
-                    "Cannot start {}: argument is not valid UTF-8: {}",
-                    command.display(),
-                    part.to_string_lossy()
-                )
-            })
-        })
-        .collect()
 }
 
 fn start_title_poll(

@@ -36,6 +36,9 @@ impl CliHistory {
             .ok_or_else(|| "Shell access is unavailable for this workspace".to_owned())?;
         let codex = (|| {
             if self.codex.is_none() {
+                if shell.which("codex")?.is_none() {
+                    return Ok(None);
+                }
                 let config = craic_agent::app_server::config(
                     shell.as_ref(),
                     &access.workspace,
@@ -43,13 +46,13 @@ impl CliHistory {
                 )?;
                 self.codex = Some(agent_history::CodexHistoryReader::new(config)?);
             }
-            Ok(self.codex.as_ref().unwrap().clone())
+            Ok(self.codex.clone())
         })();
         let grok = (|| {
             if self.grok.is_none() {
-                let program = shell
-                    .which("grok")?
-                    .ok_or_else(|| "Grok CLI is not installed".to_owned())?;
+                let Some(program) = shell.which("grok")? else {
+                    return Ok(None);
+                };
                 let command = shell.fast_command(
                     &access.workspace.root,
                     &program,
@@ -57,7 +60,7 @@ impl CliHistory {
                 )?;
                 self.grok = Some(agent_history::GrokHistoryReader::new(command)?);
             }
-            Ok(self.grok.as_ref().unwrap().clone())
+            Ok(self.grok.clone())
         })();
         let key =
             agent_history::workspace_for_system_path(workspace_id, &access.workspace.root.absolute);
@@ -66,8 +69,8 @@ impl CliHistory {
             limit,
             Some(query),
             tags,
-            codex.as_ref().map_err(Clone::clone),
-            grok.as_ref().map_err(Clone::clone),
+            codex.as_ref().map(Option::as_ref).map_err(Clone::clone),
+            grok.as_ref().map(Option::as_ref).map_err(Clone::clone),
         )?;
         Ok(CliHistoryResult {
             rows: history.rows,

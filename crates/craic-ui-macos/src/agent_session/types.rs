@@ -41,6 +41,7 @@ pub enum Command {
     },
     PrepareTerminal {
         identity: SessionIdentity,
+        session_id: isize,
         workspace: craic_config::ConfiguredWorkspace,
         provider_id: String,
         history: Option<agent_history::AgentSessionRow>,
@@ -66,6 +67,7 @@ pub enum Command {
         cancellation: CancellationToken,
     },
     Reset,
+    ResetHistory,
     Shutdown {
         completed: Option<std::sync::mpsc::SyncSender<()>>,
     },
@@ -85,9 +87,10 @@ pub enum Event {
     },
     TerminalPrepared {
         identity: SessionIdentity,
+        session_id: isize,
         provider_id: String,
         history: Option<agent_history::AgentSessionRow>,
-        result: Result<ShellCommandSpec, String>,
+        result: Result<TerminalCommand, String>,
     },
     SummaryFinished {
         identity: SessionIdentity,

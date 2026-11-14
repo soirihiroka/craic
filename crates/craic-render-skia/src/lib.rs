@@ -60,6 +60,6 @@ pub use terminal::{
     TerminalCursorShape, TerminalEventBatch, TerminalImage, TerminalMouseAction,
     TerminalMouseButton, TerminalMouseModifiers, TerminalScroll, TerminalSearchDirection,
     TerminalSearchMatch, TerminalSelectionType, TerminalSession, TerminalSide, TerminalSnapshot,
-    TerminalSpawnOptions, TerminalViewport,
+    TerminalViewport,
 };
 pub use terminal_painter::{TerminalPaintCache, TerminalPaintRequest, paint_terminal};

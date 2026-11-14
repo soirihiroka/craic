@@ -3,7 +3,7 @@ use crate::agent_status::AgentActiveState;
 
 use super::{
     AgentProvider, CommandSpec, command_binary, is_spinner_frame, normalize_title_text,
-    title_candidate, window_title_active_state,
+    target_command, title_candidate, window_title_active_state,
 };
 use crate::system::capabilities::shell::ShellAccess;
 use crate::system::{SystemRef, WorkspaceRef};
@@ -30,15 +30,10 @@ impl AgentProvider for Provider {
     fn command(
         &self,
         shell: Option<&dyn ShellAccess>,
-        system: &SystemRef,
+        _system: &SystemRef,
         workspace: &WorkspaceRef,
     ) -> Result<CommandSpec, String> {
-        Ok(CommandSpec::target(
-            system,
-            workspace,
-            command_binary("agy", shell)?,
-            Vec::new(),
-        ))
+        target_command(shell, workspace, command_binary("agy", shell)?, Vec::new())
     }
 
     fn restore_command(

@@ -196,7 +196,11 @@ impl AgentList {
         });
         agent_list.update_button.connect_clicked({
             let list = Rc::downgrade(&agent_list);
-            move |_| if let Some(list) = list.upgrade() { list.update_providers(); }
+            move |_| {
+                if let Some(list) = list.upgrade() {
+                    list.update_providers();
+                }
+            }
         });
         agent_list.connect_search();
         agent_list
@@ -243,7 +247,8 @@ impl AgentList {
             next.repo_path().display()
         );
         self.workspace.replace(Some(next));
-        self.provider_updates_generation.set(self.provider_updates_generation.get().wrapping_add(1));
+        self.provider_updates_generation
+            .set(self.provider_updates_generation.get().wrapping_add(1));
         self.provider_updates.borrow_mut().clear();
         self.provider_updates_checked_at.set(None);
         self.update_button.set_visible(false);
@@ -358,11 +363,14 @@ impl AgentList {
                         let shell = shell
                             .as_deref()
                             .ok_or_else(|| "Shell access is unavailable".to_string())?;
+                        if shell.which("codex")?.is_none() {
+                            return Ok(None);
+                        }
                         let config =
                             craic_agent::app_server::config(shell, &workspace_ref, provider_kind)?;
                         *reader = Some(agent_history::CodexHistoryReader::new(config)?);
                     }
-                    Ok(reader.as_ref().unwrap().clone())
+                    Ok(reader.clone())
                 })();
                 let grok = (|| {
                     let mut reader = grok_history
@@ -372,9 +380,9 @@ impl AgentList {
                         let shell = shell
                             .as_deref()
                             .ok_or_else(|| "Shell access is unavailable".to_string())?;
-                        let grok = shell
-                            .which("grok")?
-                            .ok_or_else(|| "Grok CLI is not installed".to_string())?;
+                        let Some(grok) = shell.which("grok")? else {
+                            return Ok(None);
+                        };
                         let command = shell.fast_command(
                             &workspace_ref.root,
                             &grok,
@@ -382,15 +390,15 @@ impl AgentList {
                         )?;
                         *reader = Some(agent_history::GrokHistoryReader::new(command)?);
                     }
-                    Ok(reader.as_ref().unwrap().clone())
+                    Ok(reader.clone())
                 })();
                 let result = agent_history::list_native_sessions(
                     &workspace,
                     loaded_limit.saturating_add(1),
                     Some(&search_query),
                     &selected_tags,
-                    codex.as_ref().map_err(Clone::clone),
-                    grok.as_ref().map_err(Clone::clone),
+                    codex.as_ref().map(Option::as_ref).map_err(Clone::clone),
+                    grok.as_ref().map(Option::as_ref).map_err(Clone::clone),
                 );
                 let (rows, tags, warnings) = match result {
                     Ok(history) => (

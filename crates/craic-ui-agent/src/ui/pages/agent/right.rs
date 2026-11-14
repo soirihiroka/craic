@@ -27,9 +27,10 @@ use crate::ui::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsageTr
 use crate::ui::components::search::{SearchOption, SearchPanel};
 use crate::ui::pages::PageCommand;
 use crate::ui::{AGENT_SESSION_NOTIFICATION_DETAILED_ACTION, agent_session_notification_id};
+use craic_system::terminal::TerminalLifecycle as TerminalSessionState;
 use craic_ui_core::ui::command_mailbox;
 use craic_ui_terminal::ui::components::terminal as terminal_component;
-use craic_ui_terminal::vte::{SpawnSpec, VteTerminal, terminal_environment};
+use craic_ui_terminal::vte::VteTerminal;
 
 #[cfg(test)]
 use super::provider::agy::terminal_text_active_state as agy_terminal_text_active_state;
@@ -84,14 +85,6 @@ impl Drop for RemoteImageUploads {
             self.images.get_mut().drain(..).collect(),
         );
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalSessionState {
-    Starting,
-    Running,
-    Exited,
-    Closing,
 }
 
 #[derive(Clone)]
@@ -1335,24 +1328,14 @@ fn spawn_command(
         RefCell<Option<Rc<dyn Fn(u64, &'static dyn AgentProvider, AgentSessionState)>>>,
     >,
 ) -> Result<(), String> {
-    let argv = command_argv(command)?;
-    let env = terminal_environment();
-    let working_dir = command.working_dir();
-
-    shell_integration.log_spawn_requested(working_dir, &command.display(), env.len());
-    let mut argv = argv.into_iter();
-    let program = argv
-        .next()
-        .ok_or_else(|| "Cannot start an empty agent command.".to_string())?;
+    shell_integration.log_spawn_requested(
+        &command.working_directory.to_string_lossy(),
+        &command.display(),
+        command.environment.len(),
+    );
     let display = command.display();
     terminal.spawn(
-        SpawnSpec {
-            program,
-            args: argv.collect(),
-            working_directory: PathBuf::from(working_dir),
-            env,
-        },
-        command.target_working_dir().to_string(),
+        command.clone(),
         {
             let terminal = terminal.clone();
             let child_pid = child_pid.clone();
@@ -1363,12 +1346,12 @@ fn spawn_command(
                 Ok(pid) => {
                     let pid = glib::Pid(pid);
                     if state.get() == TerminalSessionState::Closing {
-                        shell_integration.log_spawn_completed_after_close(pid, &display);
+                        shell_integration.log_spawn_completed_after_close(pid.0, &display);
                         return;
                     }
                     child_pid.set(Some(pid));
                     state.set(TerminalSessionState::Running);
-                    shell_integration.log_spawned(pid, &display);
+                    shell_integration.log_spawned(pid.0, &display);
                 }
                 Err(err) => {
                     if state.get() == TerminalSessionState::Closing {
@@ -1395,20 +1378,4 @@ fn spawn_command(
         },
     )?;
     Ok(())
-}
-
-fn command_argv(command: &CommandSpec) -> Result<Vec<String>, String> {
-    command
-        .argv()
-        .into_iter()
-        .map(|part| {
-            part.into_string().map_err(|part| {
-                format!(
-                    "Cannot start {}: argument is not valid UTF-8: {}",
-                    command.display(),
-                    part.to_string_lossy()
-                )
-            })
-        })
-        .collect()
 }

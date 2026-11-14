@@ -28,6 +28,7 @@ pub fn config(
         ..AppServerConfig::default()
     };
     config.capabilities.experimental_api = true;
-    config.capabilities.mcp_server_openai_form_elicitation = true;
+    // Browsing history cannot service interactive forms or tool approvals.
+    config.capabilities.mcp_server_openai_form_elicitation = false;
     Ok(config)
 }

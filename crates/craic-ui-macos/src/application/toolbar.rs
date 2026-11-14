@@ -8,9 +8,12 @@ impl AppDelegate {
         let identifier_string = identifier.to_string();
 
         if identifier_string == TOOLBAR_PAGES {
-            let mut images = Vec::with_capacity(PAGE_DESCRIPTORS.len());
-            let mut labels = Vec::with_capacity(PAGE_DESCRIPTORS.len());
-            for page in PAGE_DESCRIPTORS {
+            let pages = NSToolbarItemGroup::initWithItemIdentifier(
+                NSToolbarItemGroup::alloc(mtm),
+                identifier,
+            );
+            let mut items = Vec::with_capacity(PAGE_DESCRIPTORS.len());
+            for (index, page) in PAGE_DESCRIPTORS.iter().enumerate() {
                 let symbol = match page.id {
                     "changes" => "arrow.triangle.branch",
                     "history" => "clock.arrow.circlepath",
@@ -19,40 +22,77 @@ impl AppDelegate {
                     "agents" => "sparkles",
                     _ => "circle",
                 };
-                images.push(NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
                     &NSString::from_str(symbol),
                     Some(&NSString::from_str(page.label)),
-                )?);
-                labels.push(NSString::from_str(page.label));
+                )?;
+                image.setSize(NSSize::new(20.0, 20.0));
+                let item = NSToolbarItem::initWithItemIdentifier(
+                    NSToolbarItem::alloc(mtm),
+                    &NSString::from_str(&format!("{TOOLBAR_PAGES}.{}", page.id)),
+                );
+                item.setImage(Some(&image));
+                item.setLabel(&NSString::from_str(page.label));
+                item.setToolTip(Some(&NSString::from_str(page.label)));
+                item.setTag(index as isize);
+                unsafe {
+                    item.setTarget(Some(self));
+                    item.setAction(Some(sel!(selectPage:)));
+                }
+                // Each real toolbar subitem retains its native badge. Native toggle
+                // buttons provide selection while the group supplies the shared glass.
+                let button = unsafe {
+                    NSButton::buttonWithImage_target_action(
+                        &image,
+                        Some(self),
+                        Some(sel!(selectPageButton:)),
+                        mtm,
+                    )
+                };
+                button.setTag(index as isize);
+                button.setButtonType(NSButtonType::PushOnPushOff);
+                button.setBezelStyle(NSBezelStyle::Toolbar);
+                button.setBordered(true);
+                if button.respondsToSelector(sel!(setTintProminence:)) {
+                    button.setTintProminence(objc2_app_kit::NSTintProminence::None);
+                }
+                button.setImagePosition(NSCellImagePosition::ImageOnly);
+                button.setToolTip(Some(&NSString::from_str(page.label)));
+                button.setFrameSize(NSSize::new(42.0, 32.0));
+                button.setTranslatesAutoresizingMaskIntoConstraints(false);
+                button
+                    .widthAnchor()
+                    .constraintEqualToConstant(42.0)
+                    .setActive(true);
+                button
+                    .heightAnchor()
+                    .constraintEqualToConstant(32.0)
+                    .setActive(true);
+                button.setAccessibilityLabel(Some(&NSString::from_str(page.label)));
+                if button.respondsToSelector(sel!(setBorderShape:)) {
+                    button.setBorderShape(objc2_app_kit::NSControlBorderShape::Capsule);
+                }
+                let selected = self.ivars().active_page_id.borrow().as_deref() == Some(page.id);
+                button.setBezelColor(
+                    selected
+                        .then(NSColor::unemphasizedSelectedContentBackgroundColor)
+                        .as_deref(),
+                );
+                button.setState(if selected {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+                item.setView(Some(&button));
+                items.push(item);
             }
-            let images = NSArray::from_retained_slice(&images);
-            let labels = NSArray::from_retained_slice(&labels);
-            // This is Apple's documented image-based toolbar-group initializer. Keeping the
-            // control as an NSToolbarItemGroup lets NSToolbar own its single glass surface.
-            let pages = unsafe {
-                NSToolbarItemGroup::groupWithItemIdentifier_images_selectionMode_labels_target_action(
-                    identifier,
-                    &images,
-                    NSToolbarItemGroupSelectionMode::SelectOne,
-                    Some(&labels),
-                    Some(self),
-                    Some(sel!(selectPage:)),
-                    mtm,
-                )
-            };
+            pages.setSubitems(&NSArray::from_retained_slice(&items));
             pages.setControlRepresentation(NSToolbarItemGroupControlRepresentation::Expanded);
             pages.setVisibilityPriority(NSToolbarItemVisibilityPriorityUser);
             pages.setLabel(&NSString::from_str("Pages"));
             pages.setPaletteLabel(&NSString::from_str("Pages"));
-            pages.setSelectedIndex(0);
-            for (index, page) in PAGE_DESCRIPTORS.iter().enumerate() {
-                pages
-                    .subitems()
-                    .objectAtIndex(index)
-                    .setToolTip(Some(&NSString::from_str(page.label)));
-            }
-            if will_be_inserted && self.ivars().page_switcher.get().is_none() {
-                let _ = self.ivars().page_switcher.set(pages.retain());
+            if will_be_inserted {
+                self.ivars().page_switcher.replace(items);
                 self.restore_changes_page_badge();
                 self.restore_agents_page_badge();
             }
@@ -297,5 +337,4 @@ impl AppDelegate {
         }
         Some(item)
     }
-
 }
