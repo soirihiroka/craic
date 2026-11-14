@@ -48,6 +48,8 @@ pub trait Page {
     }
 }
 
+pub type ShellCommandComplete = Rc<dyn Fn(bool)>;
+
 pub type PageRef = Rc<dyn Page + 'static>;
 pub type PageInitializeComplete = Box<dyn FnOnce(gtk::Widget, gtk::Widget) + 'static>;
 pub type PageRefreshComplete = Rc<dyn Fn() + 'static>;
@@ -114,7 +116,8 @@ pub struct PageContext {
     run_git_action: Rc<dyn Fn()>,
     open_terminal: Rc<dyn Fn(&WorkspacePath) -> Result<(), String>>,
     open_external_terminal_path: Rc<dyn Fn(&WorkspacePath, Option<usize>, Option<usize>)>,
-    run_shell_command: Rc<dyn Fn(&ShellCommandSpec, &str) -> Result<(), String>>,
+    run_shell_command:
+        Rc<dyn Fn(&ShellCommandSpec, &str, Option<ShellCommandComplete>) -> Result<(), String>>,
     request_git_snapshot: Rc<dyn Fn(String, Arc<crate::git::GitRepoHandle>, GitSnapshotComplete)>,
     notify_badge_changed: Rc<dyn Fn()>,
     dispatch_command: Rc<dyn Fn(PageCommand)>,
@@ -134,7 +137,9 @@ impl PageContext {
         show_toast: Rc<dyn Fn(&str)>,
         open_terminal: Rc<dyn Fn(&WorkspacePath) -> Result<(), String>>,
         open_external_terminal_path: Rc<dyn Fn(&WorkspacePath, Option<usize>, Option<usize>)>,
-        run_shell_command: Rc<dyn Fn(&ShellCommandSpec, &str) -> Result<(), String>>,
+        run_shell_command: Rc<
+            dyn Fn(&ShellCommandSpec, &str, Option<ShellCommandComplete>) -> Result<(), String>,
+        >,
         request_git_snapshot: Rc<
             dyn Fn(String, Arc<crate::git::GitRepoHandle>, GitSnapshotComplete),
         >,
@@ -310,7 +315,16 @@ impl PageContext {
     }
 
     pub fn run_shell_command(&self, command: &ShellCommandSpec, title: &str) -> Result<(), String> {
-        (self.run_shell_command)(command, title)
+        (self.run_shell_command)(command, title, None)
+    }
+
+    pub fn run_shell_command_with_completion(
+        &self,
+        command: &ShellCommandSpec,
+        title: &str,
+        completion: ShellCommandComplete,
+    ) -> Result<(), String> {
+        (self.run_shell_command)(command, title, Some(completion))
     }
 
     pub fn request_git_snapshot<F>(

@@ -81,6 +81,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 safetensors = "0.8.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+semver = "1"
 skia-safe = { version = "0.99", default-features = false, features = ["binary-cache", "embed-icudtl", "gl", "egl", "wayland", "svg", "textlayout"] }
 sourceview5 = "0.11.0"
 syntect = "5"

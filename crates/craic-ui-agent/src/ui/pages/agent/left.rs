@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ui::agent_history::{self, AgentSessionRow, RestoreState, WorkspaceKey, WorkspaceTag};
 use crate::ui::agent_status::{AgentActiveState, AgentInactiveState, AgentSessionState};
@@ -83,6 +83,12 @@ pub struct AgentList {
     history_loaded: Rc<Cell<bool>>,
     provider_button: adw::SplitButton,
     selected_provider: Rc<Cell<AgentLaunch>>,
+    update_button: gtk::Button,
+    provider_updates: Rc<RefCell<Vec<craic_agent::agent_updates::ProviderUpdate>>>,
+    provider_updates_checking: Rc<Cell<bool>>,
+    provider_updates_checked_at: Rc<Cell<Option<Instant>>>,
+    provider_updates_running: Rc<Cell<bool>>,
+    provider_updates_generation: Rc<Cell<u64>>,
     search_panel: SearchPanel,
     list: gtk::ListBox,
     scroller: gtk::ScrolledWindow,
@@ -165,6 +171,7 @@ enum AgentRowRenderState {
 }
 
 include!("left/list.rs");
+include!("left/updates.rs");
 
 fn show_agent_session_context_menu(
     agent_list: &AgentList,

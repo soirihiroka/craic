@@ -135,7 +135,14 @@ impl AgentList {
             .margin_top(8)
             .margin_bottom(8)
             .build();
+        let update_button = gtk::Button::builder()
+            .label("Update")
+            .tooltip_text("Update installed agent providers")
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
         bottom_bar.append(&history_status);
+        bottom_bar.append(&update_button);
         bottom_bar.append(&provider_button);
 
         let search_panel = SearchPanel::new("Search agents");
@@ -160,6 +167,12 @@ impl AgentList {
             grok_history: Arc::new(Mutex::new(None)),
             provider_button,
             selected_provider,
+            update_button,
+            provider_updates: Rc::new(RefCell::new(Vec::new())),
+            provider_updates_checking: Rc::new(Cell::new(false)),
+            provider_updates_checked_at: Rc::new(Cell::new(None)),
+            provider_updates_running: Rc::new(Cell::new(false)),
+            provider_updates_generation: Rc::new(Cell::new(0)),
             search_panel,
             list,
             scroller,
@@ -181,6 +194,10 @@ impl AgentList {
             loading: Rc::new(Cell::new(false)),
             active_context_menu: Rc::new(RefCell::new(None)),
         });
+        agent_list.update_button.connect_clicked({
+            let list = Rc::downgrade(&agent_list);
+            move |_| if let Some(list) = list.upgrade() { list.update_providers(); }
+        });
         agent_list.connect_search();
         agent_list
             .search_panel
@@ -201,6 +218,7 @@ impl AgentList {
             };
             if list.root.is_mapped() {
                 list.reload_workspace_history();
+                list.check_provider_updates(false);
             }
             glib::ControlFlow::Continue
         });
@@ -225,6 +243,11 @@ impl AgentList {
             next.repo_path().display()
         );
         self.workspace.replace(Some(next));
+        self.provider_updates_generation.set(self.provider_updates_generation.get().wrapping_add(1));
+        self.provider_updates.borrow_mut().clear();
+        self.provider_updates_checked_at.set(None);
+        self.update_button.set_visible(false);
+        self.check_provider_updates(true);
         self.history_loaded.set(false);
         self.history_status.set_visible_child_name("idle");
         self.history_status.set_tooltip_text(None);

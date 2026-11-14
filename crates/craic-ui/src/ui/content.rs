@@ -636,7 +636,17 @@ impl ContentPane {
         command: &crate::system::capabilities::shell::ShellCommandSpec,
         title: &str,
     ) -> Result<(), String> {
-        self.terminal.run_shell_command(command, title)?;
+        self.run_shell_command_with_completion(command, title, None)
+    }
+
+    pub(crate) fn run_shell_command_with_completion(
+        &self,
+        command: &crate::system::capabilities::shell::ShellCommandSpec,
+        title: &str,
+        completion: Option<crate::ui::pages::ShellCommandComplete>,
+    ) -> Result<(), String> {
+        self.terminal
+            .run_shell_command_with_completion(command, title, completion)?;
         self.terminal_toggle_button.set_active(true);
         self.terminal_toggle_button
             .set_tooltip_text(Some("Hide terminal"));

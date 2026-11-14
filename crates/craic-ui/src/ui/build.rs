@@ -202,9 +202,9 @@ pub fn build_ui(
         }),
         Rc::new({
             let state_slot = state_slot.clone();
-            move |command, title| {
+            move |command, title, completion| {
                 if let Some(state) = state_slot.borrow().upgrade() {
-                    state.content.run_shell_command(command, title)
+                    state.content.run_shell_command_with_completion(command, title, completion)
                 } else {
                     Err("Application is not ready.".to_string())
                 }

@@ -252,6 +252,15 @@ impl TerminalPanel {
     }
 
     pub fn run_shell_command(&self, command: &ShellCommandSpec, title: &str) -> Result<(), String> {
+        self.run_shell_command_with_completion(command, title, None)
+    }
+
+    pub fn run_shell_command_with_completion(
+        &self,
+        command: &ShellCommandSpec,
+        title: &str,
+        completion: Option<Rc<dyn Fn(bool)>>,
+    ) -> Result<(), String> {
         let launch_dir = command.working_dir.absolute.clone();
         let activity = command.activity;
         let command = CommandSpec {
@@ -260,7 +269,28 @@ impl TerminalPanel {
             working_dir: local_spawn_dir_for_shell_command(command),
         };
         self.set_visible(true);
-        self.create_session(title, &command, activity, &launch_dir)?;
+        let session = self.create_session(title, &command, activity, &launch_dir)?;
+        if let Some(completion) = completion {
+            // Watch state as well as exit: asynchronous spawn failure and closing
+            // a terminal before spawn completes must also release the caller.
+            let root = session.root.downgrade();
+            let state = session.state;
+            let exit_success = session.exit_success;
+            glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+                let closed =
+                    root.upgrade().is_none() || state.get() == TerminalSessionState::Closing;
+                if !closed
+                    && matches!(
+                        state.get(),
+                        TerminalSessionState::Starting | TerminalSessionState::Running
+                    )
+                {
+                    return glib::ControlFlow::Continue;
+                }
+                completion(exit_success.get());
+                glib::ControlFlow::Break
+            });
+        }
         Ok(())
     }
 
