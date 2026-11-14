@@ -11,7 +11,11 @@ impl AppDelegate {
         if !std::ptr::eq(table, &**files.table) || files.mutation_in_progress.get() {
             return false.into();
         }
-        let Some(row) = self.filtered_file_tree_rows().get(rows.firstIndex()).cloned() else {
+        let Some(row) = self
+            .filtered_file_tree_rows()
+            .get(rows.firstIndex())
+            .cloned()
+        else {
             return false.into();
         };
         if row.info.path.is_root() || !row.info.capabilities.readable {
@@ -44,7 +48,8 @@ impl AppDelegate {
         };
         let drag_type = workspace_file_drag_type();
         pasteboard.clearContents();
-        let Some(payload) = workspace_file_drag_payload(&workspace, access.as_ref(), &row.info.path)
+        let Some(payload) =
+            workspace_file_drag_payload(&workspace, access.as_ref(), &row.info.path)
         else {
             return false.into();
         };
@@ -91,9 +96,7 @@ impl AppDelegate {
                 .workspaces
                 .borrow()
                 .iter()
-                .any(|workspace| {
-                    workspace.selection_id() == drag.workspace_selection_id
-                })
+                .any(|workspace| workspace.selection_id() == drag.workspace_selection_id)
             {
                 return NSDragOperation::None;
             }
@@ -165,9 +168,7 @@ impl AppDelegate {
                     .workspaces
                     .borrow()
                     .iter()
-                    .find(|workspace| {
-                        workspace.selection_id() == drag.workspace_selection_id
-                    })
+                    .find(|workspace| workspace.selection_id() == drag.workspace_selection_id)
                     .map(|workspace| workspace.workspace.clone())
                 else {
                     return false.into();
@@ -246,7 +247,11 @@ impl AppDelegate {
         true.into()
     }
 
-    fn handle_objc_delegate_table_view_is_group_row(&self, table: &NSTableView, row: isize) -> bool {
+    fn handle_objc_delegate_table_view_is_group_row(
+        &self,
+        table: &NSTableView,
+        row: isize,
+    ) -> bool {
         self.ivars()
             .containers
             .get()
@@ -285,15 +290,6 @@ impl AppDelegate {
                 .and_then(|row| self.make_commit_author_cell(table, row))
         } else if self
             .ivars()
-            .agents
-            .get()
-            .is_some_and(|agents| std::ptr::eq(table, &*agents.transcript_table))
-        {
-            usize::try_from(row)
-                .ok()
-                .and_then(|row| self.make_native_agent_transcript_cell(table, row))
-        } else if self
-            .ivars()
             .files
             .get()
             .is_some_and(|files| std::ptr::eq(table, &*files.preview_table))
@@ -327,10 +323,7 @@ impl AppDelegate {
                         let width = table.bounds().size.width.max(180.0);
                         let cell = NSView::initWithFrame(
                             NSView::alloc(self.mtm()),
-                            NSRect::new(
-                                NSPoint::new(0.0, 0.0),
-                                NSSize::new(width, 32.0),
-                            ),
+                            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, 32.0)),
                         );
                         let title = NSTextField::labelWithString(
                             &NSString::from_str(&file.path),
@@ -368,215 +361,212 @@ impl AppDelegate {
                 if let Some(row) = row {
                     let commit = history.commits.borrow().get(row).cloned();
                     if let Some(commit) = commit {
-            let width = table.bounds().size.width.max(180.0);
-            let cell = NSView::initWithFrame(
-                NSView::alloc(self.mtm()),
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, 54.0)),
-            );
+                        let width = table.bounds().size.width.max(180.0);
+                        let cell = NSView::initWithFrame(
+                            NSView::alloc(self.mtm()),
+                            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, 54.0)),
+                        );
 
-            let added = NSTextField::labelWithString(
-                &NSString::from_str(&format!("+{}", commit.insertions)),
-                self.mtm(),
-            );
-            added.setFont(Some(&NSFont::systemFontOfSize(10.5)));
-            added.setTextColor(Some(&NSColor::systemGreenColor()));
-            added.sizeToFit();
-            let added_size = added.frame().size;
+                        let added = NSTextField::labelWithString(
+                            &NSString::from_str(&format!("+{}", commit.insertions)),
+                            self.mtm(),
+                        );
+                        added.setFont(Some(&NSFont::systemFontOfSize(10.5)));
+                        added.setTextColor(Some(&NSColor::systemGreenColor()));
+                        added.sizeToFit();
+                        let added_size = added.frame().size;
 
-            let deleted = NSTextField::labelWithString(
-                &NSString::from_str(&format!("-{}", commit.deletions)),
-                self.mtm(),
-            );
-            deleted.setFont(Some(&NSFont::systemFontOfSize(10.5)));
-            deleted.setTextColor(Some(&NSColor::systemRedColor()));
-            deleted.sizeToFit();
-            let deleted_size = deleted.frame().size;
-            let deleted_x = width - 10.0 - deleted_size.width;
-            let added_x = deleted_x - 5.0 - added_size.width;
-            added.setFrame(NSRect::new(
-                NSPoint::new(added_x, 31.0),
-                NSSize::new(added_size.width, 17.0),
-            ));
-            deleted.setFrame(NSRect::new(
-                NSPoint::new(deleted_x, 31.0),
-                NSSize::new(deleted_size.width, 17.0),
-            ));
-            added.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
-            deleted.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
-            cell.addSubview(&added);
-            cell.addSubview(&deleted);
+                        let deleted = NSTextField::labelWithString(
+                            &NSString::from_str(&format!("-{}", commit.deletions)),
+                            self.mtm(),
+                        );
+                        deleted.setFont(Some(&NSFont::systemFontOfSize(10.5)));
+                        deleted.setTextColor(Some(&NSColor::systemRedColor()));
+                        deleted.sizeToFit();
+                        let deleted_size = deleted.frame().size;
+                        let deleted_x = width - 10.0 - deleted_size.width;
+                        let added_x = deleted_x - 5.0 - added_size.width;
+                        added.setFrame(NSRect::new(
+                            NSPoint::new(added_x, 31.0),
+                            NSSize::new(added_size.width, 17.0),
+                        ));
+                        deleted.setFrame(NSRect::new(
+                            NSPoint::new(deleted_x, 31.0),
+                            NSSize::new(deleted_size.width, 17.0),
+                        ));
+                        added.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+                        deleted.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+                        cell.addSubview(&added);
+                        cell.addSubview(&deleted);
 
-            let mut subject_trailing = added_x - 8.0;
-            if !commit.tags.is_empty() {
-                let tags_width = commit
-                    .tags
-                    .iter()
-                    .map(|tag| tag.chars().count() as f64 * 6.5 + 22.0)
-                    .sum::<f64>()
-                    .min(130.0)
-                    .max(48.0);
-                let tags = NSTokenField::initWithFrame(
-                    NSTokenField::alloc(self.mtm()),
-                    NSRect::new(
-                        NSPoint::new((subject_trailing - tags_width).max(60.0), 27.0),
-                        NSSize::new(tags_width, 22.0),
-                    ),
-                );
-                tags.setEditable(false);
-                tags.setSelectable(false);
-                tags.setBordered(false);
-                tags.setDrawsBackground(false);
-                tags.setTokenStyle(NSTokenStyle::Rounded);
-                tags.setFont(Some(&NSFont::systemFontOfSize(10.0)));
-                tags.setStringValue(&NSString::from_str(&commit.tags.join(",")));
-                tags.setToolTip(Some(&NSString::from_str(&commit.tags.join(", "))));
-                tags.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
-                subject_trailing = tags.frame().origin.x - 8.0;
-                cell.addSubview(&tags);
-            }
+                        let mut subject_trailing = added_x - 8.0;
+                        if !commit.tags.is_empty() {
+                            let tags_width = commit
+                                .tags
+                                .iter()
+                                .map(|tag| tag.chars().count() as f64 * 6.5 + 22.0)
+                                .sum::<f64>()
+                                .min(130.0)
+                                .max(48.0);
+                            let tags = NSTokenField::initWithFrame(
+                                NSTokenField::alloc(self.mtm()),
+                                NSRect::new(
+                                    NSPoint::new((subject_trailing - tags_width).max(60.0), 27.0),
+                                    NSSize::new(tags_width, 22.0),
+                                ),
+                            );
+                            tags.setEditable(false);
+                            tags.setSelectable(false);
+                            tags.setBordered(false);
+                            tags.setDrawsBackground(false);
+                            tags.setTokenStyle(NSTokenStyle::Rounded);
+                            tags.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+                            tags.setStringValue(&NSString::from_str(&commit.tags.join(",")));
+                            tags.setToolTip(Some(&NSString::from_str(&commit.tags.join(", "))));
+                            tags.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+                            subject_trailing = tags.frame().origin.x - 8.0;
+                            cell.addSubview(&tags);
+                        }
 
-            let subject = NSTextField::labelWithString(
-                &NSString::from_str(if commit.subject.is_empty() {
-                    "Untitled commit"
-                } else {
-                    &commit.subject
-                }),
-                self.mtm(),
-            );
-            subject.setFrame(NSRect::new(
-                NSPoint::new(10.0, 28.0),
-                NSSize::new((subject_trailing - 10.0).max(1.0), 20.0),
-            ));
-            subject.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
-            subject.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-            subject.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-            subject.setToolTip(Some(&NSString::from_str(&commit.subject)));
-            cell.addSubview(&subject);
+                        let subject = NSTextField::labelWithString(
+                            &NSString::from_str(if commit.subject.is_empty() {
+                                "Untitled commit"
+                            } else {
+                                &commit.subject
+                            }),
+                            self.mtm(),
+                        );
+                        subject.setFrame(NSRect::new(
+                            NSPoint::new(10.0, 28.0),
+                            NSSize::new((subject_trailing - 10.0).max(1.0), 20.0),
+                        ));
+                        subject.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                        subject.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+                        subject.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                        subject.setToolTip(Some(&NSString::from_str(&commit.subject)));
+                        cell.addSubview(&subject);
 
-            let avatar_key = commit
-                .author_email
-                .as_deref()
-                .and_then(history_avatar_key);
-            let avatar_image = avatar_key
-                .as_deref()
-                .and_then(|key| self.ivars().avatar_images.borrow().get(key).cloned())
-                .or_else(|| {
-                    NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                        &NSString::from_str("person.crop.circle.fill"),
-                        Some(&NSString::from_str(&commit.author)),
-                    )
-                });
-            if let Some(image) = avatar_image {
-                let avatar = NSImageView::imageViewWithImage(&image, self.mtm());
-                avatar.setFrame(NSRect::new(
-                    NSPoint::new(11.5, 8.0),
-                    NSSize::new(18.0, 18.0),
-                ));
-                avatar.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
-                avatar.setWantsLayer(true);
-                if let Some(layer) = avatar.layer() {
-                    layer.setCornerRadius(9.0);
-                    layer.setMasksToBounds(true);
-                }
-                avatar.setToolTip(Some(&NSString::from_str(&commit.author)));
-                cell.addSubview(&avatar);
-            }
-            if let Some(email) = commit.author_email.as_deref() {
-                self.request_history_avatar(email);
-            }
+                        let avatar_key =
+                            commit.author_email.as_deref().and_then(history_avatar_key);
+                        let avatar_image = avatar_key
+                            .as_deref()
+                            .and_then(|key| self.ivars().avatar_images.borrow().get(key).cloned())
+                            .or_else(|| {
+                                NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                                    &NSString::from_str("person.crop.circle.fill"),
+                                    Some(&NSString::from_str(&commit.author)),
+                                )
+                            });
+                        if let Some(image) = avatar_image {
+                            let avatar = NSImageView::imageViewWithImage(&image, self.mtm());
+                            avatar.setFrame(NSRect::new(
+                                NSPoint::new(11.5, 8.0),
+                                NSSize::new(18.0, 18.0),
+                            ));
+                            avatar.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+                            avatar.setWantsLayer(true);
+                            if let Some(layer) = avatar.layer() {
+                                layer.setCornerRadius(9.0);
+                                layer.setMasksToBounds(true);
+                            }
+                            avatar.setToolTip(Some(&NSString::from_str(&commit.author)));
+                            cell.addSubview(&avatar);
+                        }
+                        if let Some(email) = commit.author_email.as_deref() {
+                            self.request_history_avatar(email);
+                        }
 
-            let author_hash = NSTextField::labelWithString(
-                &NSString::from_str(&format!(
-                    "{}  ·  {}",
-                    commit.author, commit.short_hash
-                )),
-                self.mtm(),
-            );
-            author_hash.setFrame(NSRect::new(
-                NSPoint::new(34.0, 5.0),
-                NSSize::new((width - 34.0 - 104.0).max(1.0), 18.0),
-            ));
-            author_hash.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
-            author_hash.setFont(Some(&NSFont::systemFontOfSize(10.5)));
-            author_hash.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            author_hash.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-            cell.addSubview(&author_hash);
+                        let author_hash = NSTextField::labelWithString(
+                            &NSString::from_str(&format!(
+                                "{}  ·  {}",
+                                commit.author, commit.short_hash
+                            )),
+                            self.mtm(),
+                        );
+                        author_hash.setFrame(NSRect::new(
+                            NSPoint::new(34.0, 5.0),
+                            NSSize::new((width - 34.0 - 104.0).max(1.0), 18.0),
+                        ));
+                        author_hash
+                            .setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                        author_hash.setFont(Some(&NSFont::systemFontOfSize(10.5)));
+                        author_hash.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                        author_hash.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                        cell.addSubview(&author_hash);
 
-            let time = NSTextField::labelWithString(
-                &NSString::from_str(&commit.relative_time),
-                self.mtm(),
-            );
-            time.setFrame(NSRect::new(
-                NSPoint::new(width - 100.0, 5.0),
-                NSSize::new(90.0, 18.0),
-            ));
-            time.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
-            time.setAlignment(NSTextAlignment::Right);
-            time.setFont(Some(&NSFont::systemFontOfSize(10.5)));
-            time.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            time.setLineBreakMode(NSLineBreakMode::ByTruncatingHead);
-            cell.addSubview(&time);
-            Some(cell)
+                        let time = NSTextField::labelWithString(
+                            &NSString::from_str(&commit.relative_time),
+                            self.mtm(),
+                        );
+                        time.setFrame(NSRect::new(
+                            NSPoint::new(width - 100.0, 5.0),
+                            NSSize::new(90.0, 18.0),
+                        ));
+                        time.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+                        time.setAlignment(NSTextAlignment::Right);
+                        time.setFont(Some(&NSFont::systemFontOfSize(10.5)));
+                        time.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                        time.setLineBreakMode(NSLineBreakMode::ByTruncatingHead);
+                        cell.addSubview(&time);
+                        Some(cell)
                     } else if history.loading.get() && row == history.commits.borrow().len() {
-                    let width = table.bounds().size.width.max(180.0);
-                    let cell = NSView::initWithFrame(
-                        NSView::alloc(self.mtm()),
-                        NSRect::new(
-                            NSPoint::new(0.0, 0.0),
-                            NSSize::new(width, HISTORY_LOADING_ROW_HEIGHT),
-                        ),
-                    );
-                    cell.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
-                    let message = if history.query.borrow().is_empty() {
-                        "Loading more commits..."
-                    } else {
-                        "Searching more commits..."
-                    };
-                    let label = NSTextField::labelWithString(
-                        &NSString::from_str(message),
-                        self.mtm(),
-                    );
-                    label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
-                    label.setTextColor(Some(&NSColor::secondaryLabelColor()));
-                    label.sizeToFit();
-                    let label_size = label.frame().size;
-                    let row_height = HISTORY_LOADING_ROW_HEIGHT;
-                    let spinner_size = 16.0;
-                    let gap = 12.0;
-                    let group_width = spinner_size + gap + label_size.width;
-                    let group_x = (width - group_width) / 2.0;
-                    let spinner = NSProgressIndicator::initWithFrame(
-                        NSProgressIndicator::alloc(self.mtm()),
-                        NSRect::new(
-                            NSPoint::new(group_x, (row_height - spinner_size) / 2.0),
-                            NSSize::new(spinner_size, spinner_size),
-                        ),
-                    );
-                    spinner.setStyle(NSProgressIndicatorStyle::Spinning);
-                    spinner.setControlSize(NSControlSize::Small);
-                    spinner.setIndeterminate(true);
-                    spinner.setDisplayedWhenStopped(false);
-                    spinner.setAutoresizingMask(
-                        NSAutoresizingMaskOptions::ViewMinXMargin
-                            | NSAutoresizingMaskOptions::ViewMaxXMargin,
-                    );
-                    // SAFETY: AppKit creates and animates this native table-row spinner on
-                    // the main thread, and the table retains it with the row view.
-                    unsafe { spinner.startAnimation(None) };
-                    cell.addSubview(&spinner);
-                    label.setFrame(NSRect::new(
-                        NSPoint::new(
-                            group_x + spinner_size + gap,
-                            (row_height - label_size.height) / 2.0,
-                        ),
-                        label_size,
-                    ));
-                    label.setAutoresizingMask(
-                        NSAutoresizingMaskOptions::ViewMinXMargin
-                            | NSAutoresizingMaskOptions::ViewMaxXMargin,
-                    );
-                    cell.addSubview(&label);
-                    Some(cell)
+                        let width = table.bounds().size.width.max(180.0);
+                        let cell = NSView::initWithFrame(
+                            NSView::alloc(self.mtm()),
+                            NSRect::new(
+                                NSPoint::new(0.0, 0.0),
+                                NSSize::new(width, HISTORY_LOADING_ROW_HEIGHT),
+                            ),
+                        );
+                        cell.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                        let message = if history.query.borrow().is_empty() {
+                            "Loading more commits..."
+                        } else {
+                            "Searching more commits..."
+                        };
+                        let label =
+                            NSTextField::labelWithString(&NSString::from_str(message), self.mtm());
+                        label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+                        label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                        label.sizeToFit();
+                        let label_size = label.frame().size;
+                        let row_height = HISTORY_LOADING_ROW_HEIGHT;
+                        let spinner_size = 16.0;
+                        let gap = 12.0;
+                        let group_width = spinner_size + gap + label_size.width;
+                        let group_x = (width - group_width) / 2.0;
+                        let spinner = NSProgressIndicator::initWithFrame(
+                            NSProgressIndicator::alloc(self.mtm()),
+                            NSRect::new(
+                                NSPoint::new(group_x, (row_height - spinner_size) / 2.0),
+                                NSSize::new(spinner_size, spinner_size),
+                            ),
+                        );
+                        spinner.setStyle(NSProgressIndicatorStyle::Spinning);
+                        spinner.setControlSize(NSControlSize::Small);
+                        spinner.setIndeterminate(true);
+                        spinner.setDisplayedWhenStopped(false);
+                        spinner.setAutoresizingMask(
+                            NSAutoresizingMaskOptions::ViewMinXMargin
+                                | NSAutoresizingMaskOptions::ViewMaxXMargin,
+                        );
+                        // SAFETY: AppKit creates and animates this native table-row spinner on
+                        // the main thread, and the table retains it with the row view.
+                        unsafe { spinner.startAnimation(None) };
+                        cell.addSubview(&spinner);
+                        label.setFrame(NSRect::new(
+                            NSPoint::new(
+                                group_x + spinner_size + gap,
+                                (row_height - label_size.height) / 2.0,
+                            ),
+                            label_size,
+                        ));
+                        label.setAutoresizingMask(
+                            NSAutoresizingMaskOptions::ViewMinXMargin
+                                | NSAutoresizingMaskOptions::ViewMaxXMargin,
+                        );
+                        cell.addSubview(&label);
+                        Some(cell)
                     } else {
                         None
                     }
@@ -722,9 +712,7 @@ impl AppDelegate {
         let Some(files) = self.ivars().files.get() else {
             return;
         };
-        if !std::ptr::eq(table, &*files.preview_table)
-            || files.sqlite_controls.isHidden()
-        {
+        if !std::ptr::eq(table, &*files.preview_table) || files.sqlite_controls.isHidden() {
             return;
         }
         let Some(column_index) = table
@@ -781,9 +769,8 @@ impl AppDelegate {
             .get()
             .is_some_and(|workspace_table| std::ptr::eq(table, &**workspace_table))
         {
-            return (row >= 0
-                && (row as usize) < self.ivars().workspace_results.borrow().len())
-            .into();
+            return (row >= 0 && (row as usize) < self.ivars().workspace_results.borrow().len())
+                .into();
         }
         if self
             .ivars()
@@ -793,14 +780,6 @@ impl AppDelegate {
         {
             return (row >= 0 && (row as usize) < self.ivars().author_options.borrow().len())
                 .into();
-        }
-        if self
-            .ivars()
-            .agents
-            .get()
-            .is_some_and(|agents| std::ptr::eq(table, &*agents.transcript_table))
-        {
-            return false.into();
         }
         if self
             .ivars()
@@ -816,9 +795,7 @@ impl AppDelegate {
             .get()
             .is_some_and(|files| std::ptr::eq(table, &**files.table))
         {
-            return (row >= 0
-                && (row as usize) < self.filtered_file_tree_rows().len())
-                .into();
+            return (row >= 0 && (row as usize) < self.filtered_file_tree_rows().len()).into();
         }
         if self
             .ivars()

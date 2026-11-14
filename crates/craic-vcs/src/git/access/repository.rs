@@ -525,6 +525,13 @@ impl GitRepoHandle {
     }
 
     fn save_settings_blocking(&self, settings: &GitSettings) -> Result<(), String> {
+        // Reject an invalid offset before changing the repository's author settings.
+        let timezone = settings
+            .commit_timezone
+            .as_deref()
+            .filter(|timezone| !timezone.trim().is_empty())
+            .map(crate::workspace_config::normalize_timezone)
+            .transpose()?;
         if settings.use_global_user {
             let _ = self.git(&[
                 "config".into(),
@@ -555,7 +562,7 @@ impl GitRepoHandle {
 
         crate::workspace_config::save_git_config_with_file_access(
             self.files.as_ref(),
-            settings.commit_timezone.as_deref().unwrap_or_default(),
+            timezone.as_deref().unwrap_or_default(),
             settings.warn_if_remote_owner_mismatch,
             settings.use_system_timezone,
             settings.github_auth_account.as_ref(),

@@ -14,6 +14,7 @@ pub struct ProviderUpdate {
     update_argument: &'static str,
 }
 
+#[derive(Debug)]
 pub struct ProviderUpdateCheck {
     pub updates: Vec<ProviderUpdate>,
     pub checked_programs: Vec<&'static str>,

@@ -152,8 +152,8 @@ impl AppDelegate {
         font_title.setFont(Some(&NSFont::boldSystemFontOfSize(18.0)));
         appearance_pane.addSubview(&font_title);
 
-        let font_labels = ["Shell", "Text Editor", "Diff", "Agents Chat"];
-        let font_x = [24.0, 152.0, 280.0, 408.0];
+        let font_labels = ["Shell & Agents", "Text Editor", "Diff"];
+        let font_x = [24.0, 200.0, 376.0];
         let mut font_fields = Vec::with_capacity(font_labels.len());
         for (label, x) in font_labels.into_iter().zip(font_x) {
             let label = NSTextField::labelWithString(&NSString::from_str(label), mtm);
@@ -172,14 +172,9 @@ impl AppDelegate {
             appearance_pane.addSubview(&field);
             font_fields.push(field);
         }
-        let [
-            shell_font_size,
-            editor_font_size,
-            diff_font_size,
-            agent_font_size,
-        ] = font_fields
+        let [shell_font_size, editor_font_size, diff_font_size] = font_fields
             .try_into()
-            .expect("four font fields are created");
+            .expect("three font fields are created");
 
         let font_status = NSTextField::labelWithString(&NSString::new(), mtm);
         font_status.setFrame(NSRect::new(
@@ -283,7 +278,7 @@ impl AppDelegate {
         );
         commit_timezone.setPlaceholderString(Some(&NSString::from_str("+0000 or +09:30")));
         commit_timezone.setToolTip(Some(&NSString::from_str(
-            "Use +0000, -0500, or +09:30. Leave empty for the default.",
+            "Use +0000, -0500, or +09:30. Leave empty to use +0000 unless system timezone is enabled.",
         )));
         workspace_section.addSubview(&commit_timezone);
 
@@ -384,7 +379,6 @@ impl AppDelegate {
             shell_font_size,
             editor_font_size,
             diff_font_size,
-            agent_font_size,
             font_status,
             provider,
             model,
@@ -420,7 +414,6 @@ impl AppDelegate {
             (&settings.shell_font_size, font_sizes.shell),
             (&settings.editor_font_size, font_sizes.editor),
             (&settings.diff_font_size, font_sizes.diff),
-            (&settings.agent_font_size, font_sizes.agent),
         ] {
             field.setStringValue(&NSString::from_str(&format!("{value:.1}")));
         }
@@ -459,11 +452,7 @@ impl AppDelegate {
                     "Diff",
                     craic_config::DEFAULT_DIFF_FONT_SIZE,
                 )?,
-                agent: parse(
-                    &settings.agent_font_size,
-                    "Agents Chat",
-                    craic_config::DEFAULT_AGENT_FONT_SIZE,
-                )?,
+                agent: self.ivars().font_sizes.get().agent,
             })
         })() {
             Ok(font_sizes) => font_sizes,
@@ -499,12 +488,6 @@ impl AppDelegate {
                     0.0,
                 )));
             files.preview_code.set_font_size(font_sizes.editor);
-        }
-        if let Some(agents) = self.ivars().agents.get() {
-            agents
-                .composer
-                .setFont(Some(&NSFont::systemFontOfSize(font_sizes.agent)));
-            agents.transcript_table.reloadData();
         }
 
         settings
@@ -1228,5 +1211,4 @@ impl AppDelegate {
             &fetch,
         ])
     }
-
 }

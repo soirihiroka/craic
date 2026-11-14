@@ -2,6 +2,10 @@
 resolver = "3"
 members = ["crates/*"]
 default-members = ["crates/craic"]
+exclude = ["vendor/skia-bindings"]
+
+[patch.crates-io]
+skia-bindings = { path = "vendor/skia-bindings" }
 
 [workspace.package]
 version = "0.1.0"

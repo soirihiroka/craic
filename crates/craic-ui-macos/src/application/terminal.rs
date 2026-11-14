@@ -80,7 +80,97 @@ impl AppDelegate {
         )
     }
 
-    fn start_native_terminal_agent(&self, program: &str, title: &str) {
+    fn start_native_terminal_agent(
+        &self,
+        program: &str,
+        title: &str,
+        history: Option<&craic_agent::agent_history::AgentSessionRow>,
+    ) {
+        let (Some(identity), Some(commands), Some(cancellation)) = (
+            self.active_agent_identity(),
+            self.ivars().agent_commands.get(),
+            self.workspace_cancellation_token(),
+        ) else {
+            return;
+        };
+        let workspace = self
+            .ivars()
+            .workspaces
+            .borrow()
+            .iter()
+            .find(|entry| entry.selection_id() == identity.workspace_id)
+            .map(|entry| entry.workspace.clone());
+        let Some(workspace) = workspace else {
+            return;
+        };
+        let command = NativeAgentCommand::PrepareTerminal {
+            identity,
+            workspace,
+            provider_id: program.to_owned(),
+            history: history.cloned(),
+            cancellation,
+        };
+        if let Err(error) = commands.try_send(command) {
+            self.present_path_action_error(
+                "Unable to Start Agent",
+                &format!("The agent launch could not be queued: {error}"),
+            );
+        } else if let Some(agents) = self.ivars().agents.get() {
+            agents.new_chat.setEnabled(false);
+            agents
+                .new_chat
+                .setToolTip(Some(&NSString::from_str(&format!("Starting {title}…"))));
+        }
+    }
+
+    fn finish_native_terminal_agent_start(
+        &self,
+        identity: &AgentIdentity,
+        program: &str,
+        history: Option<craic_agent::agent_history::AgentSessionRow>,
+        result: Result<ShellCommandSpec, String>,
+    ) {
+        if !self.agent_event_is_current(identity) {
+            return;
+        }
+        let Some(provider) = NATIVE_AGENT_PROVIDERS
+            .iter()
+            .copied()
+            .find(|provider| provider.provider_id() == program)
+        else {
+            return;
+        };
+        let title = provider.label();
+        if let Some(agents) = self.ivars().agents.get() {
+            agents.new_chat.setEnabled(true);
+            let selected = NATIVE_AGENT_PROVIDERS[agents.selected_provider.get()];
+            agents
+                .new_chat
+                .setToolTip(Some(&NSString::from_str(&format!(
+                    "New {} chat",
+                    selected.label()
+                ))));
+        }
+        let existing = history.as_ref().and_then(|history| {
+            self.ivars()
+                .terminal_sessions
+                .borrow()
+                .iter()
+                .find(|session| session.agent_history_id == Some(history.id))
+                .map(|session| session.id)
+        });
+        if let Some(id) = existing {
+            self.activate_native_terminal_session(id);
+            self.set_native_agent_terminal_visible(true);
+            return;
+        }
+        let command = match result {
+            Ok(command) => command,
+            Err(error) => {
+                self.present_path_action_error("Unable to Start Agent", &error);
+                return;
+            }
+        };
         let Some(handle) = self.ivars().workspace_handle.borrow().clone() else {
             self.present_path_action_error(
                 "Unable to Start Agent",
@@ -103,30 +193,6 @@ impl AppDelegate {
         } else {
             None
         };
-        let mut arguments = if program == "codex" {
-            vec![
-                "--no-alt-screen".to_string(),
-                "--cd".to_string(),
-                working_directory.clone(),
-            ]
-        } else {
-            Vec::new()
-        };
-        if program == "codex"
-            && matches!(
-                craic_config::app_agent_settings().permissions.as_deref(),
-                Some(":full-access" | ":danger-full-access")
-            )
-        {
-            arguments.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-        }
-        let command = match handle.resolved_terminal_command(program, &arguments) {
-            Ok(command) => command,
-            Err(error) => {
-                self.present_path_action_error("Unable to Start Agent", &error);
-                return;
-            }
-        };
         if let Err(error) = self.spawn_native_terminal_command_with_directory_at(
             command,
             title.to_string(),
@@ -138,6 +204,18 @@ impl AppDelegate {
             self.present_path_action_error("Unable to Start Agent", &error);
             return;
         }
+        if let Some(history) = history
+            && let Some(session) = self.ivars().terminal_sessions.borrow_mut().last_mut()
+        {
+            session.agent_history_id = Some(history.id);
+            session.agent_title_locked = true;
+            session.agent_active_state = AgentActiveState::Loading;
+            session.agent_last_seen_ms = history.last_seen_at_ms;
+            session.title_label = history.title.clone();
+            session.title.setTitle(&NSString::from_str(&history.title));
+        }
+        self.refresh_native_agent_thread_rows();
+        self.restore_agents_page_badge();
         log::info!(
             "native terminal agent started provider={program} title={title} placement=agents-detail"
         );
@@ -283,6 +361,13 @@ impl AppDelegate {
         terminal.spawn(program, arguments, spawn_working_directory, &title)?;
         let agent_provider_label =
             (placement == NativeTerminalPlacement::Agent).then(|| title.clone());
+        let agent_provider = agent_provider_label.as_deref().and_then(|label| {
+            NATIVE_AGENT_PROVIDERS
+                .iter()
+                .copied()
+                .find(|provider| provider.label() == label)
+        });
+        let title = agent_provider.map_or(title, |provider| provider.default_title());
 
         let tab = NSView::initWithFrame(
             NSView::alloc(self.mtm()),
@@ -395,6 +480,13 @@ impl AppDelegate {
                 title: title_button,
                 title_label: title,
                 agent_provider_label,
+                agent_provider,
+                agent_active_state: AgentActiveState::NewChat,
+                agent_title_locked: false,
+                agent_summary_requested: false,
+                agent_summary_in_flight: false,
+                agent_last_seen_ms: craic_agent::agent_history::unix_now_ms(),
+                agent_history_id: None,
                 view: terminal.clone(),
                 working_directory: working_directory_label,
                 local_working_directory,
@@ -409,6 +501,7 @@ impl AppDelegate {
             self.ensure_native_agent_terminal_usage_timer();
             self.refresh_native_agent_thread_rows();
             self.restore_agents_page_badge();
+            self.request_native_cli_history(false);
         }
         self.activate_native_terminal_session(id);
         match placement {
@@ -463,6 +556,7 @@ impl AppDelegate {
     }
 
     fn sample_native_agent_terminal_usage(&self) {
+        self.refresh_native_terminal_agent_states();
         let sessions = self
             .ivars()
             .terminal_sessions
@@ -536,11 +630,18 @@ impl AppDelegate {
                 .as_deref()
                 .unwrap_or("Terminal agent");
             let state = if session.view.is_active() {
-                "Running"
+                match session.agent_active_state {
+                    AgentActiveState::NewChat => "New chat",
+                    AgentActiveState::Idle => "Idle",
+                    AgentActiveState::Loading => "Working",
+                    AgentActiveState::Asking => "Waiting for input",
+                }
             } else {
                 "Exited"
             };
             card.resource.setStringValue(&NSString::from_str(&resource));
+            card.metadata
+                .setStringValue(&NSString::from_str(&format!("{provider} · {state}")));
             card.selector
                 .setAccessibilityLabel(Some(&NSString::from_str(&format!(
                     "{}\n{provider} · {state}\n{resource}",
@@ -754,21 +855,8 @@ impl AppDelegate {
                 (next, "editor")
             }
             Some("agents") => {
-                let next = craic_config::normalize_font_size(
-                    font_sizes.agent + delta,
-                    craic_config::DEFAULT_AGENT_FONT_SIZE,
-                );
-                if (next - font_sizes.agent).abs() < f64::EPSILON {
-                    return;
-                }
-                font_sizes.agent = next;
-                if let Some(agents) = self.ivars().agents.get() {
-                    agents
-                        .composer
-                        .setFont(Some(&NSFont::systemFontOfSize(next)));
-                    agents.transcript_table.reloadData();
-                }
-                (next, "agent")
+                self.adjust_native_terminal_font_size(delta);
+                return;
             }
             _ => return,
         };
@@ -799,7 +887,7 @@ impl AppDelegate {
         let delta = match self.ivars().active_page_id.borrow().as_deref() {
             Some("changes" | "history") => craic_config::DEFAULT_DIFF_FONT_SIZE - font_sizes.diff,
             Some("files") => craic_config::DEFAULT_EDITOR_FONT_SIZE - font_sizes.editor,
-            Some("agents") => craic_config::DEFAULT_AGENT_FONT_SIZE - font_sizes.agent,
+            Some("agents") => craic_config::DEFAULT_SHELL_FONT_SIZE - font_sizes.shell,
             _ => return,
         };
         self.adjust_native_active_font_size(delta);
@@ -908,6 +996,7 @@ impl AppDelegate {
     }
 
     pub(crate) fn native_terminal_session_exited(&self, id: isize, exit_code: Option<i32>) {
+        self.native_provider_update_terminal_finished(id, exit_code == Some(0));
         let agent_session = self
             .ivars()
             .terminal_sessions
@@ -924,7 +1013,7 @@ impl AppDelegate {
         {
             session.reported_task_active = false;
         }
-        if exit_code == Some(0) {
+        if exit_code == Some(0) && !agent_session {
             self.schedule_native_terminal_auto_close(id);
         } else if let Some(session) = self
             .ivars()
@@ -939,6 +1028,7 @@ impl AppDelegate {
         if agent_session {
             self.refresh_native_agent_thread_rows();
             self.restore_agents_page_badge();
+            self.request_native_cli_history(false);
         }
     }
 
@@ -979,7 +1069,7 @@ impl AppDelegate {
                 self.place_native_terminal_search(placement);
             }
         }
-        if exited_successfully {
+        if exited_successfully && placement == NativeTerminalPlacement::General {
             self.schedule_native_terminal_auto_close(id);
         }
     }
@@ -990,6 +1080,11 @@ impl AppDelegate {
             let Some(session) = sessions.iter_mut().find(|session| session.id == id) else {
                 return;
             };
+            if session.placement == NativeTerminalPlacement::Agent {
+                // The provider parser owns the conversation title; OSC titles also contain
+                // transient spinner and permission states that must never rename a session.
+                return;
+            }
             if session.title_label == title {
                 return;
             }
@@ -1355,7 +1450,7 @@ impl AppDelegate {
         }
     }
 
-    fn show_native_agent_app_surface(&self) {
+    fn show_native_agent_empty_surface(&self) {
         self.set_native_agent_terminal_visible(false);
         let active_is_agent = self
             .ivars()
@@ -1458,6 +1553,7 @@ impl AppDelegate {
     }
 
     fn finish_native_terminal_close(&self, id: isize) {
+        self.native_provider_update_terminal_finished(id, false);
         let (mut entry, replacement, was_active) = {
             let mut sessions = self.ivars().terminal_sessions.borrow_mut();
             let Some(index) = sessions.iter().position(|session| session.id == id) else {
@@ -1518,7 +1614,7 @@ impl AppDelegate {
                     if let Some(replacement) = replacement {
                         self.activate_native_terminal_session(replacement);
                     } else {
-                        self.show_native_agent_app_surface();
+                        self.show_native_agent_empty_surface();
                     }
                 }
             }
@@ -1536,6 +1632,7 @@ impl AppDelegate {
             }
             self.refresh_native_agent_thread_rows();
             self.restore_agents_page_badge();
+            self.request_native_cli_history(false);
         }
         log::info!("native terminal session closed id={id}");
     }
@@ -1583,6 +1680,11 @@ impl AppDelegate {
         );
         self.ivars().workspace_create_in_progress.set(false);
         if let Some(timer) = self.ivars().toast_timer.borrow_mut().take() {
+            timer.invalidate();
+        }
+        if let Some(agents) = self.ivars().agents.get()
+            && let Some(timer) = agents.history_refresh_timer.borrow_mut().take()
+        {
             timer.invalidate();
         }
         self.shutdown_all_native_terminals();
@@ -1639,15 +1741,10 @@ impl AppDelegate {
 
     fn has_active_native_session(&self) -> bool {
         self.ivars()
-            .agents
-            .get()
-            .is_some_and(|agents| agents.state.get() != NativeAgentState::Closed)
-            || self
-                .ivars()
-                .terminal_sessions
-                .borrow()
-                .iter()
-                .any(NativeTerminalSession::has_active_task)
+            .terminal_sessions
+            .borrow()
+            .iter()
+            .any(NativeTerminalSession::has_active_task)
     }
 
     fn present_close_confirmation(&self) -> bool {
@@ -1663,23 +1760,28 @@ impl AppDelegate {
         alert.setMessageText(&NSString::from_str("Close Craic?"));
         let agent_active = self
             .ivars()
-            .agents
-            .get()
-            .is_some_and(|agents| agents.state.get() != NativeAgentState::Closed);
+            .terminal_sessions
+            .borrow()
+            .iter()
+            .any(|session| {
+                session.placement == NativeTerminalPlacement::Agent && session.has_active_task()
+            });
         let terminal_active = self
             .ivars()
             .terminal_sessions
             .borrow()
             .iter()
-            .any(NativeTerminalSession::has_active_task);
+            .any(|session| {
+                session.placement == NativeTerminalPlacement::General && session.has_active_task()
+            });
         let (message, close_label) = match (agent_active, terminal_active) {
             (true, true) => (
-                "Codex and Terminal sessions are active. Closing this window will stop both sessions and any work in progress.",
+                "Agent and terminal sessions are active. Closing this window will stop them and any work in progress.",
                 "Close and Stop Sessions",
             ),
             (true, false) => (
-                "A Codex session is active. Closing this window will stop the session and any work in progress.",
-                "Close and Stop Codex",
+                "An agent session is active. Closing this window will stop it and any work in progress.",
+                "Close and Stop Agent",
             ),
             (false, true) => (
                 "A Terminal session is active. Closing this window will stop the shell and any programs started from it.",
@@ -1923,7 +2025,8 @@ impl AppDelegate {
         else {
             return;
         };
-        let (workspace_path, selected_path) = craic_system::workspace::external_workspace_location(absolute);
+        let (workspace_path, selected_path) =
+            craic_system::workspace::external_workspace_location(absolute);
         let provider_id = workspace.provider.id();
         let display = absolute.to_string();
         let alert = NSAlert::new(self.mtm());
@@ -1953,5 +2056,4 @@ impl AppDelegate {
         });
         alert.beginSheetModalForWindow_completionHandler(window, Some(&completion));
     }
-
 }

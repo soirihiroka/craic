@@ -30,7 +30,9 @@ async fn run_repository_service(
             | RepositoryRequest::Refresh { .. }
             | RepositoryRequest::RunBranchAction { .. }
             | RepositoryRequest::RunGitAction { .. }
-            | RepositoryRequest::SaveQuickActionConfiguration { .. } => RepositoryRequestGroup::Core,
+            | RepositoryRequest::SaveQuickActionConfiguration { .. } => {
+                RepositoryRequestGroup::Core
+            }
             RepositoryRequest::LoadFileBytesComparison { .. }
             | RepositoryRequest::LoadFileComparison { .. }
             | RepositoryRequest::LoadHistoryBytesComparison { .. }
@@ -52,8 +54,7 @@ async fn run_repository_service(
             | RepositoryRequest::LoadContainers { .. }
             | RepositoryRequest::RunComposeAction { .. }
             | RepositoryRequest::RunContainerAction { .. } => RepositoryRequestGroup::Containers,
-            RepositoryRequest::LoadAgentImage { .. }
-            | RepositoryRequest::LoadAvatar { .. }
+            RepositoryRequest::LoadAvatar { .. }
             | RepositoryRequest::LoadCommitAuthors { .. }
             | RepositoryRequest::ResolveAgentFileLink { .. } => RepositoryRequestGroup::Media,
             RepositoryRequest::Commit { .. }
@@ -64,54 +65,70 @@ async fn run_repository_service(
             | RepositoryRequest::SaveCommitAuthor { .. }
             | RepositoryRequest::SaveCommitMessageModel { .. }
             | RepositoryRequest::SaveCommitMessageProvider { .. }
-            | RepositoryRequest::SaveWorkspaceSettings { .. } => RepositoryRequestGroup::CommitSettings,
+            | RepositoryRequest::SaveWorkspaceSettings { .. } => {
+                RepositoryRequestGroup::CommitSettings
+            }
             RepositoryRequest::AddIgnorePattern { .. }
             | RepositoryRequest::Discard { .. }
             | RepositoryRequest::Stash { .. } => RepositoryRequestGroup::Changes,
         };
         match group {
-            RepositoryRequestGroup::Core => handle_repository_core(
-                request,
-                repository_completion_tx.clone(),
-                retired_jobs.clone(),
-            )
-            .await,
-            RepositoryRequestGroup::History => handle_repository_history(
-                request,
-                repository_completion_tx.clone(),
-                retired_jobs.clone(),
-            )
-            .await,
-            RepositoryRequestGroup::Files => handle_repository_files(
-                request,
-                repository_completion_tx.clone(),
-                retired_jobs.clone(),
-            )
-            .await,
-            RepositoryRequestGroup::Containers => handle_repository_containers(
-                request,
-                repository_completion_tx.clone(),
-                retired_jobs.clone(),
-            )
-            .await,
-            RepositoryRequestGroup::Media => handle_repository_media(
-                request,
-                repository_completion_tx.clone(),
-                retired_jobs.clone(),
-            )
-            .await,
-            RepositoryRequestGroup::CommitSettings => handle_repository_commit_settings(
-                request,
-                repository_completion_tx.clone(),
-                retired_jobs.clone(),
-            )
-            .await,
-            RepositoryRequestGroup::Changes => handle_repository_changes(
-                request,
-                repository_completion_tx.clone(),
-                retired_jobs.clone(),
-            )
-            .await,
+            RepositoryRequestGroup::Core => {
+                handle_repository_core(
+                    request,
+                    repository_completion_tx.clone(),
+                    retired_jobs.clone(),
+                )
+                .await
+            }
+            RepositoryRequestGroup::History => {
+                handle_repository_history(
+                    request,
+                    repository_completion_tx.clone(),
+                    retired_jobs.clone(),
+                )
+                .await
+            }
+            RepositoryRequestGroup::Files => {
+                handle_repository_files(
+                    request,
+                    repository_completion_tx.clone(),
+                    retired_jobs.clone(),
+                )
+                .await
+            }
+            RepositoryRequestGroup::Containers => {
+                handle_repository_containers(
+                    request,
+                    repository_completion_tx.clone(),
+                    retired_jobs.clone(),
+                )
+                .await
+            }
+            RepositoryRequestGroup::Media => {
+                handle_repository_media(
+                    request,
+                    repository_completion_tx.clone(),
+                    retired_jobs.clone(),
+                )
+                .await
+            }
+            RepositoryRequestGroup::CommitSettings => {
+                handle_repository_commit_settings(
+                    request,
+                    repository_completion_tx.clone(),
+                    retired_jobs.clone(),
+                )
+                .await
+            }
+            RepositoryRequestGroup::Changes => {
+                handle_repository_changes(
+                    request,
+                    repository_completion_tx.clone(),
+                    retired_jobs.clone(),
+                )
+                .await
+            }
         }
     }
     log::info!("native repository service stopped");

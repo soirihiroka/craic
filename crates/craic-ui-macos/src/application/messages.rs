@@ -226,14 +226,6 @@ enum RepositoryRequest {
         line: Option<usize>,
         column: Option<usize>,
     },
-    LoadAgentImage {
-        workspace_id: String,
-        generation: u64,
-        item_id: String,
-        source: NativeAgentTranscriptImageSource,
-        access: Arc<dyn FileAccess>,
-        cancellation: WorkspaceCancellationToken,
-    },
     SaveCommitAuthor {
         workspace_id: String,
         handle: Arc<GitRepoHandle>,
@@ -675,13 +667,6 @@ enum RepositoryCompletion {
         line: Option<usize>,
         column: Option<usize>,
         result: Result<TerminalLinkTarget, String>,
-    },
-    AgentImage {
-        workspace_id: String,
-        generation: u64,
-        item_id: String,
-        source: NativeAgentTranscriptImageSource,
-        result: Result<Vec<u8>, String>,
     },
     CommitAuthorFinished {
         workspace_id: String,

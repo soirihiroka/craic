@@ -43,7 +43,11 @@ impl ShellAccess for LocalShellAccess {
             working_dir.display()
         );
         Ok(ShellCommandSpec::new(shell, working_dir)
-            .arg("-i")
+            .arg(if cfg!(target_os = "macos") {
+                "-il"
+            } else {
+                "-i"
+            })
             .activity(ShellCommandActivity::LocalInteractiveShell))
     }
 
@@ -53,7 +57,7 @@ impl ShellAccess for LocalShellAccess {
         program: &str,
         args: &[String],
     ) -> Result<ShellCommandSpec, String> {
-        if command_name_can_use_path(program) {
+        if cfg!(target_os = "macos") || command_name_can_use_path(program) {
             if let Err(err) = self.which(program) {
                 log::warn!(
                     "local shell command lookup failed workspace={} program={} error={}",
@@ -74,7 +78,11 @@ impl ShellAccess for LocalShellAccess {
                 program
             );
             return Ok(ShellCommandSpec::new(default_shell(), working_dir.clone())
-                .arg("-i")
+                .arg(if cfg!(target_os = "macos") {
+                    "-il"
+                } else {
+                    "-i"
+                })
                 .arg("-c")
                 .arg(script));
         }
@@ -98,6 +106,11 @@ impl ShellAccess for LocalShellAccess {
         program: &str,
         args: &[String],
     ) -> Result<ShellCommandSpec, String> {
+        // Desktop launches do not inherit the login shell's PATH. Even an absolute
+        // CLI path can use an env-based interpreter (for example Codex's Node shebang).
+        if cfg!(target_os = "macos") {
+            return self.command(working_dir, program, args);
+        }
         log::debug!(
             "local fast command created workspace={} working_dir={} program={}",
             self.workspace.display_name,
@@ -199,7 +212,11 @@ impl ShellAccess for LocalShellAccess {
         );
         let script = format!("command -v {}", shell_quote(program));
         let output = Command::new(&shell)
-            .arg("-i")
+            .arg(if cfg!(target_os = "macos") {
+                "-il"
+            } else {
+                "-i"
+            })
             .arg("-c")
             .arg(&script)
             .current_dir(&self.workspace.root.absolute)
@@ -257,7 +274,11 @@ fn run_local_script(
 
     let mut command = Command::new(&shell);
     if mode == ShellScriptMode::UserInteractive {
-        command.arg("-i");
+        command.arg(if cfg!(target_os = "macos") {
+            "-il"
+        } else {
+            "-i"
+        });
     }
     command
         .arg("-c")

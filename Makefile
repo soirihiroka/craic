@@ -37,6 +37,10 @@ FONTDIR ?= $(DATADIR)/fonts/$(BIN_NAME)/JetBrainsMono
 
 DESKTOP_TEMPLATE := data/$(APP_ID).desktop.in
 APP_ICON := data/icons/hicolor/scalable/apps/$(APP_ID).svg
+MACOS_ICON_SOURCE := data/macos/CraicIcon.icon
+MACOS_ICON_FILES := $(MACOS_ICON_SOURCE)/icon.json $(wildcard $(MACOS_ICON_SOURCE)/Assets/*.svg)
+MACOS_ICON_CATALOG := $(CARGO_TARGET_DIR)/macos/Assets.car
+MACOS_APP_ICON := data/macos/CraicIcon.icns
 ASSET_FILES := $(wildcard crates/craic-ui-core/assets/icons/*.svg)
 FONT_FILES := $(wildcard crates/craic-ui-core/assets/fonts/JetBrainsMono/*.ttf)
 DOCS_DIR := docs
@@ -45,7 +49,7 @@ DOCS_BUILD_DIR := $(DOCS_DIR)/build
 DEBUG_APP_BUNDLE := $(CARGO_TARGET_DIR)/debug/$(APP_NAME).app
 DEBUG_APP_EXECUTABLE := $(DEBUG_APP_BUNDLE)/Contents/MacOS/$(BIN_NAME)
 
-.PHONY: dev run build release check fmt test doc resource-watch macos-app run-macos clean install uninstall
+.PHONY: dev run build release check fmt test doc resource-watch macos-icon macos-app run-macos clean install uninstall
 
 ifeq ($(UNAME_S),Darwin)
 dev: macos-app
@@ -79,11 +83,30 @@ resource-watch:
 	@test -n "$(PID)" || { echo "usage: make resource-watch PID=<craic-pid> [INTERVAL=<seconds>]" >&2; exit 2; }
 	./tools/watch-craic-resources.sh "$(PID)" "$(or $(INTERVAL),5)"
 
-macos-app:
+macos-icon: $(MACOS_ICON_CATALOG) $(MACOS_APP_ICON) data/macos/CraicIcon.png
+
+$(MACOS_ICON_CATALOG): $(MACOS_ICON_FILES)
+	$(INSTALL) -d "$(CARGO_TARGET_DIR)/macos"
+	xcrun actool "$(MACOS_ICON_SOURCE)" --compile "$(CARGO_TARGET_DIR)/macos" \
+		--platform macosx --minimum-deployment-target 14.0 --app-icon CraicIcon \
+		--output-partial-info-plist "$(CARGO_TARGET_DIR)/macos/icon-info.plist" \
+		--target-device mac --output-format human-readable-text --notices --warnings
+
+$(MACOS_APP_ICON): $(MACOS_ICON_CATALOG)
+	$(INSTALL) -m 0644 "$(CARGO_TARGET_DIR)/macos/CraicIcon.icns" "$@"
+
+data/macos/CraicIcon.png: $(MACOS_ICON_FILES)
+	"$$(xcode-select -p)/../Applications/Icon Composer.app/Contents/Executables/ictool" \
+		"$(MACOS_ICON_SOURCE)" --export-image --output-file "$@" \
+		--platform macOS --rendition Default --width 1024 --height 1024 --scale 1 --design-generation 27
+
+macos-app: $(MACOS_ICON_CATALOG) $(MACOS_APP_ICON)
 	$(CARGO_ENV) $(CARGO) build
 	$(INSTALL) -d "$(DEBUG_APP_BUNDLE)/Contents/MacOS"
 	$(INSTALL) -d "$(DEBUG_APP_BUNDLE)/Contents/Resources"
 	$(INSTALL) -m 0644 "data/macos/Info.plist" "$(DEBUG_APP_BUNDLE)/Contents/Info.plist"
+	$(INSTALL) -m 0644 "$(MACOS_APP_ICON)" "$(DEBUG_APP_BUNDLE)/Contents/Resources/CraicIcon.icns"
+	$(INSTALL) -m 0644 "$(MACOS_ICON_CATALOG)" "$(DEBUG_APP_BUNDLE)/Contents/Resources/Assets.car"
 	$(INSTALL) -m 0755 "$(CARGO_TARGET_DIR)/debug/$(BIN_NAME)" "$(DEBUG_APP_EXECUTABLE)"
 
 run-macos: macos-app

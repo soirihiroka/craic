@@ -244,7 +244,7 @@ pub fn commit_convention_from_file_access(files: &dyn FileAccess) -> Option<Stri
 
 pub fn normalize_timezone(value: &str) -> Result<String, String> {
     let value = value.trim();
-    let compact = if value.len() == 6 && value.as_bytes()[3] == b':' {
+    let compact = if value.len() == 6 && value.is_ascii() && value.as_bytes()[3] == b':' {
         format!("{}{}", &value[..3], &value[4..])
     } else {
         value.to_string()

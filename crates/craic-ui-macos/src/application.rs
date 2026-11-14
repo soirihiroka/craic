@@ -278,74 +278,90 @@ define_class!(
         }
 
         #[unsafe(method(newAgentChat:))]
-        fn new_agent_chat(&self, _sender: &NSButton){
+        fn new_agent_chat(&self, _sender: &NSComboButton){
             self.handle_objc_new_agent_chat(_sender)
         }
 
-        #[unsafe(method(newCodexCli:))]
-        fn new_codex_cli(&self, _sender: &NSButton){
-            self.handle_objc_new_codex_cli(_sender)
+        #[unsafe(method(selectAgentProvider:))]
+        fn select_agent_provider(&self, sender: &NSMenuItem) {
+            self.handle_objc_select_agent_provider(sender)
         }
 
-        #[unsafe(method(newAgy:))]
-        fn new_agy(&self, _sender: &NSButton){
-            self.handle_objc_new_agy(_sender)
+        #[unsafe(method(checkAgentProviderUpdates:))]
+        fn check_agent_provider_updates(&self, _sender: &NSMenuItem) {
+            self.request_native_provider_updates(true)
         }
 
-        #[unsafe(method(sendAgentMessage:))]
-        fn send_agent_message(&self, _sender: &NSButton){
-            self.handle_objc_send_agent_message(_sender)
+        #[unsafe(method(updateAgentProviders:))]
+        fn update_agent_providers(&self, _sender: &NSButton) {
+            self.update_native_agent_providers()
         }
 
-        #[unsafe(method(attachAgentFiles:))]
-        fn attach_agent_files(&self, _sender: &AnyObject){
-            self.handle_objc_attach_agent_files(_sender)
+        #[unsafe(method(refreshNativeAgentHistory:))]
+        fn refresh_native_agent_history(&self, _timer: &NSTimer) {
+            self.poll_native_agent_history()
         }
 
-        #[unsafe(method(referenceAgentFile:))]
-        fn reference_agent_file(&self, _sender: &NSMenuItem){
-            self.handle_objc_reference_agent_file(_sender)
+        #[unsafe(method(hideAgentHistory:))]
+        fn hide_agent_history(&self, sender: &NSMenuItem) {
+            self.hide_native_agent_history(sender.tag())
         }
 
-        #[unsafe(method(referenceAgentFolder:))]
-        fn reference_agent_folder(&self, _sender: &NSMenuItem){
-            self.handle_objc_reference_agent_folder(_sender)
+        #[unsafe(method(toggleAgentHistoryTag:))]
+        fn toggle_agent_history_tag(&self, sender: &NSMenuItem) {
+            self.toggle_native_agent_history_tag(sender)
         }
 
-        #[unsafe(method(clearAgentAttachments:))]
-        fn clear_agent_attachments(&self, _sender: &NSButton){
-            self.handle_objc_clear_agent_attachments(_sender)
+        #[unsafe(method(agentHistoryClipBoundsChanged:))]
+        fn agent_history_clip_bounds_changed(&self, _notification: &NSNotification) {
+            self.native_agent_history_scrolled()
         }
 
-        #[unsafe(method(stopAgentTurn:))]
-        fn stop_agent_turn(&self, _sender: &NSButton){
-            self.handle_objc_stop_agent_turn(_sender)
+        #[unsafe(method(showActiveAgentStatus:))]
+        fn show_active_agent_status(&self, sender: &NSMenuItem) {
+            self.show_native_agent_session_status(Some(sender.tag()), None)
         }
 
-        #[unsafe(method(selectAgentModel:))]
-        fn select_agent_model(&self, sender: &NSPopUpButton){
-            self.handle_objc_select_agent_model(sender)
+        #[unsafe(method(showAgentHistoryStatus:))]
+        fn show_agent_history_status(&self, sender: &NSMenuItem) {
+            self.show_native_agent_session_status(None, Some(sender.tag() as i64))
         }
 
-        #[unsafe(method(selectAgentReasoning:))]
-        fn select_agent_reasoning(&self, sender: &NSPopUpButton){
-            self.handle_objc_select_agent_reasoning(sender)
+        #[unsafe(method(generateAgentSummary:))]
+        fn generate_agent_summary(&self, sender: &NSMenuItem) {
+            self.request_native_agent_summary(sender.tag(), false)
         }
 
-        #[unsafe(method(selectAgentPersonality:))]
-        fn select_agent_personality(&self, sender: &NSPopUpButton){
-            self.handle_objc_select_agent_personality(sender)
+        #[unsafe(method(unloadAgentSession:))]
+        fn unload_agent_session(&self, sender: &NSMenuItem) {
+            self.request_native_terminal_close(sender.tag())
         }
 
-        #[unsafe(method(selectAgentServiceTier:))]
-        fn select_agent_service_tier(&self, sender: &NSPopUpButton){
-            self.handle_objc_select_agent_service_tier(sender)
-        }
 
-        #[unsafe(method(selectAgentPermissions:))]
-        fn select_agent_permissions(&self, sender: &NSPopUpButton){
-            self.handle_objc_select_agent_permissions(sender)
-        }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
         #[unsafe(method(resumeAgentThread:))]
         fn resume_agent_thread(&self, sender: &NSButton){
@@ -362,105 +378,45 @@ define_class!(
             self.handle_objc_select_agent_thread_scope(sender)
         }
 
-        #[unsafe(method(renameAgentThread:))]
-        fn rename_agent_thread(&self, sender: &NSMenuItem){
-            self.handle_objc_rename_agent_thread(sender)
-        }
 
-        #[unsafe(method(archiveAgentThread:))]
-        fn archive_agent_thread(&self, sender: &NSMenuItem){
-            self.handle_objc_archive_agent_thread(sender)
-        }
 
-        #[unsafe(method(unarchiveAgentThread:))]
-        fn unarchive_agent_thread(&self, sender: &NSMenuItem){
-            self.handle_objc_unarchive_agent_thread(sender)
-        }
 
-        #[unsafe(method(deleteAgentThread:))]
-        fn delete_agent_thread(&self, sender: &NSMenuItem){
-            self.handle_objc_delete_agent_thread(sender)
-        }
 
-        #[unsafe(method(showAgentThreadHistory:))]
-        fn show_agent_thread_history(&self, _sender: &NSMenuItem){
-            self.handle_objc_show_agent_thread_history(_sender)
-        }
 
-        #[unsafe(method(showAgentThreadGoal:))]
-        fn show_agent_thread_goal(&self, _sender: &NSMenuItem){
-            self.handle_objc_show_agent_thread_goal(_sender)
-        }
 
-        #[unsafe(method(runAgentShellCommand:))]
-        fn run_agent_shell_command(&self, _sender: &NSMenuItem){
-            self.handle_objc_run_agent_shell_command(_sender)
-        }
 
-        #[unsafe(method(showAgentBackgroundTerminals:))]
-        fn show_agent_background_terminals(&self, _sender: &NSMenuItem){
-            self.handle_objc_show_agent_background_terminals(_sender)
-        }
 
-        #[unsafe(method(showAgentSkills:))]
-        fn show_agent_skills(&self, _sender: &NSMenuItem){
-            self.handle_objc_show_agent_skills(_sender)
-        }
 
-        #[unsafe(method(showAgentMcpServers:))]
-        fn show_agent_mcp_servers(&self, _sender: &NSMenuItem){
-            self.handle_objc_show_agent_mcp_servers(_sender)
-        }
 
-        #[unsafe(method(showAgentApps:))]
-        fn show_agent_apps(&self, _sender: &NSMenuItem){
-            self.handle_objc_show_agent_apps(_sender)
-        }
 
-        #[unsafe(method(showAgentPlugins:))]
-        fn show_agent_plugins(&self, _sender: &NSMenuItem){
-            self.handle_objc_show_agent_plugins(_sender)
-        }
 
-        #[unsafe(method(showAgentExperimentalFeatures:))]
-        fn show_agent_experimental_features(&self, _sender: &NSMenuItem){
-            self.handle_objc_show_agent_experimental_features(_sender)
-        }
 
-        #[unsafe(method(showAgentAccountUsage:))]
-        fn show_agent_account_usage(&self, _sender: &NSMenuItem){
-            self.handle_objc_show_agent_account_usage(_sender)
-        }
 
-        #[unsafe(method(forkActiveAgentThread:))]
-        fn fork_active_agent_thread(&self, _sender: &NSMenuItem){
-            self.handle_objc_fork_active_agent_thread(_sender)
-        }
 
-        #[unsafe(method(compactActiveAgentThread:))]
-        fn compact_active_agent_thread(&self, _sender: &NSMenuItem){
-            self.handle_objc_compact_active_agent_thread(_sender)
-        }
 
-        #[unsafe(method(startAgentReview:))]
-        fn start_agent_review(&self, _sender: &NSMenuItem){
-            self.handle_objc_start_agent_review(_sender)
-        }
 
-        #[unsafe(method(rollbackActiveAgentThread:))]
-        fn rollback_active_agent_thread(&self, _sender: &NSMenuItem){
-            self.handle_objc_rollback_active_agent_thread(_sender)
-        }
 
-        #[unsafe(method(archiveActiveAgentThread:))]
-        fn archive_active_agent_thread(&self, _sender: &NSMenuItem){
-            self.handle_objc_archive_active_agent_thread(_sender)
-        }
 
-        #[unsafe(method(openAgentChanges:))]
-        fn open_agent_changes(&self, _sender: &NSMenuItem){
-            self.handle_objc_open_agent_changes(_sender)
-        }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
         #[unsafe(method(selectPage:))]
         fn select_page(&self, sender: &NSToolbarItemGroup){
@@ -1250,10 +1206,15 @@ include!("application/repository_state.rs");
 include!("application/workspace_create.rs");
 include!("application/completions.rs");
 include!("application/toolbar.rs");
+include!("application/page_badges.rs");
 include!("application/history_builder.rs");
 include!("application/files_builder.rs");
 include!("application/containers_builder.rs");
 include!("application/agents_builder.rs");
+include!("application/agent_icons.rs");
+include!("application/agent_terminal.rs");
+include!("application/agent_updates.rs");
+include!("application/agent_history.rs");
 include!("application/lifecycle.rs");
 include!("application/events.rs");
 include!("application/objc_actions_core.rs");

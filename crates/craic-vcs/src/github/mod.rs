@@ -62,6 +62,48 @@ struct GitHubAuthGitHook {
     account: GitHubAuthAccount,
 }
 
+struct WorkspaceGitHubAuthGitHook {
+    shell: Arc<dyn ShellAccess>,
+    working_dir: WorkspacePath,
+    files: Arc<dyn crate::system::capabilities::files::FileAccess>,
+}
+
+struct WorkspaceGitHubAuthPostHook(Option<Box<dyn GitOperationPostHook>>);
+
+impl GitOperationPostHook for WorkspaceGitHubAuthPostHook {
+    fn post(self: Box<Self>) -> Result<(), String> {
+        match self.0 {
+            Some(hook) => hook.post(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl GitOperationHook for WorkspaceGitHubAuthGitHook {
+    fn pre(&self) -> Result<Box<dyn GitOperationPostHook>, String> {
+        // Read the current selection for each operation, including after settings
+        // are saved while a repository monitor still retains this handle.
+        let account = crate::workspace_config::git_config_from_file_access(self.files.as_ref())
+            .github_auth_account;
+        let hook = git_auth_hook(self.shell.clone(), self.working_dir.clone(), account)
+            .map(|hook| hook.pre())
+            .transpose()?;
+        Ok(Box::new(WorkspaceGitHubAuthPostHook(hook)))
+    }
+}
+
+pub fn workspace_git_auth_hook(
+    shell: Arc<dyn ShellAccess>,
+    working_dir: WorkspacePath,
+    files: Arc<dyn crate::system::capabilities::files::FileAccess>,
+) -> Arc<dyn GitOperationHook> {
+    Arc::new(WorkspaceGitHubAuthGitHook {
+        shell,
+        working_dir,
+        files,
+    })
+}
+
 struct GitHubAuthRestoreHook {
     shell: Arc<dyn ShellAccess>,
     working_dir: WorkspacePath,

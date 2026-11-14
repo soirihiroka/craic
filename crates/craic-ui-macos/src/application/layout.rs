@@ -193,106 +193,6 @@ impl AppDelegate {
                 NSPoint::ZERO,
                 NSSize::new(width, usable_height),
             ));
-            agents.title.setFrame(NSRect::new(
-                NSPoint::new(22.0, usable_height - 48.0),
-                NSSize::new((width - 124.0).max(1.0), 24.0),
-            ));
-            agents.tools.setFrame(NSRect::new(
-                NSPoint::new((width - 96.0).max(0.0), usable_height - 51.0),
-                NSSize::new(36.0_f64.min(width.max(1.0)), 28.0),
-            ));
-            agents.thread_actions.setFrame(NSRect::new(
-                NSPoint::new((width - 58.0).max(0.0), usable_height - 51.0),
-                NSSize::new(36.0_f64.min(width.max(1.0)), 28.0),
-            ));
-            agents
-                .spinner
-                .setFrameOrigin(NSPoint::new(22.0, usable_height - 72.0));
-            agents.status.setFrame(NSRect::new(
-                NSPoint::new(46.0, usable_height - 72.0),
-                NSSize::new((width - 344.0).max(1.0), 18.0),
-            ));
-            agents.usage.setFrame(NSRect::new(
-                NSPoint::new((width - 284.0).max(0.0), usable_height - 72.0),
-                NSSize::new(168.0_f64.min(width.max(1.0)), 18.0),
-            ));
-            agents.usage_progress.setFrame(NSRect::new(
-                NSPoint::new((width - 108.0).max(0.0), usable_height - 67.0),
-                NSSize::new(84.0_f64.min(width.max(1.0)), 8.0),
-            ));
-            let selector_width = (width - 44.0).max(1.0);
-            let controls_width = (selector_width - 16.0).max(1.0);
-            let model_width = (controls_width * 0.46).max(1.0);
-            let reasoning_width = (controls_width * 0.22).max(1.0);
-            let permission_width = (controls_width - model_width - reasoning_width).max(1.0);
-            agents.model.setFrame(NSRect::new(
-                NSPoint::new(22.0, usable_height - 110.0),
-                NSSize::new(model_width, 28.0),
-            ));
-            agents.reasoning.setFrame(NSRect::new(
-                NSPoint::new(30.0 + model_width, usable_height - 110.0),
-                NSSize::new(reasoning_width, 28.0),
-            ));
-            agents.permissions.setFrame(NSRect::new(
-                NSPoint::new(38.0 + model_width + reasoning_width, usable_height - 110.0),
-                NSSize::new(permission_width, 28.0),
-            ));
-            let secondary_width = ((selector_width - 8.0) / 2.0).max(1.0);
-            agents.personality.setFrame(NSRect::new(
-                NSPoint::new(22.0, usable_height - 146.0),
-                NSSize::new(secondary_width, 28.0),
-            ));
-            agents.service_tier.setFrame(NSRect::new(
-                NSPoint::new(30.0 + secondary_width, usable_height - 146.0),
-                NSSize::new(secondary_width, 28.0),
-            ));
-            let composer_height = 72.0;
-            let composer_bottom = 18.0;
-            let composer_width = (width - 156.0).max(120.0);
-            agents.composer_scroll.setFrame(NSRect::new(
-                NSPoint::new(22.0, composer_bottom),
-                NSSize::new(composer_width, composer_height),
-            ));
-            agents.send.setFrame(NSRect::new(
-                NSPoint::new(width - 116.0, composer_bottom + 34.0),
-                NSSize::new(92.0, 32.0),
-            ));
-            agents.stop.setFrame(NSRect::new(
-                NSPoint::new(width - 86.0, composer_bottom + 8.0),
-                NSSize::new(32.0, 32.0),
-            ));
-            let attachment_y = composer_bottom + composer_height + 8.0;
-            agents.attach.setFrame(NSRect::new(
-                NSPoint::new(22.0, attachment_y),
-                NSSize::new(30.0, 30.0),
-            ));
-            agents.attachment_tokens.setFrame(NSRect::new(
-                NSPoint::new(60.0, attachment_y + 2.0),
-                NSSize::new((width - 116.0).max(1.0), 26.0),
-            ));
-            agents.clear_attachments.setFrame(NSRect::new(
-                NSPoint::new(width - 50.0, attachment_y + 4.0),
-                NSSize::new(22.0, 22.0),
-            ));
-            agents.separator.setFrame(NSRect::new(
-                NSPoint::new(0.0, attachment_y + 38.0),
-                NSSize::new(width, 1.0),
-            ));
-            let transcript_bottom = attachment_y + 39.0;
-            let transcript_top = usable_height - 158.0;
-            agents.transcript_scroll.setFrame(NSRect::new(
-                NSPoint::new(8.0, transcript_bottom),
-                NSSize::new(
-                    (width - 16.0).max(1.0),
-                    (transcript_top - transcript_bottom).max(1.0),
-                ),
-            ));
-            let transcript_count = agents.transcript_items.borrow().len();
-            if transcript_count != 0 {
-                agents.transcript_table.noteHeightOfRowsWithIndexesChanged(
-                    &NSIndexSet::indexSetWithIndexesInRange(NSRange::new(0, transcript_count)),
-                );
-            }
             agents.empty.setFrame(NSRect::new(
                 NSPoint::new(28.0, usable_height / 2.0 - 24.0),
                 NSSize::new((width - 56.0).max(1.0), 48.0),
@@ -491,5 +391,4 @@ impl AppDelegate {
             files.text_selection.set(selection);
         }
     }
-
 }

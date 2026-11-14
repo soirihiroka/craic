@@ -508,41 +508,56 @@ impl AppDelegate {
         if let Some(agents) = self.ivars().agents.get() {
             agents.sidebar_root.setFrame(sidebar_bounds);
             let agents_safe = agents.sidebar_root.safeAreaInsets();
-            let agents_top = sidebar_bounds.size.height - agents_safe.top;
-            let launch_widths = [68.0, 104.0, 62.0];
-            let launch_spacing = 8.0;
-            let launch_total = launch_widths.iter().sum::<f64>() + launch_spacing * 2.0;
-            let mut launch_x = ((sidebar_bounds.size.width - launch_total) / 2.0).max(8.0);
-            for (button, width) in [
-                (&agents.new_chat, launch_widths[0]),
-                (&agents.codex_cli, launch_widths[1]),
-                (&agents.agy, launch_widths[2]),
-            ] {
-                button.setFrame(NSRect::new(
-                    NSPoint::new(launch_x, agents_safe.bottom + 12.0),
-                    NSSize::new(width, 32.0),
-                ));
-                launch_x += width + launch_spacing;
-            }
+            let agents_top = sidebar_bounds.size.height - agents_safe.top - 12.0;
+            agents.new_chat.setFrame(NSRect::new(
+                NSPoint::new(
+                    (sidebar_bounds.size.width - 178.0).max(12.0),
+                    agents_safe.bottom + 12.0,
+                ),
+                NSSize::new(
+                    164.0_f64.min((sidebar_bounds.size.width - 24.0).max(1.0)),
+                    32.0,
+                ),
+            ));
+            agents.update_button.setFrame(NSRect::new(
+                NSPoint::new(14.0, agents_safe.bottom + 12.0),
+                NSSize::new(28.0, 28.0),
+            ));
+            agents.history_status.setFrame(NSRect::new(
+                NSPoint::new(14.0, (agents_top - 22.0).max(agents_safe.bottom + 54.0)),
+                NSSize::new((sidebar_bounds.size.width - 110.0).max(1.0), 18.0),
+            ));
             let search_visible = self.ivars().agents_search_visible.get();
+            agents
+                .history_tags_button
+                .setHidden(!search_visible || agents.history_tags.borrow().is_empty());
+            agents.history_tags_button.setFrame(NSRect::new(
+                NSPoint::new(
+                    (sidebar_bounds.size.width - 96.0).max(14.0),
+                    (agents_top - 26.0).max(agents_safe.bottom + 54.0),
+                ),
+                NSSize::new(82.0, 24.0),
+            ));
             agents.history_search.setHidden(!search_visible);
-            agents.history_scope.setHidden(!search_visible);
+            agents
+                .history_scope
+                .setHidden(!agents.history_has_more.get());
             agents.history_search.setFrame(NSRect::new(
-                NSPoint::new(14.0, (agents_top - 38.0).max(agents_safe.bottom + 54.0)),
+                NSPoint::new(14.0, (agents_top - 58.0).max(agents_safe.bottom + 54.0)),
                 NSSize::new((sidebar_bounds.size.width - 112.0).max(1.0), 28.0),
             ));
             agents.history_scope.setFrame(NSRect::new(
                 NSPoint::new(
                     (sidebar_bounds.size.width - 92.0).max(14.0),
-                    (agents_top - 38.0).max(agents_safe.bottom + 54.0),
+                    (agents_top - 58.0).max(agents_safe.bottom + 54.0),
                 ),
                 NSSize::new(78.0, 28.0),
             ));
-            let threads_top = if search_visible {
-                agents_top - 38.0
+            let threads_top = if search_visible || agents.history_has_more.get() {
+                agents_top - 62.0
             } else {
-                agents_top
-            };
+                agents_top - 28.0
+            } - 6.0;
             agents.threads_scroll.setFrame(NSRect::new(
                 NSPoint::new(8.0, agents_safe.bottom + 54.0),
                 NSSize::new(
@@ -718,7 +733,10 @@ impl AppDelegate {
             return;
         };
         agents.history_search.setStringValue(&NSString::new());
-        self.refresh_native_agent_thread_rows();
+        agents.history_query.borrow_mut().clear();
+        agents.selected_history_tags.borrow_mut().clear();
+        self.refresh_native_agent_history_tags();
+        self.request_native_cli_history(true);
         self.layout_sidebar();
         if let Some(window) = self.ivars().window.get() {
             window.makeFirstResponder(None);
@@ -1047,5 +1065,4 @@ impl AppDelegate {
             );
         }
     }
-
 }

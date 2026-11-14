@@ -154,13 +154,23 @@ impl AppDelegate {
         selection_header.addSubview(&select_all_check);
         let select_all_label =
             NSTextField::labelWithString(&NSString::from_str("0 changed files"), mtm);
-        select_all_label.setFrame(NSRect::new(
-            NSPoint::new(48.0, 10.0),
-            NSSize::new(SIDEBAR_WIDTH - 56.0, 22.0),
-        ));
         select_all_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
-        select_all_label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+        select_all_label.setUsesSingleLineMode(true);
+        select_all_label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        select_all_label.setTranslatesAutoresizingMaskIntoConstraints(false);
         selection_header.addSubview(&select_all_label);
+        select_all_label
+            .centerYAnchor()
+            .constraintEqualToAnchor(&selection_header.centerYAnchor())
+            .setActive(true);
+        select_all_label
+            .leadingAnchor()
+            .constraintEqualToAnchor_constant(&selection_header.leadingAnchor(), 48.0)
+            .setActive(true);
+        select_all_label
+            .trailingAnchor()
+            .constraintEqualToAnchor_constant(&selection_header.trailingAnchor(), -8.0)
+            .setActive(true);
         let changed_files_menu = NSMenu::new(mtm);
         for (title, action) in [
             ("Select All", sel!(selectAllChangedFilesFromMenu:)),
@@ -567,10 +577,7 @@ impl AppDelegate {
             title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
             text_group.addSubview(&title);
             let subtitle = NSTextField::labelWithString(&NSString::from_str(subtitle), mtm);
-            subtitle.setFrame(NSRect::new(
-                NSPoint::ZERO,
-                NSSize::new(480.0, 15.0),
-            ));
+            subtitle.setFrame(NSRect::new(NSPoint::ZERO, NSSize::new(480.0, 15.0)));
             subtitle.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
             subtitle.setFont(Some(&NSFont::systemFontOfSize(12.0)));
             subtitle.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -1267,5 +1274,4 @@ impl AppDelegate {
         application.activate();
         log::info!("native macOS application window launched");
     }
-
 }

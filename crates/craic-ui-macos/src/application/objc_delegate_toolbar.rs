@@ -1,5 +1,9 @@
 impl AppDelegate {
-    fn handle_objc_delegate_table_view_height_of_row(&self, table: &NSTableView, row: isize) -> f64 {
+    fn handle_objc_delegate_table_view_height_of_row(
+        &self,
+        table: &NSTableView,
+        row: isize,
+    ) -> f64 {
         if self
             .ivars()
             .workspace_table
@@ -15,31 +19,6 @@ impl AppDelegate {
             .is_some_and(|author_table| std::ptr::eq(table, &**author_table))
         {
             return AUTHOR_ROW_HEIGHT;
-        }
-        if self
-            .ivars()
-            .agents
-            .get()
-            .is_some_and(|agents| std::ptr::eq(table, &*agents.transcript_table))
-        {
-            return usize::try_from(row)
-                .ok()
-                .and_then(|row| {
-                    self.ivars()
-                        .agents
-                        .get()?
-                        .transcript_items
-                        .borrow()
-                        .get(row)
-                        .map(|item| {
-                            native_agent_transcript_row_height(
-                                item,
-                                table.bounds().size.width,
-                                self.ivars().font_sizes.get().agent,
-                            )
-                        })
-                })
-                .unwrap_or(64.0);
         }
         if self
             .ivars()

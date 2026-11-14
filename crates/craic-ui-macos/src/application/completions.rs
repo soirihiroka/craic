@@ -422,19 +422,6 @@ impl AppDelegate {
                 column,
                 result,
             } => self.apply_agent_file_link(&workspace_id, line, column, result),
-            RepositoryCompletion::AgentImage {
-                workspace_id,
-                generation,
-                item_id,
-                source,
-                result,
-            } => self.apply_native_agent_transcript_image(
-                &workspace_id,
-                generation,
-                &item_id,
-                source,
-                result,
-            ),
             RepositoryCompletion::CommitAuthorFinished {
                 workspace_id,
                 cancellation,
@@ -802,6 +789,7 @@ impl AppDelegate {
                 attention: true,
             }),
         };
+        self.render_page_badge(page_id, badge);
         if let Some(handle) = self.ivars().app_handle.get()
             && let Err(command) = handle.try_send(AppCommand::SetPageBadge {
                 page: PageId::new(page_id),
@@ -823,16 +811,63 @@ impl AppDelegate {
             return;
         };
         let item = group.subitems().objectAtIndex(index);
-        if let Some(control) = group
-            .view()
-            .and_then(|view| view.downcast::<NSSegmentedControl>().ok())
-        {
-            let label = match badge {
-                NativePageBadge::Count(count) if count > 0 => count.to_string(),
-                _ => String::new(),
+        let page = PAGE_DESCRIPTORS[index];
+        let tooltip = match badge {
+            NativePageBadge::Count(count) if count > 0 => match page_id {
+                "changes" => format!("{} · {count} changed files", page.label),
+                "agents" => format!("{} · {count} active sessions", page.label),
+                _ => format!("{} · {count}", page.label),
+            },
+            _ => page.label.to_owned(),
+        };
+        item.setToolTip(Some(&NSString::from_str(&tooltip)));
+        if matches!(page_id, "changes" | "agents") {
+            let count = match badge {
+                NativePageBadge::Count(count) => count,
+                _ => 0,
             };
-            control.setLabel_forSegment(&NSString::from_str(&label), index as isize);
-            control.sizeToFit();
+            let image_name = format!("dev.craic.page-badge.{page_id}.{count}");
+            if item
+                .image()
+                .and_then(|image| image.name())
+                .as_ref()
+                .map(|name| name.to_string())
+                == Some(image_name)
+            {
+                return;
+            }
+            if let Some(image) = native_page_badge_image(page_id, count) {
+                item.setImage(Some(&image));
+                // Grouped toolbar items do not display NSItemBadge. Refresh the native
+                // segments with an image that includes the count circle instead.
+                let selected = group.selectedIndex();
+                group.setSubitems(&group.subitems());
+                group.setSelectedIndex(selected);
+            }
+        }
+        // AppKit may wrap the group's segmented control in its native glass container.
+        let mut views = group.view().into_iter().collect::<Vec<_>>();
+        while let Some(view) = views.pop() {
+            if let Some(control) = view.downcast_ref::<NSSegmentedControl>() {
+                if index >= control.segmentCount() as usize {
+                    continue;
+                }
+                control.setImage_forSegment(item.image().as_deref(), index as isize);
+                control.setLabel_forSegment(&NSString::new(), index as isize);
+                control.setToolTip_forSegment(Some(&NSString::from_str(&tooltip)), index as isize);
+                control.setWidth_forSegment(0.0, index as isize);
+                control.sizeToFit();
+                if AnyClass::get(c"NSItemBadge").is_some()
+                    && item.respondsToSelector(sel!(setBadge:))
+                {
+                    item.setBadge(None);
+                }
+                return;
+            }
+            views.extend(view.subviews().iter());
+        }
+        if matches!(page_id, "changes" | "agents") {
+            return;
         }
         if AnyClass::get(c"NSItemBadge").is_none() || !item.respondsToSelector(sel!(setBadge:)) {
             return;
@@ -859,27 +894,20 @@ impl AppDelegate {
     }
 
     fn restore_agents_page_badge(&self) {
-        let app_count = usize::from(self.ivars().agents.get().is_some_and(|agents| {
-            matches!(
-                agents.state.get(),
-                NativeAgentState::Connecting
-                    | NativeAgentState::Initializing
-                    | NativeAgentState::Running
-            )
-        }));
         let terminal_count = self
             .ivars()
             .terminal_sessions
             .borrow()
             .iter()
             .filter(|session| {
-                session.placement == NativeTerminalPlacement::Agent && session.has_active_task()
+                session.placement == NativeTerminalPlacement::Agent
+                    && session.view.is_active()
+                    && matches!(
+                        session.agent_active_state,
+                        AgentActiveState::Loading | AgentActiveState::Asking
+                    )
             })
             .count();
-        self.set_page_badge(
-            "agents",
-            NativePageBadge::Count(app_count + terminal_count),
-        );
+        self.set_page_badge("agents", NativePageBadge::Count(terminal_count));
     }
-
 }

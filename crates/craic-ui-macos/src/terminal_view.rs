@@ -850,6 +850,25 @@ impl TerminalMetalView {
         self.has_session() && !self.ivars().exited.get()
     }
 
+    pub fn agent_content(&self) -> Option<(String, String, String, usize)> {
+        let session = self.ivars().session.borrow();
+        let session = session.as_ref()?;
+        Some((
+            self.ivars().title.borrow().clone(),
+            session.text_before_cursor(1000),
+            session.recent_text(1000),
+            session.cursor_row(),
+        ))
+    }
+
+    pub fn agent_transcript(&self) -> Option<String> {
+        self.ivars()
+            .session
+            .borrow()
+            .as_ref()
+            .map(|session| session.all_text())
+    }
+
     pub fn child_pid(&self) -> Option<u32> {
         self.ivars()
             .session
@@ -1234,7 +1253,7 @@ impl TerminalMetalView {
         }
     }
 
-    fn send_input(&self, bytes: Vec<u8>) {
+    pub(crate) fn send_input(&self, bytes: Vec<u8>) {
         if let Some(session) = self.ivars().session.borrow().as_ref() {
             if let Err(error) = session.input(bytes) {
                 log::warn!("native terminal input failed: {error}");

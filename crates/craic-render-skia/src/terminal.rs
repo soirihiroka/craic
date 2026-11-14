@@ -702,6 +702,38 @@ impl TerminalSession {
         )
     }
 
+    pub fn text_before_cursor(&self, max_lines: usize) -> String {
+        let terminal = self.terminal.lock();
+        let end = terminal.grid().cursor.point.line - Line(1);
+        if end < terminal.topmost_line() {
+            return String::new();
+        }
+        let start = (end - Line(max_lines.saturating_sub(1).min(i32::MAX as usize) as i32))
+            .max(terminal.topmost_line());
+        terminal.bounds_to_string(
+            Point::new(start, Column(0)),
+            Point::new(end, terminal.last_column()),
+        )
+    }
+
+    pub fn recent_text(&self, max_lines: usize) -> String {
+        let terminal = self.terminal.lock();
+        let end = terminal.bottommost_line();
+        let start = (end - Line(max_lines.saturating_sub(1).min(i32::MAX as usize) as i32))
+            .max(terminal.topmost_line());
+        terminal.bounds_to_string(
+            Point::new(start, Column(0)),
+            Point::new(end, terminal.last_column()),
+        )
+    }
+
+    pub fn cursor_row(&self) -> usize {
+        let terminal = self.terminal.lock();
+        terminal
+            .history_size()
+            .saturating_add(terminal.grid().cursor.point.line.0.max(0) as usize)
+    }
+
     pub fn search(
         &self,
         pattern: &str,

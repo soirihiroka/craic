@@ -1,5 +1,5 @@
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,19 +9,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::agent_session::{
-    ActiveThreadAction as NativeAgentThreadAction, Attachment as NativeAgentAttachment,
-    AttachmentKind as NativeAgentAttachmentKind,
-    BackgroundTerminal as NativeAgentBackgroundTerminal, Command as NativeAgentCommand,
-    DEFAULT_SERVICE_TIER_ID, Event as NativeAgentEvent,
-    ExperimentalFeature as NativeAgentExperimentalFeature,
-    PendingRequest as NativeAgentPendingRequest, RequestResponse as NativeAgentRequestResponse,
-    ReviewTarget as NativeAgentReviewTarget, SelectorOption as NativeAgentSelectorOption,
-    SessionIdentity as AgentIdentity, SessionState as NativeAgentState,
-    SkillOption as NativeAgentSkillOption, ThreadSummary as NativeAgentThreadSummary,
-    TokenUsage as NativeAgentTokenUsage, ToolAction as NativeAgentToolAction,
-    TranscriptImageSource as NativeAgentTranscriptImageSource,
-    TranscriptItem as NativeAgentTranscriptItem, TranscriptKind as NativeAgentTranscriptKind,
-    TranscriptStatus as NativeAgentTranscriptStatus,
+    CliHistoryResult as NativeCliHistoryResult, Command as NativeAgentCommand,
+    Event as NativeAgentEvent, SessionIdentity as AgentIdentity,
+    ThreadSummary as NativeAgentThreadSummary,
 };
 use crate::code_view::CodeMetalView;
 use crate::commit_composer::{COMMIT_COMPOSER_HEIGHT, CommitComposer, CommitComposerActions};
@@ -37,10 +27,11 @@ use craic_agent::agent_provider::{
     CancellationToken, ModelOption, default_provider, find_provider, is_canceled_error,
     model_options, registered_providers,
 };
+use craic_agent::agent_status::AgentActiveState;
 use craic_agent::agent_usage::{AgentResourceUsage, ProcessSnapshot, ProcessUsageTracker};
 use craic_agent::ai_commit::CommitMessageDraft;
-use craic_agent::display::permission_profile_label;
 use craic_agent::remote_media::{self, RemoteMedia, RemoteMediaKind};
+use craic_agent::terminal_provider as terminal_agent;
 use craic_app_core::{
     ActionId, AppCommand, AppHandle, ApplicationRuntime, ApplicationViewState, Badge,
     PAGE_DESCRIPTORS, PageCommand, PageId, PageServiceRequest, PageViewState, RefreshScope,
@@ -53,7 +44,7 @@ use craic_file_support::{
 };
 use craic_language::markdown_lint::MarkdownLintIssue;
 use craic_language::{
-    CompletionSet, LinkTarget, LintKind, destination_target, detected_links, language_id_from_path,
+    CompletionSet, LinkTarget, LintKind, destination_target, language_id_from_path,
     language_support_for_id,
 };
 use craic_platform::{
@@ -111,24 +102,24 @@ use objc2_app_kit::{
     NSAppearance, NSAppearanceNameDarkAqua, NSApplication, NSApplicationActivationPolicy,
     NSApplicationDelegate, NSApplicationTerminateReply, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSBezelStyle, NSBorderType, NSBox, NSBoxType, NSButton, NSButtonType,
-    NSCellImagePosition, NSColor, NSControlSize, NSControlStateValueMixed, NSControlStateValueOff,
-    NSControlStateValueOn, NSControlTextEditingDelegate, NSDragOperation, NSDraggingInfo, NSEvent,
-    NSEventModifierFlags, NSEventType, NSFindPanelAction, NSFont, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSGlassEffectView, NSGlassEffectViewStyle, NSImage,
-    NSImageScaling, NSImageView, NSItemBadge, NSLayoutConstraint, NSLayoutConstraintOrientation,
-    NSLayoutPriorityDefaultHigh, NSLayoutPriorityDefaultLow, NSLineBreakMode, NSLinkAttributeName,
-    NSMenu, NSMenuDelegate, NSMenuItem, NSMenuItemValidation, NSMenuToolbarItem, NSModalResponseOK,
-    NSOpenPanel, NSPasteboard, NSPasteboardTypeFileURL, NSPasteboardTypeString, NSPopUpButton,
-    NSPopover, NSPopoverBehavior, NSProgressIndicator, NSProgressIndicatorStyle,
-    NSRunningApplication, NSSavePanel, NSScrollView, NSSearchField, NSSecureTextField,
-    NSSegmentedControl, NSSplitView, NSSplitViewController, NSSplitViewDelegate,
-    NSSplitViewDividerStyle, NSSplitViewItem,
-    NSTabViewController, NSTabViewControllerTabStyle, NSTabViewItem, NSTableColumn,
-    NSTableHeaderView, NSTableRowView, NSTableView, NSTableViewColumnAutoresizingStyle,
-    NSTableViewDataSource, NSTableViewDelegate, NSTableViewDropOperation, NSTableViewStyle,
-    NSTextAlignment, NSTextDelegate, NSTextField, NSTextFieldDelegate, NSTextView,
-    NSTextViewDelegate, NSTitlePosition, NSTokenField, NSTokenStyle, NSToolbar, NSToolbarDelegate,
-    NSToolbarDisplayMode, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemGroup,
+    NSCellImagePosition, NSColor, NSComboButton, NSComboButtonStyle, NSControlSize,
+    NSControlStateValueMixed, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSDragOperation, NSDraggingInfo, NSEvent, NSEventModifierFlags,
+    NSEventType, NSFindPanelAction, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
+    NSGlassEffectView, NSGlassEffectViewStyle, NSImage, NSImageScaling, NSImageView, NSItemBadge,
+    NSLayoutConstraint, NSLayoutConstraintOrientation, NSLayoutPriorityDefaultHigh,
+    NSLayoutPriorityDefaultLow, NSLineBreakMode, NSMenu, NSMenuDelegate, NSMenuItem,
+    NSMenuItemValidation, NSMenuToolbarItem, NSModalResponseOK, NSOpenPanel, NSPasteboard,
+    NSPasteboardTypeFileURL, NSPasteboardTypeString, NSPopUpButton, NSPopover, NSPopoverBehavior,
+    NSProgressIndicator, NSProgressIndicatorStyle, NSRunningApplication, NSSavePanel, NSScrollView,
+    NSSearchField, NSSecureTextField, NSSegmentedControl, NSSplitView, NSSplitViewController,
+    NSSplitViewDelegate, NSSplitViewDividerStyle, NSSplitViewItem, NSTabViewController,
+    NSTabViewControllerTabStyle, NSTabViewItem, NSTableColumn, NSTableHeaderView, NSTableRowView,
+    NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
+    NSTableViewDropOperation, NSTableViewStyle, NSTextAlignment, NSTextDelegate, NSTextField,
+    NSTextFieldDelegate, NSTextView, NSTextViewDelegate, NSTitlePosition, NSTokenField,
+    NSTokenStyle, NSToolbar, NSToolbarDelegate, NSToolbarDisplayMode,
+    NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemGroup,
     NSToolbarItemGroupControlRepresentation, NSToolbarItemGroupSelectionMode,
     NSToolbarItemIdentifier, NSToolbarItemVisibilityPriorityHigh,
     NSToolbarItemVisibilityPriorityLow, NSToolbarItemVisibilityPriorityUser,
@@ -150,7 +141,7 @@ use objc2_foundation::{
     NSString, NSTimer, NSURL, NSUserDefaults,
 };
 use objc2_pdf_kit::{PDFDisplayDirection, PDFDisplayMode, PDFDocument, PDFView};
-use objc2_uniform_type_identifiers::{UTType, UTTypeAudio, UTTypeImage};
+use objc2_uniform_type_identifiers::UTType;
 use objc2_web_kit::{
     WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate,
     WKNavigationType, WKUserContentController, WKUserScript, WKUserScriptInjectionTime, WKWebView,
@@ -189,8 +180,6 @@ const SELECTION_HEADER_HEIGHT: f64 = 42.0;
 const REPOSITORY_CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
 const FILE_PREVIEW_CACHE_CAPACITY: usize = 6;
 const HISTORY_PREVIEW_CACHE_CAPACITY: usize = 48;
-const AGENT_IMAGE_PREVIEW_LIMIT: u64 = 16 * 1024 * 1024;
-const AGENT_IMAGE_CACHE_CAPACITY: usize = 16;
 const AGENT_TERMINAL_ROW_HEIGHT: f64 = 74.0;
 const AGENT_THREAD_COMPACT_ROW_HEIGHT: f64 = 62.0;
 const AGENT_THREAD_PREVIEW_ROW_HEIGHT: f64 = 96.0;
@@ -236,11 +225,13 @@ while kill -0 "$root_pid" 2>/dev/null; do
 done
 "#;
 const ACTIVE_PAGE_DEFAULT: &str = "dev.craic.page.active-index";
-const AGENT_MODEL_DEFAULT: &str = "dev.craic.agent.model";
-const AGENT_REASONING_DEFAULT: &str = "dev.craic.agent.reasoning";
-const AGENT_PERSONALITY_DEFAULT: &str = "dev.craic.agent.personality";
-const AGENT_SERVICE_TIER_DEFAULT: &str = "dev.craic.agent.service-tier";
-const AGENT_PERMISSIONS_DEFAULT: &str = "dev.craic.agent.permissions";
+
+const NATIVE_AGENT_PROVIDERS: [&'static dyn terminal_agent::AgentProvider; 4] = [
+    &terminal_agent::codex::PROVIDER,
+    &terminal_agent::grok::PROVIDER,
+    &terminal_agent::opencode::PROVIDER,
+    &terminal_agent::agy::PROVIDER,
+];
 
 enum NativePageBadge {
     None,

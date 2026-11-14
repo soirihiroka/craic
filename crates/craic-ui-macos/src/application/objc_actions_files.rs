@@ -7,7 +7,9 @@ impl AppDelegate {
             .query
             .replace(sender.stringValue().to_string().trim().to_lowercase());
         files.table.reloadData();
-        files.status.setHidden(!self.filtered_file_tree_rows().is_empty());
+        files
+            .status
+            .setHidden(!self.filtered_file_tree_rows().is_empty());
         if self.filtered_file_tree_rows().is_empty() {
             files
                 .status
@@ -24,8 +26,7 @@ impl AppDelegate {
             .replace(sender.stringValue().to_string().trim().to_lowercase());
         containers.table.reloadData();
         let has_rows = !containers.rows.borrow().is_empty();
-        let no_matches = self.filtered_container_rows().is_empty()
-            && has_rows;
+        let no_matches = self.filtered_container_rows().is_empty() && has_rows;
         containers.scroll.setHidden(!has_rows || no_matches);
         containers.status.setHidden(has_rows && !no_matches);
         if no_matches {
@@ -393,16 +394,17 @@ impl AppDelegate {
         };
         let working_directory = access.copy_path(&directory);
         let local_working_directory = access.local_path(&directory);
-        let result = handle
-            .interactive_shell_command_at(&directory)
-            .and_then(|(command, title)| {
-                self.spawn_native_terminal_command_with_directory(
-                    command,
-                    title,
-                    working_directory,
-                    local_working_directory,
-                )
-            });
+        let result =
+            handle
+                .interactive_shell_command_at(&directory)
+                .and_then(|(command, title)| {
+                    self.spawn_native_terminal_command_with_directory(
+                        command,
+                        title,
+                        working_directory,
+                        local_working_directory,
+                    )
+                });
         if let Err(error) = result {
             self.present_path_action_error("Unable to Open Terminal", &error);
         }
@@ -427,10 +429,7 @@ impl AppDelegate {
         let result = handle
             .terminal_command_at(&directory, &program, &[])
             .and_then(|command| {
-                self.spawn_native_terminal_command(
-                    command,
-                    format!("Run {}", info.display_name),
-                )
+                self.spawn_native_terminal_command(command, format!("Run {}", info.display_name))
             });
         match result {
             Ok(()) => self.set_native_terminal_visible(true),
@@ -445,7 +444,18 @@ impl AppDelegate {
         if info.kind.is_directory() || !info.capabilities.readable {
             return;
         }
-        self.append_native_agent_reference(PathBuf::from(access.copy_path(&info.path)));
+        let terminal = self.ivars().active_agent_terminal_id.get().and_then(|id| {
+            self.ivars()
+                .terminal_sessions
+                .borrow()
+                .iter()
+                .find(|session| session.id == id && session.view.is_active())
+                .map(|session| session.view.clone())
+        });
+        if let Some(terminal) = terminal {
+            terminal.send_input(format!("@{} ", access.copy_path(&info.path)).into_bytes());
+            terminal.focus_terminal();
+        }
         let Some(handle) = self.ivars().app_handle.get() else {
             return;
         };
@@ -765,10 +775,8 @@ impl AppDelegate {
         if let Err(command) = handle.try_send(AppCommand::ActivatePage(descriptor.page_id())) {
             log::warn!("page menu activation queue rejected command={command:?}");
         } else {
-            NSUserDefaults::standardUserDefaults().setInteger_forKey(
-                index as isize,
-                &NSString::from_str(ACTIVE_PAGE_DEFAULT),
-            );
+            NSUserDefaults::standardUserDefaults()
+                .setInteger_forKey(index as isize, &NSString::from_str(ACTIVE_PAGE_DEFAULT));
         }
     }
 
@@ -794,8 +802,7 @@ impl AppDelegate {
             return;
         }
         let visible = history.scroll.contentView().bounds();
-        let remaining =
-            history.table.bounds().size.height - visible.origin.y - visible.size.height;
+        let remaining = history.table.bounds().size.height - visible.origin.y - visible.size.height;
         if remaining <= 360.0 {
             self.request_history_page(false);
         }

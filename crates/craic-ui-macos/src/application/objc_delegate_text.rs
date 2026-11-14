@@ -29,34 +29,7 @@ impl AppDelegate {
     }
 
     fn handle_objc_delegate_text_did_change(&self, notification: &NSNotification) {
-        if let Some(object) = notification.object() {
-            for (input, submit) in self
-                .ivars()
-                .agent_request_multiline_inputs
-                .borrow()
-                .values()
-            {
-                if std::ptr::eq(
-                    &*object,
-                    (&**input as *const NSTextView).cast::<AnyObject>(),
-                ) {
-                    submit.setEnabled(!input.string().to_string().trim().is_empty());
-                    return;
-                }
-            }
-        }
-        if let (Some(agents), Some(object)) =
-            (self.ivars().agents.get(), notification.object())
-            && std::ptr::eq(
-                &*object,
-                (&*agents.composer as *const NSTextView).cast::<AnyObject>(),
-            )
-        {
-            self.refresh_agent_controls();
-            return;
-        }
-        if let (Some(files), Some(object)) =
-            (self.ivars().files.get(), notification.object())
+        if let (Some(files), Some(object)) = (self.ivars().files.get(), notification.object())
             && std::ptr::eq(
                 &*object,
                 (&*files.preview_text as *const NSTextView).cast::<AnyObject>(),
@@ -76,18 +49,12 @@ impl AppDelegate {
 
     unsafe fn handle_objc_delegate_text_view_clicked_on_link_at_index(
         &self,
-        text_view: &NSTextView,
+        _text_view: &NSTextView,
         link: &AnyObject,
         _char_index: usize,
     ) -> Bool {
-        let Some(agents) = self.ivars().agents.get() else {
-            return false.into();
-        };
-        if !text_view.isDescendantOf(&agents.transcript_table) {
-            return false.into();
-        }
         let Some(value) = link.downcast_ref::<NSString>() else {
-            log::warn!("native Codex transcript link had an unsupported value type");
+            log::warn!("native text link had an unsupported value type");
             return false.into();
         };
         self.activate_native_agent_link(destination_target(&value.to_string()));
@@ -144,7 +111,10 @@ impl AppDelegate {
         }
     }
 
-    fn handle_objc_delegate_validate_menu_item(&self, menu_item: &NSMenuItem) -> objc2::runtime::Bool {
+    fn handle_objc_delegate_validate_menu_item(
+        &self,
+        menu_item: &NSMenuItem,
+    ) -> objc2::runtime::Bool {
         let Some(action) = menu_item.action() else {
             return true.into();
         };
@@ -182,7 +152,7 @@ impl AppDelegate {
                                 info.capabilities.readable
                             }
                     }))
-                .into();
+            .into();
         }
         if action == sel!(pasteWorkspaceFile:) {
             if self
@@ -193,8 +163,7 @@ impl AppDelegate {
             {
                 return false.into();
             }
-            let Some((access, destination_parent)) = self.workspace_file_creation_parent()
-            else {
+            let Some((access, destination_parent)) = self.workspace_file_creation_parent() else {
                 return false.into();
             };
             return workspace_file_clipboard_from_pasteboard(
@@ -202,8 +171,7 @@ impl AppDelegate {
                 access.as_ref(),
             )
             .is_some_and(|(source, _)| {
-                source != destination_parent
-                    && !destination_parent.is_descendant_of(&source)
+                source != destination_parent && !destination_parent.is_descendant_of(&source)
             })
             .into();
         }
@@ -224,17 +192,19 @@ impl AppDelegate {
                 .files
                 .get()
                 .is_some_and(|files| !files.mutation_in_progress.get())
-                && self.selected_workspace_file_info().is_some_and(|(_, info)| {
-                    !info.path.is_root()
-                        && info.capabilities.readable
-                        && info.path.parent().is_some_and(|parent| {
-                            self.ivars().files.get().is_some_and(|files| {
-                                files.rows.borrow().iter().any(|row| {
-                                    row.info.path == parent && row.info.capabilities.creatable
+                && self
+                    .selected_workspace_file_info()
+                    .is_some_and(|(_, info)| {
+                        !info.path.is_root()
+                            && info.capabilities.readable
+                            && info.path.parent().is_some_and(|parent| {
+                                self.ivars().files.get().is_some_and(|files| {
+                                    files.rows.borrow().iter().any(|row| {
+                                        row.info.path == parent && row.info.capabilities.creatable
+                                    })
                                 })
                             })
-                        })
-                }))
+                    }))
             .into();
         }
         if action == sel!(moveWorkspaceFile:) {
@@ -265,11 +235,13 @@ impl AppDelegate {
                 .files
                 .get()
                 .is_some_and(|files| !files.mutation_in_progress.get())
-                && self.selected_workspace_file_info().is_some_and(|(access, info)| {
-                    access.supports_download()
-                        && !info.path.is_root()
-                        && info.capabilities.readable
-                }))
+                && self
+                    .selected_workspace_file_info()
+                    .is_some_and(|(access, info)| {
+                        access.supports_download()
+                            && !info.path.is_root()
+                            && info.capabilities.readable
+                    }))
             .into();
         }
         if action == sel!(copyTerminalWorkingDirectory:)
@@ -289,9 +261,7 @@ impl AppDelegate {
             }
             .into();
         }
-        if action == sel!(moveTerminalSessionLeft:)
-            || action == sel!(moveTerminalSessionRight:)
-        {
+        if action == sel!(moveTerminalSessionLeft:) || action == sel!(moveTerminalSessionRight:) {
             let sessions = self.ivars().terminal_sessions.borrow();
             let Some(index) = sessions
                 .iter()
@@ -355,8 +325,7 @@ impl AppDelegate {
             } else if action == sel!(stopContainer:) {
                 (
                     format!("{compose_prefix}Stop"),
-                    compose.is_some()
-                        || container.as_ref().is_some_and(ContainerSummary::can_stop),
+                    compose.is_some() || container.as_ref().is_some_and(ContainerSummary::can_stop),
                     false,
                 )
             } else if action == sel!(restartContainer:) {
@@ -425,18 +394,6 @@ impl AppDelegate {
         }
         if self
             .ivars()
-            .agents
-            .get()
-            .is_some_and(|agents| std::ptr::eq(table, &*agents.transcript_table))
-        {
-            return self
-                .ivars()
-                .agents
-                .get()
-                .map_or(0, |agents| agents.transcript_items.borrow().len() as isize);
-        }
-        if self
-            .ivars()
             .files
             .get()
             .is_some_and(|files| std::ptr::eq(table, &*files.preview_table))
@@ -461,8 +418,17 @@ impl AppDelegate {
                     .filter(|row| {
                         let query = files.query.borrow();
                         query.is_empty()
-                            || row.info.display_name.to_lowercase().contains(query.as_str())
-                            || row.info.path.display().to_lowercase().contains(query.as_str())
+                            || row
+                                .info
+                                .display_name
+                                .to_lowercase()
+                                .contains(query.as_str())
+                            || row
+                                .info
+                                .path
+                                .display()
+                                .to_lowercase()
+                                .contains(query.as_str())
                     })
                     .count() as isize
             });

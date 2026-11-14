@@ -694,7 +694,11 @@ fn default_shell_command_path(name: &str) -> Option<PathBuf> {
     let shell = default_shell();
     let script = format!("command -v {}", shell_quote(name));
     let output = Command::new(&shell)
-        .arg("-i")
+        .arg(if cfg!(target_os = "macos") {
+            "-il"
+        } else {
+            "-i"
+        })
         .arg("-c")
         .arg(&script)
         .current_dir(std::env::temp_dir())

@@ -6,6 +6,10 @@
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>craic</string>
+    <key>CFBundleIconFile</key>
+    <string>CraicIcon.icns</string>
+    <key>CFBundleIconName</key>
+    <string>CraicIcon</string>
     <key>CFBundleIdentifier</key>
     <string>dev.craic.Craic</string>
     <key>CFBundleInfoDictionaryVersion</key>

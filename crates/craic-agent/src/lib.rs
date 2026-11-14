@@ -12,3 +12,5 @@ pub mod app_server;
 pub mod approval;
 pub mod display;
 pub mod remote_media;
+pub mod smart_summary;
+pub mod terminal_provider;

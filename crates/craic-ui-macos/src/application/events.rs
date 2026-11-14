@@ -80,15 +80,15 @@ impl AppDelegate {
         *current = revision;
         drop(revisions);
 
-        let badge = if state.refreshing {
-            NativePageBadge::Indicator
-        } else if let Some(badge) = state.badge.as_ref() {
+        let badge = if let Some(badge) = state.badge.as_ref() {
             badge
                 .text
                 .parse::<usize>()
                 .ok()
                 .map(NativePageBadge::Count)
                 .unwrap_or(NativePageBadge::Indicator)
+        } else if state.refreshing {
+            NativePageBadge::Indicator
         } else {
             NativePageBadge::None
         };
@@ -129,7 +129,7 @@ impl AppDelegate {
             "history" => self.request_history_page(true),
             "files" => self.request_files_tree(),
             "containers" => self.request_containers(),
-            "agents" => self.complete_pending_page_service("agents", Ok(serde_json::Value::Null)),
+            "agents" => self.request_native_cli_history(false),
             _ => {
                 self.complete_pending_page_service(
                     &page,
@@ -633,6 +633,13 @@ impl AppDelegate {
                 self.request_containers();
             }
         } else if showing_agents {
+            self.ensure_native_agent_history_timer();
+            self.request_native_provider_updates(false);
+            if self.ivars().agents.get().is_some_and(|agents| {
+                (provider_changed || !agents.history_loaded.get()) && !agents.history_loading.get()
+            }) {
+                self.request_native_cli_history(false);
+            }
             self.hide_repository_home();
             if let Some(search_panel) = self.ivars().diff_search_panel.get() {
                 search_panel.setHidden(true);
