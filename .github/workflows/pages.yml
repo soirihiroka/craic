@@ -1,21 +1,111 @@
-name: Deploy static content to Pages
+name: Fedora build and Pages
 
 on:
   push:
-    branches: ["main"]
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: "pages"
-  cancel-in-progress: false
+  group: pages-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TZ: UTC
+  CARGO_INCREMENTAL: "0"
 
 jobs:
+  fedora:
+    name: Fedora 44 x86_64 RPM
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container: registry.fedoraproject.org/fedora:44
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install packaging tools
+        run: dnf install -y git tar gzip findutils rpm-build rpm-sign gnupg2 createrepo_c dnf5-plugins rustfmt
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: dnf builddep -y packaging/craic.spec
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-fedora-44-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-fedora-44-
+
+      - name: Check formatting and Rust
+        run: |
+          cargo fmt --all -- --check
+          make check CARGO='cargo --locked'
+
+      - name: Build RPM and source RPM
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          release="0.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}.git${GITHUB_SHA:0:8}"
+          mkdir -p "$RUNNER_TEMP/rpmbuild/SOURCES"
+          git -c safe.directory="$GITHUB_WORKSPACE" archive --format=tar.gz \
+            --prefix="craic-${version}/" -o "$RUNNER_TEMP/rpmbuild/SOURCES/craic-${version}.tar.gz" HEAD
+          rpmbuild -ba packaging/craic.spec \
+            --define "_topdir $RUNNER_TEMP/rpmbuild" \
+            --define "package_version $version" --define "package_release $release"
+          mkdir -p rpm/fedora/44/x86_64
+          cp "$RUNNER_TEMP"/rpmbuild/RPMS/x86_64/*.rpm rpm/fedora/44/x86_64/
+          cp "$RUNNER_TEMP"/rpmbuild/SRPMS/*.rpm rpm/craic.src.rpm
+
+      - name: Sign packages
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          RPM_SIGNING_KEY: ${{ secrets.RPM_SIGNING_KEY }}
+        run: |
+          if [[ -n "$RPM_SIGNING_KEY" ]]; then
+            export GNUPGHOME="$RUNNER_TEMP/rpm-gnupg"
+            install -d -m 700 "$GNUPGHOME"
+            trap 'gpgconf --kill gpg-agent; rm -rf "$GNUPGHOME"' EXIT
+            printf '%s' "$RPM_SIGNING_KEY" | gpg --batch --import
+            fingerprint=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" {print $10; exit}')
+            rpmsign --define "_openpgp_sign gpg" --define "_openpgp_sign_id $fingerprint" \
+              --addsign rpm/fedora/44/x86_64/*.rpm rpm/craic.src.rpm
+            gpg --batch --armor --export "$fingerprint" > rpm/RPM-GPG-KEY-craic
+          fi
+
+      - name: Generate DNF repository and verify installation
+        run: |
+          createrepo_c rpm/fedora/44/x86_64
+          rpm -qp --requires rpm/fedora/44/x86_64/*.rpm
+          dnf install -y --setopt=localpkg_gpgcheck=0 rpm/fedora/44/x86_64/*.rpm
+
+      - name: Upload DNF repository
+        uses: actions/upload-artifact@v7
+        with:
+          name: fedora-repository
+          path: rpm/
+          if-no-files-found: error
+          retention-days: 7
+
   deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: fedora
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -35,9 +125,30 @@ jobs:
         run: make doc
 
       - name: Setup Pages
+        id: pages
         uses: actions/configure-pages@v6
 
-      - name: Upload artifact
+      - name: Download DNF repository
+        uses: actions/download-artifact@v8
+        with:
+          name: fedora-repository
+          path: docs/build/rpm
+
+      - name: Write repository configuration
+        env:
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          repo = Path('docs/build/rpm')
+          text = Path('packaging/craic.repo.in').read_text()
+          text = text.replace('@BASE_URL@', os.environ['BASE_URL'].rstrip('/'))
+          text = text.replace('@GPGCHECK@', '1' if (repo / 'RPM-GPG-KEY-craic').exists() else '0')
+          (repo / 'craic.repo').write_text(text)
+          PY
+
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:
           path: docs/build

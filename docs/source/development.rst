@@ -15,6 +15,46 @@ Useful development commands are exposed by the project Makefile:
 
 Run ``cargo fmt`` before submitting Rust changes.
 
+Build cache cleanup
+-------------------
+
+Remove incremental compiler caches while keeping compiled dependencies and
+application binaries:
+
+.. code-block:: console
+
+   $ make clean-incremental
+
+This also handles target-specific build directories and respects
+``CARGO_TARGET_DIR``. Stop active builds before cleaning their caches.
+Use ``make clean`` to remove all Cargo build output. To prevent new incremental
+caches during an individual build, use ``CARGO_INCREMENTAL=0 make build``.
+
+Fedora CI and publishing
+------------------------
+
+The GitHub Actions workflow builds Fedora 44 x86_64 RPMs on pull requests and
+pushes to ``main``. It checks formatting, runs ``cargo check``, builds binary
+and source RPMs, validates the desktop entry, and verifies package installation.
+Only Cargo downloads are cached; incremental compilation is disabled in CI.
+
+After a successful build on ``main``, the workflow deploys the documentation
+and a DNF repository together to GitHub Pages. Pages must use GitHub Actions
+as its publishing source. The repository lives at
+``rpm/fedora/44/x86_64/`` beneath the Pages URL, with a generated configuration
+at ``rpm/craic.repo`` and the corresponding source RPM at ``rpm/craic.src.rpm``.
+Each deployment replaces the previous development build. The package version
+comes from ``Cargo.toml``; the RPM release includes the workflow run number,
+attempt, and commit identifier so later builds can be installed with DNF updates.
+
+Packages are unsigned by default. To enable package signatures, store an
+ASCII-armored, unencrypted GPG signing private key in the repository's
+``RPM_SIGNING_KEY`` Actions secret, for example with
+``gh secret set RPM_SIGNING_KEY < signing-key.asc``. The workflow publishes the
+public key and enables package signature checking in the generated repository
+configuration. Repository metadata is served over HTTPS without a separate
+signature. Keep the signing key stable across deployments.
+
 Resource diagnostics
 --------------------
 

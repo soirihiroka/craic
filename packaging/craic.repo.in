@@ -1,0 +1,7 @@
+[craic]
+name=Craic development builds
+baseurl=@BASE_URL@/rpm/fedora/$releasever/$basearch/
+enabled=1
+gpgcheck=@GPGCHECK@
+repo_gpgcheck=0
+gpgkey=@BASE_URL@/rpm/RPM-GPG-KEY-craic

@@ -49,7 +49,7 @@ DOCS_BUILD_DIR := $(DOCS_DIR)/build
 DEBUG_APP_BUNDLE := $(CARGO_TARGET_DIR)/debug/$(APP_NAME).app
 DEBUG_APP_EXECUTABLE := $(DEBUG_APP_BUNDLE)/Contents/MacOS/$(BIN_NAME)
 
-.PHONY: dev run build release check fmt test doc resource-watch macos-icon macos-app run-macos clean install uninstall
+.PHONY: dev run build release check fmt test doc resource-watch macos-icon macos-app run-macos clean clean-incremental install uninstall
 
 ifeq ($(UNAME_S),Darwin)
 dev: macos-app
@@ -115,8 +115,13 @@ run-macos: macos-app
 clean:
 	$(CARGO_ENV) $(CARGO) clean
 
+clean-incremental:
+	@if [ -d "$(CARGO_TARGET_DIR)" ]; then \
+		find "$(CARGO_TARGET_DIR)" -type d -name incremental -prune -exec rm -rf -- {} +; \
+	fi
+
 install: release
-	$(INSTALL) -Dm755 target/release/$(BIN_NAME) "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
+	$(INSTALL) -Dm755 "$(CARGO_TARGET_DIR)/release/$(BIN_NAME)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
 	$(INSTALL) -d "$(DESTDIR)$(APPLICATIONSDIR)"
 	$(SED) -e "s|@APP_ID@|$(APP_ID)|g" \
 		-e "s|@APP_NAME@|$(APP_NAME)|g" \
