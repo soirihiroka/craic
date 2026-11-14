@@ -1,6 +1,22 @@
 Getting Started
 ===============
 
+Fedora development packages
+---------------------------
+
+GitHub Pages hosts a DNF repository for Fedora 44 on x86_64 alongside this
+documentation. Download the `repository configuration <rpm/craic.repo>`_ and
+save it as ``/etc/yum.repos.d/craic.repo``, then install:
+
+.. code-block:: console
+
+   $ sudo dnf install craic
+
+Use ``sudo dnf upgrade craic`` to install subsequent development builds.
+The `source RPM <rpm/craic.src.rpm>`_ is published alongside each build.
+Packages are unsigned unless the maintainer configures the CI signing secret;
+the repository configuration reflects whether package signatures are enabled.
+
 Requirements
 ------------
 
@@ -12,7 +28,9 @@ Fedora
 
 .. code-block:: console
 
-   $ sudo dnf install rust cargo gtk4-devel webkitgtk6.0-devel \
+   $ sudo dnf install rust cargo clang clang-devel gcc-c++ make python3 git \
+       gtk4-devel webkitgtk6.0-devel libpanel-devel fontconfig-devel \
+       freetype-devel mesa-libEGL-devel mesa-libGL-devel wayland-devel \
        gtksourceview5-devel libadwaita-devel vte291-gtk4-devel \
        poppler-glib-devel gobject-introspection-devel pkgconf-pkg-config
 
