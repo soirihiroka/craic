@@ -67,6 +67,12 @@ The default installation prefix is ``$HOME/.local``.
 
    $ make install
 
+On macOS, this installs ``Craic.app`` in ``$HOME/Applications`` and the
+command-line executable in ``$PREFIX/bin``. Use ``APPLICATIONSDIR`` to choose
+a different app bundle destination, and use the same value when uninstalling.
+On Linux, this installs the executable, desktop entry, icons, and fonts beneath
+``PREFIX``.
+
 Use ``PREFIX`` to select a different prefix. Use the matching value when
 uninstalling:
 

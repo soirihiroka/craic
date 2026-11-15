@@ -29,7 +29,11 @@ RUST_LOG ?= craic=debug
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 DATADIR ?= $(PREFIX)/share
+ifeq ($(UNAME_S),Darwin)
+APPLICATIONSDIR ?= $(HOME)/Applications
+else
 APPLICATIONSDIR ?= $(DATADIR)/applications
+endif
 APPDATADIR ?= $(DATADIR)/$(BIN_NAME)
 ICON_THEME_DIR ?= $(DATADIR)/icons/hicolor
 ICONDIR ?= $(ICON_THEME_DIR)/scalable/apps
@@ -120,15 +124,33 @@ clean-incremental:
 		find "$(CARGO_TARGET_DIR)" -type d -name incremental -prune -exec rm -rf -- {} +; \
 	fi
 
+ifeq ($(UNAME_S),Darwin)
+install: release $(MACOS_ICON_CATALOG) $(MACOS_APP_ICON)
+	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"
+	$(INSTALL) -m 0755 "$(CARGO_TARGET_DIR)/release/$(BIN_NAME)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
+	$(INSTALL) -d "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/MacOS"
+	$(INSTALL) -d "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/Resources"
+	$(INSTALL) -m 0644 "data/macos/Info.plist" "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/Info.plist"
+	$(INSTALL) -m 0644 "$(MACOS_APP_ICON)" "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/Resources/CraicIcon.icns"
+	$(INSTALL) -m 0644 "$(MACOS_ICON_CATALOG)" "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/Resources/Assets.car"
+	$(INSTALL) -m 0755 "$(CARGO_TARGET_DIR)/release/$(BIN_NAME)" "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/MacOS/$(BIN_NAME)"
+	@echo "Installed $(APP_NAME) to $(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app"
+
+uninstall:
+	rm -f "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
+	rm -rf "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app"
+else
 install: release
-	$(INSTALL) -Dm755 "$(CARGO_TARGET_DIR)/release/$(BIN_NAME)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
+	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"
+	$(INSTALL) -m 0755 "$(CARGO_TARGET_DIR)/release/$(BIN_NAME)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
 	$(INSTALL) -d "$(DESTDIR)$(APPLICATIONSDIR)"
 	$(SED) -e "s|@APP_ID@|$(APP_ID)|g" \
 		-e "s|@APP_NAME@|$(APP_NAME)|g" \
 		-e "s|@BIN_PATH@|$(BINDIR)/$(BIN_NAME)|g" \
 		"$(DESKTOP_TEMPLATE)" > "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_ID).desktop"
 	chmod 0644 "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_ID).desktop"
-	$(INSTALL) -Dm644 "$(APP_ICON)" "$(DESTDIR)$(ICONDIR)/$(APP_ID).svg"
+	$(INSTALL) -d "$(DESTDIR)$(ICONDIR)"
+	$(INSTALL) -m 0644 "$(APP_ICON)" "$(DESTDIR)$(ICONDIR)/$(APP_ID).svg"
 	$(INSTALL) -d "$(DESTDIR)$(APPDATADIR)/assets"
 	$(INSTALL) -m 0644 $(ASSET_FILES) "$(DESTDIR)$(APPDATADIR)/assets/"
 	$(INSTALL) -d "$(DESTDIR)$(FONTDIR)"
@@ -159,3 +181,4 @@ uninstall:
 	@if command -v "$(FC_CACHE)" >/dev/null 2>&1; then \
 		"$(FC_CACHE)" -q "$(DESTDIR)$(DATADIR)/fonts" || true; \
 	fi
+endif
