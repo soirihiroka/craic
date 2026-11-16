@@ -742,11 +742,6 @@ impl AppDelegate {
                 let selected = PAGE_DESCRIPTORS
                     .get(item.tag() as usize)
                     .is_some_and(|page| page.id == descriptor.id);
-                button.setBezelColor(
-                    selected
-                        .then(NSColor::unemphasizedSelectedContentBackgroundColor)
-                        .as_deref(),
-                );
                 button.setState(if selected {
                     NSControlStateValueOn
                 } else {

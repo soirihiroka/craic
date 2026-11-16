@@ -39,8 +39,8 @@ impl AppDelegate {
                     item.setTarget(Some(self));
                     item.setAction(Some(sel!(selectPage:)));
                 }
-                // Each real toolbar subitem retains its native badge. Native toggle
-                // buttons provide selection while the group supplies the shared glass.
+                // Each real toolbar subitem retains its native badge. Leave tint and
+                // bezel colors at their defaults so AppKit draws the selected state.
                 let button = unsafe {
                     NSButton::buttonWithImage_target_action(
                         &image,
@@ -53,9 +53,6 @@ impl AppDelegate {
                 button.setButtonType(NSButtonType::PushOnPushOff);
                 button.setBezelStyle(NSBezelStyle::Toolbar);
                 button.setBordered(true);
-                if button.respondsToSelector(sel!(setTintProminence:)) {
-                    button.setTintProminence(objc2_app_kit::NSTintProminence::None);
-                }
                 button.setImagePosition(NSCellImagePosition::ImageOnly);
                 button.setToolTip(Some(&NSString::from_str(page.label)));
                 button.setFrameSize(NSSize::new(42.0, 32.0));
@@ -73,11 +70,6 @@ impl AppDelegate {
                     button.setBorderShape(objc2_app_kit::NSControlBorderShape::Capsule);
                 }
                 let selected = self.ivars().active_page_id.borrow().as_deref() == Some(page.id);
-                button.setBezelColor(
-                    selected
-                        .then(NSColor::unemphasizedSelectedContentBackgroundColor)
-                        .as_deref(),
-                );
                 button.setState(if selected {
                     NSControlStateValueOn
                 } else {
