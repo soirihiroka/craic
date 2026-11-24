@@ -1,10 +1,10 @@
 use crate::ui::components::terminal::{TerminalActivation, TerminalFileActivation};
-use craic_platform::terminal::{TerminalBackend, TerminalCommand, TerminalLifecycle, TerminalSize};
+use craic_platform::terminal::{TerminalBackend, TerminalCommand, TerminalLifecycle};
 use craic_render_skia::{
     TerminalClipboard, TerminalKey, TerminalKeyAction, TerminalKeyEvent, TerminalKeyModifiers,
-    TerminalMouseAction, TerminalMouseButton, TerminalMouseModifiers, TerminalPaintCache,
-    TerminalPaintRequest, TerminalScroll, TerminalSearchDirection, TerminalSelectionType,
-    TerminalSession, TerminalSide, TerminalViewport, paint_terminal,
+    TerminalLink, TerminalMouseAction, TerminalMouseButton, TerminalMouseModifiers,
+    TerminalPaintCache, TerminalPaintRequest, TerminalScroll, TerminalSearchDirection,
+    TerminalSelectionType, TerminalSession, TerminalSide, TerminalViewport, paint_terminal,
 };
 use craic_ui_core::ui::{canvas_scroll, components::context_menu};
 use glib::translate::IntoGlib;
@@ -16,14 +16,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::rc::Rc;
-use std::sync::LazyLock;
 use std::time::Duration;
-
-const TERMINAL_LINK_PATTERN: &str = r#"https?://[^\s<>"'`]+|(?x:
-    (?: /[A-Za-z0-9._~+%/@=-]+
-      | (?:\.{1,2}/)?(?:[A-Za-z0-9._~+%-]+/)+[A-Za-z0-9._~+%-]+
-      | [A-Za-z0-9._~+%-]+\.[A-Za-z0-9._~+%-]+ )
-    (?::[0-9]+(?::[0-9]+)?)?)"#;
 
 type Handler<T> = Rc<dyn Fn(T)>;
 type FileDropHandler = Rc<dyn Fn(GtkTerminal, Vec<PathBuf>)>;
@@ -68,11 +61,7 @@ struct View {
     session_controllers: RefCell<Vec<gtk::EventController>>,
 }
 
-impl TerminalBackend for GtkTerminal {
-    fn process_id(&self) -> Option<u32> {
-        self.0.session.borrow().as_ref()?.process_id()
-    }
-
+impl GtkTerminal {
     fn lifecycle(&self) -> TerminalLifecycle {
         if self.0.terminated.get() {
             TerminalLifecycle::Closing
@@ -96,19 +85,7 @@ impl TerminalBackend for GtkTerminal {
         Ok(())
     }
 
-    fn resize_terminal(&mut self, size: TerminalSize) -> Result<(), String> {
-        let viewport =
-            TerminalViewport::new(size.columns, size.rows, size.cell_width, size.cell_height);
-        self.0.viewport.set(viewport);
-        if let Some(session) = self.0.session.borrow_mut().as_mut() {
-            session
-                .resize(viewport)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    }
-
-    fn terminate_process(&mut self) -> Result<(), String> {
+    pub fn terminate(&self) {
         self.0.terminated.set(true);
         for controller in self.0.session_controllers.take() {
             self.0.canvas.remove_controller(&controller);
@@ -126,11 +103,8 @@ impl TerminalBackend for GtkTerminal {
                 }
             });
         }
-        Ok(())
     }
-}
 
-impl GtkTerminal {
     pub fn new(font_size: f64) -> Self {
         let font_size = (font_size * 4.0 / 3.0) as f32;
         let mut paint = TerminalPaintCache::new(font_size);
@@ -344,10 +318,6 @@ impl GtkTerminal {
 
     pub fn foreground_process_group(&self) -> Option<i32> {
         self.0.session.borrow().as_ref()?.foreground_process_group()
-    }
-
-    pub fn terminate(&self) {
-        let _ = self.clone().terminate_process();
     }
 
     pub fn set_font_size(&self, font_size: f64) {
@@ -721,19 +691,21 @@ impl GtkTerminal {
                         view.session
                             .borrow()
                             .as_ref()
-                            .and_then(|session| link_at(&session.snapshot(), line, col))
+                            .and_then(|session| session.link_at(line, col))
                     })
                     .flatten();
                 if let Some(target) = target {
-                    let activation =
-                        if target.starts_with("http://") || target.starts_with("https://") {
-                            TerminalActivation::Url(target)
-                        } else {
+                    let activation = match target {
+                        TerminalLink::Url(url) => TerminalActivation::Url(url),
+                        TerminalLink::File { path, line, column } => {
                             TerminalActivation::File(TerminalFileActivation {
-                                target,
+                                path,
+                                line,
+                                column,
                                 launch_dir: view.launch_dir.borrow().clone(),
                             })
-                        };
+                        }
+                    };
                     let handlers = view.activation_handlers.borrow().clone();
                     for handler in handlers {
                         handler(activation.clone());
@@ -1299,48 +1271,4 @@ fn mouse_button(button: u32) -> TerminalMouseButton {
         3 => TerminalMouseButton::Right,
         _ => TerminalMouseButton::None,
     }
-}
-
-fn link_at(
-    snapshot: &craic_render_skia::TerminalSnapshot,
-    line: usize,
-    col: usize,
-) -> Option<String> {
-    static LINK: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(TERMINAL_LINK_PATTERN).unwrap());
-    let mut row = String::new();
-    let mut column = 0;
-    let mut byte_offset = None;
-    for cell in snapshot.cells.iter().filter(|cell| cell.line == line) {
-        while column < cell.column {
-            if col == column {
-                byte_offset = Some(row.len());
-            }
-            row.push(' ');
-            column += 1;
-        }
-        let width = if cell.style.wide { 2 } else { 1 };
-        if (cell.column..cell.column + width).contains(&col) {
-            if let Some(uri) = &cell.hyperlink {
-                return Some(uri.clone());
-            }
-            byte_offset = Some(row.len());
-        }
-        row.push_str(if cell.text.is_empty() {
-            " "
-        } else {
-            &cell.text
-        });
-        column = cell.column + width;
-    }
-    let offset = byte_offset?;
-    let target = LINK
-        .find_iter(&row)
-        .find(|found| found.range().contains(&offset))?
-        .as_str();
-    Some(
-        target
-            .trim_end_matches(['.', ',', ';', ')', ']', '}'])
-            .to_owned(),
-    )
 }

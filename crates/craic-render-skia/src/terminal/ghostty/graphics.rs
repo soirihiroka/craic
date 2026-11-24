@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use skia_safe::Codec;
+use skia_safe::{Codec, EncodedImageFormat};
 
 use super::*;
 
@@ -94,6 +94,12 @@ impl Graphics {
 
         while unsafe { ghostty_render_state_image_iterator_next(iter) } {
             let get = |kind, output| unsafe { ghostty_render_state_image_get(iter, kind, output) };
+            let mut protocol = GHOSTTY_IMAGE_PROTOCOL_KITTY;
+            if get(GHOSTTY_RENDER_STATE_IMAGE_DATA_PROTOCOL, out(&mut protocol)) != GHOSTTY_SUCCESS
+                || protocol != GHOSTTY_IMAGE_PROTOCOL_KITTY
+            {
+                continue;
+            }
             let mut id = 0u32;
             let mut generation = 0u64;
             let mut layer: GhosttyImageLayer = GHOSTTY_IMAGE_LAYER_BELOW_TEXT;
@@ -249,6 +255,9 @@ unsafe extern "C" fn decode_png(
     let Some(mut codec) = Codec::from_data(Data::new_copy(encoded)) else {
         return false;
     };
+    if codec.encoded_format() != EncodedImageFormat::PNG {
+        return false;
+    }
     let dimensions = codec.dimensions();
     let Some(len) = (dimensions.width as usize)
         .checked_mul(dimensions.height as usize)

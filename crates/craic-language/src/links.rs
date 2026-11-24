@@ -52,18 +52,46 @@ fn detected_token(
         .len();
     let leading = token.len() - leading;
     let candidate = &token[leading..];
-    let trimmed =
-        candidate.trim_end_matches(['.', ',', ';', '!', '?', ')', ']', '}', '>', '\'', '"']);
+    let mut excess = [0i32; 3];
+    for ch in candidate.chars() {
+        match ch {
+            '(' => excess[0] -= 1,
+            ')' => excess[0] += 1,
+            '[' => excess[1] -= 1,
+            ']' => excess[1] += 1,
+            '{' => excess[2] -= 1,
+            '}' => excess[2] += 1,
+            _ => {}
+        }
+    }
+    let trimmed = candidate.trim_end_matches(|ch| {
+        let index = match ch {
+            ')' => 0,
+            ']' => 1,
+            '}' => 2,
+            _ => return matches!(ch, '.' | ',' | ';' | '!' | '?' | '>' | '\'' | '"'),
+        };
+        let trim = excess[index] > 0;
+        excess[index] -= 1;
+        trim
+    });
     if trimmed.is_empty() {
         return None;
     }
     let start = token_start + leading;
     let end = start + trimmed.len();
-    if trimmed.starts_with("https://")
-        || trimmed.starts_with("http://")
-        || trimmed.starts_with("mailto:")
-    {
+    if trimmed.split_once(':').is_some_and(|(scheme, rest)| {
+        scheme.eq_ignore_ascii_case("mailto")
+            || (rest.starts_with("//")
+                && (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")))
+    }) {
         return Some((start, end, LinkTarget::Url(trimmed.to_owned())));
+    }
+    if trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"))
+    {
+        return Some((start, end, destination_target(trimmed)));
     }
     parse_file_target(trimmed).map(|target| (start, end, target))
 }

@@ -79,6 +79,15 @@ pub fn paint_terminal(
         ((request.cell_height - request.font_size) / 2.0).max(0.0) + request.font_size * 0.82;
     let paint_images = |layer| {
         let paint = Paint::default();
+        canvas.save();
+        canvas.clip_rect(
+            Rect::from_wh(
+                request.snapshot.columns as f32 * request.cell_width,
+                request.snapshot.lines as f32 * request.cell_height,
+            ),
+            None,
+            false,
+        );
         for image in request
             .snapshot
             .images
@@ -100,11 +109,12 @@ pub fn paint_terminal(
                 &paint,
             );
         }
+        canvas.restore();
     };
     paint_images(ImageLayer::BelowBackground);
     for cell in &request.snapshot.cells {
         let (_, cell_background) = cell_colors(cell);
-        if cell_background != background {
+        if cell.explicit_background || cell_background != background {
             let mut paint = Paint::default();
             paint.set_color(cell_background);
             canvas.draw_rect(

@@ -6,6 +6,8 @@ pub enum TerminalActivation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalFileActivation {
-    pub target: String,
+    pub path: String,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
     pub launch_dir: String,
 }

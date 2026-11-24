@@ -57,6 +57,7 @@ macro_rules! handle {
 }
 
 mod graphics;
+mod sixel_compat;
 use graphics::Graphics;
 
 handle!(Terminal, GhosttyTerminal, ghostty_terminal_free);
@@ -90,6 +91,7 @@ handle!(MouseEvent, GhosttyMouseEvent, ghostty_mouse_event_free);
 struct Effects {
     reply: Vec<u8>,
     events: TerminalEventBatch,
+    reset_epoch: u64,
 }
 
 struct EffectState(NonNull<Effects>);
@@ -114,6 +116,7 @@ impl Drop for EffectState {
 
 pub(super) struct Emulator {
     graphics: Graphics,
+    sixel: sixel_compat::SixelGraphics,
     rows: Rows,
     cells: Cells,
     render: Render,
@@ -142,6 +145,7 @@ impl Emulator {
             })?;
             let mut emulator = Self {
                 graphics,
+                sixel: sixel_compat::SixelGraphics::default(),
                 rows: Rows::new(|out| ghostty_render_state_row_iterator_new(null(), out))?,
                 cells: Cells::new(|out| ghostty_render_state_row_cells_new(null(), out))?,
                 render: Render::new(|out| ghostty_render_state_new(null(), out))?,
@@ -179,6 +183,7 @@ impl Emulator {
                     clipboard_write as *const c_void,
                 ),
                 (GHOSTTY_TERMINAL_OPT_SIZE, size_report as *const c_void),
+                (GHOSTTY_TERMINAL_OPT_RESET, reset as *const c_void),
             ] {
                 check(ghostty_terminal_set(term, option, callback))?;
             }
@@ -218,7 +223,7 @@ impl Emulator {
     }
 
     pub(super) fn feed(&mut self, bytes: &[u8]) {
-        unsafe { ghostty_terminal_vt_write(self.terminal.0, bytes.as_ptr(), bytes.len()) };
+        self.sixel.feed(self.terminal.0, bytes, &mut self.effects);
         self.effects.get_mut().events.needs_redraw = true;
     }
 
@@ -596,57 +601,17 @@ impl Emulator {
         let (_, _, total) = self.scrollbar();
         for row in 0..total {
             let row_start = text.len();
-            let mut wrapped = false;
             for col in 0..self.viewport.columns {
                 let Some(cell) = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, row, col) else {
                     break;
                 };
-                unsafe {
-                    if col == 0 {
-                        let mut raw = 0;
-                        if ghostty_grid_ref_row(&cell, &mut raw) == GHOSTTY_SUCCESS {
-                            ghostty_row_get(raw, GHOSTTY_ROW_DATA_WRAP, out(&mut wrapped));
-                        }
-                    }
-                    let mut raw = 0;
-                    let mut width: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW;
-                    ghostty_grid_ref_cell(&cell, &mut raw);
-                    ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, out(&mut width));
-                    if matches!(
-                        width,
-                        GHOSTTY_CELL_WIDE_SPACER_TAIL | GHOSTTY_CELL_WIDE_SPACER_HEAD
-                    ) {
-                        continue;
-                    }
-                    let mut len = 0;
-                    let mut result = ghostty_grid_ref_graphemes(
-                        &cell,
-                        codepoints.as_mut_ptr(),
-                        codepoints.len(),
-                        &mut len,
-                    );
-                    if result == GHOSTTY_OUT_OF_SPACE {
-                        codepoints.resize(len, 0);
-                        result = ghostty_grid_ref_graphemes(
-                            &cell,
-                            codepoints.as_mut_ptr(),
-                            codepoints.len(),
-                            &mut len,
-                        );
-                    }
-                    positions.push((text.len(), (row, col)));
-                    if result == GHOSTTY_SUCCESS && len != 0 {
-                        text.extend(
-                            codepoints[..len]
-                                .iter()
-                                .filter_map(|&cp| char::from_u32(cp)),
-                        );
-                    } else {
-                        text.push(' ');
-                    }
+                if is_spacer(cell_width(&cell)) {
+                    continue;
                 }
+                positions.push((text.len(), (row, col)));
+                append_cell_text(&cell, &mut codepoints, &mut text);
             }
-            if !wrapped {
+            if !self.wrapped_row(row) {
                 text.truncate(row_start + text[row_start..].trim_end_matches(' ').len());
                 while positions
                     .last()
@@ -988,20 +953,15 @@ impl Emulator {
                     ghostty_cell_get(raw, GHOSTTY_CELL_DATA_HAS_STYLING, out(&mut styled));
                     ghostty_cell_get(raw, GHOSTTY_CELL_DATA_HAS_HYPERLINK, out(&mut hyperlink));
                     let mut background = colors.background;
-                    if ghostty_render_state_row_cells_get(
+                    let explicit_background = ghostty_render_state_row_cells_get(
                         cells,
                         GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
                         out(&mut background),
-                    ) != GHOSTTY_SUCCESS
-                    {
+                    ) == GHOSTTY_SUCCESS;
+                    if !explicit_background {
                         background = colors.background;
                     }
-                    if !has_text
-                        && !styled
-                        && !selected
-                        && !hyperlink
-                        && rgb(background) == snapshot.background
-                    {
+                    if !has_text && !styled && !selected && !hyperlink && !explicit_background {
                         continue;
                     }
                     let mut foreground = colors.foreground;
@@ -1047,6 +1007,10 @@ impl Emulator {
                             text = String::from_utf8_lossy(&graphemes[..buf.len]).into_owned();
                         }
                     }
+                    // Virtual Kitty placements are drawn in the image plane.
+                    if text.starts_with(KITTY_PLACEHOLDER) {
+                        text.clear();
+                    }
                     let hyperlink = hyperlink.then(|| self.hyperlink(line, col)).flatten();
                     let flags = style.flags;
                     snapshot.cells.push(TerminalCell {
@@ -1055,6 +1019,7 @@ impl Emulator {
                         text,
                         foreground: rgb(foreground),
                         background: rgb(background),
+                        explicit_background,
                         selected,
                         hyperlink,
                         style: TerminalCellStyle {
@@ -1074,29 +1039,174 @@ impl Emulator {
             }
         }
         snapshot.images = self.graphics.render(self.terminal.0, render);
+        self.sixel
+            .render(self.terminal.0, offset, self.viewport, &mut snapshot.images);
         Ok(snapshot)
     }
 
-    fn hyperlink(&self, line: usize, col: usize) -> Option<String> {
-        let cell = self.grid_ref(GHOSTTY_POINT_TAG_VIEWPORT, line, col)?;
-        let mut len = 0;
-        unsafe {
-            if ghostty_grid_ref_hyperlink_uri(&cell, null_mut(), 0, &mut len)
-                != GHOSTTY_OUT_OF_SPACE
-            {
-                return None;
-            }
-            let mut bytes = vec![0; len];
-            check(ghostty_grid_ref_hyperlink_uri(
-                &cell,
-                bytes.as_mut_ptr(),
-                bytes.len(),
-                &mut len,
-            ))
-            .ok()?;
-            bytes.truncate(len);
-            String::from_utf8(bytes).ok()
+    pub(super) fn link_at(&self, line: usize, col: usize) -> Option<LinkTarget> {
+        if line >= self.viewport.lines || col >= self.viewport.columns {
+            return None;
         }
+        let (offset, _, total) = self.scrollbar();
+        let row = offset + line;
+        let tag = GHOSTTY_POINT_TAG_SCREEN;
+        let mut clicked = self.grid_ref(tag, row, col)?;
+        let mut clicked_column = col;
+        if col > 0 && cell_width(&clicked) == GHOSTTY_CELL_WIDE_SPACER_TAIL {
+            clicked_column -= 1;
+            clicked = self.grid_ref(tag, row, clicked_column)?;
+        }
+        if let Some(uri) = hyperlink_uri(&clicked) {
+            return link_target(&uri);
+        }
+
+        // Walk Ghostty's logical line so a soft wrap preserves both the URL
+        // and the mapping from a clicked cell to a UTF-8 byte offset.
+        let mut start = row;
+        while start > 0 && self.wrapped_row(start - 1) {
+            start -= 1;
+        }
+        let mut text = String::new();
+        let mut hit = None;
+        let mut codepoints = vec![0; 16];
+        for current in start..total {
+            for column in 0..self.viewport.columns {
+                let cell = self.grid_ref(tag, current, column)?;
+                if is_spacer(cell_width(&cell)) {
+                    continue;
+                }
+                if current == row && column == clicked_column {
+                    hit = Some(text.len());
+                }
+                append_cell_text(&cell, &mut codepoints, &mut text);
+            }
+            if !self.wrapped_row(current) {
+                break;
+            }
+        }
+        let hit = hit?;
+        craic_language::detected_links(&text)
+            .into_iter()
+            .find_map(|(start, end, _)| {
+                (start..end)
+                    .contains(&hit)
+                    .then(|| link_target(&text[start..end]))
+                    .flatten()
+            })
+    }
+
+    fn wrapped_row(&self, row: usize) -> bool {
+        let Some(cell) = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, row, 0) else {
+            return false;
+        };
+        let mut raw = 0;
+        let mut wrapped = false;
+        unsafe {
+            ghostty_grid_ref_row(&cell, &mut raw) == GHOSTTY_SUCCESS
+                && ghostty_row_get(raw, GHOSTTY_ROW_DATA_WRAP, out(&mut wrapped)) == GHOSTTY_SUCCESS
+                && wrapped
+        }
+    }
+    fn hyperlink(&self, line: usize, col: usize) -> Option<String> {
+        hyperlink_uri(&self.grid_ref(GHOSTTY_POINT_TAG_VIEWPORT, line, col)?)
+    }
+}
+
+fn hyperlink_uri(cell: &GhosttyGridRef) -> Option<String> {
+    let mut len = 0;
+    unsafe {
+        if ghostty_grid_ref_hyperlink_uri(cell, null_mut(), 0, &mut len) != GHOSTTY_OUT_OF_SPACE {
+            return None;
+        }
+        let mut bytes = vec![0; len];
+        check(ghostty_grid_ref_hyperlink_uri(
+            cell,
+            bytes.as_mut_ptr(),
+            bytes.len(),
+            &mut len,
+        ))
+        .ok()?;
+        bytes.truncate(len);
+        String::from_utf8(bytes).ok()
+    }
+}
+
+const KITTY_PLACEHOLDER: char = '\u{10eeee}';
+
+fn is_spacer(width: GhosttyCellWide) -> bool {
+    matches!(
+        width,
+        GHOSTTY_CELL_WIDE_SPACER_HEAD | GHOSTTY_CELL_WIDE_SPACER_TAIL
+    )
+}
+
+fn append_cell_text(cell: &GhosttyGridRef, codepoints: &mut Vec<u32>, text: &mut String) {
+    let mut len = 0;
+    unsafe {
+        let mut result =
+            ghostty_grid_ref_graphemes(cell, codepoints.as_mut_ptr(), codepoints.len(), &mut len);
+        if result == GHOSTTY_OUT_OF_SPACE {
+            codepoints.resize(len, 0);
+            result = ghostty_grid_ref_graphemes(
+                cell,
+                codepoints.as_mut_ptr(),
+                codepoints.len(),
+                &mut len,
+            );
+        }
+        if result == GHOSTTY_SUCCESS && len != 0 && codepoints[0] != u32::from(KITTY_PLACEHOLDER) {
+            text.extend(
+                codepoints[..len]
+                    .iter()
+                    .filter_map(|&cp| char::from_u32(cp)),
+            );
+        } else {
+            text.push(' ');
+        }
+    }
+}
+
+fn cell_width(cell: &GhosttyGridRef) -> GhosttyCellWide {
+    let mut raw = 0;
+    let mut width = GHOSTTY_CELL_WIDE_NARROW;
+    unsafe {
+        if ghostty_grid_ref_cell(cell, &mut raw) == GHOSTTY_SUCCESS {
+            ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, out(&mut width));
+        }
+    }
+    width
+}
+
+fn link_target(raw: &str) -> Option<LinkTarget> {
+    if raw.chars().any(char::is_control) {
+        return None;
+    }
+    if let Ok(uri) = url::Url::parse(raw) {
+        match uri.scheme() {
+            "https" | "http" | "mailto" => return Some(LinkTarget::Url(raw.to_owned())),
+            "file" => {
+                let path = uri.to_file_path().ok()?;
+                let path = path.to_str()?;
+                if path.chars().any(char::is_control) {
+                    return None;
+                }
+                let location = match uri.fragment() {
+                    Some(fragment) if fragment.starts_with('L') => format!("{path}#{fragment}"),
+                    _ => path.to_owned(),
+                };
+                return match craic_language::destination_target(&location) {
+                    file @ LinkTarget::File { .. } => Some(file),
+                    _ => None,
+                };
+            }
+            _ if raw.contains("://") => return None,
+            _ => {} // A file location such as main.rs:42 also parses as a URL.
+        }
+    }
+    match craic_language::destination_target(raw) {
+        file @ LinkTarget::File { .. } => Some(file),
+        _ => None,
     }
 }
 
@@ -1270,6 +1380,12 @@ unsafe extern "C" fn clipboard_write(
             );
         }
     }
+}
+
+unsafe extern "C" fn reset(_: GhosttyTerminal, userdata: *mut c_void) {
+    let effects = unsafe { &mut *userdata.cast::<Effects>() };
+    effects.reset_epoch = effects.reset_epoch.wrapping_add(1);
+    effects.events.title = Some(None);
 }
 
 unsafe extern "C" fn device_attributes(

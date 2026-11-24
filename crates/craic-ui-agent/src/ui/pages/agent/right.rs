@@ -616,34 +616,26 @@ fn confirm_open_agent_terminal_url(ctx: PageContext, url: String) {
     );
 }
 
-#[derive(Clone, Debug)]
-struct TerminalFileLocation {
-    path: String,
-    line: Option<usize>,
-    column: Option<usize>,
-}
-
 fn open_agent_terminal_file_location(
     ctx: &PageContext,
     file: &terminal_component::TerminalFileActivation,
 ) {
-    let location = parse_terminal_file_location(&file.target);
     let Some(terminal_links) = ctx.terminal_links() else {
         let message = "Terminal link navigation is unavailable for this workspace.".to_string();
         log::warn!(
             "agent terminal file activation failed target={} launch_dir={} reason=no-terminal-link-capability",
-            file.target,
+            file.path,
             file.launch_dir
         );
         ctx.show_toast(&message);
         return;
     };
-    let target = match terminal_links.resolve_file(&file.launch_dir, &location.path) {
+    let target = match terminal_links.resolve_file(&file.launch_dir, &file.path) {
         Ok(path) => path,
         Err(err) => {
             log::warn!(
                 "agent terminal file activation failed target={} launch_dir={}: {}",
-                file.target,
+                file.path,
                 file.launch_dir,
                 err
             );
@@ -657,62 +649,28 @@ fn open_agent_terminal_file_location(
         TerminalLinkTarget::External(path) => {
             log::info!(
                 "agent terminal external file activation requesting new window target={} path={} line={:?} column={:?}",
-                file.target,
+                file.path,
                 path.absolute,
-                location.line,
-                location.column
+                file.line,
+                file.column
             );
-            ctx.open_external_terminal_path(&path, location.line, location.column);
+            ctx.open_external_terminal_path(&path, file.line, file.column);
             return;
         }
     };
 
     log::info!(
         "agent terminal file activation dispatched target={} resolved_path={} line={:?} column={:?}",
-        file.target,
+        file.path,
         path.display(),
-        location.line,
-        location.column
+        file.line,
+        file.column
     );
     ctx.dispatch_command(PageCommand::OpenFileLocation {
         path: path.relative_or_empty().to_string(),
-        line: location.line,
-        column: location.column,
+        line: file.line,
+        column: file.column,
     });
-}
-
-fn parse_terminal_file_location(target: &str) -> TerminalFileLocation {
-    let target = target
-        .strip_prefix("file://")
-        .unwrap_or(target)
-        .trim()
-        .to_string();
-    let mut path = target.as_str();
-    let mut line = None;
-    let mut column = None;
-
-    if let Some((before, last)) = path.rsplit_once(':')
-        && let Ok(value) = last.parse::<usize>()
-        && value > 0
-    {
-        if let Some((before_line, maybe_line)) = before.rsplit_once(':')
-            && let Ok(line_value) = maybe_line.parse::<usize>()
-            && line_value > 0
-        {
-            path = before_line;
-            line = Some(line_value);
-            column = Some(value);
-        } else {
-            path = before;
-            line = Some(value);
-        }
-    }
-
-    TerminalFileLocation {
-        path: path.to_string(),
-        line,
-        column,
-    }
 }
 
 fn active_state_counts_as_running(state: AgentActiveState) -> bool {

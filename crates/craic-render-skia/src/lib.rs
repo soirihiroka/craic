@@ -63,3 +63,5 @@ pub use terminal::{
     TerminalSelectionType, TerminalSession, TerminalSide, TerminalSnapshot, TerminalViewport,
 };
 pub use terminal_painter::{TerminalPaintCache, TerminalPaintRequest, paint_terminal};
+
+pub use craic_language::LinkTarget as TerminalLink;

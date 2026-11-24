@@ -365,10 +365,10 @@ define_class!(
                 && event
                     .modifierFlags()
                     .contains(NSEventModifierFlags::Command)
-                && let Some(target) = terminal_link_at(&self.ivars().snapshot.borrow(), line, column)
+                && let Some(target) = self.ivars().session.borrow().as_ref().and_then(|session| session.link_at(line, column))
             {
                 if let Some(delegate) = self.ivars().activation_delegate.borrow().load() {
-                    delegate.activate_native_terminal_link(&target);
+                    delegate.activate_native_terminal_link(target);
                 }
                 return;
             }
@@ -1435,63 +1435,6 @@ fn terminal_metrics(font_size: f64) -> (f64, f64, f64) {
         (BASE_CELL_WIDTH * scale).max(1.0),
         (BASE_CELL_HEIGHT * scale).max(1.0),
     )
-}
-
-fn terminal_link_at(snapshot: &TerminalSnapshot, line: usize, column: usize) -> Option<String> {
-    if line >= snapshot.lines || column >= snapshot.columns {
-        return None;
-    }
-    if let Some(link) = snapshot
-        .cells
-        .iter()
-        .find(|cell| cell.line == line && cell.column == column)
-        .and_then(|cell| cell.hyperlink.as_ref())
-    {
-        return Some(link.clone());
-    }
-
-    let mut characters = vec![' '; snapshot.columns];
-    for cell in snapshot.cells.iter().filter(|cell| cell.line == line) {
-        if cell.column < characters.len()
-            && let Some(character) = cell.text.chars().next()
-        {
-            characters[cell.column] = character;
-        }
-    }
-    let is_boundary = |character: char| {
-        character.is_whitespace()
-            || matches!(
-                character,
-                '\'' | '"' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'
-            )
-    };
-    if is_boundary(characters[column]) {
-        return None;
-    }
-    let mut start = column;
-    while start > 0 && !is_boundary(characters[start - 1]) {
-        start -= 1;
-    }
-    let mut end = column + 1;
-    while end < characters.len() && !is_boundary(characters[end]) {
-        end += 1;
-    }
-    let candidate = characters[start..end]
-        .iter()
-        .collect::<String>()
-        .trim_matches(|character: char| matches!(character, ',' | ';' | '!' | '?'))
-        .trim_end_matches(['.', ':'])
-        .to_string();
-    looks_like_terminal_link(&candidate).then_some(candidate)
-}
-
-fn looks_like_terminal_link(candidate: &str) -> bool {
-    candidate.contains("://")
-        || candidate.starts_with("mailto:")
-        || candidate.starts_with('/')
-        || candidate.starts_with("./")
-        || candidate.starts_with("../")
-        || candidate.contains('/')
 }
 
 fn terminal_input_text(string: &AnyObject) -> String {

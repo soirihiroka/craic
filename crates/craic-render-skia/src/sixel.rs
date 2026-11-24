@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 const MAX_SIXEL_SEQUENCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SIXEL_DIMENSION: usize = 4096;
 const MAX_SIXEL_PIXELS: usize = 4 * 1024 * 1024;
@@ -10,131 +7,42 @@ pub(crate) struct SixelDecoded {
     pub width: usize,
     pub height: usize,
     pub rgba: Vec<u8>,
-    pub output_line: u64,
 }
 
-pub(crate) struct SixelStreamParser {
-    state: StreamState,
-    output_line: Arc<AtomicU64>,
-}
-
-enum StreamState {
-    Ground,
-    Escape,
-    Dcs(DcsCapture),
-}
-
-struct DcsCapture {
-    header: Vec<u8>,
+// Ghostty identifies the DCS boundaries. This state only interprets the
+// contents of a DCS with the Sixel final byte and no intermediates.
+#[derive(Default)]
+pub(crate) struct SixelCapture {
     decoder: Option<SixelDecoder>,
-    escape: bool,
     rejected: bool,
     bytes: usize,
 }
 
-impl SixelStreamParser {
-    pub(crate) fn new(output_line: Arc<AtomicU64>) -> Self {
-        Self {
-            state: StreamState::Ground,
-            output_line,
+impl SixelCapture {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) {
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        if self.bytes > MAX_SIXEL_SEQUENCE_BYTES {
+            self.rejected = true;
+            self.decoder = None;
         }
-    }
-
-    pub(crate) fn output_line(&self) -> u64 {
-        self.output_line.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<SixelDecoded> {
-        let mut decoded = Vec::new();
-        for &byte in bytes {
-            let mut finish_dcs = false;
-            match &mut self.state {
-                StreamState::Ground => match byte {
-                    b'\n' => {
-                        self.output_line.fetch_add(1, Ordering::Relaxed);
-                    }
-                    0x1b => self.state = StreamState::Escape,
-                    0x90 => self.state = StreamState::Dcs(DcsCapture::new()),
-                    _ => {}
-                },
-                StreamState::Escape => {
-                    self.state = if byte == b'P' {
-                        StreamState::Dcs(DcsCapture::new())
-                    } else {
-                        if byte == b'\n' {
-                            self.output_line.fetch_add(1, Ordering::Relaxed);
-                        }
-                        StreamState::Ground
-                    };
-                }
-                StreamState::Dcs(capture) => {
-                    capture.bytes = capture.bytes.saturating_add(1);
-                    if capture.bytes > MAX_SIXEL_SEQUENCE_BYTES {
-                        capture.rejected = true;
-                        capture.decoder = None;
-                    }
-                    if capture.escape {
-                        capture.escape = false;
-                        if byte == b'\\' {
-                            finish_dcs = true;
-                        }
-                    } else {
-                        match byte {
-                            0x1b => capture.escape = true,
-                            0x9c => finish_dcs = true,
-                            _ if capture.rejected => {}
-                            _ => capture.feed(byte),
-                        }
-                    }
-                }
-            }
-
-            if finish_dcs {
-                let state = std::mem::replace(&mut self.state, StreamState::Ground);
-                if let StreamState::Dcs(mut capture) = state
-                    && let Some(mut image) = capture.finish()
-                {
-                    image.output_line = self.output_line();
-                    decoded.push(image);
-                }
-            }
-        }
-        decoded
-    }
-}
-
-impl DcsCapture {
-    fn new() -> Self {
-        Self {
-            header: Vec::with_capacity(24),
-            decoder: None,
-            escape: false,
-            rejected: false,
-            bytes: 0,
-        }
-    }
-
-    fn feed(&mut self, byte: u8) {
-        if let Some(decoder) = self.decoder.as_mut() {
-            decoder.feed(byte);
+        if self.rejected {
             return;
         }
-        if byte == b'q' {
-            self.decoder = Some(SixelDecoder::new());
-        } else if (0x40..=0x7e).contains(&byte) {
-            self.rejected = true;
-        } else if self.header.len() < 128 {
-            self.header.push(byte);
-        } else {
-            self.rejected = true;
+        for &byte in bytes {
+            if let Some(decoder) = &mut self.decoder {
+                decoder.feed(byte);
+            } else if byte == b'q' {
+                self.decoder = Some(SixelDecoder::new());
+            } else if !(byte.is_ascii_digit() || byte == b';') {
+                // DECRQSS uses $q and must stay in the terminal protocol.
+                self.rejected = true;
+                break;
+            }
         }
     }
 
-    fn finish(&mut self) -> Option<SixelDecoded> {
-        (!self.rejected)
-            .then(|| self.decoder.take())
-            .flatten()
-            .and_then(SixelDecoder::finish)
+    pub(crate) fn finish(self) -> Option<SixelDecoded> {
+        self.decoder.and_then(SixelDecoder::finish)
     }
 }
 
@@ -342,7 +250,6 @@ impl SixelDecoder {
             width,
             height,
             rgba,
-            output_line: 0,
         })
     }
 }

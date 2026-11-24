@@ -1,24 +1,18 @@
+use craic_language::LinkTarget;
 use craic_platform::terminal::{TerminalBackend, TerminalCommand, TerminalLifecycle, TerminalSize};
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::io;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::watch;
 
 use skia_safe::{AlphaType, ColorType, Data, Image, ImageInfo, images};
 
-use crate::sixel::{SixelDecoded, SixelStreamParser};
-
 mod ghostty;
 mod pty;
 
 use ghostty::Emulator;
 use pty::PtyWorker;
-
-const MAX_SIXEL_IMAGES: usize = 32;
-const MAX_SIXEL_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalViewport {
@@ -61,6 +55,7 @@ pub struct TerminalCell {
     pub text: String,
     pub foreground: TerminalColor,
     pub background: TerminalColor,
+    pub(crate) explicit_background: bool,
     pub style: TerminalCellStyle,
     pub selected: bool,
     pub hyperlink: Option<String>,
@@ -279,104 +274,17 @@ pub struct TerminalKeyEvent<'a> {
     pub unshifted: Option<char>,
 }
 
-struct StoredSixelImage {
-    id: u64,
-    output_line: u64,
-    column: usize,
-    width: usize,
-    height: usize,
-    bytes: usize,
-    image: Image,
-}
-
 struct TerminalState {
     emulator: Emulator,
     viewport: TerminalViewport,
     wake: watch::Sender<()>,
-    sixel: SixelStreamParser,
-    images: VecDeque<StoredSixelImage>,
-    image_bytes: usize,
-    next_image: u64,
 }
 
 impl TerminalState {
     fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.emulator.feed(bytes);
-        for decoded in self.sixel.feed(bytes) {
-            self.store_sixel(decoded);
-        }
         self.wake.send_replace(());
         self.emulator.take_reply()
-    }
-
-    fn store_sixel(&mut self, decoded: SixelDecoded) {
-        let bytes = decoded.rgba.len();
-        if bytes > MAX_SIXEL_IMAGE_BYTES {
-            return;
-        }
-        let info = ImageInfo::new(
-            (decoded.width as i32, decoded.height as i32),
-            ColorType::RGBA8888,
-            AlphaType::Unpremul,
-            None,
-        );
-        let Some(image) =
-            images::raster_from_data(&info, Data::new_copy(&decoded.rgba), decoded.width * 4)
-        else {
-            return;
-        };
-        while self.images.len() >= MAX_SIXEL_IMAGES
-            || self.image_bytes + bytes > MAX_SIXEL_IMAGE_BYTES
-        {
-            let Some(removed) = self.images.pop_front() else {
-                break;
-            };
-            self.image_bytes -= removed.bytes;
-        }
-        self.next_image += 1;
-        self.image_bytes += bytes;
-        self.images.push_back(StoredSixelImage {
-            id: self.next_image,
-            output_line: decoded.output_line,
-            column: if self.sixel.output_line() == decoded.output_line {
-                self.emulator.cursor_position().1
-            } else {
-                0
-            },
-            width: decoded.width,
-            height: decoded.height,
-            bytes,
-            image,
-        });
-    }
-
-    fn snapshot(&mut self) -> io::Result<TerminalSnapshot> {
-        let mut snapshot = self.emulator.snapshot()?;
-        let cursor_line = self.emulator.cursor_position().0;
-        let current_output_line = self.sixel.output_line();
-        for image in &self.images {
-            let output_delta = current_output_line.saturating_sub(image.output_line);
-            let line = (cursor_line + snapshot.display_offset) as i64
-                - output_delta.min(i64::MAX as u64) as i64;
-            let occupied = image
-                .height
-                .div_ceil(usize::from(self.viewport.cell_height)) as i64;
-            if line < snapshot.lines as i64 && line + occupied > 0 {
-                snapshot.images.push(TerminalImage {
-                    id: image.id,
-                    line: line as i32,
-                    column: image.column as i32,
-                    width: image.width,
-                    height: image.height,
-                    generation: 0,
-                    offset: (0, 0),
-                    source: (0, 0, image.width as u32, image.height as u32),
-                    layer: ImageLayer::BelowBackground,
-                    image: image.image.clone(),
-                });
-            }
-        }
-        Ok(snapshot)
     }
 }
 
@@ -398,10 +306,6 @@ impl TerminalSession {
                 emulator: Emulator::new(viewport)?,
                 viewport,
                 wake: watch::Sender::new(()),
-                sixel: SixelStreamParser::new(Arc::new(AtomicU64::new(0))),
-                images: VecDeque::new(),
-                image_bytes: 0,
-                next_image: 0,
             })),
             pty: None,
         })
@@ -592,9 +496,13 @@ impl TerminalSession {
         batch
     }
 
+    pub fn link_at(&self, line: usize, column: usize) -> Option<LinkTarget> {
+        self.lock().emulator.link_at(line, column)
+    }
+
     pub fn snapshot(&self) -> TerminalSnapshot {
         let mut state = self.lock();
-        state.snapshot().unwrap_or_else(|error| {
+        state.emulator.snapshot().unwrap_or_else(|error| {
             log::warn!("terminal render state unavailable: {error}");
             TerminalSnapshot {
                 columns: state.viewport.columns,

@@ -6,12 +6,30 @@ use std::path::PathBuf;
 pub mod process;
 pub mod terminal;
 
+pub const TERMINAL_PROGRAM: &str = "Craic-libghostty";
+pub const TERMINAL_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub fn terminal_environment() -> HashMap<String, String> {
     let mut environment = std::env::vars().collect::<HashMap<_, _>>();
-    environment.remove("NO_COLOR");
+    // Child PTYs are owned by Craic even when the app was started inside a
+    // multiplexer. Those flags apply only to the parent terminal.
+    for key in [
+        "NO_COLOR",
+        "TMUX",
+        "TMUX_PANE",
+        "ZELLIJ",
+        "ZELLIJ_SESSION_NAME",
+        "ZELLIJ_VERSION",
+    ] {
+        environment.remove(key);
+    }
     environment.insert("TERM".to_string(), "xterm-256color".to_string());
     environment.insert("COLORTERM".to_string(), "truecolor".to_string());
-    environment.insert("TERM_PROGRAM".to_string(), "Craic".to_string());
+    environment.insert("TERM_PROGRAM".to_string(), TERMINAL_PROGRAM.to_string());
+    environment.insert(
+        "TERM_PROGRAM_VERSION".to_string(),
+        TERMINAL_PROGRAM_VERSION.to_string(),
+    );
     environment.insert("CLICOLOR".to_string(), "1".to_string());
     if !["LC_ALL", "LC_CTYPE", "LANG"].into_iter().any(|key| {
         environment.get(key).is_some_and(|value| {

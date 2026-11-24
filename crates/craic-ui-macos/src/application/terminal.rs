@@ -2032,9 +2032,8 @@ impl AppDelegate {
         }
     }
 
-    pub(crate) fn activate_native_terminal_link(&self, value: &str) {
-        log::info!("native terminal link activated target={value}");
-        self.activate_native_agent_link(destination_target(value));
+    pub(crate) fn activate_native_terminal_link(&self, target: LinkTarget) {
+        self.activate_native_agent_link(target);
     }
 
     fn apply_agent_file_link(

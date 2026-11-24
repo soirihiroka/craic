@@ -4,6 +4,7 @@ use crate::system::capabilities::shell::{
     ShellCommandResult, ShellCommandRunRequest, ShellCommandSpec, ShellRunRequest,
 };
 use crate::system::path::{WorkspacePath, WorkspaceRef};
+use craic_platform::{TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
@@ -53,6 +54,17 @@ impl SshShellAccess {
     }
 }
 
+fn remote_terminal_prefix(working_dir: &WorkspacePath) -> String {
+    // OpenSSH sends TERM with the PTY request. TERM_PROGRAM otherwise
+    // depends on the remote server's AcceptEnv configuration.
+    format!(
+        "cd {} && export TERM_PROGRAM={} TERM_PROGRAM_VERSION={} &&",
+        shell_quote(&working_dir.absolute),
+        shell_quote(TERMINAL_PROGRAM),
+        shell_quote(TERMINAL_PROGRAM_VERSION),
+    )
+}
+
 impl ShellAccess for SshShellAccess {
     fn interactive_shell(
         &self,
@@ -60,8 +72,8 @@ impl ShellAccess for SshShellAccess {
     ) -> Result<ShellCommandSpec, String> {
         let working_dir = working_dir.unwrap_or(&self.workspace.root);
         let remote = format!(
-            "cd {} && {{ craic_shell=\"${{SHELL:-/bin/sh}}\"; sh -c {} {} \"$$\" \"${{craic_shell##*/}}\" </dev/null >/dev/null 2>&1 & exec \"$craic_shell\" -i; }}",
-            shell_quote(&working_dir.absolute),
+            "{} {{ craic_shell=\"${{SHELL:-/bin/sh}}\"; sh -c {} {} \"$$\" \"${{craic_shell##*/}}\" </dev/null >/dev/null 2>&1 & exec \"$craic_shell\" -i; }}",
+            remote_terminal_prefix(working_dir),
             shell_quote(REMOTE_SHELL_ACTIVITY_MONITOR),
             shell_quote(REMOTE_SHELL_ACTIVITY_NOTIFICATION),
         );
@@ -96,8 +108,8 @@ impl ShellAccess for SshShellAccess {
                 script.push_str(&shell_quote(arg));
             }
             let remote = format!(
-                "cd {} && exec \"${{SHELL:-/bin/sh}}\" -i -c {}",
-                shell_quote(&working_dir.absolute),
+                "{} exec \"${{SHELL:-/bin/sh}}\" -i -c {}",
+                remote_terminal_prefix(working_dir),
                 shell_quote(&script)
             );
             log::debug!(
@@ -115,8 +127,8 @@ impl ShellAccess for SshShellAccess {
         }
 
         let mut remote = format!(
-            "cd {} && exec {}",
-            shell_quote(&working_dir.absolute),
+            "{} exec {}",
+            remote_terminal_prefix(working_dir),
             shell_quote(program)
         );
         for arg in args {

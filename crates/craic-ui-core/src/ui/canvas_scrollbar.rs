@@ -290,16 +290,6 @@ pub fn scroll_for_lane_press(
     Some(vertical_scrollbar_scroll_for_press(layout, y))
 }
 
-fn track_rect(width: i32, height: i32) -> Rect {
-    let rect = vertical_scrollbar_track_rect(width as f64, height as f64);
-    Rect {
-        x: rect.x,
-        y: rect.y,
-        width: rect.width,
-        height: rect.height,
-    }
-}
-
 pub fn visual_track_rect(width: i32, height: i32, hover_progress: f64) -> (f64, f64, f64, f64) {
     handle_rect(width, height, hover_progress).tuple()
 }
