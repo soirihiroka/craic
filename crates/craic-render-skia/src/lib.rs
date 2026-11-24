@@ -57,9 +57,9 @@ pub use syntax::{
 };
 pub use terminal::{
     TerminalCell, TerminalCellStyle, TerminalClipboard, TerminalColor, TerminalCursor,
-    TerminalCursorShape, TerminalEventBatch, TerminalImage, TerminalMouseAction,
-    TerminalMouseButton, TerminalMouseModifiers, TerminalScroll, TerminalSearchDirection,
-    TerminalSearchMatch, TerminalSelectionType, TerminalSession, TerminalSide, TerminalSnapshot,
-    TerminalViewport,
+    TerminalCursorShape, TerminalEventBatch, TerminalImage, TerminalKey, TerminalKeyAction,
+    TerminalKeyEvent, TerminalKeyModifiers, TerminalMouseAction, TerminalMouseButton,
+    TerminalMouseModifiers, TerminalScroll, TerminalSearchDirection, TerminalSearchMatch,
+    TerminalSelectionType, TerminalSession, TerminalSide, TerminalSnapshot, TerminalViewport,
 };
 pub use terminal_painter::{TerminalPaintCache, TerminalPaintRequest, paint_terminal};

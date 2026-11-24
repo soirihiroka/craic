@@ -1,4 +1,4 @@
-use craic_ui_terminal::vte::VteTerminal;
+use craic_ui_terminal::gtk_terminal::GtkTerminal;
 use std::cell::OnceCell;
 
 use super::provider::AgentProvider;
@@ -12,7 +12,7 @@ const TITLE_SCAN_ROWS: usize = 1000;
 
 pub fn session_title(
     provider: &'static dyn AgentProvider,
-    terminal: &VteTerminal,
+    terminal: &GtkTerminal,
     _log_scan: bool,
 ) -> Option<String> {
     let text = terminal.text_before_cursor(TITLE_SCAN_ROWS)?;
@@ -26,7 +26,7 @@ pub fn session_title(
 pub fn active_state(
     _session_id: u64,
     provider: &'static dyn AgentProvider,
-    terminal: &VteTerminal,
+    terminal: &GtkTerminal,
     _log_scan: bool,
 ) -> AgentActiveState {
     let window_title = terminal.title();

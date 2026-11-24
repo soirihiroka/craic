@@ -5,13 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-alacritty_terminal.workspace = true
 craic-language.workspace = true
 craic-platform.workspace = true
 craic-text-layout.workspace = true
 libc.workspace = true
 log.workspace = true
 polling.workspace = true
+regex.workspace = true
+rustix-openpty = "0.2"
+tokio.workspace = true
+
+[build-dependencies]
+bindgen = "0.72"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 skia-safe.workspace = true

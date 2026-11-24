@@ -1,7 +1,10 @@
-use skia_safe::{Canvas, Color, Font, FontMgr, FontStyle, Paint, PaintStyle, Rect};
+use skia_safe::{
+    Canvas, Color, Font, FontMgr, FontStyle, Paint, PaintStyle, Rect, canvas::SrcRectConstraint,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::terminal::ImageLayer;
 use crate::{
     TerminalCell, TerminalCellStyle, TerminalColor, TerminalCursorShape, TerminalSnapshot,
 };
@@ -31,6 +34,18 @@ impl TerminalPaintCache {
         }
     }
 
+    pub fn cell_size(&mut self, font_size: f32) -> (u16, u16) {
+        let font = &self.fonts(font_size).regular;
+        let (width, _) = font.measure_str("M", None);
+        let (_, metrics) = font.metrics();
+        (
+            width.ceil().max(1.0) as u16,
+            (metrics.descent - metrics.ascent + metrics.leading)
+                .ceil()
+                .max(1.0) as u16,
+        )
+    }
+
     fn fonts(&mut self, font_size: f32) -> &TerminalFonts {
         if self.font_size.to_bits() != font_size.to_bits() {
             self.font_size = font_size;
@@ -45,7 +60,7 @@ pub fn paint_terminal(
     request: TerminalPaintRequest<'_>,
     cache: &mut TerminalPaintCache,
 ) {
-    let background = Color::from_rgb(30, 30, 30);
+    let background = terminal_color(request.snapshot.background);
     canvas.clear(background);
     canvas.save();
     canvas.clip_rect(
@@ -62,27 +77,63 @@ pub fn paint_terminal(
     let fonts = cache.fonts(request.font_size);
     let baseline =
         ((request.cell_height - request.font_size) / 2.0).max(0.0) + request.font_size * 0.82;
-    let image_paint = Paint::default();
-    for image in &request.snapshot.images {
-        canvas.draw_image(
-            &image.image,
-            (
-                image.column as f32 * request.cell_width,
-                image.line as f32 * request.cell_height,
-            ),
-            Some(&image_paint),
-        );
+    let paint_images = |layer| {
+        let paint = Paint::default();
+        for image in request
+            .snapshot
+            .images
+            .iter()
+            .filter(|image| image.layer == layer)
+        {
+            let (src_x, src_y, width, height) = image.source;
+            let source = Rect::from_xywh(src_x as f32, src_y as f32, width as f32, height as f32);
+            let destination = Rect::from_xywh(
+                image.column as f32 * request.cell_width + image.offset.0 as f32,
+                image.line as f32 * request.cell_height + image.offset.1 as f32,
+                image.width as f32,
+                image.height as f32,
+            );
+            canvas.draw_image_rect(
+                &image.image,
+                Some((&source, SrcRectConstraint::Strict)),
+                destination,
+                &paint,
+            );
+        }
+    };
+    paint_images(ImageLayer::BelowBackground);
+    for cell in &request.snapshot.cells {
+        let (_, cell_background) = cell_colors(cell);
+        if cell_background != background {
+            let mut paint = Paint::default();
+            paint.set_color(cell_background);
+            canvas.draw_rect(
+                Rect::from_xywh(
+                    cell.column as f32 * request.cell_width,
+                    cell.line as f32 * request.cell_height,
+                    if cell.style.wide {
+                        request.cell_width * 2.0
+                    } else {
+                        request.cell_width
+                    },
+                    request.cell_height,
+                ),
+                &paint,
+            );
+        }
     }
+    paint_images(ImageLayer::BelowText);
     for cell in &request.snapshot.cells {
         paint_cell(
             canvas,
-            &fonts,
+            fonts,
             cell,
             request.cell_width,
             request.cell_height,
             baseline,
         );
     }
+    paint_images(ImageLayer::AboveText);
 
     if request.cursor_visible
         && let Some(cursor) = request.snapshot.cursor
@@ -179,37 +230,7 @@ fn paint_cell(
 ) {
     let x = cell.column as f32 * cell_width;
     let y = cell.line as f32 * cell_height;
-    let (mut foreground, mut background) = (
-        terminal_color(cell.foreground, true),
-        terminal_color(cell.background, false),
-    );
-    if cell.style.inverse {
-        std::mem::swap(&mut foreground, &mut background);
-    }
-    if cell.style.dim {
-        foreground = dim_color(foreground);
-    }
-    if cell.selected {
-        background = Color::from_rgb(46, 95, 145);
-        foreground = Color::WHITE;
-    }
-    if background != Color::from_rgb(30, 30, 30) {
-        let mut paint = Paint::default();
-        paint.set_color(background);
-        canvas.draw_rect(
-            Rect::from_xywh(
-                x,
-                y,
-                if cell.style.wide {
-                    cell_width * 2.0
-                } else {
-                    cell_width
-                },
-                cell_height,
-            ),
-            &paint,
-        );
-    }
+    let (foreground, _) = cell_colors(cell);
     if !cell.style.hidden && !cell.text.trim_matches([' ', '\t']).is_empty() {
         let mut paint = Paint::default();
         paint.set_color(foreground);
@@ -254,7 +275,14 @@ impl TerminalFonts {
         let font = |style| {
             Font::new(
                 manager
-                    .match_family_style("Menlo", style)
+                    .match_family_style(
+                        if cfg!(target_os = "macos") {
+                            "Menlo"
+                        } else {
+                            "monospace"
+                        },
+                        style,
+                    )
                     .or_else(|| manager.legacy_make_typeface(None, style))
                     .expect("Skia must provide a terminal typeface"),
                 size,
@@ -362,62 +390,25 @@ impl ResolvedTerminalFont<'_> {
     }
 }
 
-fn terminal_color(color: TerminalColor, foreground: bool) -> Color {
-    match color {
-        TerminalColor::Rgb(red, green, blue) => Color::from_rgb(red, green, blue),
-        TerminalColor::Indexed(index) => indexed_color(index),
-        TerminalColor::Named(index) => match index {
-            0..=15 => indexed_color(index as u8),
-            256 | 267 => Color::from_rgb(224, 224, 224),
-            257 | 268 => Color::from_rgb(30, 30, 30),
-            258 => Color::from_rgb(224, 224, 224),
-            259..=266 => dim_color(indexed_color((index - 259) as u8)),
-            _ if foreground => Color::from_rgb(224, 224, 224),
-            _ => Color::from_rgb(30, 30, 30),
-        },
-    }
+fn terminal_color(TerminalColor(red, green, blue): TerminalColor) -> Color {
+    Color::from_rgb(red, green, blue)
 }
 
-fn indexed_color(index: u8) -> Color {
-    const ANSI: [(u8, u8, u8); 16] = [
-        (30, 30, 30),
-        (205, 49, 49),
-        (13, 188, 121),
-        (229, 229, 16),
-        (36, 114, 200),
-        (188, 63, 188),
-        (17, 168, 205),
-        (229, 229, 229),
-        (102, 102, 102),
-        (241, 76, 76),
-        (35, 209, 139),
-        (245, 245, 67),
-        (59, 142, 234),
-        (214, 112, 214),
-        (41, 184, 219),
-        (255, 255, 255),
-    ];
-    match index {
-        0..=15 => {
-            let (red, green, blue) = ANSI[index as usize];
-            Color::from_rgb(red, green, blue)
-        }
-        16..=231 => {
-            let index = index - 16;
-            let red = cube_component(index / 36);
-            let green = cube_component((index / 6) % 6);
-            let blue = cube_component(index % 6);
-            Color::from_rgb(red, green, blue)
-        }
-        232..=255 => {
-            let gray = 8 + (index - 232) * 10;
-            Color::from_rgb(gray, gray, gray)
-        }
+fn cell_colors(cell: &TerminalCell) -> (Color, Color) {
+    if cell.selected {
+        return (Color::WHITE, Color::from_rgb(46, 95, 145));
     }
-}
-
-fn cube_component(value: u8) -> u8 {
-    if value == 0 { 0 } else { 55 + value * 40 }
+    let (mut fg, mut bg) = (
+        terminal_color(cell.foreground),
+        terminal_color(cell.background),
+    );
+    if cell.style.inverse {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if cell.style.dim {
+        fg = dim_color(fg);
+    }
+    (fg, bg)
 }
 
 fn dim_color(color: Color) -> Color {

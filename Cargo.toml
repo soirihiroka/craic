@@ -14,7 +14,6 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 adw = { package = "libadwaita", version = "0.9", features = ["v1_9"] }
-alacritty_terminal = "0.26.0"
 async-trait = "0.1"
 base64 = "0.22.1"
 block2 = "0.6.2"
@@ -126,15 +125,9 @@ typos-dict = "0.13.31"
 unicase = "2.9.0"
 unicode-segmentation = "1.13"
 uuid = { version = "1", features = ["serde", "v4"] }
-vte4 = { version = "0.10", features = ["v0_84"] }
 walkdir = "2"
 webkit6 = "0.6"
 zeroize = "1"
-
-# The native terminal executes these crates on every PTY update and rendered frame. Keep the
-# application debuggable while avoiding pathologically slow terminal parsing/painting in `make dev`.
-[profile.dev.package.alacritty_terminal]
-opt-level = 2
 
 [profile.dev.package.craic-render-skia]
 opt-level = 2

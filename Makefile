@@ -35,6 +35,7 @@ else
 APPLICATIONSDIR ?= $(DATADIR)/applications
 endif
 APPDATADIR ?= $(DATADIR)/$(BIN_NAME)
+GHOSTTY_VT_LICENSES := $(wildcard data/licenses/ghostty-vt/*)
 ICON_THEME_DIR ?= $(DATADIR)/icons/hicolor
 ICONDIR ?= $(ICON_THEME_DIR)/scalable/apps
 FONTDIR ?= $(DATADIR)/fonts/$(BIN_NAME)/JetBrainsMono
@@ -111,6 +112,8 @@ macos-app: $(MACOS_ICON_CATALOG) $(MACOS_APP_ICON)
 	$(INSTALL) -m 0644 "data/macos/Info.plist" "$(DEBUG_APP_BUNDLE)/Contents/Info.plist"
 	$(INSTALL) -m 0644 "$(MACOS_APP_ICON)" "$(DEBUG_APP_BUNDLE)/Contents/Resources/CraicIcon.icns"
 	$(INSTALL) -m 0644 "$(MACOS_ICON_CATALOG)" "$(DEBUG_APP_BUNDLE)/Contents/Resources/Assets.car"
+	$(INSTALL) -d "$(DEBUG_APP_BUNDLE)/Contents/Resources/Licenses/ghostty-vt"
+	$(INSTALL) -m 0644 $(GHOSTTY_VT_LICENSES) "$(DEBUG_APP_BUNDLE)/Contents/Resources/Licenses/ghostty-vt/"
 	$(INSTALL) -m 0755 "$(CARGO_TARGET_DIR)/debug/$(BIN_NAME)" "$(DEBUG_APP_EXECUTABLE)"
 
 run-macos: macos-app
@@ -127,21 +130,28 @@ clean-incremental:
 ifeq ($(UNAME_S),Darwin)
 install: release $(MACOS_ICON_CATALOG) $(MACOS_APP_ICON)
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"
+	$(INSTALL) -d "$(DESTDIR)$(DATADIR)/licenses/$(BIN_NAME)/ghostty-vt"
+	$(INSTALL) -m 0644 $(GHOSTTY_VT_LICENSES) "$(DESTDIR)$(DATADIR)/licenses/$(BIN_NAME)/ghostty-vt/"
 	$(INSTALL) -m 0755 "$(CARGO_TARGET_DIR)/release/$(BIN_NAME)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
 	$(INSTALL) -d "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/MacOS"
 	$(INSTALL) -d "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/Resources"
 	$(INSTALL) -m 0644 "data/macos/Info.plist" "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/Info.plist"
 	$(INSTALL) -m 0644 "$(MACOS_APP_ICON)" "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/Resources/CraicIcon.icns"
 	$(INSTALL) -m 0644 "$(MACOS_ICON_CATALOG)" "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/Resources/Assets.car"
+	$(INSTALL) -d "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/Resources/Licenses/ghostty-vt"
+	$(INSTALL) -m 0644 $(GHOSTTY_VT_LICENSES) "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/Resources/Licenses/ghostty-vt/"
 	$(INSTALL) -m 0755 "$(CARGO_TARGET_DIR)/release/$(BIN_NAME)" "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app/Contents/MacOS/$(BIN_NAME)"
 	@echo "Installed $(APP_NAME) to $(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app"
 
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
+	rm -rf "$(DESTDIR)$(DATADIR)/licenses/$(BIN_NAME)/ghostty-vt"
 	rm -rf "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_NAME).app"
 else
 install: release
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"
+	$(INSTALL) -d "$(DESTDIR)$(DATADIR)/licenses/$(BIN_NAME)/ghostty-vt"
+	$(INSTALL) -m 0644 $(GHOSTTY_VT_LICENSES) "$(DESTDIR)$(DATADIR)/licenses/$(BIN_NAME)/ghostty-vt/"
 	$(INSTALL) -m 0755 "$(CARGO_TARGET_DIR)/release/$(BIN_NAME)" "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
 	$(INSTALL) -d "$(DESTDIR)$(APPLICATIONSDIR)"
 	$(SED) -e "s|@APP_ID@|$(APP_ID)|g" \
@@ -168,6 +178,7 @@ install: release
 
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/$(BIN_NAME)"
+	rm -rf "$(DESTDIR)$(DATADIR)/licenses/$(BIN_NAME)/ghostty-vt"
 	rm -f "$(DESTDIR)$(APPLICATIONSDIR)/$(APP_ID).desktop"
 	rm -f "$(DESTDIR)$(ICONDIR)/$(APP_ID).svg"
 	rm -rf "$(DESTDIR)$(APPDATADIR)"

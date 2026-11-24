@@ -20,7 +20,7 @@ the repository configuration reflects whether package signatures are enabled.
 Requirements
 ------------
 
-Craic requires Rust, Cargo, GTK 4, Libadwaita, GtkSourceView 5, VTE, WebKitGTK,
+Craic requires Rust, Cargo, GTK 4, Libadwaita, GtkSourceView 5, WebKitGTK,
 Poppler GLib, GObject Introspection, and pkg-config.
 
 Fedora
@@ -28,10 +28,10 @@ Fedora
 
 .. code-block:: console
 
-   $ sudo dnf install rust cargo clang clang-devel gcc-c++ make python3 git \
+   $ sudo dnf install rust cargo clang clang-devel llvm gcc-c++ make python3 git \
        gtk4-devel webkitgtk6.0-devel libpanel-devel fontconfig-devel \
        freetype-devel mesa-libEGL-devel mesa-libGL-devel wayland-devel \
-       gtksourceview5-devel libadwaita-devel vte291-gtk4-devel \
+       gtksourceview5-devel libadwaita-devel curl xz \
        poppler-glib-devel gobject-introspection-devel pkgconf-pkg-config
 
 Ubuntu and Debian
@@ -40,8 +40,23 @@ Ubuntu and Debian
 .. code-block:: console
 
    $ sudo apt install rustc cargo libgtk-4-dev libgtksourceview-5-dev \
-       libadwaita-1-dev libvte-2.91-gtk4-dev libpoppler-glib-dev \
+       libadwaita-1-dev curl xz-utils llvm libclang-dev libpoppler-glib-dev \
        gobject-introspection pkg-config
+
+Terminal engine
+~~~~~~~~~~~~~~~
+
+Craic statically links Ghostty's terminal emulation library, libghostty-vt.
+The first build fetches and verifies the pinned Ghostty release. On Linux,
+the build uses Zig 0.17 or downloads the pinned compiler if needed. On
+macOS, the build uses Ghostty's published macOS static library and requires
+the Xcode tools. Craic also uses ``llvm-nm`` and ``llvm-objcopy`` to keep
+Ghostty's bundled Wuffs library separate from Skia's. On macOS these are
+available through Homebrew's ``llvm`` package. Set ``GHOSTTY_VT_DIR`` to
+use a local installation of
+libghostty-vt 1.0.1 or a compatible 1.x release. The directory must
+contain ``include/ghostty/vt.h`` and a self-contained static archive at
+``lib/libghostty-vt.a``.
 
 Run from source
 ---------------

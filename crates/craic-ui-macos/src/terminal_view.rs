@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use crate::application::AppDelegate;
 use craic_render_skia::{
-    TerminalClipboard, TerminalMouseAction, TerminalMouseButton, TerminalMouseModifiers,
+    TerminalClipboard, TerminalColor, TerminalKey, TerminalKeyAction, TerminalKeyEvent,
+    TerminalKeyModifiers, TerminalMouseAction, TerminalMouseButton, TerminalMouseModifiers,
     TerminalPaintCache, TerminalPaintRequest, TerminalScroll, TerminalSearchDirection,
     TerminalSelectionType, TerminalSession, TerminalSide, TerminalSnapshot, TerminalViewport,
     paint_terminal,
@@ -41,7 +42,15 @@ use skia_safe::gpu::{self, DirectContext, SurfaceOrigin, backend_render_targets,
 const BASE_FONT_SIZE: f64 = 13.0;
 const BASE_CELL_WIDTH: f64 = 8.0;
 const BASE_CELL_HEIGHT: f64 = 18.0;
-const REPORTED_ACTIVITY_TITLE_PREFIX: &str = "craic-terminal-activity:";
+
+#[derive(Clone, Copy)]
+struct TerminalKeyInput {
+    code: u16,
+    key: TerminalKey,
+    action: TerminalKeyAction,
+    modifiers: TerminalKeyModifiers,
+    unshifted: Option<char>,
+}
 
 struct MetalState {
     _device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -73,6 +82,8 @@ pub(crate) struct TerminalMetalViewIvars {
     accessibility_timestamp: Cell<Option<Instant>>,
     accessibility_dirty: Cell<bool>,
     marked_text: RefCell<String>,
+    interpreting_key: Cell<Option<TerminalKeyInput>>,
+    pressed_keys: RefCell<std::collections::HashMap<u16, TerminalKeyInput>>,
     title: RefCell<String>,
     title_button: RefCell<Option<Retained<NSButton>>>,
     activation_delegate: RefCell<Weak<AppDelegate>>,
@@ -132,43 +143,34 @@ define_class!(
         ) {
             let text = terminal_input_text(string);
             self.ivars().marked_text.borrow_mut().clear();
-            self.send_input(text.into_bytes());
+            if let Some(input) = self.ivars().interpreting_key.take() {
+                if self.send_key(input, &text) {
+                    self.ivars().pressed_keys.borrow_mut().insert(input.code, input);
+                }
+            } else {
+                self.send_input(text.into_bytes());
+            }
         }
 
         #[unsafe(method(doCommandBySelector:))]
         unsafe fn do_command_by_selector(&self, selector: Sel) {
-            let input = if selector == sel!(insertNewline:) {
-                Some("\r")
+            let key = if selector == sel!(insertNewline:) {
+                TerminalKey::Enter
             } else if selector == sel!(insertTab:) {
-                Some("\t")
+                TerminalKey::Tab
             } else if selector == sel!(deleteBackward:) {
-                Some("\x7f")
+                TerminalKey::Backspace
             } else if selector == sel!(deleteForward:) {
-                Some("\x1b[3~")
+                TerminalKey::Delete
             } else if selector == sel!(cancelOperation:) {
-                Some("\x1b")
-            } else if selector == sel!(moveUp:) {
-                Some("\x1b[A")
-            } else if selector == sel!(moveDown:) {
-                Some("\x1b[B")
-            } else if selector == sel!(moveRight:) {
-                Some("\x1b[C")
-            } else if selector == sel!(moveLeft:) {
-                Some("\x1b[D")
-            } else if selector == sel!(moveToBeginningOfLine:) {
-                Some("\x1b[H")
-            } else if selector == sel!(moveToEndOfLine:) {
-                Some("\x1b[F")
-            } else if selector == sel!(pageUp:) {
-                Some("\x1b[5~")
-            } else if selector == sel!(pageDown:) {
-                Some("\x1b[6~")
+                TerminalKey::Escape
             } else {
-                None
+                return;
             };
-            if let Some(input) = input {
-                self.send_input(input.as_bytes().to_vec());
-            }
+            self.send_key(TerminalKeyInput {
+                code: 0, key, action: TerminalKeyAction::Press,
+                modifiers: TerminalKeyModifiers::default(), unshifted: None,
+            }, "");
         }
 
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
@@ -304,6 +306,7 @@ define_class!(
         fn resign_first_responder(&self) -> bool {
             self.ivars().focused.set(false);
             self.ivars().marked_text.borrow_mut().clear();
+            self.ivars().pressed_keys.borrow_mut().clear();
             if let Some(session) = self.ivars().session.borrow().as_ref() {
                 session.report_focus(false);
             }
@@ -533,33 +536,6 @@ define_class!(
                 .charactersIgnoringModifiers()
                 .map(|text| text.to_string())
                 .unwrap_or_default();
-            let mut modifier_parameter = 1;
-            if modifiers.contains(NSEventModifierFlags::Shift) {
-                modifier_parameter += 1;
-            }
-            if modifiers.contains(NSEventModifierFlags::Option) {
-                modifier_parameter += 2;
-            }
-            if modifiers.contains(NSEventModifierFlags::Control) {
-                modifier_parameter += 4;
-            }
-            if modifiers.contains(NSEventModifierFlags::Command) {
-                modifier_parameter += 8;
-            }
-            let disambiguates_modified_keys = self
-                .ivars()
-                .session
-                .borrow()
-                .as_ref()
-                .is_some_and(TerminalSession::disambiguates_modified_keys);
-            if disambiguates_modified_keys
-                && modifier_parameter != 1
-                && let Some(sequence) =
-                    terminal_special_key(event.keyCode(), modifier_parameter)
-            {
-                self.send_input(sequence.into_bytes());
-                return;
-            }
             if modifiers.contains(NSEventModifierFlags::Command) {
                 let font_delta = match (unmodified.as_str(), event.keyCode()) {
                     ("=" | "+", _) | (_, 69) => Some(1.0),
@@ -592,18 +568,41 @@ define_class!(
                     _ => return,
                 }
             }
-            if modifiers.contains(NSEventModifierFlags::Control)
-                && let Some(character) = unmodified.chars().next()
-                && character.is_ascii()
-            {
-                self.send_input(vec![(character.to_ascii_uppercase() as u8) & 0x1f]);
+            let code = event.keyCode();
+            let special = terminal_special_key(code);
+            let unshifted = event.charactersByApplyingModifiers(NSEventModifierFlags::empty())
+                .map(|characters| characters.to_string())
+                .unwrap_or(unmodified)
+                .chars().next().filter(|ch| !ch.is_control());
+            let Some(key) = special.or_else(|| unshifted.map(TerminalKey::Character)) else {
+                self.interpretKeyEvents(&NSArray::from_slice(&[event]));
                 return;
+            };
+            let input = TerminalKeyInput {
+                code, key,
+                action: if event.isARepeat() { TerminalKeyAction::Repeat } else { TerminalKeyAction::Press },
+                modifiers: terminal_modifiers(modifiers),
+                unshifted: if special.is_none() { unshifted } else { None },
+            };
+            if (special.is_some() && self.ivars().marked_text.borrow().is_empty()) || input.modifiers.control {
+                if self.send_key(input, "") {
+                    self.ivars().pressed_keys.borrow_mut().insert(code, input);
+                }
+            } else {
+                self.ivars().interpreting_key.set(Some(input));
+                self.interpretKeyEvents(&NSArray::from_slice(&[event]));
+                self.ivars().interpreting_key.set(None);
             }
-            if let Some(sequence) = terminal_special_key(event.keyCode(), 1) {
-                self.send_input(sequence.into_bytes());
-                return;
+        }
+
+        #[unsafe(method(keyUp:))]
+        fn key_up(&self, event: &NSEvent) {
+            let input = self.ivars().pressed_keys.borrow_mut().remove(&event.keyCode());
+            if let Some(mut input) = input {
+                input.action = TerminalKeyAction::Release;
+                input.modifiers = terminal_modifiers(event.modifierFlags());
+                self.send_key(input, "");
             }
-            self.interpretKeyEvents(&NSArray::from_slice(&[event]));
         }
 
         #[unsafe(method_id(menuForEvent:))]
@@ -760,6 +759,7 @@ impl TerminalMetalView {
                 lines: 1,
                 display_offset: 0,
                 cursor: None,
+                background: TerminalColor(30, 30, 30),
                 cells: Vec::new(),
                 images: Vec::new(),
             }),
@@ -775,6 +775,8 @@ impl TerminalMetalView {
             accessibility_timestamp: Cell::new(None),
             accessibility_dirty: Cell::new(true),
             marked_text: RefCell::new(String::new()),
+            interpreting_key: Cell::new(None),
+            pressed_keys: RefCell::new(std::collections::HashMap::new()),
             title: RefCell::new("Terminal".to_owned()),
             title_button: RefCell::new(None),
             activation_delegate: RefCell::new(Weak::default()),
@@ -929,7 +931,7 @@ impl TerminalMetalView {
             .collect::<Vec<_>>()
             .join(" ");
         if !text.is_empty() {
-            self.send_input(text.into_bytes());
+            self.paste_text(&text);
         }
     }
 
@@ -1087,32 +1089,28 @@ impl TerminalMetalView {
     }
 
     fn drain_terminal_events(&self) {
-        let batch = self.ivars().session.borrow().as_ref().map(|session| {
-            session.drain_events_with_clipboard(|| {
-                NSPasteboard::generalPasteboard()
-                    .stringForType(unsafe { NSPasteboardTypeString })
-                    .map(|text| text.to_string())
-            })
-        });
+        let batch = self
+            .ivars()
+            .session
+            .borrow()
+            .as_ref()
+            .map(TerminalSession::drain_events);
         let Some(batch) = batch else { return };
         if let Some((kind, text)) = batch.clipboard_store {
             self.store_clipboard(kind, &text);
         }
+        if let Some(active) = batch.activity
+            && let Some(delegate) = self.ivars().activation_delegate.borrow().load()
+        {
+            delegate
+                .native_terminal_reported_activity_changed(self.ivars().session_id.get(), active);
+        }
         if let Some(title) = batch.title {
             let title = title
+                .as_deref()
                 .filter(|title| !title.trim().is_empty())
-                .unwrap_or_else(|| "Terminal".to_owned());
-            match title.strip_prefix(REPORTED_ACTIVITY_TITLE_PREFIX) {
-                Some("active") | Some("idle") => {
-                    if let Some(delegate) = self.ivars().activation_delegate.borrow().load() {
-                        delegate.native_terminal_reported_activity_changed(
-                            self.ivars().session_id.get(),
-                            title.ends_with("active"),
-                        );
-                    }
-                }
-                _ => self.set_session_title(&title),
-            }
+                .unwrap_or("Terminal");
+            self.set_session_title(title);
         }
         if batch.bell {
             objc2_app_kit::NSBeep();
@@ -1283,23 +1281,55 @@ impl TerminalMetalView {
         if let Some(text) =
             NSPasteboard::generalPasteboard().stringForType(unsafe { NSPasteboardTypeString })
         {
-            self.send_input(text.to_string().into_bytes());
+            self.paste_text(&text.to_string());
+        }
+    }
+
+    fn paste_text(&self, text: &str) {
+        if let Some(session) = self.ivars().session.borrow().as_ref()
+            && let Err(error) = session.paste(text)
+            && session.lifecycle() == TerminalLifecycle::Running
+        {
+            log::warn!("native terminal paste failed: {error}");
+        }
+        self.update_snapshot();
+        self.render_frame();
+    }
+
+    fn send_key(&self, input: TerminalKeyInput, text: &str) -> bool {
+        let result = self.ivars().session.borrow().as_ref().map(|session| {
+            session.send_key(TerminalKeyEvent {
+                key: input.key,
+                action: input.action,
+                modifiers: input.modifiers,
+                consumed_modifiers: TerminalKeyModifiers {
+                    alt: !text.is_empty() && input.modifiers.alt,
+                    shift: !text.is_empty() && input.modifiers.shift,
+                    ..Default::default()
+                },
+                text,
+                unshifted: input.unshifted,
+            })
+        });
+        match result {
+            Some(Ok(true)) => {
+                self.ivars().cursor_visible.set(true);
+                self.update_snapshot();
+                self.start_display_link();
+                true
+            }
+            Some(Err(error)) => {
+                log::debug!("native terminal key input failed: {error}");
+                false
+            }
+            _ => false,
         }
     }
 
     fn select_all(&self) {
-        let snapshot = self.ivars().snapshot.borrow();
-        let session_ref = self.ivars().session.borrow();
-        let Some(session) = session_ref.as_ref() else {
-            return;
-        };
-        session.begin_selection(0, 0, TerminalSelectionType::Simple, TerminalSide::Left);
-        session.update_selection(
-            snapshot.lines.saturating_sub(1),
-            snapshot.columns.saturating_sub(1),
-            TerminalSide::Right,
-        );
-        drop(snapshot);
+        if let Some(session) = self.ivars().session.borrow().as_ref() {
+            session.select_all();
+        }
         self.update_snapshot();
         self.render_frame();
     }
@@ -1359,13 +1389,12 @@ impl TerminalMetalView {
             return false;
         }
         let point = self.convertPoint_fromView(event.locationInWindow(), None);
-        let (line, column, _) = self.terminal_grid_point(point);
         self.ivars()
             .session
             .borrow()
             .as_ref()
             .is_some_and(|session| {
-                session.report_mouse(
+                session.report_mouse_at(
                     button,
                     action,
                     TerminalMouseModifiers {
@@ -1373,8 +1402,10 @@ impl TerminalMetalView {
                         option: false,
                         control: flags.contains(NSEventModifierFlags::Control),
                     },
-                    line,
-                    column,
+                    (point.x * f64::from(self.viewport().cell_width)
+                        / self.ivars().cell_width.get()) as f32,
+                    (point.y * f64::from(self.viewport().cell_height)
+                        / self.ivars().cell_height.get()) as f32,
                 )
             })
     }
@@ -1473,51 +1504,65 @@ fn terminal_input_text(string: &AnyObject) -> String {
     }
 }
 
-fn terminal_special_key(key_code: u16, modifier_parameter: u8) -> Option<String> {
-    if modifier_parameter != 1 {
-        let sequence = match key_code {
-            36 | 76 => format!("\x1b[13;{modifier_parameter}:1u"),
-            48 => format!("\x1b[9;{modifier_parameter}:1u"),
-            51 => format!("\x1b[127;{modifier_parameter}:1u"),
-            53 => format!("\x1b[27;{modifier_parameter}:1u"),
-            117 => format!("\x1b[3;{modifier_parameter}~"),
-            123 => format!("\x1b[1;{modifier_parameter}D"),
-            124 => format!("\x1b[1;{modifier_parameter}C"),
-            125 => format!("\x1b[1;{modifier_parameter}B"),
-            126 => format!("\x1b[1;{modifier_parameter}A"),
-            115 => format!("\x1b[1;{modifier_parameter}H"),
-            119 => format!("\x1b[1;{modifier_parameter}F"),
-            116 => format!("\x1b[5;{modifier_parameter}~"),
-            121 => format!("\x1b[6;{modifier_parameter}~"),
-            122 => format!("\x1b[11;{modifier_parameter}~"),
-            120 => format!("\x1b[12;{modifier_parameter}~"),
-            99 => format!("\x1b[13;{modifier_parameter}~"),
-            118 => format!("\x1b[14;{modifier_parameter}~"),
-            _ => return None,
-        };
-        return Some(sequence);
+fn terminal_modifiers(flags: NSEventModifierFlags) -> TerminalKeyModifiers {
+    TerminalKeyModifiers {
+        shift: flags.contains(NSEventModifierFlags::Shift),
+        alt: flags.contains(NSEventModifierFlags::Option),
+        control: flags.contains(NSEventModifierFlags::Control),
+        super_key: flags.contains(NSEventModifierFlags::Command),
+        caps_lock: flags.contains(NSEventModifierFlags::CapsLock),
+        num_lock: false,
     }
+}
 
-    match key_code {
-        36 | 76 => Some("\r".to_string()),
-        48 => Some("\t".to_string()),
-        51 => Some("\x7f".to_string()),
-        53 => Some("\x1b".to_string()),
-        117 => Some("\x1b[3~".to_string()),
-        123 => Some("\x1b[D".to_string()),
-        124 => Some("\x1b[C".to_string()),
-        125 => Some("\x1b[B".to_string()),
-        126 => Some("\x1b[A".to_string()),
-        115 => Some("\x1b[H".to_string()),
-        119 => Some("\x1b[F".to_string()),
-        116 => Some("\x1b[5~".to_string()),
-        121 => Some("\x1b[6~".to_string()),
-        122 => Some("\x1bOP".to_string()),
-        120 => Some("\x1bOQ".to_string()),
-        99 => Some("\x1bOR".to_string()),
-        118 => Some("\x1bOS".to_string()),
-        _ => None,
-    }
+fn terminal_special_key(key_code: u16) -> Option<TerminalKey> {
+    use TerminalKey::*;
+    Some(match key_code {
+        36 => Enter,
+        48 => Tab,
+        51 => Backspace,
+        53 => Escape,
+        65 => KeypadDecimal,
+        67 => KeypadMultiply,
+        69 => KeypadAdd,
+        75 => KeypadDivide,
+        76 => KeypadEnter,
+        78 => KeypadSubtract,
+        81 => KeypadEqual,
+        82..=89 => Keypad((key_code - 82) as u8),
+        91 | 92 => Keypad((key_code - 83) as u8),
+        122 => Function(1),
+        120 => Function(2),
+        99 => Function(3),
+        118 => Function(4),
+        96 => Function(5),
+        97 => Function(6),
+        98 => Function(7),
+        100 => Function(8),
+        101 => Function(9),
+        109 => Function(10),
+        103 => Function(11),
+        111 => Function(12),
+        105 => Function(13),
+        107 => Function(14),
+        113 => Function(15),
+        106 => Function(16),
+        64 => Function(17),
+        79 => Function(18),
+        80 => Function(19),
+        90 => Function(20),
+        114 => Insert,
+        115 => Home,
+        116 => PageUp,
+        117 => Delete,
+        119 => End,
+        121 => PageDown,
+        123 => Left,
+        124 => Right,
+        125 => Down,
+        126 => Up,
+        _ => return None,
+    })
 }
 
 fn terminal_accessibility_text(snapshot: &TerminalSnapshot) -> String {
@@ -1533,7 +1578,7 @@ fn terminal_accessibility_text(snapshot: &TerminalSnapshot) -> String {
             line.push(' ');
         }
         line.push_str(&format!(
-            "[Sixel image, {} by {} pixels]",
+            "[Terminal image, {} by {} pixels]",
             image.width, image.height
         ));
     }

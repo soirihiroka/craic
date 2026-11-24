@@ -1,10 +1,7 @@
 use crate::config;
+use crate::gtk_terminal::GtkTerminal;
 use crate::system::capabilities::shell::{ShellCommandActivity, ShellCommandSpec};
-use crate::ui::components::{
-    search::{SearchOption, SearchPanel},
-    terminal as terminal_component,
-};
-use crate::vte::VteTerminal;
+use crate::ui::components::search::{SearchOption, SearchPanel};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
@@ -46,7 +43,7 @@ struct TerminalSession {
     id: u64,
     root: gtk::Overlay,
     row: gtk::ListBoxRow,
-    terminal: VteTerminal,
+    terminal: GtkTerminal,
     child_pid: Rc<Cell<Option<glib::Pid>>>,
     activity: ShellCommandActivity,
     reported_task_name: Rc<RefCell<Option<String>>>,
@@ -620,16 +617,16 @@ fn reorder_session_rows(
     true
 }
 
-fn configured_terminal(font_size: f64) -> VteTerminal {
-    VteTerminal::new(font_size)
+fn configured_terminal(font_size: f64) -> GtkTerminal {
+    GtkTerminal::new(font_size)
 }
 
-fn set_terminal_font(terminal: &VteTerminal, font_size: f64) {
+fn set_terminal_font(terminal: &GtkTerminal, font_size: f64) {
     terminal.set_font_size(font_size);
 }
 
 fn install_terminal_shortcuts(
-    terminal: &VteTerminal,
+    terminal: &GtkTerminal,
     sessions: &Rc<RefCell<Vec<TerminalSession>>>,
     search_panel: &SearchPanel,
 ) {
@@ -698,19 +695,14 @@ fn install_terminal_shortcuts(
                 return glib::Propagation::Stop;
             }
 
-            if let Some(sequence) = terminal_component::modified_enter_sequence(key, modifiers) {
-                terminal.feed_child(sequence.as_bytes());
-                return glib::Propagation::Stop;
-            }
-
             glib::Propagation::Proceed
         }
     });
-    terminal.terminal().add_controller(keys);
+    terminal.add_controller(keys);
 }
 
 fn set_terminal_font_for_sessions(
-    terminal: &VteTerminal,
+    terminal: &GtkTerminal,
     sessions: &Rc<RefCell<Vec<TerminalSession>>>,
     font_size: f64,
 ) {
@@ -737,7 +729,7 @@ fn font_size_delta_for_key(key: gdk::Key, modifiers: gdk::ModifierType) -> Optio
     None
 }
 
-fn install_terminal_activation(terminal: &VteTerminal, activation_handlers: &ActivationHandlers) {
+fn install_terminal_activation(terminal: &GtkTerminal, activation_handlers: &ActivationHandlers) {
     terminal.connect_activation({
         let activation_handlers = activation_handlers.clone();
 
@@ -777,7 +769,7 @@ fn connect_terminal_search_option(
 fn active_terminal(
     sessions: &Rc<RefCell<Vec<TerminalSession>>>,
     session_rail: &gtk::ListBox,
-) -> Option<VteTerminal> {
+) -> Option<GtkTerminal> {
     session_rail
         .selected_row()
         .and_then(|row| session_by_row(sessions, &row))
@@ -785,7 +777,7 @@ fn active_terminal(
 }
 
 fn apply_terminal_search(
-    terminal: &VteTerminal,
+    terminal: &GtkTerminal,
     search_panel: &SearchPanel,
     options: &TerminalSearchOptions,
     search_move: TerminalSearchMove,
@@ -836,7 +828,7 @@ fn terminal_search_pattern(query: &str, options: &TerminalSearchOptions) -> Stri
     pattern
 }
 
-fn install_focus_tracking(terminal: &VteTerminal, focus_handlers: &FocusHandlers) {
+fn install_focus_tracking(terminal: &GtkTerminal, focus_handlers: &FocusHandlers) {
     let focus = gtk::EventControllerFocus::new();
     focus.connect_enter({
         let focus_handlers = focus_handlers.clone();
@@ -848,7 +840,7 @@ fn install_focus_tracking(terminal: &VteTerminal, focus_handlers: &FocusHandlers
 
         move |_| notify_focus_handlers(&focus_handlers, false)
     });
-    terminal.terminal().add_controller(focus);
+    terminal.add_controller(focus);
 }
 
 fn notify_focus_handlers(focus_handlers: &FocusHandlers, focused: bool) {
@@ -859,7 +851,7 @@ fn notify_focus_handlers(focus_handlers: &FocusHandlers, focused: bool) {
 
 fn install_terminal_interaction_trackers(
     session_id: u64,
-    terminal: &VteTerminal,
+    terminal: &GtkTerminal,
     state: &Rc<Cell<TerminalSessionState>>,
     exit_success: &Rc<Cell<bool>>,
     root: &gtk::Box,
@@ -902,7 +894,7 @@ fn install_terminal_interaction_trackers(
             reset_auto_close();
         }
     });
-    terminal.terminal().add_controller(click);
+    terminal.add_controller(click);
 
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
     scroll.connect_scroll({
@@ -913,7 +905,7 @@ fn install_terminal_interaction_trackers(
             gtk::glib::Propagation::Proceed
         }
     });
-    terminal.terminal().add_controller(scroll);
+    terminal.add_controller(scroll);
 }
 
 fn queue_terminal_auto_close(
@@ -997,7 +989,7 @@ fn clear_terminal_auto_close_timer(auto_close_source: &Rc<RefCell<Option<glib::S
 fn install_exit_key_handler(
     session_id: u64,
     root: &gtk::Box,
-    terminal: &VteTerminal,
+    terminal: &GtkTerminal,
     state: &Rc<Cell<TerminalSessionState>>,
     exit_success: &Rc<Cell<bool>>,
     sessions: &Rc<RefCell<Vec<TerminalSession>>>,
@@ -1054,11 +1046,11 @@ fn install_exit_key_handler(
             glib::Propagation::Proceed
         }
     });
-    terminal.terminal().add_controller(keys);
+    terminal.add_controller(keys);
 }
 
 fn spawn_command(
-    terminal: &VteTerminal,
+    terminal: &GtkTerminal,
     command: &CommandSpec,
     child_pid: &Rc<Cell<Option<glib::Pid>>>,
     state: &Rc<Cell<TerminalSessionState>>,
@@ -1075,7 +1067,7 @@ fn spawn_command(
                 Ok(pid) => {
                     if state.get() == TerminalSessionState::Closing {
                         log::debug!(
-                            "VTE terminal spawn completed after close pid={pid} command={display}"
+                            "terminal spawn completed after close pid={pid} command={display}"
                         );
                         return;
                     }
@@ -1085,7 +1077,7 @@ fn spawn_command(
                 Err(err) => {
                     if state.get() == TerminalSessionState::Closing {
                         log::debug!(
-                            "VTE terminal spawn failed after close command={display}: {err}"
+                            "terminal spawn failed after close command={display}: {err}"
                         );
                         return;
                     }
@@ -1105,7 +1097,7 @@ fn spawn_command(
 }
 
 fn start_title_poll(
-    terminal: &VteTerminal,
+    terminal: &GtkTerminal,
     label: &gtk::Label,
     fallback_title: &str,
     state: &Rc<Cell<TerminalSessionState>>,
@@ -1146,7 +1138,7 @@ fn start_title_poll(
 
 fn connect_child_exit(
     session_id: u64,
-    terminal: &VteTerminal,
+    terminal: &GtkTerminal,
     label: &gtk::Label,
     fallback_title: &str,
     child_pid: &Rc<Cell<Option<glib::Pid>>>,
@@ -1232,7 +1224,7 @@ fn child_exit_summary(status: ExitStatus) -> ChildExitSummary {
     }
 }
 
-fn short_terminal_title(terminal: &VteTerminal, fallback_title: &str) -> String {
+fn short_terminal_title(terminal: &GtkTerminal, fallback_title: &str) -> String {
     terminal_window_title(terminal)
         .or_else(|| foreground_process_name(terminal))
         .unwrap_or_else(|| fallback_title.to_string())
@@ -1242,7 +1234,7 @@ fn update_session_title(label: &gtk::Label, title: &str) {
     label.set_label(&terminal_title_text(title).unwrap_or_else(|| "Terminal".to_string()));
 }
 
-fn terminal_window_title(terminal: &VteTerminal) -> Option<String> {
+fn terminal_window_title(terminal: &GtkTerminal) -> Option<String> {
     terminal
         .title()
         .and_then(|title| terminal_title_text(&title))
@@ -1253,12 +1245,12 @@ fn terminal_title_text(title: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-fn foreground_process_name(terminal: &VteTerminal) -> Option<String> {
+fn foreground_process_name(terminal: &GtkTerminal) -> Option<String> {
     let foreground_pgid = foreground_process_group(terminal)?;
     process_name_for_group(foreground_pgid)
 }
 
-fn foreground_process_group(terminal: &VteTerminal) -> Option<libc::pid_t> {
+fn foreground_process_group(terminal: &GtkTerminal) -> Option<libc::pid_t> {
     terminal.foreground_process_group()
 }
 
@@ -1418,7 +1410,7 @@ fn active_task_name(session: &TerminalSession) -> Option<String> {
 }
 
 fn install_reported_shell_activity(
-    terminal: &VteTerminal,
+    terminal: &GtkTerminal,
     session_id: u64,
     task_name: &Rc<RefCell<Option<String>>>,
 ) {
@@ -1438,7 +1430,7 @@ fn install_reported_shell_activity(
     });
 }
 
-fn active_shell_task_name(terminal: &VteTerminal, shell_pid: glib::Pid) -> Option<String> {
+fn active_shell_task_name(terminal: &GtkTerminal, shell_pid: glib::Pid) -> Option<String> {
     let foreground_pgid = foreground_process_group(terminal)?;
     let shell_pid = shell_pid.0 as libc::pid_t;
     let shell_pgid = process_group(shell_pid).unwrap_or(shell_pid);

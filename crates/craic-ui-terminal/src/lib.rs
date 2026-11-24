@@ -6,7 +6,8 @@ pub use craic_system::system;
 pub mod terminal;
 pub mod ui;
 
+pub mod gtk_terminal;
+#[cfg(test)]
 mod process;
-pub mod vte;
 
 pub use terminal::*;

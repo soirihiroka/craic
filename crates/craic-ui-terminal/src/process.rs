@@ -1,5 +1,3 @@
-pub(super) use craic_platform::terminal::begin_process_group_shutdown;
-
 #[cfg(test)]
 use craic_platform::terminal::signal_process_groups as signal_terminal_process_groups;
 

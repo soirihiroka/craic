@@ -1,37 +1,24 @@
 use craic_platform::terminal::{TerminalBackend, TerminalCommand, TerminalLifecycle, TerminalSize};
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::io::{self, Read};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::thread::JoinHandle;
+use std::io;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+use tokio::sync::watch;
 
-use alacritty_terminal::event::{Event, EventListener, OnResize, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, Msg, State};
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Direction, Line, Point, Side as GridSide};
-use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::search::RegexSearch;
-use alacritty_terminal::term::{Config, Term, TermMode, point_to_viewport, viewport_to_point};
-use alacritty_terminal::tty::{self, EventedPty, EventedReadWrite, Options, Pty, Shell};
-use alacritty_terminal::vte::ansi::{Color, CursorShape};
-#[cfg(unix)]
-use polling::{Event as PollingEvent, PollMode, Poller};
 use skia_safe::{AlphaType, ColorType, Data, Image, ImageInfo, images};
 
 use crate::sixel::{SixelDecoded, SixelStreamParser};
 
-const TERMINAL_EVENT_CAPACITY: usize = 512;
-const SIXEL_EVENT_CAPACITY: usize = 8;
+mod ghostty;
+mod pty;
+
+use ghostty::Emulator;
+use pty::PtyWorker;
+
 const MAX_SIXEL_IMAGES: usize = 32;
 const MAX_SIXEL_IMAGE_BYTES: usize = 16 * 1024 * 1024;
-static NEXT_WINDOW_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalViewport {
@@ -44,43 +31,16 @@ pub struct TerminalViewport {
 impl TerminalViewport {
     pub fn new(columns: usize, lines: usize, cell_width: u16, cell_height: u16) -> Self {
         Self {
-            columns: columns.max(alacritty_terminal::term::MIN_COLUMNS),
-            lines: lines.max(alacritty_terminal::term::MIN_SCREEN_LINES),
+            columns: columns.clamp(2, u16::MAX as usize),
+            lines: lines.clamp(1, u16::MAX as usize),
             cell_width: cell_width.max(1),
             cell_height: cell_height.max(1),
         }
     }
-
-    fn window_size(self) -> WindowSize {
-        WindowSize {
-            num_lines: u16::try_from(self.lines).unwrap_or(u16::MAX),
-            num_cols: u16::try_from(self.columns).unwrap_or(u16::MAX),
-            cell_width: self.cell_width,
-            cell_height: self.cell_height,
-        }
-    }
-}
-
-impl Dimensions for TerminalViewport {
-    fn total_lines(&self) -> usize {
-        self.lines
-    }
-
-    fn screen_lines(&self) -> usize {
-        self.lines
-    }
-
-    fn columns(&self) -> usize {
-        self.columns
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TerminalColor {
-    Named(u16),
-    Indexed(u8),
-    Rgb(u8, u8, u8),
-}
+pub struct TerminalColor(pub u8, pub u8, pub u8);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TerminalCellStyle {
@@ -122,6 +82,7 @@ pub enum TerminalScroll {
     PageDown,
     Top,
     Bottom,
+    Row(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,13 +144,24 @@ pub struct TerminalCursor {
     pub shape: TerminalCursorShape,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageLayer {
+    BelowBackground,
+    BelowText,
+    AboveText,
+}
+
 #[derive(Clone)]
 pub struct TerminalImage {
     pub id: u64,
     pub line: i32,
-    pub column: usize,
+    pub column: i32,
     pub width: usize,
     pub height: usize,
+    pub(crate) generation: u64,
+    pub(crate) offset: (u32, u32),
+    pub(crate) source: (u32, u32, u32, u32),
+    pub(crate) layer: ImageLayer,
     pub(crate) image: Image,
 }
 
@@ -213,6 +185,10 @@ impl PartialEq for TerminalImage {
             && self.column == other.column
             && self.width == other.width
             && self.height == other.height
+            && self.generation == other.generation
+            && self.offset == other.offset
+            && self.source == other.source
+            && self.layer == other.layer
     }
 }
 
@@ -224,6 +200,7 @@ pub struct TerminalSnapshot {
     pub lines: usize,
     pub display_offset: usize,
     pub cursor: Option<TerminalCursor>,
+    pub background: TerminalColor,
     pub cells: Vec<TerminalCell>,
     pub images: Vec<TerminalImage>,
 }
@@ -239,158 +216,68 @@ pub enum TerminalClipboard {
 pub struct TerminalEventBatch {
     pub needs_redraw: bool,
     pub title: Option<Option<String>>,
+    pub activity: Option<bool>,
+    pub next_animation: Option<Duration>,
     pub clipboard_store: Option<(TerminalClipboard, String)>,
     pub bell: bool,
     pub exited: bool,
     pub exit_code: Option<i32>,
+    pub exit_status: Option<std::process::ExitStatus>,
 }
 
-#[derive(Clone)]
-struct TerminalEventProxy {
-    sender: SyncSender<Event>,
-    exit: Arc<Mutex<TerminalExitState>>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalKey {
+    Character(char),
+    Enter,
+    Escape,
+    Tab,
+    Backspace,
+    Delete,
+    Insert,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Up,
+    Down,
+    Left,
+    Right,
+    Function(u8),
+    Keypad(u8),
+    KeypadEnter,
+    KeypadAdd,
+    KeypadSubtract,
+    KeypadMultiply,
+    KeypadDivide,
+    KeypadDecimal,
+    KeypadEqual,
 }
 
-#[derive(Default)]
-struct TerminalExitState {
-    exited: bool,
-    drained: bool,
-    reported: bool,
-    code: Option<i32>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalKeyAction {
+    Press,
+    Repeat,
+    Release,
 }
 
-impl EventListener for TerminalEventProxy {
-    fn send_event(&self, event: Event) {
-        // Exit is process state, not a best-effort redraw notification. Record
-        // it before enqueueing so a full UI queue cannot lose it or leave a
-        // reaped process ID eligible for shutdown signals.
-        match &event {
-            Event::ChildExit(status) => {
-                let mut exit = self.exit.lock().unwrap_or_else(|error| error.into_inner());
-                exit.exited = true;
-                exit.code = status.code();
-            }
-            Event::Exit => {
-                let mut exit = self.exit.lock().unwrap_or_else(|error| error.into_inner());
-                exit.exited = true;
-                exit.drained = true;
-            }
-            _ => {}
-        }
-        match self.sender.try_send(event) {
-            Ok(()) | Err(TrySendError::Full(Event::Wakeup | Event::MouseCursorDirty)) => {}
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
-        }
-    }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalKeyModifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+    pub super_key: bool,
+    pub caps_lock: bool,
+    pub num_lock: bool,
 }
 
-#[cfg(unix)]
-struct SixelTeeReader {
-    file: std::fs::File,
-    parser: SixelStreamParser,
-    images: SyncSender<SixelDecoded>,
-    event_proxy: TerminalEventProxy,
+pub struct TerminalKeyEvent<'a> {
+    pub key: TerminalKey,
+    pub action: TerminalKeyAction,
+    pub modifiers: TerminalKeyModifiers,
+    pub consumed_modifiers: TerminalKeyModifiers,
+    pub text: &'a str,
+    pub unshifted: Option<char>,
 }
-
-#[cfg(unix)]
-impl Read for SixelTeeReader {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = self.file.read(buffer)?;
-        if count == 0 {
-            return Ok(0);
-        }
-        for image in self.parser.feed(&buffer[..count]) {
-            if self.images.try_send(image).is_ok() {
-                self.event_proxy.send_event(Event::Wakeup);
-            }
-        }
-        Ok(count)
-    }
-}
-
-#[cfg(unix)]
-struct SixelPty {
-    inner: Pty,
-    reader: SixelTeeReader,
-}
-
-#[cfg(unix)]
-impl SixelPty {
-    fn new(
-        inner: Pty,
-        images: SyncSender<SixelDecoded>,
-        output_line: Arc<AtomicU64>,
-        event_proxy: TerminalEventProxy,
-    ) -> io::Result<Self> {
-        let file = inner.file().try_clone()?;
-        Ok(Self {
-            inner,
-            reader: SixelTeeReader {
-                file,
-                parser: SixelStreamParser::new(output_line),
-                images,
-                event_proxy,
-            },
-        })
-    }
-}
-
-#[cfg(unix)]
-impl EventedReadWrite for SixelPty {
-    type Reader = SixelTeeReader;
-    type Writer = std::fs::File;
-
-    unsafe fn register(
-        &mut self,
-        poller: &Arc<Poller>,
-        interest: PollingEvent,
-        mode: PollMode,
-    ) -> io::Result<()> {
-        unsafe { self.inner.register(poller, interest, mode) }
-    }
-
-    fn reregister(
-        &mut self,
-        poller: &Arc<Poller>,
-        interest: PollingEvent,
-        mode: PollMode,
-    ) -> io::Result<()> {
-        self.inner.reregister(poller, interest, mode)
-    }
-
-    fn deregister(&mut self, poller: &Arc<Poller>) -> io::Result<()> {
-        self.inner.deregister(poller)
-    }
-
-    fn reader(&mut self) -> &mut Self::Reader {
-        &mut self.reader
-    }
-
-    fn writer(&mut self) -> &mut Self::Writer {
-        self.inner.writer()
-    }
-}
-
-#[cfg(unix)]
-impl EventedPty for SixelPty {
-    fn next_child_event(&mut self) -> Option<tty::ChildEvent> {
-        self.inner.next_child_event()
-    }
-}
-
-#[cfg(unix)]
-impl OnResize for SixelPty {
-    fn on_resize(&mut self, window_size: WindowSize) {
-        self.inner.on_resize(window_size);
-    }
-}
-
-#[cfg(unix)]
-type TerminalPty = SixelPty;
-#[cfg(not(unix))]
-type TerminalPty = Pty;
-
-type TerminalIoThread = JoinHandle<(EventLoop<TerminalPty, TerminalEventProxy>, State)>;
 
 struct StoredSixelImage {
     id: u64,
@@ -402,362 +289,262 @@ struct StoredSixelImage {
     image: Image,
 }
 
-#[derive(Default)]
-struct StoredSixelState {
+struct TerminalState {
+    emulator: Emulator,
+    viewport: TerminalViewport,
+    wake: watch::Sender<()>,
+    sixel: SixelStreamParser,
     images: VecDeque<StoredSixelImage>,
-    total_bytes: usize,
-    next_id: u64,
+    image_bytes: usize,
+    next_image: u64,
 }
 
-struct SixelPlane {
-    receiver: Receiver<SixelDecoded>,
-    output_line: Arc<AtomicU64>,
-    state: Mutex<StoredSixelState>,
-}
-
-impl SixelPlane {
-    fn new(receiver: Receiver<SixelDecoded>, output_line: Arc<AtomicU64>) -> Self {
-        Self {
-            receiver,
-            output_line,
-            state: Mutex::new(StoredSixelState::default()),
+impl TerminalState {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.emulator.feed(bytes);
+        for decoded in self.sixel.feed(bytes) {
+            self.store_sixel(decoded);
         }
+        self.wake.send_replace(());
+        self.emulator.take_reply()
     }
 
-    fn snapshot(
-        &self,
-        cursor_line: i32,
-        cursor_column: usize,
-        display_offset: usize,
-        viewport_lines: usize,
-        cell_height: u16,
-    ) -> Vec<TerminalImage> {
-        let current_output_line = self.output_line.load(Ordering::Relaxed);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while let Ok(decoded) = self.receiver.try_recv() {
-            let bytes = decoded.rgba.len();
-            if bytes > MAX_SIXEL_IMAGE_BYTES {
-                log::warn!(
-                    "discarding oversized terminal Sixel image width={} height={} bytes={bytes}",
-                    decoded.width,
-                    decoded.height
-                );
-                continue;
-            }
-            let info = ImageInfo::new(
-                (decoded.width as i32, decoded.height as i32),
-                ColorType::RGBA8888,
-                AlphaType::Unpremul,
-                None,
-            );
-            let Some(image) = images::raster_from_data(
-                &info,
-                Data::new_copy(&decoded.rgba),
-                decoded.width.saturating_mul(4),
-            ) else {
-                log::warn!(
-                    "discarding terminal Sixel image that Skia could not decode width={} height={}",
-                    decoded.width,
-                    decoded.height
-                );
-                continue;
-            };
-            while state.images.len() >= MAX_SIXEL_IMAGES
-                || state.total_bytes.saturating_add(bytes) > MAX_SIXEL_IMAGE_BYTES
-            {
-                let Some(removed) = state.images.pop_front() else {
-                    break;
-                };
-                state.total_bytes = state.total_bytes.saturating_sub(removed.bytes);
-            }
-            state.next_id = state.next_id.wrapping_add(1).max(1);
-            let id = state.next_id;
-            state.total_bytes = state.total_bytes.saturating_add(bytes);
-            state.images.push_back(StoredSixelImage {
-                id,
-                output_line: decoded.output_line,
-                column: if current_output_line == decoded.output_line {
-                    cursor_column
-                } else {
-                    0
-                },
-                width: decoded.width,
-                height: decoded.height,
-                bytes,
-                image,
-            });
-            log::info!(
-                "decoded terminal Sixel image id={id} width={} height={} retained_bytes={}",
-                decoded.width,
-                decoded.height,
-                state.total_bytes
-            );
+    fn store_sixel(&mut self, decoded: SixelDecoded) {
+        let bytes = decoded.rgba.len();
+        if bytes > MAX_SIXEL_IMAGE_BYTES {
+            return;
         }
+        let info = ImageInfo::new(
+            (decoded.width as i32, decoded.height as i32),
+            ColorType::RGBA8888,
+            AlphaType::Unpremul,
+            None,
+        );
+        let Some(image) =
+            images::raster_from_data(&info, Data::new_copy(&decoded.rgba), decoded.width * 4)
+        else {
+            return;
+        };
+        while self.images.len() >= MAX_SIXEL_IMAGES
+            || self.image_bytes + bytes > MAX_SIXEL_IMAGE_BYTES
+        {
+            let Some(removed) = self.images.pop_front() else {
+                break;
+            };
+            self.image_bytes -= removed.bytes;
+        }
+        self.next_image += 1;
+        self.image_bytes += bytes;
+        self.images.push_back(StoredSixelImage {
+            id: self.next_image,
+            output_line: decoded.output_line,
+            column: if self.sixel.output_line() == decoded.output_line {
+                self.emulator.cursor_position().1
+            } else {
+                0
+            },
+            width: decoded.width,
+            height: decoded.height,
+            bytes,
+            image,
+        });
+    }
 
-        let cell_height = usize::from(cell_height.max(1));
-        state
-            .images
-            .iter()
-            .filter_map(|image| {
-                let output_delta = current_output_line.saturating_sub(image.output_line);
-                let line = i64::from(cursor_line) - i64::try_from(output_delta).unwrap_or(i64::MAX)
-                    + i64::try_from(display_offset).unwrap_or(i64::MAX);
-                let occupied_lines = image.height.div_ceil(cell_height) as i64;
-                (line < viewport_lines as i64 && line.saturating_add(occupied_lines) > 0).then(
-                    || TerminalImage {
-                        id: image.id,
-                        line: i32::try_from(line).unwrap_or(if line < 0 {
-                            i32::MIN
-                        } else {
-                            i32::MAX
-                        }),
-                        column: image.column,
-                        width: image.width,
-                        height: image.height,
-                        image: image.image.clone(),
-                    },
-                )
-            })
-            .collect()
+    fn snapshot(&mut self) -> io::Result<TerminalSnapshot> {
+        let mut snapshot = self.emulator.snapshot()?;
+        let cursor_line = self.emulator.cursor_position().0;
+        let current_output_line = self.sixel.output_line();
+        for image in &self.images {
+            let output_delta = current_output_line.saturating_sub(image.output_line);
+            let line = (cursor_line + snapshot.display_offset) as i64
+                - output_delta.min(i64::MAX as u64) as i64;
+            let occupied = image
+                .height
+                .div_ceil(usize::from(self.viewport.cell_height)) as i64;
+            if line < snapshot.lines as i64 && line + occupied > 0 {
+                snapshot.images.push(TerminalImage {
+                    id: image.id,
+                    line: line as i32,
+                    column: image.column as i32,
+                    width: image.width,
+                    height: image.height,
+                    generation: 0,
+                    offset: (0, 0),
+                    source: (0, 0, image.width as u32, image.height as u32),
+                    layer: ImageLayer::BelowBackground,
+                    image: image.image.clone(),
+                });
+            }
+        }
+        Ok(snapshot)
     }
 }
 
 pub struct TerminalSession {
-    terminal: Arc<FairMutex<Term<TerminalEventProxy>>>,
-    sender: alacritty_terminal::event_loop::EventLoopSender,
-    events: Receiver<Event>,
-    io_thread: Option<TerminalIoThread>,
-    shutdown_started: bool,
-    process_shutdown: Option<craic_platform::terminal::ProcessGroupShutdown>,
-    viewport: TerminalViewport,
-    child_pid: u32,
-    exit: Arc<Mutex<TerminalExitState>>,
-    #[cfg(unix)]
-    control_pty: std::fs::File,
-    sixel: SixelPlane,
+    state: Arc<Mutex<TerminalState>>,
+    pty: Option<PtyWorker>,
 }
 
 impl TerminalSession {
-    pub fn spawn(command: TerminalCommand, viewport: TerminalViewport) -> io::Result<Self> {
-        let mut argv = command.spawn_argv().map_err(io::Error::other)?.into_iter();
-        let program = argv
-            .next()
-            .ok_or_else(|| io::Error::other("Terminal command is empty"))?;
-        let (event_sender, events) = sync_channel(TERMINAL_EVENT_CAPACITY);
-        let (sixel_sender, sixel_receiver) = sync_channel(SIXEL_EVENT_CAPACITY);
-        let sixel_output_line = Arc::new(AtomicU64::new(0));
-        let exit = Arc::new(Mutex::new(TerminalExitState::default()));
-        let event_proxy = TerminalEventProxy {
-            sender: event_sender,
-            exit: Arc::clone(&exit),
-        };
-        let pty_options = Options {
-            shell: Some(Shell::new(program, argv.collect())),
-            working_directory: Some(command.working_directory),
-            drain_on_exit: true,
-            env: command.environment,
-        };
-        let window_id = NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed);
-        let pty = tty::new(&pty_options, viewport.window_size(), window_id)?;
-        let child_pid = pty.child().id();
-        #[cfg(unix)]
-        let control_pty = pty.file().try_clone()?;
-        #[cfg(unix)]
-        let pty = SixelPty::new(
-            pty,
-            sixel_sender,
-            Arc::clone(&sixel_output_line),
-            event_proxy.clone(),
-        )?;
-        #[cfg(not(unix))]
-        drop(sixel_sender);
-        let terminal_config = Config {
-            kitty_keyboard: true,
-            ..Config::default()
-        };
-        let terminal = Arc::new(FairMutex::new(Term::new(
-            terminal_config,
-            &viewport,
-            event_proxy.clone(),
-        )));
-        terminal.lock().is_focused = true;
-        let event_loop = EventLoop::new(
-            Arc::clone(&terminal),
-            event_proxy,
-            pty,
-            pty_options.drain_on_exit,
-            false,
-        )?;
-        let sender = event_loop.channel();
-        let io_thread = Some(event_loop.spawn());
+    pub fn new(viewport: TerminalViewport) -> io::Result<Self> {
+        let viewport = TerminalViewport::new(
+            viewport.columns,
+            viewport.lines,
+            viewport.cell_width,
+            viewport.cell_height,
+        );
         Ok(Self {
-            terminal,
-            sender,
-            events,
-            io_thread,
-            shutdown_started: false,
-            process_shutdown: None,
-            viewport,
-            child_pid,
-            exit,
-            #[cfg(unix)]
-            control_pty,
-            sixel: SixelPlane::new(sixel_receiver, sixel_output_line),
+            state: Arc::new(Mutex::new(TerminalState {
+                emulator: Emulator::new(viewport)?,
+                viewport,
+                wake: watch::Sender::new(()),
+                sixel: SixelStreamParser::new(Arc::new(AtomicU64::new(0))),
+                images: VecDeque::new(),
+                image_bytes: 0,
+                next_image: 0,
+            })),
+            pty: None,
         })
     }
 
+    pub fn spawn(command: TerminalCommand, viewport: TerminalViewport) -> io::Result<Self> {
+        let mut terminal = Self::new(viewport)?;
+        let viewport = terminal.lock().viewport;
+        terminal.pty = Some(PtyWorker::spawn(
+            command,
+            viewport,
+            Arc::clone(&terminal.state),
+        )?);
+        Ok(terminal)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, TerminalState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
     pub fn child_pid(&self) -> u32 {
-        self.child_pid
+        self.pty.as_ref().map_or(0, PtyWorker::pid)
+    }
+
+    pub fn foreground_process_group(&self) -> Option<i32> {
+        self.pty.as_ref().filter(|pty| pty.running())?.foreground()
+    }
+
+    pub fn feed(&self, bytes: &[u8]) {
+        let reply = self.lock().feed(bytes);
+        if let Some(pty) = &self.pty {
+            let _ = pty.input(reply);
+        }
     }
 
     pub fn input(&self, bytes: impl Into<Cow<'static, [u8]>>) -> io::Result<()> {
-        self.sender
-            .send(Msg::Input(bytes.into()))
-            .map_err(|error| io::Error::other(error.to_string()))
+        self.pty
+            .as_ref()
+            .filter(|pty| pty.running())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "Terminal process is not running")
+            })?
+            .input(bytes.into().into_owned())
     }
 
-    pub fn disambiguates_modified_keys(&self) -> bool {
-        self.terminal
-            .lock()
-            .mode()
-            .contains(TermMode::DISAMBIGUATE_ESC_CODES)
-    }
-
-    pub fn resize(&mut self, viewport: TerminalViewport) -> io::Result<()> {
-        if self.viewport == viewport {
-            return Ok(());
+    pub fn send_key(&self, event: TerminalKeyEvent<'_>) -> io::Result<bool> {
+        let bytes = self.lock().emulator.key(event)?;
+        if bytes.is_empty() {
+            return Ok(false);
         }
-        self.terminal.lock().resize(viewport);
-        self.sender
-            .send(Msg::Resize(viewport.window_size()))
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        self.viewport = viewport;
+        self.input(bytes)?;
+        self.scroll(TerminalScroll::Bottom);
+        Ok(true)
+    }
+
+    pub fn paste(&self, text: &str) -> io::Result<()> {
+        let bytes = self.lock().emulator.paste(text)?;
+        self.input(bytes)?;
+        self.scroll(TerminalScroll::Bottom);
         Ok(())
     }
 
+    pub fn resize(&mut self, viewport: TerminalViewport) -> io::Result<()> {
+        let viewport = TerminalViewport::new(
+            viewport.columns,
+            viewport.lines,
+            viewport.cell_width,
+            viewport.cell_height,
+        );
+        let mut state = self.lock();
+        if state.viewport != viewport {
+            state.emulator.resize(viewport)?;
+            state.viewport = viewport;
+        }
+        // A resize can generate a mode-2048 in-band pixel-size report.
+        if let Some(pty) = self.pty.as_ref().filter(|pty| pty.running()) {
+            pty.resize(viewport)?;
+            pty.input(state.emulator.take_reply())?;
+        }
+        Ok(())
+    }
+
+    pub fn scrollbar(&self) -> (usize, usize, usize) {
+        self.lock().emulator.scrollbar()
+    }
+
     pub fn scroll(&self, scroll: TerminalScroll) {
-        self.terminal.lock().scroll_display(match scroll {
-            TerminalScroll::Lines(lines) => Scroll::Delta(lines),
-            TerminalScroll::PageUp => Scroll::PageUp,
-            TerminalScroll::PageDown => Scroll::PageDown,
-            TerminalScroll::Top => Scroll::Top,
-            TerminalScroll::Bottom => Scroll::Bottom,
-        });
+        self.lock().emulator.scroll(scroll);
     }
 
     pub fn begin_selection(
         &self,
         line: usize,
         column: usize,
-        selection_type: TerminalSelectionType,
+        kind: TerminalSelectionType,
         side: TerminalSide,
     ) {
-        let mut terminal = self.terminal.lock();
-        let point = viewport_to_point(
-            terminal.grid().display_offset(),
-            Point::new(
-                line.min(terminal.screen_lines().saturating_sub(1)),
-                Column(column.min(terminal.columns().saturating_sub(1))),
-            ),
-        );
-        terminal.selection = Some(Selection::new(
-            match selection_type {
-                TerminalSelectionType::Simple => SelectionType::Simple,
-                TerminalSelectionType::Block => SelectionType::Block,
-                TerminalSelectionType::Semantic => SelectionType::Semantic,
-                TerminalSelectionType::Lines => SelectionType::Lines,
-            },
-            point,
-            match side {
-                TerminalSide::Left => Direction::Left,
-                TerminalSide::Right => Direction::Right,
-            },
-        ));
+        self.lock()
+            .emulator
+            .begin_selection(line, column, kind, side);
     }
 
     pub fn update_selection(&self, line: usize, column: usize, side: TerminalSide) {
-        let mut terminal = self.terminal.lock();
-        let point = viewport_to_point(
-            terminal.grid().display_offset(),
-            Point::new(
-                line.min(terminal.screen_lines().saturating_sub(1)),
-                Column(column.min(terminal.columns().saturating_sub(1))),
-            ),
-        );
-        if let Some(selection) = terminal.selection.as_mut() {
-            selection.update(
-                point,
-                match side {
-                    TerminalSide::Left => Direction::Left,
-                    TerminalSide::Right => Direction::Right,
-                },
-            );
-        }
+        self.lock().emulator.update_selection(line, column, side);
     }
 
     pub fn clear_selection(&self) {
-        self.terminal.lock().selection = None;
+        self.lock().emulator.clear_selection();
+    }
+
+    pub fn select_all(&self) {
+        self.lock().emulator.select_all();
     }
 
     pub fn selected_text(&self) -> Option<String> {
-        self.terminal.lock().selection_to_string()
+        self.lock().emulator.selected_text()
     }
 
     pub fn visible_text(&self) -> String {
-        let terminal = self.terminal.lock();
-        let display_offset = terminal.grid().display_offset();
-        let start = viewport_to_point(display_offset, Point::new(0, Column(0)));
-        let end = viewport_to_point(
-            display_offset,
-            Point::new(
-                terminal.screen_lines().saturating_sub(1),
-                terminal.last_column(),
-            ),
-        );
-        terminal.bounds_to_string(start, end)
+        let state = self.lock();
+        let (offset, len, _) = state.emulator.scrollbar();
+        state.emulator.text_rows(offset, offset + len)
     }
 
     pub fn all_text(&self) -> String {
-        let terminal = self.terminal.lock();
-        terminal.bounds_to_string(
-            Point::new(terminal.topmost_line(), Column(0)),
-            Point::new(terminal.bottommost_line(), terminal.last_column()),
-        )
+        self.lock().emulator.all_text()
     }
 
     pub fn text_before_cursor(&self, max_lines: usize) -> String {
-        let terminal = self.terminal.lock();
-        let end = terminal.grid().cursor.point.line - Line(1);
-        if end < terminal.topmost_line() {
-            return String::new();
-        }
-        let start = (end - Line(max_lines.saturating_sub(1).min(i32::MAX as usize) as i32))
-            .max(terminal.topmost_line());
-        terminal.bounds_to_string(
-            Point::new(start, Column(0)),
-            Point::new(end, terminal.last_column()),
-        )
+        let state = self.lock();
+        let end = state.emulator.history_size() + state.emulator.cursor_position().0;
+        state.emulator.text_rows(end.saturating_sub(max_lines), end)
     }
 
     pub fn recent_text(&self, max_lines: usize) -> String {
-        let terminal = self.terminal.lock();
-        let end = terminal.bottommost_line();
-        let start = (end - Line(max_lines.saturating_sub(1).min(i32::MAX as usize) as i32))
-            .max(terminal.topmost_line());
-        terminal.bounds_to_string(
-            Point::new(start, Column(0)),
-            Point::new(end, terminal.last_column()),
-        )
+        let state = self.lock();
+        let (_, _, end) = state.emulator.scrollbar();
+        state.emulator.text_rows(end.saturating_sub(max_lines), end)
     }
 
     pub fn cursor_row(&self) -> usize {
-        let terminal = self.terminal.lock();
-        terminal
-            .history_size()
-            .saturating_add(terminal.grid().cursor.point.line.0.max(0) as usize)
+        let state = self.lock();
+        state.emulator.history_size() + state.emulator.cursor_position().0
     }
 
     pub fn search(
@@ -765,435 +552,90 @@ impl TerminalSession {
         pattern: &str,
         direction: TerminalSearchDirection,
     ) -> Result<Option<TerminalSearchMatch>, String> {
-        let mut terminal = self.terminal.lock();
-        if pattern.is_empty() {
-            terminal.selection = None;
-            return Ok(None);
-        }
-        let mut regex = RegexSearch::new(pattern).map_err(|error| error.to_string())?;
-        let origin = terminal_search_origin(&terminal, direction);
-        let (grid_direction, side) = match direction {
-            TerminalSearchDirection::Previous => (Direction::Left, GridSide::Left),
-            TerminalSearchDirection::Next => (Direction::Right, GridSide::Right),
-        };
-        let Some(found) = terminal.search_next(&mut regex, origin, grid_direction, side, None)
-        else {
-            return Ok(None);
-        };
-        let start = *found.start();
-        let end = *found.end();
-        let mut selection = Selection::new(SelectionType::Simple, start, Direction::Left);
-        selection.update(end, Direction::Right);
-        selection.include_all();
-        terminal.selection = Some(selection);
-
-        let target_offset = usize::try_from(-start.line.0).unwrap_or_default();
-        let current_offset = terminal.grid().display_offset();
-        let delta = target_offset as i32 - current_offset as i32;
-        if delta != 0 {
-            terminal.scroll_display(Scroll::Delta(delta));
-        }
-
-        Ok(Some(TerminalSearchMatch {
-            start_line: start.line.0,
-            start_column: start.column.0,
-            end_line: end.line.0,
-            end_column: end.column.0,
-        }))
+        self.lock().emulator.search(pattern, direction)
     }
 
     pub fn mouse_reporting_enabled(&self) -> bool {
-        self.terminal.lock().mode().intersects(TermMode::MOUSE_MODE)
+        self.lock().emulator.mouse_reporting_enabled()
     }
 
-    pub fn report_mouse(
+    pub fn report_mouse_at(
         &self,
         button: TerminalMouseButton,
         action: TerminalMouseAction,
         modifiers: TerminalMouseModifiers,
-        line: usize,
-        column: usize,
+        x: f32,
+        y: f32,
     ) -> bool {
-        let mode = *self.terminal.lock().mode();
-        if !mode.intersects(TermMode::MOUSE_MODE)
-            || (action == TerminalMouseAction::Move
-                && ((button == TerminalMouseButton::None
-                    && !mode.contains(TermMode::MOUSE_MOTION))
-                    || (button != TerminalMouseButton::None
-                        && !mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG))))
-        {
-            return false;
-        }
-        let mut code = match button {
-            TerminalMouseButton::None => 3,
-            TerminalMouseButton::Left => 0,
-            TerminalMouseButton::Middle => 1,
-            TerminalMouseButton::Right => 2,
-            TerminalMouseButton::WheelUp => 64,
-            TerminalMouseButton::WheelDown => 65,
-        };
-        if action == TerminalMouseAction::Release && !mode.contains(TermMode::SGR_MOUSE) {
-            code = 3;
-        }
-        if action == TerminalMouseAction::Move {
-            code += 32;
-        }
-        if modifiers.shift {
-            code += 4;
-        }
-        if modifiers.option {
-            code += 8;
-        }
-        if modifiers.control {
-            code += 16;
-        }
-        let column = column.saturating_add(1);
-        let line = line.saturating_add(1);
-        let sequence = if mode.contains(TermMode::SGR_MOUSE) {
-            format!(
-                "\x1b[<{code};{column};{line}{}",
-                if action == TerminalMouseAction::Release {
-                    'm'
-                } else {
-                    'M'
-                }
-            )
-            .into_bytes()
-        } else if mode.contains(TermMode::UTF8_MOUSE) {
-            let mut sequence = b"\x1b[M".to_vec();
-            for value in [
-                code + 32,
-                column.saturating_add(32),
-                line.saturating_add(32),
-            ] {
-                let character = char::from_u32(u32::try_from(value.min(2_047)).unwrap_or(2_047))
-                    .unwrap_or('\u{fffd}');
-                let mut bytes = [0; 4];
-                sequence.extend_from_slice(character.encode_utf8(&mut bytes).as_bytes());
-            }
-            sequence
-        } else {
-            vec![
-                0x1b,
-                b'[',
-                b'M',
-                u8::try_from((code + 32).min(255)).unwrap_or(255),
-                u8::try_from(column.saturating_add(32).min(255)).unwrap_or(255),
-                u8::try_from(line.saturating_add(32).min(255)).unwrap_or(255),
-            ]
-        };
-        self.input(sequence).is_ok()
+        let bytes = self.lock().emulator.mouse(button, action, modifiers, x, y);
+        bytes.is_ok_and(|bytes| !bytes.is_empty() && self.input(bytes).is_ok())
     }
 
     pub fn report_focus(&self, focused: bool) {
-        if self.terminal.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
-            let _ = self.input(if focused { b"\x1b[I" } else { b"\x1b[O" }.to_vec());
-        }
+        let bytes = self.lock().emulator.focus(focused);
+        let _ = self.input(bytes);
     }
 
-    pub fn try_recv_event(&self) -> Option<Event> {
-        match self.events.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-        }
+    pub fn subscribe(&self) -> watch::Receiver<()> {
+        self.lock().wake.subscribe()
     }
 
-    pub fn drain_events(&self, clipboard: Option<&str>) -> TerminalEventBatch {
-        self.drain_events_with_clipboard(|| clipboard.map(ToOwned::to_owned))
-    }
-
-    pub fn drain_events_with_clipboard(
-        &self,
-        mut clipboard: impl FnMut() -> Option<String>,
-    ) -> TerminalEventBatch {
-        let mut batch = TerminalEventBatch::default();
-        while let Some(event) = self.try_recv_event() {
-            match event {
-                Event::MouseCursorDirty | Event::Wakeup | Event::CursorBlinkingChange => {
-                    batch.needs_redraw = true;
-                }
-                Event::Title(title) => batch.title = Some(Some(title)),
-                Event::ResetTitle => batch.title = Some(None),
-                Event::ClipboardStore(kind, text) => {
-                    batch.clipboard_store = Some((terminal_clipboard(kind), text));
-                }
-                Event::ClipboardLoad(_, formatter) => {
-                    if let Some(clipboard) = clipboard() {
-                        let _ = self.input(formatter(&clipboard).into_bytes());
-                    }
-                }
-                Event::ColorRequest(index, formatter) => {
-                    let color = if index == 257 {
-                        alacritty_terminal::vte::ansi::Rgb {
-                            r: 30,
-                            g: 30,
-                            b: 30,
-                        }
-                    } else {
-                        alacritty_terminal::vte::ansi::Rgb {
-                            r: 224,
-                            g: 224,
-                            b: 224,
-                        }
-                    };
-                    let _ = self.input(formatter(color).into_bytes());
-                }
-                Event::PtyWrite(text) => {
-                    let response = if text == "\x1b[?6c" {
-                        log::debug!(
-                            "advertising terminal Sixel support in primary device attributes"
-                        );
-                        "\x1b[?63;4c".as_bytes().to_vec()
-                    } else {
-                        text.into_bytes()
-                    };
-                    let _ = self.input(response);
-                }
-                Event::TextAreaSizeRequest(formatter) => {
-                    let _ = self.input(formatter(self.viewport.window_size()).into_bytes());
-                }
-                Event::Bell => batch.bell = true,
-                Event::Exit | Event::ChildExit(_) => {}
-            }
-        }
-        let mut exit = self.exit.lock().unwrap_or_else(|error| error.into_inner());
-        if exit.drained && !exit.reported {
-            exit.reported = true;
+    pub fn drain_events(&self) -> TerminalEventBatch {
+        let mut state = self.lock();
+        let mut batch = state.emulator.drain_events();
+        if let Some(status) = self.pty.as_ref().and_then(PtyWorker::take_exit) {
             batch.exited = true;
-            batch.exit_code = exit.code;
+            batch.exit_status = status;
+            batch.exit_code = status.and_then(|status| status.code());
             batch.needs_redraw = true;
         }
         batch
     }
 
     pub fn snapshot(&self) -> TerminalSnapshot {
-        let terminal = self.terminal.lock();
-        let columns = terminal.columns();
-        let lines = terminal.screen_lines();
-        let content = terminal.renderable_content();
-        let display_offset = content.display_offset;
-        let cursor = point_to_viewport(display_offset, content.cursor.point).and_then(|point| {
-            (point.line < lines).then_some(TerminalCursor {
-                line: point.line,
-                column: point.column.0,
-                shape: terminal_cursor_shape(content.cursor.shape),
-            })
-        });
-        let images = self.sixel.snapshot(
-            content.cursor.point.line.0,
-            content.cursor.point.column.0,
-            display_offset,
-            lines,
-            self.viewport.cell_height,
-        );
-        let mut cells = Vec::with_capacity(columns.saturating_mul(lines));
-        for indexed in content.display_iter {
-            let Some(point) = point_to_viewport(display_offset, indexed.point) else {
-                continue;
-            };
-            if point.line >= lines || indexed.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
+        let mut state = self.lock();
+        state.snapshot().unwrap_or_else(|error| {
+            log::warn!("terminal render state unavailable: {error}");
+            TerminalSnapshot {
+                columns: state.viewport.columns,
+                lines: state.viewport.lines,
+                display_offset: 0,
+                cursor: None,
+                background: TerminalColor(30, 30, 30),
+                cells: Vec::new(),
+                images: Vec::new(),
             }
-            let mut text = if indexed.flags.contains(Flags::HIDDEN) {
-                " ".to_owned()
-            } else {
-                indexed.c.to_string()
-            };
-            if let Some(zerowidth) = indexed.zerowidth() {
-                text.extend(zerowidth);
-            }
-            cells.push(TerminalCell {
-                line: point.line,
-                column: point.column.0,
-                text,
-                foreground: terminal_color(indexed.fg),
-                background: terminal_color(indexed.bg),
-                style: terminal_cell_style(indexed.flags),
-                selected: content
-                    .selection
-                    .is_some_and(|selection| selection.contains(indexed.point)),
-                hyperlink: indexed
-                    .hyperlink()
-                    .map(|hyperlink| hyperlink.uri().to_owned()),
-            });
-        }
-        TerminalSnapshot {
-            columns,
-            lines,
-            display_offset,
-            cursor,
-            cells,
-            images,
-        }
+        })
     }
 
     pub fn shutdown(mut self) -> io::Result<()> {
-        self.stop_io()
+        self.pty.as_mut().map_or(Ok(()), PtyWorker::stop)
     }
 
-    /// Signal the child immediately before transferring cleanup to a worker.
-    /// The shared plan owns the remaining wait/escalation without repeating HUP.
     pub fn begin_shutdown(&mut self) {
-        if self.io_thread.is_none() || self.shutdown_started {
-            return;
+        if let Some(pty) = &mut self.pty {
+            pty.begin_shutdown();
         }
-        self.shutdown_started = true;
-        if !self
-            .exit
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .exited
-        {
-            #[cfg(unix)]
-            let foreground = {
-                let group = unsafe { libc::tcgetpgrp(self.control_pty.as_raw_fd()) };
-                (group > 0).then_some(group)
-            };
-            #[cfg(not(unix))]
-            let foreground = None;
-            self.process_shutdown = craic_platform::terminal::begin_process_group_shutdown(
-                self.child_pid as i32,
-                foreground,
-            );
-        }
-    }
-
-    fn stop_io(&mut self) -> io::Result<()> {
-        if self.io_thread.is_none() {
-            return Ok(());
-        }
-        self.begin_shutdown();
-        if let Some(shutdown) = self.process_shutdown.take() {
-            shutdown.finish();
-        }
-        let _ = self.sender.send(Msg::Shutdown);
-        let join_result = self
-            .io_thread
-            .take()
-            .map(|thread| thread.join())
-            .transpose()
-            .map_err(|_| io::Error::other("terminal I/O thread panicked"));
-        if let Err(error) = join_result {
-            return Err(error);
-        }
-        Ok(())
-    }
-}
-
-fn terminal_search_origin(
-    terminal: &Term<TerminalEventProxy>,
-    direction: TerminalSearchDirection,
-) -> Point {
-    let selected = terminal
-        .selection
-        .as_ref()
-        .and_then(|selection| selection.to_range(terminal));
-    match (direction, selected) {
-        (TerminalSearchDirection::Next, Some(range)) => terminal_point_after(terminal, range.end),
-        (TerminalSearchDirection::Previous, Some(range)) => {
-            terminal_point_before(terminal, range.start)
-        }
-        _ => terminal.renderable_content().cursor.point,
-    }
-}
-
-fn terminal_point_after(terminal: &Term<TerminalEventProxy>, point: Point) -> Point {
-    if point.column.0 + 1 < terminal.columns() {
-        Point::new(point.line, point.column + 1)
-    } else {
-        Point::new(
-            (point.line + Line(1)).min(terminal.bottommost_line()),
-            Column(0),
-        )
-    }
-}
-
-fn terminal_point_before(terminal: &Term<TerminalEventProxy>, point: Point) -> Point {
-    if point.column.0 > 0 {
-        Point::new(point.line, point.column - 1)
-    } else {
-        Point::new(
-            (point.line - Line(1)).max(terminal.topmost_line()),
-            Column(terminal.columns().saturating_sub(1)),
-        )
-    }
-}
-
-fn terminal_clipboard(kind: alacritty_terminal::term::ClipboardType) -> TerminalClipboard {
-    match kind {
-        alacritty_terminal::term::ClipboardType::Clipboard => TerminalClipboard::Clipboard,
-        alacritty_terminal::term::ClipboardType::Selection => TerminalClipboard::Selection,
-    }
-}
-
-impl Drop for TerminalSession {
-    fn drop(&mut self) {
-        let _ = self.stop_io();
-    }
-}
-
-fn terminal_color(color: Color) -> TerminalColor {
-    match color {
-        Color::Named(color) => TerminalColor::Named(color as u16),
-        Color::Indexed(color) => TerminalColor::Indexed(color),
-        Color::Spec(color) => TerminalColor::Rgb(color.r, color.g, color.b),
-    }
-}
-
-fn terminal_cell_style(flags: Flags) -> TerminalCellStyle {
-    TerminalCellStyle {
-        bold: flags.contains(Flags::BOLD),
-        italic: flags.intersects(Flags::ITALIC | Flags::BOLD_ITALIC),
-        dim: flags.contains(Flags::DIM),
-        inverse: flags.contains(Flags::INVERSE),
-        hidden: flags.contains(Flags::HIDDEN),
-        strikeout: flags.contains(Flags::STRIKEOUT),
-        underline: flags.intersects(Flags::ALL_UNDERLINES),
-        wide: flags.contains(Flags::WIDE_CHAR),
-    }
-}
-
-fn terminal_cursor_shape(shape: CursorShape) -> TerminalCursorShape {
-    match shape {
-        CursorShape::Block => TerminalCursorShape::Block,
-        CursorShape::Underline => TerminalCursorShape::Underline,
-        CursorShape::Beam => TerminalCursorShape::Beam,
-        CursorShape::HollowBlock => TerminalCursorShape::HollowBlock,
-        CursorShape::Hidden => TerminalCursorShape::Hidden,
     }
 }
 
 impl TerminalBackend for TerminalSession {
     fn process_id(&self) -> Option<u32> {
-        (!self
-            .exit
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .exited
-            && self.io_thread.is_some()
-            && !self.shutdown_started)
-            .then_some(self.child_pid)
+        self.pty
+            .as_ref()
+            .filter(|pty| pty.running())
+            .map(PtyWorker::pid)
     }
 
     fn lifecycle(&self) -> TerminalLifecycle {
-        if self.io_thread.is_none() || self.shutdown_started {
-            TerminalLifecycle::Closing
-        } else if self
-            .exit
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .exited
-        {
-            TerminalLifecycle::Exited
-        } else {
-            TerminalLifecycle::Running
+        match &self.pty {
+            Some(pty) if pty.closing() => TerminalLifecycle::Closing,
+            Some(pty) if pty.running() => TerminalLifecycle::Running,
+            _ => TerminalLifecycle::Exited,
         }
     }
 
     fn send_input(&self, bytes: &[u8]) -> Result<(), String> {
-        if self.lifecycle() != TerminalLifecycle::Running {
-            return Err("Terminal process is not running.".to_owned());
-        }
         self.input(bytes.to_vec())
             .map_err(|error| error.to_string())
     }
@@ -1209,6 +651,9 @@ impl TerminalBackend for TerminalSession {
     }
 
     fn terminate_process(&mut self) -> Result<(), String> {
-        self.stop_io().map_err(|error| error.to_string())
+        self.pty
+            .as_mut()
+            .map_or(Ok(()), PtyWorker::stop)
+            .map_err(|error| error.to_string())
     }
 }
