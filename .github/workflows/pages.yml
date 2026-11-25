@@ -25,7 +25,6 @@ jobs:
     container: registry.fedoraproject.org/fedora:44
     env:
       CARGO_BUILD_JOBS: "2"
-      CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     defaults:
       run:
@@ -50,12 +49,10 @@ jobs:
           key: cargo-fedora-44-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-fedora-44-
 
-      - name: Check formatting and Rust
-        run: |
-          cargo fmt --all -- --check
-          cargo check --locked
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
 
-      - name: Build RPM and source RPM
+      - name: Check Rust and build binary and source RPMs
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
           release="0.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}.git${GITHUB_SHA:0:8}"
@@ -89,7 +86,8 @@ jobs:
         run: |
           createrepo_c rpm/fedora/44/x86_64
           rpm -qp --requires rpm/fedora/44/x86_64/*.rpm
-          dnf install -y --setopt=localpkg_gpgcheck=0 rpm/fedora/44/x86_64/*.rpm
+          dnf install -y --repofrompath="craic-ci,file://$PWD/rpm/fedora/44/x86_64" \
+            --setopt=craic-ci.gpgcheck=0 craic
 
       - name: Upload DNF repository
         uses: actions/upload-artifact@v7

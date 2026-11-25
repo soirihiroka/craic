@@ -13,6 +13,7 @@ BuildRequires:  rust >= 1.94
 BuildRequires:  clang
 BuildRequires:  clang-devel
 BuildRequires:  llvm
+BuildRequires:  ninja-build
 BuildRequires:  gcc-c++
 BuildRequires:  make
 BuildRequires:  python3
@@ -49,6 +50,7 @@ repository tools, terminals, and document previews.
 
 %build
 export CARGO_INCREMENTAL=0
+cargo check --release --locked
 cargo build --release --locked
 
 %install

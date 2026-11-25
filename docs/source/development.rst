@@ -34,9 +34,10 @@ Fedora CI and publishing
 ------------------------
 
 The GitHub Actions workflow builds Fedora 44 x86_64 RPMs on pull requests and
-pushes to ``main``. It checks formatting, runs ``cargo check``, builds binary
-and source RPMs, validates the desktop entry, and verifies package installation.
-Only Cargo downloads are cached; incremental compilation is disabled in CI.
+pushes to ``main``. It checks formatting, runs ``cargo check --release --locked``
+in the RPM build tree, builds binary and source RPMs, validates the desktop
+entry, and installs the package from the generated DNF repository. CI caches
+Cargo downloads and disables incremental compilation.
 
 After a successful build on ``main``, the workflow deploys the documentation
 and a DNF repository together to GitHub Pages. Pages must use GitHub Actions

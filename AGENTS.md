@@ -3,9 +3,15 @@ Unless specified, you should not write any test.
 
 Focus on your assigned task. There might be other agents working on it at the same time.
 
-Static analysis are fine. Run rust check before reporting. You must run cargo fmt.
+Never build, package, or run compiler-backed checks or tests locally, including
+through Make, a local container, or an IDE task. Use remote CI for builds and
+run the Rust check there before reporting. Run `cargo fmt --all` locally.
 
-On macOS, never run Cargo build, check, test, or clean commands directly. Use the matching Make target so rust-skia always receives the repository's Xcode Clang, SDK, and libclang environment.
+On remote macOS runners, use the matching Make targets so rust-skia receives
+the repository's Xcode Clang, SDK, and libclang environment.
+
+Create commits with `TZ=UTC git commit` and verify that both the author and
+committer timestamps use `+0000` with `git log -1 --format='%ai%n%ci'`.
 
 Avoid custom CSS unless absolutely needed.
 
