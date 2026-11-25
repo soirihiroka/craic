@@ -976,6 +976,7 @@ impl TerminalMetalView {
 
     pub fn refresh_renderer_visibility(&self) {
         if self.can_render() && self.has_session() {
+            self.ivars().frame_dirty.set(true);
             self.start_display_link();
         } else if let Some(display_link) = self.ivars().display_link.borrow().as_ref() {
             display_link.setPaused(true);

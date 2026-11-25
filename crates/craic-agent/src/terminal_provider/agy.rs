@@ -38,12 +38,17 @@ impl AgentProvider for Provider {
 
     fn restore_command(
         &self,
-        _shell: Option<&dyn ShellAccess>,
+        shell: Option<&dyn ShellAccess>,
         _system: &SystemRef,
-        _workspace: &WorkspaceRef,
-        _cli_session_id: &str,
+        workspace: &WorkspaceRef,
+        cli_session_id: &str,
     ) -> Result<CommandSpec, String> {
-        Err("AGY sessions cannot be restored from CLI history yet".to_string())
+        target_command(
+            shell,
+            workspace,
+            command_binary("agy", shell)?,
+            vec!["--conversation".into(), cli_session_id.into()],
+        )
     }
 
     fn shell_integration(&self) -> &'static dyn AgentShellIntegration {

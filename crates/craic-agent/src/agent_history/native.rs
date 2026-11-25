@@ -1,3 +1,4 @@
+mod agy;
 mod codex;
 pub use codex::CodexHistoryReader;
 mod grok;
@@ -57,6 +58,7 @@ pub fn list_native_sessions(
         let mut opencode = Vec::new();
         let opencode = read_opencode_sessions(workspace.repo_path(), &mut opencode)
             .map(|available| available.then_some(opencode));
+        let agy = agy::list(workspace.repo_path());
         [
             (
                 "Codex",
@@ -70,6 +72,7 @@ pub fn list_native_sessions(
                     .unwrap_or_else(|_| Err("Grok history worker failed".to_string())),
             ),
             ("OpenCode", opencode),
+            ("AGY", agy),
         ]
     });
     for (provider, result) in results {

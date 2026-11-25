@@ -1728,9 +1728,6 @@ fn activate_page(state: &Rc<AppState>, index: usize) {
     if state.active_page.borrow().as_ref() != Some(&page_id) {
         state.active_page.replace(Some(page_id.clone()));
         state.page_host.show(&state.pages, index);
-        let page = state.pages[index].clone();
-        let activate_page = page.clone();
-        page.initialize(Box::new(move |_, _| activate_page.activate()));
         if let Err(command) = state.app_handle.try_send(AppCommand::ActivatePage(page_id)) {
             log::warn!("GTK page activation queue rejected command={command:?}");
         }

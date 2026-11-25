@@ -425,8 +425,9 @@ impl PageHost {
         let left_slot = self.left_slot.clone();
         let right_slot = self.right_slot.clone();
         let show_generation = self.show_generation.clone();
-        let label = page.label();
+        let active_page = page.clone();
         page.initialize(Box::new(move |left, right| {
+            let label = active_page.label();
             if show_generation.get() != generation {
                 log::trace!(
                     "ignored stale page panes label={} generation={}",
@@ -441,6 +442,7 @@ impl PageHost {
             left_slot.append(&left);
             right_slot.append(&right);
             log::debug!("page panes displayed label={label}");
+            active_page.activate();
         }));
     }
 }

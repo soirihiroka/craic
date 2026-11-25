@@ -59,6 +59,23 @@ struct View {
     activation_handlers: RefCell<Vec<Handler<TerminalActivation>>>,
     file_drop_handler: RefCell<Option<FileDropHandler>>,
     session_controllers: RefCell<Vec<gtk::EventController>>,
+    window_lifetime: RefCell<Option<WindowLifetime>>,
+}
+
+struct WindowLifetime {
+    window: glib::WeakRef<gtk::Window>,
+    application: glib::WeakRef<gtk::Application>,
+    removed: Option<glib::SignalHandlerId>,
+}
+
+impl Drop for WindowLifetime {
+    fn drop(&mut self) {
+        if let (Some(application), Some(removed)) =
+            (self.application.upgrade(), self.removed.take())
+        {
+            application.disconnect(removed);
+        }
+    }
 }
 
 impl GtkTerminal {
@@ -86,7 +103,10 @@ impl GtkTerminal {
     }
 
     pub fn terminate(&self) {
-        self.0.terminated.set(true);
+        if self.0.terminated.replace(true) {
+            return;
+        }
+        self.0.window_lifetime.take();
         for controller in self.0.session_controllers.take() {
             self.0.canvas.remove_controller(&controller);
         }
@@ -159,18 +179,53 @@ impl GtkTerminal {
             activation_handlers: RefCell::new(Vec::new()),
             file_drop_handler: RefCell::new(None),
             session_controllers: RefCell::new(Vec::new()),
+            window_lifetime: RefCell::new(None),
         }));
         terminal.0.root.connect_root_notify({
             let view = Rc::downgrade(&terminal.0);
-            let rooted = Cell::new(false);
             move |widget| {
-                if widget.root().is_some() {
-                    rooted.set(true);
-                } else if rooted.replace(false)
-                    && let Some(view) = view.upgrade()
+                // Page navigation unparents the pane. Keep watching its
+                // owning window even while the terminal is off-page.
+                let Some(view) = view.upgrade().filter(|view| !view.terminated.get()) else {
+                    return;
+                };
+                let Some(window) = widget.root().and_downcast::<gtk::Window>() else {
+                    return;
+                };
+                let Some(application) = window.application() else {
+                    return;
+                };
+                if view
+                    .window_lifetime
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|lifetime| {
+                        lifetime.window.upgrade().as_ref() == Some(&window)
+                            && lifetime.application.upgrade().as_ref() == Some(&application)
+                    })
                 {
-                    GtkTerminal(view).terminate();
+                    return;
                 }
+                let window = window.downgrade();
+                let removed = application.connect_window_removed({
+                    let window = window.clone();
+                    let view = Rc::downgrade(&view);
+                    move |_, removed| {
+                        if window.upgrade().as_ref() == Some(removed)
+                            && let Some(view) = view.upgrade()
+                        {
+                            log::debug!(
+                                "closing terminal because its application window was removed"
+                            );
+                            GtkTerminal(view).terminate();
+                        }
+                    }
+                });
+                view.window_lifetime.replace(Some(WindowLifetime {
+                    window,
+                    application: application.downgrade(),
+                    removed: Some(removed),
+                }));
             }
         });
         terminal.install_canvas();
