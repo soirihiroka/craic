@@ -1,4 +1,6 @@
 %global debug_package %{nil}
+# Fedora 44's GCC LTO crashes when linking the bundled native dependencies.
+%global _lto_cflags %{nil}
 
 Name:           craic
 Version:        %{?package_version}%{!?package_version:0.1.0}
