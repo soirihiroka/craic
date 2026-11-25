@@ -50,6 +50,8 @@ repository tools, terminals, and document previews.
 
 %build
 export CARGO_INCREMENTAL=0
+# Skia passes Clang's --target flag even when RPM defaults to GCC.
+export CLANGCC=clang CLANGCXX=clang++
 cargo check --release --locked
 cargo build --release --locked
 
