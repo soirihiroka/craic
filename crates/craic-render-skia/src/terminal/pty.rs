@@ -68,7 +68,9 @@ impl PtyWorker {
             .stderr(Stdio::from(slave));
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) < 0 {
+                if libc::setsid() < 0
+                    || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0
+                {
                     return Err(io::Error::last_os_error());
                 }
                 for signal in [

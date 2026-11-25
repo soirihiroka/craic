@@ -22,7 +22,6 @@ BuildRequires:  curl
 BuildRequires:  xz
 BuildRequires:  pkgconfig(gtk4) >= 4.10
 BuildRequires:  pkgconfig(libadwaita-1) >= 1.9
-BuildRequires:  pkgconfig(gtksourceview-5)
 BuildRequires:  pkgconfig(poppler-glib) >= 26.1
 BuildRequires:  pkgconfig(libpanel-1)
 BuildRequires:  pkgconfig(webkitgtk-6.0)

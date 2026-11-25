@@ -20,7 +20,7 @@ the repository configuration reflects whether package signatures are enabled.
 Requirements
 ------------
 
-Craic requires Rust, Cargo, GTK 4, Libadwaita, GtkSourceView 5, WebKitGTK,
+Craic requires Rust, Cargo, GTK 4, Libadwaita, WebKitGTK,
 Poppler GLib, GObject Introspection, and pkg-config.
 
 Fedora
@@ -31,7 +31,7 @@ Fedora
    $ sudo dnf install rust cargo clang clang-devel llvm gcc-c++ make python3 git \
        gtk4-devel webkitgtk6.0-devel libpanel-devel fontconfig-devel \
        freetype-devel mesa-libEGL-devel mesa-libGL-devel wayland-devel \
-       gtksourceview5-devel libadwaita-devel curl xz \
+       libadwaita-devel curl xz \
        poppler-glib-devel gobject-introspection-devel pkgconf-pkg-config
 
 Ubuntu and Debian
@@ -39,7 +39,7 @@ Ubuntu and Debian
 
 .. code-block:: console
 
-   $ sudo apt install rustc cargo libgtk-4-dev libgtksourceview-5-dev \
+   $ sudo apt install rustc cargo libgtk-4-dev \
        libadwaita-1-dev curl xz-utils llvm libclang-dev libpoppler-glib-dev \
        gobject-introspection pkg-config
 

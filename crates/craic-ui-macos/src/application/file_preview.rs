@@ -1275,8 +1275,9 @@ impl AppDelegate {
             }
         };
         let text = files.text_buffer.borrow().clone();
-        files.preview_code.set_syntax(analysis.syntax.clone());
-        files.preview_code.set_folds(analysis.fold_ranges.clone());
+        files
+            .preview_code
+            .set_syntax_and_folds(analysis.syntax, analysis.fold_ranges);
         files
             .preview_code
             .set_diagnostics(analysis.diagnostics.clone());

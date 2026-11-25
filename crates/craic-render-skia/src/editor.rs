@@ -415,7 +415,7 @@ impl EditorMetrics {
         Self {
             font_size,
             line_height: font_size * 1.62,
-            char_width: font_size * 0.602,
+            char_width: font_size * 0.6,
             gutter_width: 54.0,
             text_inset: 10.0,
         }

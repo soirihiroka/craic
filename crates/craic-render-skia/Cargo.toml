@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+craic-file-support.workspace = true
 craic-language.workspace = true
 craic-platform.workspace = true
 craic-text-layout.workspace = true

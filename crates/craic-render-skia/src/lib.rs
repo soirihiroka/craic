@@ -5,7 +5,6 @@ mod diff_layout;
 mod diff_painter;
 mod editor;
 mod editor_buffer;
-mod editor_painter;
 mod editor_search;
 mod editor_selection;
 mod geometry;
@@ -37,7 +36,6 @@ pub use editor_buffer::{
     EditorTextBuffer, byte_offset_for_line_column, clamp_to_char_boundary, next_char_boundary,
     next_word_boundary, previous_char_boundary, previous_word_boundary,
 };
-pub use editor_painter::{EditorPaintRequest, paint_editor};
 pub use editor_search::{EditorSearchMatch, editor_search_index_after, find_editor_search_matches};
 pub use editor_selection::{
     AnchoredSelection, CodeSelection, DragSelection, SelectionMode, clipped_bounds, drag_for_mode,
@@ -53,7 +51,7 @@ pub use scrollbar::{
 pub use skia_canvas::Context;
 pub use syntax::{
     DiffSyntaxSpan, TextDiagnosticKind, TextDiagnosticSpan, TextSyntaxAnalysis, TextSyntaxSpan,
-    analyze_text_syntax, build_diff_syntax, build_text_syntax,
+    analyze_text_syntax, analyze_text_syntax_for_language, build_diff_syntax, build_text_syntax,
 };
 pub use terminal::{
     TerminalCell, TerminalCellStyle, TerminalClipboard, TerminalColor, TerminalCursor,

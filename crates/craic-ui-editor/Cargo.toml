@@ -10,12 +10,15 @@ craic-config.workspace = true
 craic-language.workspace = true
 craic-render-skia.workspace = true
 craic-file-support.workspace = true
+craic-ui-code.workspace = true
 craic-ui-core.workspace = true
 craic-vcs.workspace = true
 gdk4-wayland.workspace = true
 gl.workspace = true
+gpui.workspace = true
+gpui_wgpu = { workspace = true, features = ["bench-support"] }
 gtk.workspace = true
 log.workspace = true
 skia-safe.workspace = true
-sourceview5.workspace = true
+tokio.workspace = true
 unicode-segmentation.workspace = true

@@ -34,6 +34,7 @@ craic-text-layout = { path = "crates/craic-text-layout" }
 craic-vcs = { path = "crates/craic-vcs" }
 craic-ui-core = { package = "craic-ui-gtk-core", path = "crates/craic-ui-core" }
 craic-ui-agent = { path = "crates/craic-ui-agent" }
+craic-ui-code = { path = "crates/craic-ui-code" }
 craic-ui-containers = { path = "crates/craic-ui-containers" }
 craic-ui-editor = { path = "crates/craic-ui-editor" }
 craic-ui-file = { path = "crates/craic-ui-file" }
@@ -50,6 +51,9 @@ freetype = { package = "freetype-rs", version = "0.38" }
 gdk4-wayland = "0.11"
 glycin = { version = "3.1.0", features = ["gdk4"] }
 gl = "0.14"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "10113795dffdde78b274c9455fc9c1f3234bf564", default-features = false }
+gpui_apple = { git = "https://github.com/zed-industries/zed", rev = "10113795dffdde78b274c9455fc9c1f3234bf564" }
+gpui_wgpu = { git = "https://github.com/zed-industries/zed", rev = "10113795dffdde78b274c9455fc9c1f3234bf564" }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
 gtk4 = { version = "0.11", features = ["v4_10"] }
 libc = "0.2"
@@ -86,7 +90,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 semver = "1"
 skia-safe = { version = "0.99", default-features = false, features = ["binary-cache", "embed-icudtl", "gl", "egl", "wayland", "svg", "textlayout"] }
-sourceview5 = "0.11.0"
 syntect = "5"
 toml = "1"
 tokio = { version = "1.52", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }

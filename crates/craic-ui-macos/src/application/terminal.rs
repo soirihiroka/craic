@@ -1825,6 +1825,9 @@ impl AppDelegate {
                 files.preview_web_content.removeAllUserScripts();
             }
         }
+        if let Some(containers) = self.ivars().containers.get() {
+            containers.inspect_code.teardown_renderer();
+        }
         self.ivars().files_monitor.borrow_mut().take();
         self.ivars().repository_background_pull.borrow_mut().take();
         self.ivars().repository_monitor.borrow_mut().take();

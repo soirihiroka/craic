@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use craic_language::{CompletionSet, SyntaxHighlighter, language_id_from_path};
+use craic_file_support::LanguageId;
+use craic_language::{CompletionItem, CompletionSet, SyntaxHighlighter, language_id_from_path};
 
 use crate::{DiffRow, DiffRowKind, DiffSide};
 
@@ -50,7 +51,15 @@ pub fn analyze_text_syntax(
     source: &str,
     completion_cursor: Option<usize>,
 ) -> TextSyntaxAnalysis {
-    let mut highlighter = SyntaxHighlighter::new_id(language_id_from_path(path));
+    analyze_text_syntax_for_language(language_id_from_path(path), source, completion_cursor)
+}
+
+pub fn analyze_text_syntax_for_language(
+    language: LanguageId,
+    source: &str,
+    completion_cursor: Option<usize>,
+) -> TextSyntaxAnalysis {
+    let mut highlighter = SyntaxHighlighter::new_id(language);
     highlighter.set_source(source);
     let mut highlights = highlighter.highlight_current();
     highlights.sort_by_key(|range| (range.start, range.end));
@@ -79,13 +88,50 @@ pub fn analyze_text_syntax(
             })
         })
         .collect();
-    let completions = completion_cursor.and_then(|cursor| highlighter.completions_current(cursor));
+    let completions = completion_cursor.and_then(|cursor| {
+        highlighter
+            .completions_current(cursor)
+            .or_else(|| document_word_completions(source, cursor))
+    });
     TextSyntaxAnalysis {
         syntax,
         diagnostics,
         fold_ranges,
         completions,
     }
+}
+
+fn document_word_completions(source: &str, cursor: usize) -> Option<CompletionSet> {
+    // Use the same bound as syntax highlighting to keep completion work predictable.
+    if source.len() > 512 * 1024 {
+        return None;
+    }
+    let is_word = |character: char| character == '_' || character.is_alphanumeric();
+    let before = source.get(..cursor)?;
+    let start = before
+        .rfind(|character| !is_word(character))
+        .map_or(0, |offset| {
+            offset + before[offset..].chars().next().unwrap().len_utf8()
+        });
+    let prefix = &before[start..];
+    if prefix.chars().count() < 2 || source[cursor..].starts_with(is_word) {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let items: Vec<_> = source
+        .split(|character| !is_word(character))
+        .filter(|word| word.len() > prefix.len() && word.starts_with(prefix) && seen.insert(*word))
+        .take(48)
+        .map(|word| CompletionItem {
+            label: word.to_owned(),
+            insert_text: word.to_owned(),
+        })
+        .collect();
+    (!items.is_empty()).then_some(CompletionSet {
+        items,
+        replacement_start: start,
+        replacement_end: cursor,
+    })
 }
 
 pub fn build_diff_syntax(path: &str, rows: &[DiffRow]) -> Vec<DiffSyntaxSpan> {

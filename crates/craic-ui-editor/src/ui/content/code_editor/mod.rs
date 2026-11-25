@@ -1,17 +1,29 @@
 mod diagnostics;
+mod input;
 mod search;
+mod viewport;
 
 use crate::config;
 use crate::git::{DiffKind, FileComparison};
-use crate::language_support::{language_support, language_support_for_id};
+use crate::language_support::language_support;
 use crate::markdown_lint::MarkdownLintIssue;
 use crate::spellcheck::SpellcheckIssue;
 use crate::ui::components::search::SearchPanel;
 use craic_file_support::LanguageId;
-use gtk::{gdk, glib};
-use sourceview5::prelude::*;
+use craic_render_skia::{
+    EditorMetrics, EditorSelection, TextDiagnosticKind, TextDiagnosticSpan,
+    analyze_text_syntax_for_language,
+};
+use craic_ui_code::{Editor, SearchOptions};
+use gpui::{Rgba, rgb};
+use gtk::prelude::*;
+use gtk::{Orientation, glib};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::OnceLock;
+use std::time::Duration;
+use viewport::Viewport;
 
 pub use craic_render_skia::byte_offset_for_line_column;
 
@@ -21,203 +33,109 @@ pub struct DocumentRevision(u64);
 #[derive(Clone)]
 pub struct CodeEditor {
     pub root: gtk::Box,
-    view: sourceview5::View,
-    buffer: sourceview5::Buffer,
-    scroller: gtk::ScrolledWindow,
-    scroll_mark: gtk::TextMark,
-    search_panel: SearchPanel,
-    // Keep the context alive; search callbacks use weak references to avoid a buffer cycle.
-    _search_context: sourceview5::SearchContext,
-    font_provider: gtk::CssProvider,
-    state: Rc<EditorState>,
+    view: Viewport,
 }
 
 type EditCallback = Rc<dyn Fn()>;
 type MarkdownLintIgnoreCallback = Rc<dyn Fn(String)>;
+type ScrollCallback = Rc<dyn Fn(f64)>;
 
 struct EditorState {
+    editor: RefCell<Editor>,
     revision: Cell<u64>,
-    loading: Cell<bool>,
-    user_action_depth: Cell<u32>,
-    pending_edit: Cell<bool>,
-    language: Cell<LanguageId>,
-    font_size: Cell<f64>,
+    adjustment: gtk::Adjustment,
+    syncing_scroll: Cell<bool>,
+    last_offset: Cell<Option<usize>>,
+    pending_source_offset: Cell<Option<usize>>,
     edit_callbacks: RefCell<Vec<EditCallback>>,
+    scroll_callbacks: RefCell<Vec<ScrollCallback>>,
     markdown_lint_ignore_callbacks: RefCell<Vec<MarkdownLintIgnoreCallback>>,
     markdown_lint_issues: RefCell<Vec<MarkdownLintIssue>>,
     spellcheck_issues: RefCell<Vec<SpellcheckIssue>>,
+    syntax_diagnostics: RefCell<Vec<TextDiagnosticSpan>>,
+    analysis_task: RefCell<Option<glib::JoinHandle<()>>>,
+    diff_marks: RefCell<HashMap<usize, Rgba>>,
+    search_panel: SearchPanel,
+    search_open: Cell<bool>,
+    search_options: Cell<SearchOptions>,
 }
 
 impl CodeEditor {
     pub fn new(language: &str, text: &str) -> Self {
-        sourceview5::init();
-        let buffer = sourceview5::Buffer::new(None);
-        buffer.set_implicit_trailing_newline(false);
-        buffer.set_enable_undo(true);
-        let scroll_mark = buffer.create_mark(None, &buffer.start_iter(), true);
-        let view = sourceview5::View::with_buffer(&buffer);
-        view.set_monospace(true);
-        view.set_editable(false);
-        view.set_cursor_visible(false);
-        view.set_show_line_numbers(true);
-        view.set_show_line_marks(true);
-        view.set_highlight_current_line(true);
-        view.set_auto_indent(true);
-        view.set_indent_on_tab(true);
-        view.set_indent_width(4);
-        view.set_tab_width(4);
-        view.set_insert_spaces_instead_of_tabs(true);
-        view.set_smart_backspace(true);
-        view.set_smart_home_end(sourceview5::SmartHomeEndType::Before);
-        view.set_wrap_mode(gtk::WrapMode::WordChar);
-        view.set_left_margin(8);
-        view.set_right_margin(8);
-        view.set_top_margin(8);
-        view.set_bottom_margin(8);
-        view.set_hexpand(true);
-        view.set_vexpand(true);
-        view.set_enable_snippets(true);
-        let words = sourceview5::CompletionWords::new(Some("Document words"));
-        words.register(&buffer);
-        view.completion().add_provider(&words);
-        for (category, icon) in [
-            ("git-added", "list-add-symbolic"),
-            ("git-deleted", "list-remove-symbolic"),
-        ] {
-            let attributes = sourceview5::MarkAttributes::new();
-            attributes.set_icon_name(icon);
-            view.set_mark_attributes(category, &attributes, 0);
-        }
-        let scroller = gtk::ScrolledWindow::builder()
-            .child(&view)
-            .hscrollbar_policy(gtk::PolicyType::Automatic)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .hexpand(true)
-            .vexpand(true)
-            .build();
-        let root = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .hexpand(true)
-            .vexpand(false)
-            .width_request(240)
-            .height_request(100)
-            .build();
-        let font_provider = gtk::CssProvider::new();
-        // TextView has no font-size property. Keep zoom styling local to this view.
-        #[allow(deprecated)]
-        view.style_context()
-            .add_provider(&font_provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        let adjustment = gtk::Adjustment::new(0.0, 0.0, 0.0, 16.0, 100.0, 0.0);
+        let search_panel = SearchPanel::new("Search");
         let state = Rc::new(EditorState {
+            editor: RefCell::new(Editor::new(config::DEFAULT_EDITOR_FONT_SIZE as f32)),
             revision: Cell::new(1),
-            loading: Cell::new(false),
-            user_action_depth: Cell::new(0),
-            pending_edit: Cell::new(false),
-            language: Cell::new(LanguageId::PlainText),
-            font_size: Cell::new(config::DEFAULT_EDITOR_FONT_SIZE),
+            adjustment: adjustment.clone(),
+            syncing_scroll: Cell::new(false),
+            last_offset: Cell::new(None),
+            pending_source_offset: Cell::new(None),
             edit_callbacks: RefCell::new(Vec::new()),
+            scroll_callbacks: RefCell::new(Vec::new()),
             markdown_lint_ignore_callbacks: RefCell::new(Vec::new()),
             markdown_lint_issues: RefCell::new(Vec::new()),
             spellcheck_issues: RefCell::new(Vec::new()),
+            syntax_diagnostics: RefCell::new(Vec::new()),
+            analysis_task: RefCell::new(None),
+            diff_marks: RefCell::new(HashMap::new()),
+            search_panel: search_panel.clone(),
+            search_open: Cell::new(false),
+            search_options: Cell::new(SearchOptions::default()),
         });
-        buffer.connect_begin_user_action({
-            let state = Rc::downgrade(&state);
-            move |_| {
-                if let Some(state) = state.upgrade() {
-                    state
-                        .user_action_depth
-                        .set(state.user_action_depth.get() + 1);
-                }
-            }
-        });
-        buffer.connect_changed({
-            let state = Rc::downgrade(&state);
-            move |buffer| {
-                let Some(state) = state.upgrade() else { return };
-                state
-                    .revision
-                    .set(state.revision.get().wrapping_add(1).max(1));
-                diagnostics::clear(buffer, &state);
-                if !state.loading.get() {
-                    if state.user_action_depth.get() > 0 {
-                        state.pending_edit.set(true);
-                    } else {
-                        notify_edit(&state);
-                    }
-                }
-            }
-        });
-        buffer.connect_end_user_action({
-            let state = Rc::downgrade(&state);
-            move |_| {
-                let Some(state) = state.upgrade() else { return };
-                state
-                    .user_action_depth
-                    .set(state.user_action_depth.get().saturating_sub(1));
-                if state.user_action_depth.get() == 0
-                    && state.pending_edit.replace(false)
-                    && !state.loading.get()
+        let view = Viewport::new(state);
+        let content = gtk::Box::new(Orientation::Horizontal, 0);
+        content.set_vexpand(true);
+        content.append(&view);
+        let scrollbar = gtk::Scrollbar::new(Orientation::Vertical, Some(&adjustment));
+        content.append(&scrollbar);
+        adjustment.connect_value_changed({
+            let weak = view.downgrade();
+            move |adjustment| {
+                if let Some(view) = weak.upgrade()
+                    && !view.state().syncing_scroll.get()
                 {
-                    notify_edit(&state);
+                    let current = view.state().editor.borrow().viewport.scroll_y();
+                    view.scroll(0.0, adjustment.value() - current);
                 }
             }
         });
-        let (search_panel, search_context) = search::install(&view, &buffer, &root);
+        let root = gtk::Box::new(Orientation::Vertical, 0);
+        root.set_hexpand(true);
+        root.set_size_request(240, 100);
+        search::install(&view, &root);
         root.append(&search_panel.widget());
-        root.append(&scroller);
-        let style_manager = adw::StyleManager::for_display(&view.display());
-        // GBinding disconnects automatically when the buffer is finalized.
-        style_manager
-            .bind_property("dark", &buffer, "style-scheme")
-            .transform_to(|_, dark: bool| {
-                Some(sourceview5::StyleSchemeManager::default().scheme(if dark {
-                    "Adwaita-dark"
-                } else {
-                    "Adwaita"
-                }))
-            })
-            .sync_create()
-            .build();
-        diagnostics::install(&view, &buffer, &state);
-        install_shortcuts(&view, &root, &font_provider, &state);
-        let editor = Self {
-            root,
-            view,
-            buffer,
-            scroller,
-            scroll_mark,
-            search_panel,
-            _search_context: search_context,
-            font_provider,
-            state,
-        };
-        editor.set_font_size(config::DEFAULT_EDITOR_FONT_SIZE);
+        root.append(&content);
+        input::install(&view);
+        let editor = Self { root, view };
         editor.set_document(language, text);
         editor
     }
 
     pub fn toggle_search(&self) {
-        self.search_panel.toggle();
+        self.view.state().search_panel.toggle();
     }
 
     pub fn set_text(&self, text: &str) {
-        if self.document_text() == text {
-            return;
+        let state = self.view.state();
+        {
+            let mut editor = state.editor.borrow_mut();
+            if editor.document.text() == text {
+                return;
+            }
+            let offset = editor
+                .viewport
+                .source_offset(&editor.document, editor.metrics);
+            editor.reset_document(
+                text.to_owned(),
+                Vec::new(),
+                EditorSelection::default(),
+                true,
+            );
+            state.pending_source_offset.set(Some(offset));
         }
-        let scroll_offset = self.source_offset_at_scroll_top();
-        self.state.loading.set(true);
-        // Loading/reloading a document must neither trigger autosave nor enter undo history.
-        self.buffer.begin_irreversible_action();
-        self.buffer.set_text(text);
-        self.buffer.end_irreversible_action();
-        self.buffer.set_modified(false);
-        self.state.loading.set(false);
-        self.clear_file_diff();
-        self.set_source_offset_at_scroll_top(scroll_offset);
-        log::debug!(
-            "source editor document replaced bytes={} revision={}",
-            text.len(),
-            self.state.revision.get()
-        );
+        self.view.clear_frame();
+        self.view.document_changed(false);
     }
 
     pub fn set_document(&self, language: &str, text: &str) {
@@ -225,18 +143,26 @@ impl CodeEditor {
     }
 
     pub fn set_document_id(&self, language: LanguageId, text: &str) {
-        self.set_language_id(language);
-        self.set_text(text);
+        let state = self.view.state();
+        if state.editor.borrow().document.text() == text {
+            self.set_language_id(language);
+        } else {
+            state.editor.borrow_mut().language = language;
+            self.set_text(text);
+        }
     }
 
     pub fn select_range(&self, start: usize, end: usize) {
-        let text = self.document_text();
-        let end = iter_at_byte(&self.buffer, &text, end.max(start));
-        let start = iter_at_byte(&self.buffer, &text, start);
-        self.buffer.select_range(&end, &start);
-        self.view.grab_focus();
         self.view
-            .scroll_to_mark(&self.buffer.selection_bound(), 0.1, false, 0.0, 0.0);
+            .state()
+            .editor
+            .borrow_mut()
+            .select(EditorSelection {
+                anchor: start,
+                focus: end.max(start),
+            });
+        self.view.grab_focus();
+        self.view.refresh();
     }
 
     pub fn select_line_column(&self, line: usize, column: usize) {
@@ -245,53 +171,45 @@ impl CodeEditor {
     }
 
     pub fn set_file_diff(&self, comparison: Option<&FileComparison>) {
-        self.clear_file_diff();
-        let Some(comparison) = comparison else { return };
-        let mut insertion_at = 0;
-        for row in &comparison.rows {
-            if let Some(number) = row.right_number {
-                if row.right_kind == DiffKind::Added {
-                    if let Some(iter) = self.buffer.iter_at_line(number.saturating_sub(1) as i32) {
-                        self.buffer.create_source_mark(None, "git-added", &iter);
+        let state = self.view.state();
+        let mut marks = state.diff_marks.borrow_mut();
+        marks.clear();
+        if let Some(comparison) = comparison {
+            let last_line = state
+                .editor
+                .borrow()
+                .document
+                .lines()
+                .len()
+                .saturating_sub(1);
+            let mut insertion_at = 0;
+            for row in &comparison.rows {
+                if let Some(number) = row.right_number {
+                    if row.right_kind == DiffKind::Added {
+                        marks.insert(number.saturating_sub(1), rgb(0x57a64a));
                     }
+                    insertion_at = number;
                 }
-                insertion_at = number;
-            }
-            if row.left_kind == DiffKind::Deleted && row.left_number.is_some() {
-                let line = insertion_at.min(self.buffer.line_count().saturating_sub(1) as usize);
-                if let Some(iter) = self.buffer.iter_at_line(line as i32) {
-                    self.buffer.create_source_mark(None, "git-deleted", &iter);
+                if row.left_kind == DiffKind::Deleted && row.left_number.is_some() {
+                    marks.insert(insertion_at.min(last_line), rgb(0xda5b5d));
                 }
             }
         }
+        self.view.queue_draw();
     }
 
     pub fn clear_file_diff(&self) {
-        let (start, end) = self.buffer.bounds();
-        for category in ["git-added", "git-deleted"] {
-            self.buffer
-                .remove_source_marks(&start, &end, Some(category));
-        }
+        self.set_file_diff(None);
     }
 
     pub fn set_spellcheck_issues(&self, issues: Vec<SpellcheckIssue>) {
-        diagnostics::apply_ranges(
-            &self.buffer,
-            "spellcheck",
-            issues.iter().map(|issue| (issue.start, issue.end)),
-        );
-        self.state.spellcheck_issues.replace(issues);
-        diagnostics::update_menu(&self.view, &self.state, self.buffer.cursor_position());
+        self.view.state().spellcheck_issues.replace(issues);
+        self.view.refresh_diagnostics();
     }
 
     pub fn set_markdown_lint_issues(&self, issues: Vec<MarkdownLintIssue>) {
-        diagnostics::apply_ranges(
-            &self.buffer,
-            "markdown-lint",
-            issues.iter().map(|issue| (issue.start, issue.end)),
-        );
-        self.state.markdown_lint_issues.replace(issues);
-        diagnostics::update_menu(&self.view, &self.state, self.buffer.cursor_position());
+        self.view.state().markdown_lint_issues.replace(issues);
+        self.view.refresh_diagnostics();
     }
 
     pub fn set_language(&self, language: &str) {
@@ -299,51 +217,37 @@ impl CodeEditor {
     }
 
     pub fn set_language_id(&self, language: LanguageId) {
-        self.state.language.set(language);
-        let manager = sourceview5::LanguageManager::default();
-        let preferred = match language {
-            LanguageId::PlainText => "",
-            LanguageId::Bash => "sh",
-            LanguageId::JavaScript => "js",
-            LanguageId::Jsx => "jsx",
-            LanguageId::Tsx => "typescript-jsx",
-            LanguageId::Python => "python3",
-            LanguageId::CSharp => "c-sharp",
-            LanguageId::ObjectiveC => "objc",
-            LanguageId::VisualBasic => "vbnet",
-            LanguageId::Make => "makefile",
-            LanguageId::MarkdownInline => "markdown",
-            LanguageId::Hlsl | LanguageId::Slang => "cpp",
-            _ => "",
-        };
-        let support = language_support_for_id(language);
-        let syntax = (language != LanguageId::PlainText)
-            .then(|| {
-                std::iter::once(preferred)
-                    .chain(support.aliases.iter().copied())
-                    .find_map(|id| manager.language(id))
-            })
-            .flatten();
-        self.buffer.set_language(syntax.as_ref());
+        let mut editor = self.view.state().editor.borrow_mut();
+        if editor.language != language {
+            editor.language = language;
+            drop(editor);
+            self.view.analyze(false);
+        }
     }
 
-    pub fn set_font_size(&self, font_size: f64) {
-        set_font_size(&self.font_provider, &self.state, font_size);
+    pub fn set_font_size(&self, size: f64) {
+        self.view.set_font_size(size);
     }
 
     pub fn document_text(&self) -> String {
-        let (start, end) = self.buffer.bounds();
-        self.buffer.text(&start, &end, true).to_string()
+        self.view.state().editor.borrow().document.text().to_owned()
     }
 
     pub fn document_revision(&self) -> DocumentRevision {
-        DocumentRevision(self.state.revision.get())
+        DocumentRevision(self.view.state().revision.get())
     }
 
     pub fn set_editable(&self, editable: bool) {
-        self.view.set_editable(editable);
-        self.view.set_cursor_visible(editable);
-        diagnostics::update_menu(&self.view, &self.state, self.buffer.cursor_position());
+        let mut editor = self.view.state().editor.borrow_mut();
+        editor.editable = editable;
+        if !editable {
+            editor.marked_text.clear();
+            editor.clear_completion();
+        }
+        drop(editor);
+        self.view
+            .update_property(&[gtk::accessible::Property::ReadOnly(!editable)]);
+        self.view.queue_draw();
     }
 
     pub fn set_read_only(&self, read_only: bool) {
@@ -351,138 +255,227 @@ impl CodeEditor {
     }
 
     pub fn connect_scroll_changed<F: Fn(f64) + 'static>(&self, callback: F) {
-        self.scroller
-            .vadjustment()
-            .connect_value_changed(move |adjustment| callback(adjustment.value()));
+        self.view
+            .state()
+            .scroll_callbacks
+            .borrow_mut()
+            .push(Rc::new(callback));
     }
 
     pub fn source_offset_at_scroll_top(&self) -> usize {
-        let (iter, _) = self.view.line_at_y(self.view.visible_rect().y());
-        self.buffer
-            .text(&self.buffer.start_iter(), &iter, true)
-            .len()
+        let state = self.view.state();
+        let editor = state.editor.borrow();
+        state.pending_source_offset.get().unwrap_or_else(|| {
+            editor
+                .viewport
+                .source_offset(&editor.document, editor.metrics)
+        })
     }
 
     pub fn set_source_offset_at_scroll_top(&self, offset: usize) {
-        let iter = iter_at_byte(&self.buffer, &self.document_text(), offset);
-        // scroll_to_mark also works before allocation; GTK scrolls after validating layout.
-        self.buffer.move_mark(&self.scroll_mark, &iter);
-        self.view
-            .scroll_to_mark(&self.scroll_mark, 0.0, true, 0.0, 0.0);
+        self.view.state().pending_source_offset.set(Some(offset));
+        self.view.refresh();
     }
 
     pub fn connect_edit<F: Fn() + 'static>(&self, callback: F) {
-        self.state
+        self.view
+            .state()
             .edit_callbacks
             .borrow_mut()
             .push(Rc::new(callback));
     }
 
     pub fn connect_markdown_lint_ignore<F: Fn(String) + 'static>(&self, callback: F) {
-        self.state
+        self.view
+            .state()
             .markdown_lint_ignore_callbacks
             .borrow_mut()
             .push(Rc::new(callback));
     }
 }
 
-fn iter_at_byte(buffer: &sourceview5::Buffer, text: &str, offset: usize) -> gtk::TextIter {
-    let mut offset = offset.min(text.len());
-    while !text.is_char_boundary(offset) {
-        offset -= 1;
+impl Viewport {
+    fn set_font_size(&self, size: f64) -> f64 {
+        let size = config::normalize_font_size(size, config::DEFAULT_EDITOR_FONT_SIZE);
+        let mut editor = self.state().editor.borrow_mut();
+        editor.metrics = EditorMetrics::for_font_size(size as f32);
+        editor.reveal_selection();
+        drop(editor);
+        self.refresh();
+        size
     }
-    buffer.iter_at_offset(text[..offset].chars().count() as i32)
-}
 
-fn start_offset(text: &str, char_offset: i32) -> usize {
-    text.char_indices()
-        .nth(char_offset as usize)
-        .map_or(text.len(), |(offset, _)| offset)
-}
-
-fn notify_edit(state: &EditorState) {
-    let callbacks = state.edit_callbacks.borrow().clone();
-    for callback in callbacks {
-        callback();
+    fn scroll(&self, x: f64, y: f64) {
+        let mut state = self.state().editor.borrow_mut();
+        let Editor {
+            document,
+            viewport,
+            metrics,
+            ..
+        } = &mut *state;
+        viewport.scroll_by(x, y, document, *metrics);
+        drop(state);
+        self.refresh();
     }
-}
 
-fn set_font_size(provider: &gtk::CssProvider, state: &EditorState, size: f64) {
-    let size = config::normalize_font_size(size, config::DEFAULT_EDITOR_FONT_SIZE);
-    state.font_size.set(size);
-    provider.load_from_data(&format!("textview {{ font-size: {size}px; }}"));
-}
-
-fn install_shortcuts(
-    view: &sourceview5::View,
-    root: &gtk::Box,
-    provider: &gtk::CssProvider,
-    state: &Rc<EditorState>,
-) {
-    let keys = gtk::EventControllerKey::new();
-    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-    keys.connect_key_pressed({
-        let view = view.downgrade();
-        let provider = provider.clone();
-        let state = Rc::downgrade(state);
-        move |_, key, _, modifiers| {
-            if !modifiers.contains(gdk::ModifierType::CONTROL_MASK)
-                || modifiers.contains(gdk::ModifierType::ALT_MASK)
+    fn refresh(&self) {
+        let state = self.state();
+        let (old_scroll, scroll_y, document_height, page, step, source_offset) = {
+            let mut editor = state.editor.borrow_mut();
+            let Editor {
+                document,
+                viewport,
+                metrics,
+                ..
+            } = &mut *editor;
+            let page = viewport.height();
+            let step = f64::from(metrics.line_height);
+            let current = viewport.scroll_y();
+            if page > 0.0
+                && viewport.width() > 0.0
+                && let Some(offset) = state.pending_source_offset.take()
             {
-                return glib::Propagation::Proceed;
+                let row = document.visual_line_for_offset(offset.min(document.text().len()));
+                let y = f64::from(metrics.text_inset) + row as f64 * step;
+                viewport.scroll_by(0.0, y - current, document, *metrics);
             }
-            let (Some(view), Some(state)) = (view.upgrade(), state.upgrade()) else {
-                return glib::Propagation::Proceed;
-            };
-            let delta = match key {
-                gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => Some(1.0),
-                gdk::Key::minus | gdk::Key::underscore | gdk::Key::KP_Subtract => Some(-1.0),
-                _ => None,
-            };
-            if let Some(delta) = delta {
-                set_font_size(&provider, &state, state.font_size.get() + delta);
-                config::save_editor_font_size(state.font_size.get());
-                return glib::Propagation::Stop;
+            (
+                state.adjustment.value(),
+                viewport.scroll_y(),
+                f64::from(document.content_size(*metrics).1),
+                page,
+                step,
+                viewport.source_offset(document, *metrics),
+            )
+        };
+        state.syncing_scroll.set(true);
+        state
+            .adjustment
+            .configure(scroll_y, 0.0, document_height.max(page), step, page, page);
+        state.syncing_scroll.set(false);
+        let previous = state.last_offset.replace(Some(source_offset));
+        self.queue_draw();
+        if old_scroll != scroll_y || previous.is_some_and(|previous| previous != source_offset) {
+            let callbacks = state.scroll_callbacks.borrow().clone();
+            for callback in callbacks {
+                callback(scroll_y);
             }
-            if matches!(key, gdk::Key::slash | gdk::Key::question) && view.is_editable() {
-                let buffer = view
-                    .buffer()
-                    .downcast::<sourceview5::Buffer>()
-                    .expect("source buffer");
-                toggle_line_comment(&buffer, state.language.get());
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
         }
-    });
-    root.add_controller(keys);
-}
+    }
 
-fn toggle_line_comment(buffer: &sourceview5::Buffer, language: LanguageId) {
-    let Some(prefix) = language_support_for_id(language).line_comment else {
-        return;
-    };
-    let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
-    let selection = craic_render_skia::EditorSelection {
-        anchor: start_offset(
-            &text,
-            buffer.iter_at_mark(&buffer.selection_bound()).offset(),
-        ),
-        focus: start_offset(&text, buffer.cursor_position()),
-    };
-    let Some(edit) = craic_render_skia::toggle_editor_line_comment(&text, selection, prefix) else {
-        return;
-    };
-    let selection = edit.map_selection(selection);
-    let mut start = iter_at_byte(buffer, &text, edit.range_start);
-    let mut end = iter_at_byte(buffer, &text, edit.range_end);
-    buffer.begin_user_action();
-    buffer.delete(&mut start, &mut end);
-    buffer.insert(&mut start, &edit.replacement);
-    let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
-    buffer.select_range(
-        &iter_at_byte(buffer, &text, selection.focus),
-        &iter_at_byte(buffer, &text, selection.anchor),
-    );
-    buffer.end_user_action();
+    fn document_changed(&self, edited: bool) {
+        let state = self.state();
+        state.revision.set(state.revision.get().wrapping_add(1));
+        state.spellcheck_issues.borrow_mut().clear();
+        state.markdown_lint_issues.borrow_mut().clear();
+        state.diff_marks.borrow_mut().clear();
+        state.syntax_diagnostics.borrow_mut().clear();
+        self.update_property(&[gtk::accessible::Property::ValueText(
+            state.editor.borrow().document.text(),
+        )]);
+        self.analyze(edited);
+        if state.search_open.get() {
+            search::update(self, !edited);
+        }
+        self.refresh();
+        if edited {
+            let callbacks = state.edit_callbacks.borrow().clone();
+            for callback in callbacks {
+                callback();
+            }
+        }
+    }
+
+    fn analyze(&self, complete: bool) {
+        static ANALYSIS_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, std::io::Error>> =
+            OnceLock::new();
+        let state = self.state();
+        if let Some(task) = state.analysis_task.borrow_mut().take() {
+            task.abort();
+        }
+        let Ok(runtime) = ANALYSIS_RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(2)
+                .build()
+        }) else {
+            return;
+        };
+        let view = self.downgrade();
+        let task = glib::spawn_future_local(async move {
+            // Coalesce typing before copying and parsing the document.
+            if complete {
+                glib::timeout_future(Duration::from_millis(50)).await;
+            }
+            let Some(current) = view.upgrade() else {
+                return;
+            };
+            let (text, language, completion) = {
+                let editor = current.state().editor.borrow();
+                (
+                    editor.document.text().to_owned(),
+                    editor.language,
+                    (complete && editor.editable && editor.selection.is_empty())
+                        .then_some(editor.selection.focus),
+                )
+            };
+            drop(current);
+            let analysis = runtime
+                .spawn_blocking(move || {
+                    analyze_text_syntax_for_language(language, &text, completion)
+                })
+                .await;
+            let Some(view) = view.upgrade() else { return };
+            let state = view.state();
+            state.analysis_task.borrow_mut().take();
+            let Ok(analysis) = analysis else { return };
+            let mut editor = state.editor.borrow_mut();
+            editor.set_syntax_and_folds(analysis.syntax, analysis.fold_ranges);
+            if editor.selection.is_empty()
+                && editor.editable
+                && completion == Some(editor.selection.focus)
+                && let Some(items) = analysis.completions
+            {
+                editor.completion_range = Some((items.replacement_start, items.replacement_end));
+                editor.completion_items = items
+                    .items
+                    .into_iter()
+                    .map(|item| item.insert_text)
+                    .collect();
+            }
+            drop(editor);
+            state.syntax_diagnostics.replace(analysis.diagnostics);
+            view.refresh_diagnostics();
+            view.refresh();
+        });
+        state.analysis_task.replace(Some(task));
+    }
+
+    fn refresh_diagnostics(&self) {
+        let state = self.state();
+        let mut spans = state.syntax_diagnostics.borrow().clone();
+        spans.extend(
+            state
+                .spellcheck_issues
+                .borrow()
+                .iter()
+                .map(|issue| TextDiagnosticSpan {
+                    start: issue.start,
+                    end: issue.end,
+                    kind: TextDiagnosticKind::Spelling,
+                }),
+        );
+        spans.extend(
+            state
+                .markdown_lint_issues
+                .borrow()
+                .iter()
+                .map(|issue| TextDiagnosticSpan {
+                    start: issue.start,
+                    end: issue.end,
+                    kind: TextDiagnosticKind::Warning,
+                }),
+        );
+        state.editor.borrow_mut().set_diagnostics(spans);
+        self.queue_draw();
+    }
 }

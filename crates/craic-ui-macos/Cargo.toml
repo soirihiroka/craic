@@ -17,11 +17,15 @@ craic-platform.workspace = true
 craic-project.workspace = true
 craic-render-skia.workspace = true
 craic-system.workspace = true
+craic-ui-code.workspace = true
 craic-ui-containers.workspace = true
 craic-ui-preview.workspace = true
 craic-vcs.workspace = true
 dispatch2.workspace = true
 env_logger.workspace = true
+gpui.workspace = true
+gpui_apple = { workspace = true, features = ["runtime_shaders"] }
+gpui_wgpu.workspace = true
 log.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
