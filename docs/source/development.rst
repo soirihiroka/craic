@@ -48,6 +48,10 @@ Each deployment replaces the previous development build. The package version
 comes from ``Cargo.toml``; the RPM release includes the workflow run number,
 attempt, and commit identifier so later builds can be installed with DNF updates.
 
+To retry publication without rebuilding the RPMs, run the workflow manually on
+``main`` with ``fedora_run_id`` set to a completed run whose Fedora build
+succeeded. The RPM artifact is retained for seven days.
+
 Packages are unsigned by default. To enable package signatures, store an
 ASCII-armored, unencrypted GPG signing private key in the repository's
 ``RPM_SIGNING_KEY`` Actions secret, for example with

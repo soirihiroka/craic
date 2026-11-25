@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      fedora_run_id:
+        description: Successful Fedora build run to republish
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -19,6 +24,7 @@ env:
 
 jobs:
   fedora:
+    if: github.event_name != 'workflow_dispatch' || !inputs.fedora_run_id
     name: Fedora 44 x86_64 RPM
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -98,9 +104,12 @@ jobs:
           retention-days: 7
 
   deploy:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: >-
+      ${{ !cancelled() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' &&
+      (needs.fedora.result == 'success' || (needs.fedora.result == 'skipped' && inputs.fedora_run_id)) }}
     needs: fedora
     permissions:
+      actions: read
       contents: read
       pages: write
       id-token: write
@@ -108,7 +117,24 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
+    env:
+      PAGES_ARTIFACT: github-pages-${{ github.run_attempt }}
     steps:
+      - name: Verify the selected Fedora build
+        if: inputs.fedora_run_id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.fedora_run_id }}
+        run: |
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]]
+          run="repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN"
+          gh api "$run" | jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .head_repository.full_name == $repo and .head_branch == "main"
+            and .path == ".github/workflows/pages.yml" and .status == "completed"
+            and (.event == "push" or .event == "workflow_dispatch")'
+          gh api "$run/jobs" | jq -e '
+            any(.jobs[]; .name == "Fedora 44 x86_64 RPM" and .conclusion == "success")'
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -131,6 +157,8 @@ jobs:
         with:
           name: fedora-repository
           path: docs/build/rpm
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.fedora_run_id || github.run_id }}
 
       - name: Write repository configuration
         env:
@@ -147,10 +175,29 @@ jobs:
           PY
 
       - name: Upload Pages artifact
+        id: upload
         uses: actions/upload-pages-artifact@v5
         with:
+          name: ${{ env.PAGES_ARTIFACT }}
           path: docs/build
+
+      - name: Wait for the Pages artifact to be listed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact_id }}
+        run: |
+          for attempt in {1..6}; do
+            if listed_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?name=$PAGES_ARTIFACT" --jq '.artifacts[0].id') &&
+              [[ "$listed_id" == "$ARTIFACT_ID" ]]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Pages artifact $PAGES_ARTIFACT did not appear in the run"
+          exit 1
 
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
+        with:
+          artifact_name: ${{ env.PAGES_ARTIFACT }}
